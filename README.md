@@ -185,8 +185,16 @@ Use this when:
 Use this when:
 - the agent escaped the harness
 - a repeated governance mistake appears
-- you need to decide where a corrective rule belongs
+- you need a step-by-step tool for classifying the problem
 - you need to decide whether the issue belongs in law, tracker, `AGENTS.md`, or enforcement
+
+Typical use:
+1. record the problem
+2. classify the gap
+3. check existing rules first
+4. choose the owning layer
+5. apply the smallest sufficient correction
+6. verify references and follow-up
 
 ### `MECHANICAL_ENFORCEMENT_POLICY.md`
 Use this when:

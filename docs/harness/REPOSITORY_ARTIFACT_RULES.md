@@ -205,6 +205,8 @@ When artifact structure changes, the agent must explicitly review whether update
 
 If any related artifact is intentionally not updated, that decision must be visible and justified.
 
+When a governing document is split, renamed, moved, or replaced, update the affected read paths, ownership references, and synchronization points before treating the change as complete.
+
 ## Generated Or Derived Artifacts
 Generated or derived repository artifacts should be added only when they are:
 - important to repeated agent work
