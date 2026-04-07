@@ -118,7 +118,7 @@ This is the first tool-facing entry point. It tells the agent how to classify th
 
 Then read in this order:
 1. `HARNESS_CONSTITUTION.md`
-2. the root control layer as needed
+2. the root control tools when the task is initialization, rebuild, or governance recovery
 3. `docs/harness/*`
 4. `AGENTS.md`
 

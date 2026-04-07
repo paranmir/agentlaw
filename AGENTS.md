@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Purpose
-This document is a short execution-entry map for a project using the Harness starter skeleton. The source of truth is not `AGENTS.md`, but the constitution-law-operational-artifact-execution-entry system.
+This document is a short execution-entry map for a project using the Harness starter skeleton. The source of truth is not `AGENTS.md`, but the constitution-root-control-law-operational-artifact-execution-entry system.
 
 Any coding agent working in this repository must follow the read-first order and governing hierarchy below.
 

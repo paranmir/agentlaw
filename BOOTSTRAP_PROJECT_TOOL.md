@@ -1,4 +1,4 @@
-# Bootstrap Project Prompt
+# Bootstrap Project Tool
 
 ## Purpose
 Use this document when a coding agent is asked to initialize Harness governance in a target repository.
