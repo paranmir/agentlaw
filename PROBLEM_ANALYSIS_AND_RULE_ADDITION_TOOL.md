@@ -94,7 +94,7 @@ Default to amendment of existing text rather than creating parallel meaning.
 ## Step 5. Choose The Owning Layer
 Use this ownership map:
 - constitutional structure and invariant starter protections -> `HARNESS_CONSTITUTION.md`
-- starter carry-forward and project-instance preservation rules -> `STARTER_SPECIALIZATION_RULES.md`
+- starter carry-forward and project-instance preservation rules -> `docs/harness/STARTER_SPECIALIZATION_RULES.md`
 - scope and repository boundary -> `docs/harness/HARNESS_SCOPE.md`
 - inputs, outputs, execution flow, regression expectations, readiness -> `docs/harness/INPUT_OUTPUT_CONTRACT.md`
 - structural and behavioral judgment -> `docs/harness/ORACLE_AND_JUDGMENT.md`
@@ -114,7 +114,7 @@ Use this ladder:
 3. local law amendment
 4. short `AGENTS.md` guardrail addition
 5. constitutional amendment
-6. enforcement follow-up under `MECHANICAL_ENFORCEMENT_POLICY.md`
+6. enforcement follow-up under `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
 
 Use:
 - `tracker only` when the issue is real but not stable enough for a governing rule
@@ -150,7 +150,7 @@ Detailed structural synchronization rules live in:
 If the same problem keeps recurring and is mechanically detectable, do not keep solving it only with prose.
 
 Use:
-- `MECHANICAL_ENFORCEMENT_POLICY.md`
+- `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
 
 Especially when:
 - the problem is repeated

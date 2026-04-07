@@ -84,10 +84,10 @@ Silence is not permission.
 ## Read Path Rule
 When initializing or rebuilding a project instance, read these root-level control documents before rewriting project-specific laws:
 1. `HARNESS_CONSTITUTION.md`
-2. `BOOTSTRAP_PROJECT_PROMPT.md`
-3. `STARTER_SPECIALIZATION_RULES.md`
+2. `BOOTSTRAP_PROJECT_TOOL.md`
+3. `docs/harness/STARTER_SPECIALIZATION_RULES.md`
 4. the relevant files in `docs/harness/*`
-5. `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md` when the task comes from a current problem or repeated harness failure
+5. `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md` when the task comes from a current problem or repeated harness failure
 6. `AGENTS.md`
 
 ## Genericization Failure Rule

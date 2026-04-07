@@ -81,24 +81,21 @@ Examples:
 - `ORACLE_AND_JUDGMENT.md`
 - `FAILURE_TAXONOMY.md`
 - `REPOSITORY_ARTIFACT_RULES.md`
+- `STARTER_SPECIALIZATION_RULES.md`
+- `MECHANICAL_ENFORCEMENT_POLICY.md`
 
 ### Execution-Entry Documents
 Execution-entry documents use stable conventional names.
 
 Examples:
 - `AGENTS.md`
-- `BOOTSTRAP_PROJECT_PROMPT.md`
-- `STARTER_SPECIALIZATION_RULES.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
 
 ### Root Control Documents
 Root control documents use stable conventional names and live at repository root.
 
 Examples:
-- `HARNESS_CONSTITUTION.md`
-- `BOOTSTRAP_PROJECT_PROMPT.md`
-- `STARTER_SPECIALIZATION_RULES.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+- `BOOTSTRAP_PROJECT_TOOL.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 ### Plan Documents
 Plan documents use lowercase kebab case with names that describe the work clearly.
@@ -138,13 +135,11 @@ The default repository directories are:
 
 These default directories should be used before introducing new top-level or peer directories.
 
-The default root-level bootstrap and control-loop documents are:
+The default root-level constitution, entry, and control documents are:
 - `HARNESS_CONSTITUTION.md`
 - `AGENTS.md`
-- `BOOTSTRAP_PROJECT_PROMPT.md`
-- `STARTER_SPECIALIZATION_RULES.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
-- `MECHANICAL_ENFORCEMENT_POLICY.md`
+- `BOOTSTRAP_PROJECT_TOOL.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 ## Directory Creation Gate
 Creating a new directory is not the default response to project growth.
@@ -183,9 +178,15 @@ When a new artifact type or structure seems necessary:
 
 ## Specialization Reference
 Starter-law carry-forward and project-instance specialization rules live in:
-- `STARTER_SPECIALIZATION_RULES.md`
+- `docs/harness/STARTER_SPECIALIZATION_RULES.md`
 
 Use that document when the question is not artifact structure itself, but how starter protections must survive project-specific rewriting.
+
+## Mechanical Enforcement Reference
+Executable enforcement requirements for mechanically detectable constraints live in:
+- `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+
+Use that document when the question is not artifact structure itself, but whether prose must become tests, lint, CI, or structural checks.
 
 ## Shared Artifact Set Separation Rule
 If the repository has multiple shared artifact sets or derived outputs, they must not silently collapse into one unmanaged operational file set.

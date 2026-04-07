@@ -31,17 +31,17 @@ Its job is narrower:
 .
 ├─ HARNESS_CONSTITUTION.md
 ├─ AGENTS.md
-├─ BOOTSTRAP_PROJECT_PROMPT.md
-├─ STARTER_SPECIALIZATION_RULES.md
-├─ PROBLEM_ANALYSIS_AND_RULE_ADDITION.md
-├─ MECHANICAL_ENFORCEMENT_POLICY.md
+├─ BOOTSTRAP_PROJECT_TOOL.md
+├─ PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md
 ├─ docs/
 │  └─ harness/
 │     ├─ HARNESS_SCOPE.md
 │     ├─ INPUT_OUTPUT_CONTRACT.md
 │     ├─ ORACLE_AND_JUDGMENT.md
 │     ├─ FAILURE_TAXONOMY.md
-│     └─ REPOSITORY_ARTIFACT_RULES.md
+│     ├─ REPOSITORY_ARTIFACT_RULES.md
+│     ├─ STARTER_SPECIALIZATION_RULES.md
+│     └─ MECHANICAL_ENFORCEMENT_POLICY.md
 ├─ plans/
 │  ├─ active/
 │  ├─ completed/
@@ -57,16 +57,13 @@ Its job is narrower:
 - top-level governance and stable structure
 
 ### Root Control Layer
-- `BOOTSTRAP_PROJECT_PROMPT.md`
-- `STARTER_SPECIALIZATION_RULES.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
-- `MECHANICAL_ENFORCEMENT_POLICY.md`
+- `BOOTSTRAP_PROJECT_TOOL.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 These documents help an agent:
 - initialize the harness
-- specialize it into a real project
 - analyze governance problems
-- decide when prose must become executable enforcement
+- recover governance safely when something escaped the harness
 
 ### Law Layer
 - `docs/harness/*`
@@ -77,6 +74,8 @@ This is where the real project meaning belongs:
 - judgment
 - failure handling
 - artifact structure
+- starter-specialization carry-forward rules
+- executable enforcement policy
 
 ### Operational Artifacts
 - `plans/*`
@@ -111,7 +110,7 @@ The target repository should end up with the files and directories shown above.
 ### 2. Start with the bootstrap entry point
 
 Read:
-- `BOOTSTRAP_PROJECT_PROMPT.md`
+- `BOOTSTRAP_PROJECT_TOOL.md`
 
 This is the first tool-facing entry point. It tells the agent how to classify the repository and how to initialize or rebuild the harness correctly.
 
@@ -169,19 +168,13 @@ At minimum, the repository should have readable law for:
 
 ## How To Use The Root Control Documents
 
-### `BOOTSTRAP_PROJECT_PROMPT.md`
+### `BOOTSTRAP_PROJECT_TOOL.md`
 Use this when:
 - initializing a new repository
 - rebuilding harness docs in an existing repository
 - discarding weak earlier harness output and regenerating it from the current starter
 
-### `STARTER_SPECIALIZATION_RULES.md`
-Use this when:
-- converting starter law into project-specific law
-- checking whether starter protections were preserved
-- reviewing whether the result is too generic for an existing codebase
-
-### `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+### `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 Use this when:
 - the agent escaped the harness
 - a repeated governance mistake appears
@@ -196,7 +189,15 @@ Typical use:
 5. apply the smallest sufficient correction
 6. verify references and follow-up
 
-### `MECHANICAL_ENFORCEMENT_POLICY.md`
+## Important Law Documents Beyond The Core Five
+
+### `docs/harness/STARTER_SPECIALIZATION_RULES.md`
+Use this when:
+- converting starter law into project-specific law
+- checking whether starter protections were preserved
+- reviewing whether the result is too generic for an existing codebase
+
+### `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
 Use this when:
 - a repeated rule violation is mechanically detectable
 - prose-only guidance is no longer enough

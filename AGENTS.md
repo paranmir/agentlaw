@@ -10,8 +10,8 @@ This repository starts from the Harness starter skeleton.
 
 - Purpose of `AGENTS.md`: act as a short execution-entry map for the current project
 - Purpose of the law layer: store the real working criteria under `docs/harness/*`
-- Purpose of `BOOTSTRAP_PROJECT_PROMPT.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
-- Purpose of the root control layer: provide starter-level bootstrap, specialization, and corrective-governance guidance before detailed law work
+- Purpose of `BOOTSTRAP_PROJECT_TOOL.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
+- Purpose of the root control layer: provide starter-level bootstrap and corrective-governance guidance before detailed law work
 
 ## Source of Truth
 Document priority is:
@@ -30,17 +30,18 @@ Important:
 Check the current agreement in this order:
 
 1. `HARNESS_CONSTITUTION.md`
-2. Root control layer, in this order when relevant:
-   - `BOOTSTRAP_PROJECT_PROMPT.md` for initialization or rebuild
-   - `STARTER_SPECIALIZATION_RULES.md` for project-specific rewriting of starter laws
-   - `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md` for current problems, harness escape, or repeated rule failure
-   - `MECHANICAL_ENFORCEMENT_POLICY.md` for executable enforcement decisions on mechanically detectable implementation or structure rules
-3. `docs/harness/HARNESS_SCOPE.md`
-4. `docs/harness/INPUT_OUTPUT_CONTRACT.md`
-5. `docs/harness/ORACLE_AND_JUDGMENT.md`
-6. `docs/harness/FAILURE_TAXONOMY.md`
-7. `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
-8. `AGENTS.md`
+2. Root control tools, in this order when relevant:
+   - `BOOTSTRAP_PROJECT_TOOL.md` for initialization or rebuild
+   - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md` for current problems, harness escape, or repeated rule failure
+3. Law layer, in this order when relevant:
+   - `docs/harness/HARNESS_SCOPE.md`
+   - `docs/harness/INPUT_OUTPUT_CONTRACT.md`
+   - `docs/harness/ORACLE_AND_JUDGMENT.md`
+   - `docs/harness/FAILURE_TAXONOMY.md`
+   - `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+   - `docs/harness/STARTER_SPECIALIZATION_RULES.md`
+   - `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+4. `AGENTS.md`
 
 If the project grows in complexity, also read these when they exist and are relevant:
 - `plans/active/*`

@@ -18,7 +18,7 @@ The governance hierarchy is:
 
 Rules:
 - The constitution defines stable top-level rules.
-- Root control documents are starter-level control documents that live beside the constitution and guide initialization, specialization, and corrective governance loops without replacing the law layer.
+- Root control documents are starter-level control documents that live beside the constitution and guide initialization and corrective-governance loops without replacing the law layer.
 - Project-specific real working criteria belong in `docs/harness/*`.
 - Structured repository artifacts may store durable planning, reference, or derived context, but they do not override the law layer.
 - A structured repository artifact is approved only when it is created under the repository artifact rules and any required synchronization impact has been handled or explicitly recorded.
@@ -55,6 +55,8 @@ The minimum law-document categories are:
 Additional law documents may be required when the project needs them:
 - `RUNNER_FLOW`
 - `REGRESSION_STRATEGY`
+- `STARTER_SPECIALIZATION_RULES`
+- `MECHANICAL_ENFORCEMENT_POLICY`
 
 Rule:
 - `RUNNER_FLOW` and `REGRESSION_STRATEGY` are conceptually required before implementation.
@@ -77,7 +79,7 @@ At minimum, invariant starter protections include:
 If a project instance needs to weaken or remove one of these protections, that decision must be explicit, justified, and traceable to the owning higher-order governing layer rather than introduced by local summarization or replacement.
 
 Detailed starter-specialization carry-forward rules live in:
-- `STARTER_SPECIALIZATION_RULES.md`
+- `docs/harness/STARTER_SPECIALIZATION_RULES.md`
 
 ## 4. Structured Knowledge Expansion
 As a project grows, agents must not compensate by turning `AGENTS.md` into a larger rule store.
@@ -111,14 +113,11 @@ Rules:
 Root control documents are root-level control artifacts that work beside the constitution and before detailed law reading.
 
 The default root control documents are:
-- `BOOTSTRAP_PROJECT_PROMPT.md`
-- `STARTER_SPECIALIZATION_RULES.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
-- `MECHANICAL_ENFORCEMENT_POLICY.md`
+- `BOOTSTRAP_PROJECT_TOOL.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 Their role is to:
 - help agents initialize or rebuild a repository from the starter skeleton
-- preserve starter protections during project-specific specialization
 - analyze current governance problems and place corrective additions at the correct layer
 
 They must not:
