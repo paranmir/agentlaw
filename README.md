@@ -2,99 +2,219 @@
 
 A law-first harness kit for AI coding agents.
 
-`harness-kit` helps a repository establish governance before implementation begins. It gives coding agents a structured starting point for bootstrap, law documents, specialization, problem analysis, and enforcement promotion.
+`harness-kit` gives a repository a governed starting structure before implementation begins. It is designed for agents that can read and rewrite repository files directly, and it is built to work for both brand-new repositories and already-existing codebases.
 
-## Who This Is For
+## What This Is
 
-This kit is designed for:
+This repo is a reusable starter kit for:
 - Codex
 - Claude Code
 - Gemini CLI
-- other coding agents that can read repository files directly
+- other coding agents with direct repository access
 
-## What This Repo Gives You
+It is not:
+- an application framework
+- a language-specific scaffold
+- a build system
+- a test runner
 
-Root control layer:
+Its job is narrower:
+- establish governance first
+- keep entry guidance short
+- move durable meaning into structured law documents
+- preserve starter protections during specialization
+- promote repeated, detectable violations into executable enforcement
+
+## Repository Structure
+
+```text
+.
+├─ HARNESS_CONSTITUTION.md
+├─ AGENTS.md
+├─ BOOTSTRAP_PROJECT_PROMPT.md
+├─ STARTER_SPECIALIZATION_RULES.md
+├─ PROBLEM_ANALYSIS_AND_RULE_ADDITION.md
+├─ MECHANICAL_ENFORCEMENT_POLICY.md
+├─ docs/
+│  └─ harness/
+│     ├─ HARNESS_SCOPE.md
+│     ├─ INPUT_OUTPUT_CONTRACT.md
+│     ├─ ORACLE_AND_JUDGMENT.md
+│     ├─ FAILURE_TAXONOMY.md
+│     └─ REPOSITORY_ARTIFACT_RULES.md
+├─ plans/
+│  ├─ active/
+│  ├─ completed/
+│  └─ tech-debt-tracker.md
+└─ references/
+   └─ README.md
+```
+
+## What Each Part Does
+
+### Constitution
 - `HARNESS_CONSTITUTION.md`
-- `AGENTS.md`
+- top-level governance and stable structure
+
+### Root Control Layer
 - `BOOTSTRAP_PROJECT_PROMPT.md`
 - `STARTER_SPECIALIZATION_RULES.md`
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
 - `MECHANICAL_ENFORCEMENT_POLICY.md`
 
-Law layer:
-- `docs/harness/HARNESS_SCOPE.md`
-- `docs/harness/INPUT_OUTPUT_CONTRACT.md`
-- `docs/harness/ORACLE_AND_JUDGMENT.md`
-- `docs/harness/FAILURE_TAXONOMY.md`
-- `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+These documents help an agent:
+- initialize the harness
+- specialize it into a real project
+- analyze governance problems
+- decide when prose must become executable enforcement
 
-Operational artifacts:
-- `plans/active/`
-- `plans/completed/`
-- `plans/tech-debt-tracker.md`
-- `references/README.md`
+### Law Layer
+- `docs/harness/*`
 
-## What It Does
+This is where the real project meaning belongs:
+- scope
+- contract
+- judgment
+- failure handling
+- artifact structure
 
-This kit is built to help agents:
-- bootstrap a new repository before writing product code
-- establish a law-first document structure
-- preserve starter protections during project-specific specialization
-- analyze current governance problems before adding new rules
-- promote repeated, mechanically detectable violations into executable enforcement
+### Operational Artifacts
+- `plans/*`
+- `references/*`
 
-## Repository Modes
+These support the law layer. They do not replace it.
 
-`harness-kit` is designed to work with:
-- empty repositories
-- near-empty repositories
-- existing repositories with meaningful code or runtime artifacts
+### Execution Entry
+- `AGENTS.md`
 
-It does not assume every project starts from zero.
-
-## How To Use
-
-1. Put this kit at the root of your target repository.
-2. Start with `BOOTSTRAP_PROJECT_PROMPT.md`.
-3. Read `HARNESS_CONSTITUTION.md`.
-4. Follow `AGENTS.md`.
-5. Fill `docs/harness/*` from the actual repository state.
-6. Begin implementation only after the law layer is materially ready.
-
-If the repository already has code:
-- treat current code and file structure as the authoritative product source
-- treat old design prose as reference-only unless the law layer explicitly promotes something out of it
+This stays short and routes the agent into the right files.
 
 ## Core Principles
 
 - Law-first before implementation
 - Short `AGENTS.md`, never a rule encyclopedia
-- Structured docs instead of one giant instruction file
-- Specialization is overlay, not replacement
-- Repeated detectable violations should become executable enforcement
-- If a forbidden path can be made to fail directly, prose-only guidance is not enough
+- Shared starter protections survive project specialization
+- Existing projects must be rewritten from real code and runtime facts, not vague starter prose
+- Repeated, mechanically detectable violations should become executable enforcement
 
-## Current Status
+## How To Use
 
-This repo is currently **beta**.
+### 1. Put `harness-kit` at the root of the target repository
 
-It is best suited for:
+You can:
+- copy these files into the repository
+- extract the distributed zip into the repository
+- or otherwise place this structure at repository root
+
+The target repository should end up with the files and directories shown above.
+
+### 2. Start with the bootstrap entry point
+
+Read:
+- `BOOTSTRAP_PROJECT_PROMPT.md`
+
+This is the first tool-facing entry point. It tells the agent how to classify the repository and how to initialize or rebuild the harness correctly.
+
+### 3. Read the governing order
+
+Then read in this order:
+1. `HARNESS_CONSTITUTION.md`
+2. the root control layer as needed
+3. `docs/harness/*`
+4. `AGENTS.md`
+
+If plans or references already exist, read them only when relevant.
+
+### 4. Classify the target repository
+
+The bootstrap is designed for three modes:
+
+- `empty`
+  - almost no product files exist yet
+- `near-empty`
+  - some structure exists, but product meaning is still mostly undefined
+- `existing`
+  - code, runtime artifacts, or meaningful project behavior already exist
+
+This classification matters. The harness should not treat all repositories as greenfield.
+
+### 5. Run the bootstrap correctly
+
+#### For empty or near-empty repositories
+The agent should:
+- instantiate the starter law layer
+- define the initial first-release boundary
+- keep unknowns explicit
+- avoid inventing extra structure without need
+
+#### For existing repositories
+The agent should:
+- preserve starter structure and protections
+- treat current code and file structure as the authoritative product baseline
+- rewrite `docs/harness/*` from repository facts
+- replace generic starter wording with concrete local meaning
+- make important code/UI/doc mismatches explicit
+- use `plans/tech-debt-tracker.md` when repeated, material, or enforcement-relevant discrepancies already exist
+
+### 6. Do not implement too early
+
+Implementation should start only after the law layer is materially ready.
+
+At minimum, the repository should have readable law for:
+- scope
+- input/output contract
+- judgment
+- failure handling
+- execution flow and regression expectations
+
+## How To Use The Root Control Documents
+
+### `BOOTSTRAP_PROJECT_PROMPT.md`
+Use this when:
+- initializing a new repository
+- rebuilding harness docs in an existing repository
+- discarding weak earlier harness output and regenerating it from the current starter
+
+### `STARTER_SPECIALIZATION_RULES.md`
+Use this when:
+- converting starter law into project-specific law
+- checking whether starter protections were preserved
+- reviewing whether the result is too generic for an existing codebase
+
+### `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+Use this when:
+- the agent escaped the harness
+- a repeated governance mistake appears
+- you need to decide where a corrective rule belongs
+- you need to decide whether the issue belongs in law, tracker, `AGENTS.md`, or enforcement
+
+### `MECHANICAL_ENFORCEMENT_POLICY.md`
+Use this when:
+- a repeated rule violation is mechanically detectable
+- prose-only guidance is no longer enough
+- a repository constraint should become lint, CI, structure checks, or tests
+
+## Expected Result Of A Good Bootstrap
+
+For any repository, a good bootstrap should produce:
+- a short `AGENTS.md`
+- a readable law layer under `docs/harness/*`
+- explicit blockers where meaning is still missing
+- no premature implementation
+
+For an existing repository, a good bootstrap should also produce:
+- concrete local law text
+- explicit important mismatches
+- non-empty tracker entries when real repeated or materially important drift already exists
+
+## Beta Status
+
+`harness-kit` is still beta.
+
+It is currently strongest for:
 - repository initialization
-- harness setup
 - governance scaffolding
-- early project structuring
-- rebuilding governance around an already-existing codebase
+- law-first project setup
+- rebuilding structure around an already-existing codebase
 
-## Notes
-
-This repository is a starter kit, not a finished application framework.
-
-It does not prescribe:
-- a programming language
-- a frontend or backend stack
-- a package manager
-- a test framework
-- a CI provider
-
-Those belong to the target project once the law layer is established.
+It is still evolving through recursive improvement based on real agent failures and bootstrap results.

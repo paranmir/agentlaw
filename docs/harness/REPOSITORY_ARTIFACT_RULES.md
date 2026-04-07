@@ -187,13 +187,13 @@ Starter-law carry-forward and project-instance specialization rules live in:
 
 Use that document when the question is not artifact structure itself, but how starter protections must survive project-specific rewriting.
 
-## Source And Distribution Separation Rule
-If the repository has both source-repository-only artifacts and distributable artifacts, they must not silently share the same operational file set.
+## Shared Artifact Set Separation Rule
+If the repository has multiple shared artifact sets or derived outputs, they must not silently collapse into one unmanaged operational file set.
 
-When a change affects distributed artifacts, confirm that:
-- the distributed variant does not reference source-repository-only paths
-- the source-repository variant does not rely on distributed-project assumptions
-- packaging outputs are built from the intended distributable source set
+When a change affects shared artifacts or derived outputs, confirm that:
+- each shared artifact set still points to the intended generalized document set
+- derived outputs are built from the intended shared source set
+- no parallel shared artifact set silently keeps obsolete or conflicting meaning
 
 ## Mandatory Synchronization Check
 When artifact structure changes, the agent must explicitly review whether updates are needed in:
@@ -201,7 +201,7 @@ When artifact structure changes, the agent must explicitly review whether update
 - `HARNESS_CONSTITUTION.md`
 - `docs/harness/*`
 - `plans/tech-debt-tracker.md`
-- distributable packaging inputs or outputs when they exist
+- other shared artifact sets or derived outputs when they exist
 
 If any related artifact is intentionally not updated, that decision must be visible and justified.
 

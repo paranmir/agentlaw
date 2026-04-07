@@ -62,7 +62,7 @@ If a request changes scope, contract meaning, judgment logic, failure handling, 
 Before making meaningful changes, classify the request as one or more of:
 - `content-only`: changes local content without changing artifact structure or governance routing
 - `structure-affecting`: changes repository structure, artifact classes, or directory usage
-- `distribution-affecting`: changes what belongs in the distributable starter skeleton or how distributed files relate to source variants
+- `shared-artifact-affecting`: changes shared artifact sets or how derived outputs relate to them
 - `governance-affecting`: changes constitutional or law-layer meaning
 
 This classification must be made before implementation or restructuring work proceeds.
@@ -81,7 +81,7 @@ Outputs must:
 - keep `AGENTS.md` short and operational
 
 ## Synchronization Rule
-When a change is `structure-affecting`, `distribution-affecting`, or `governance-affecting`, the agent must check whether related governing artifacts also require updates.
+When a change is `structure-affecting`, `shared-artifact-affecting`, or `governance-affecting`, the agent must check whether related governing artifacts also require updates.
 
 At minimum, check the relevant combination of:
 - `HARNESS_CONSTITUTION.md`
@@ -89,7 +89,7 @@ At minimum, check the relevant combination of:
 - `docs/harness/*`
 - `plans/tech-debt-tracker.md`
 - `references/*`
-- distributable or source-repository packaging artifacts when they exist
+- derived outputs or parallel shared artifact sets when they exist
 
 A change is not complete if it leaves known related governing artifacts outdated without explicitly recording the deferred impact.
 
@@ -180,11 +180,11 @@ These additions support the law layer; they do not replace it.
 When the same constraint is checked repeatedly in review, the project should record it as a promotion candidate for lint, CI, structural tests, or equivalent automated enforcement.
 
 ## Completion Gate For Structural Changes
-A `structure-affecting`, `distribution-affecting`, or `governance-affecting` change should be treated as incomplete until:
+A `structure-affecting`, `shared-artifact-affecting`, or `governance-affecting` change should be treated as incomplete until:
 - the change classification is explicit
 - the affected governing artifacts have been reviewed for synchronization impact
 - required updates are applied or deferred impact is explicitly recorded
-- no known source-versus-distribution confusion remains
+- no known artifact-set confusion remains
 
 ## Next Update Trigger
 Update this document when:
