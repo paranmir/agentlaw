@@ -55,6 +55,7 @@ Additional requirements for existing projects:
 - do not treat `browser app`, `local persistence`, or similarly generic summaries as sufficient when the repository exposes more specific governed behavior
 - if the current repository exposes concrete mismatches, unstable semantics, or misleading controls, document those discrepancies explicitly in the law layer rather than smoothing them away
 - if known drift exists and the tracker remains empty, treat the bootstrap as incomplete unless the absence is explicitly justified
+- do not document every visible discrepancy by default; document the discrepancies that materially affect governed meaning, review safety, or repeated future work
 
 Your first deliverable is the law layer and short entry map, not product code.
 ```
@@ -90,6 +91,7 @@ It should not:
 - overload `AGENTS.md`
 - preserve starter form while leaving project laws generic when concrete local facts are already available
 - leave known project mismatches undocumented just because the starter structure is complete
+- flood the law layer with low-importance implementation irregularities that do not materially affect governed meaning
 - jump straight into implementation
 
 ## When To Reuse This Prompt

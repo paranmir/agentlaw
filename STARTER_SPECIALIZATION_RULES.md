@@ -69,6 +69,7 @@ For existing projects, this also means:
 - replace generic starter placeholders with concrete repository facts when those facts are already visible
 - prefer code-backed local detail over reusable starter wording
 - treat undocumented known discrepancies as an incomplete specialization result
+- avoid inflating the law layer with local irregularities that do not materially affect governed meaning or review safety
 
 ## Allowed Weakening Threshold
 A project instance may weaken or remove one of the starter protections only when all of the following are true:
@@ -97,6 +98,10 @@ Treat the result as incomplete when one or more of the following is true:
 - known repository-specific discrepancies are visible in code but absent from the law layer
 - concrete persistence, UI, or runtime semantics remain generic even though the repository exposes them directly
 - the tracker stays empty despite visible repeated, material, or mechanically detectable discrepancies
+
+It is not incomplete merely because every visible discrepancy in the codebase was not documented.
+
+The failure is genericization or omission of important discrepancies, not the absence of exhaustive issue listing.
 
 ## Next Update Trigger
 Update this document when:

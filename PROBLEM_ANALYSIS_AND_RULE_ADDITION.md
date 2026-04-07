@@ -57,6 +57,28 @@ Then determine which of these is true:
 
 Do not promote a problem upward until this analysis is explicit.
 
+## Project-Mismatch Importance Test
+When the problem is a project-specific code/UI/doc discrepancy, do not assume that every discrepancy belongs in the law layer.
+
+Treat a discrepancy as important enough for law or tracker handling when one or more of the following is true:
+- it changes scope, contract meaning, oracle meaning, failure interpretation, execution flow, or regression expectations
+- it creates user-visible misleading behavior about what a control, output, or runtime path actually does
+- it creates maintenance risk by making another agent or maintainer likely to act on a false assumption about current behavior
+- it can cause runtime breakage, invalid results, or failed flows if left implicit
+- it is repeated, likely to recur, or already a candidate for stronger enforcement
+
+Do not treat a discrepancy as law-worthy by default when it is:
+- a one-off local implementation detail with no governance impact
+- obvious from code but not important to project meaning, review safety, or future maintenance
+- already adequately governed by an existing law statement without needing more detail
+
+The goal is not to document every irregularity. The goal is to document the discrepancies that materially affect:
+- governed meaning
+- user-visible meaning
+- review and oracle quality
+- maintenance safety
+- future enforcement needs
+
 ## Existing Rule First Check
 Before adding a new rule, check the existing governing documents first.
 
@@ -116,6 +138,7 @@ Guidance:
 For existing-project bootstrap failures:
 - choose at least `local law amendment` when concrete repository facts are visible but law text remains generic
 - choose at least `tracker entry only` when known discrepancies exist but remain untracked
+- do not force every visible discrepancy into law when it fails the project-mismatch importance test
 
 ## Placement Rules
 Add the corrective rule at the smallest layer that owns the meaning.
@@ -128,6 +151,7 @@ Examples:
 - if the problem is “agents skip required read-first order,” add or strengthen a short `AGENTS.md` guardrail
 - if the problem is repeated but not yet stable enough for law, record it in `plans/tech-debt-tracker.md`
 - if the problem is “the bootstrap preserved starter structure but failed to extract concrete local facts,” strengthen `BOOTSTRAP_PROJECT_PROMPT.md`, `STARTER_SPECIALIZATION_RULES.md`, or the affected project law document
+- if the problem is “a discrepancy matters for future work but not enough for core law meaning,” record it in `plans/tech-debt-tracker.md` rather than overloading the law layer
 
 Do not add a new root file or new artifact class when an existing governing file already owns the problem.
 
@@ -197,6 +221,10 @@ When bootstrap or rebuild work targets an existing repository with meaningful co
 - the law layer contains concrete repository-specific facts rather than only starter-level generalities
 - known code/UI/doc mismatches remain explicitly documented
 - repeated, material, or mechanically detectable drift is either tracked or explicitly justified as not needing a tracker entry yet
+
+This completion rule does not require documenting every visible discrepancy.
+
+It requires documenting the discrepancies that pass the project-mismatch importance test and leaving the rest out unless they later become repeated, misleading, or enforcement-relevant.
 
 ## Reference Update Completion Rule
 If the corrective work adds, removes, splits, renames, or repositions a governing document, the work is not complete until affected references are updated.
