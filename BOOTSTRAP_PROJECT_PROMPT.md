@@ -34,17 +34,27 @@ If the repository is empty or near-empty:
 
 If the repository already has meaningful code or runtime artifacts:
 - instantiate the starter law layer
+- preserve the starter structure and starter protections while specializing it into project law
 - treat the current code and file structure as the authoritative behavioral baseline
 - rewrite `docs/harness/*` from current repository facts rather than from legacy planning prose
-- keep current drift between code, UI, docs, and expectations explicit
+- extract concrete project-specific runtime facts into the law layer instead of leaving the result at generic starter wording
+- make known mismatches between code, UI, docs, and expectations explicit
+- record concrete known drift in `plans/tech-debt-tracker.md` when the repository already contains repeated, material, or mechanically detectable mismatches
 - use `plans/*` only when the recovery or implementation work is genuinely multi-step
 - use `references/*` only for durable non-authoritative material
 
 In both cases:
+- preserve starter form and starter protections while filling that form with repository-local facts
 - preserve starter-level structural protections in `REPOSITORY_ARTIFACT_RULES.md`
 - preserve both structural and behavioral oracle layers in `ORACLE_AND_JUDGMENT.md`
 - document scope, contract, oracle, failure handling, execution flow, and regression expectations before implementation
 - do not begin implementation until the documentation gate is satisfied for the affected area
+
+Additional requirements for existing projects:
+- do not leave project laws at starter-level generality when concrete runtime facts are already visible in code or files
+- do not treat `browser app`, `local persistence`, or similarly generic summaries as sufficient when the repository exposes more specific governed behavior
+- if the current repository exposes concrete mismatches, unstable semantics, or misleading controls, document those discrepancies explicitly in the law layer rather than smoothing them away
+- if known drift exists and the tracker remains empty, treat the bootstrap as incomplete unless the absence is explicitly justified
 
 Your first deliverable is the law layer and short entry map, not product code.
 ```
@@ -67,12 +77,19 @@ A correct bootstrap should produce:
 - `plans/*` only when complexity justifies them
 - `references/*` only when durable repository-local references are needed
 
+For an existing project, a correct bootstrap must also produce:
+- project-specific law text that another agent could use without re-deriving core runtime facts from code
+- explicit known mismatches when code, UI, docs, or expectations disagree
+- non-empty tracked debt or promotion candidates when real repeated or structurally important drift already exists
+
 It should not:
 
 - trust legacy planning prose over actual code
 - delete starter structural protections during project-specific specialization
 - collapse structural and behavioral oracle into one vague section
 - overload `AGENTS.md`
+- preserve starter form while leaving project laws generic when concrete local facts are already available
+- leave known project mismatches undocumented just because the starter structure is complete
 - jump straight into implementation
 
 ## When To Reuse This Prompt

@@ -53,6 +53,7 @@ Then determine which of these is true:
 - `misplaced rule`: a rule exists, but it lives at the wrong layer
 - `ignored rule`: the rule exists and is adequate, but the agent failed to follow it
 - `mechanical gap`: the rule is repeated often enough that prose may no longer be sufficient
+- `genericization gap`: starter form was preserved, but project-specific runtime meaning was not extracted strongly enough
 
 Do not promote a problem upward until this analysis is explicit.
 
@@ -112,6 +113,10 @@ Guidance:
 - choose `constitutional amendment` only for shared structural gaps or starter invariants
 - choose `mechanical enforcement promotion` when repeated review is no longer reliable enough
 
+For existing-project bootstrap failures:
+- choose at least `local law amendment` when concrete repository facts are visible but law text remains generic
+- choose at least `tracker entry only` when known discrepancies exist but remain untracked
+
 ## Placement Rules
 Add the corrective rule at the smallest layer that owns the meaning.
 
@@ -122,6 +127,7 @@ Examples:
 - if the problem is “agents create new directories without checking current classes first,” strengthen `REPOSITORY_ARTIFACT_RULES.md`
 - if the problem is “agents skip required read-first order,” add or strengthen a short `AGENTS.md` guardrail
 - if the problem is repeated but not yet stable enough for law, record it in `plans/tech-debt-tracker.md`
+- if the problem is “the bootstrap preserved starter structure but failed to extract concrete local facts,” strengthen `BOOTSTRAP_PROJECT_PROMPT.md`, `STARTER_SPECIALIZATION_RULES.md`, or the affected project law document
 
 Do not add a new root file or new artifact class when an existing governing file already owns the problem.
 
@@ -180,8 +186,17 @@ Check:
 - did it keep `AGENTS.md` short
 - did it avoid creating a new artifact class unnecessarily
 - does another related document also need synchronization
+- for existing-project work, did it convert visible local repository facts into readable law rather than leaving them implicit in code
+- for existing-project work, do known discrepancies remain explicitly documented in law or tracker form
 
 If the answer to any of these is no, correct the placement before continuing.
+
+## Existing-Project Bootstrap Completion Rule
+When bootstrap or rebuild work targets an existing repository with meaningful code or runtime artifacts, the work is incomplete unless all of the following are true:
+- starter structure and protections remain intact
+- the law layer contains concrete repository-specific facts rather than only starter-level generalities
+- known code/UI/doc mismatches remain explicitly documented
+- repeated, material, or mechanically detectable drift is either tracked or explicitly justified as not needing a tracker entry yet
 
 ## Reference Update Completion Rule
 If the corrective work adds, removes, splits, renames, or repositions a governing document, the work is not complete until affected references are updated.

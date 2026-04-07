@@ -17,6 +17,8 @@ Project-specific law documents may add:
 
 They must not silently remove or materially weaken starter protections by summarization, omission, or replacement.
 
+They also must not preserve starter form while leaving project law at generic starter-level wording when the target repository already exposes more concrete runtime facts.
+
 ## Starter Invariants
 At minimum, the following starter protections are invariant and must carry forward unless a higher-order governing rule explicitly changes them:
 - law-versus-operational-artifact-versus-execution-entry separation
@@ -36,6 +38,8 @@ Project instances must keep these protections explicitly readable, not merely im
 - expansion decisions must prefer existing governed structure first
 - synchronization checks are required when structure or meaning changes
 - both structural and behavioral oracle layers remain usable for later review and implementation judgment
+- project-specific law must become concretely more local as repository facts become available
+- known runtime discrepancies must remain explicit rather than being smoothed into generic readiness prose
 
 ## Artifact-Law Preservation
 When a project instance rewrites `REPOSITORY_ARTIFACT_RULES.md` in project-specific terms, it may add local artifact maps and local runtime examples.
@@ -61,6 +65,11 @@ The default behavior is:
 - preserve its existing protections
 - add or strengthen only the text needed for local meaning
 
+For existing projects, this also means:
+- replace generic starter placeholders with concrete repository facts when those facts are already visible
+- prefer code-backed local detail over reusable starter wording
+- treat undocumented known discrepancies as an incomplete specialization result
+
 ## Allowed Weakening Threshold
 A project instance may weaken or remove one of the starter protections only when all of the following are true:
 - the change is explicit
@@ -79,6 +88,15 @@ When initializing or rebuilding a project instance, read these root-level contro
 4. the relevant files in `docs/harness/*`
 5. `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md` when the task comes from a current problem or repeated harness failure
 6. `AGENTS.md`
+
+## Genericization Failure Rule
+Specialization is incomplete when it preserves the starter outline but fails to capture project-specific runtime meaning.
+
+Treat the result as incomplete when one or more of the following is true:
+- the resulting law could still describe many unrelated browser projects equally well
+- known repository-specific discrepancies are visible in code but absent from the law layer
+- concrete persistence, UI, or runtime semantics remain generic even though the repository exposes them directly
+- the tracker stays empty despite visible repeated, material, or mechanically detectable discrepancies
 
 ## Next Update Trigger
 Update this document when:
