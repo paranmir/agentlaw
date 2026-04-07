@@ -1,0 +1,83 @@
+# Repository Guidelines
+
+## Purpose
+This document is a short execution-entry map for a project using the Harness starter skeleton. The source of truth is not `AGENTS.md`, but the constitution-law-operational-artifact-execution-entry system.
+
+Any coding agent working in this repository must follow the read-first order and governing hierarchy below.
+
+## What This Repository Is
+This repository starts from the Harness starter skeleton.
+
+- Purpose of `AGENTS.md`: act as a short execution-entry map for the current project
+- Purpose of the law layer: store the real working criteria under `docs/harness/*`
+- Purpose of `BOOTSTRAP_PROJECT_PROMPT.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
+- Purpose of the root control layer: provide starter-level bootstrap, specialization, and corrective-governance guidance before detailed law work
+
+## Source of Truth
+Document priority is:
+
+1. `HARNESS_CONSTITUTION.md`
+2. `docs/harness/*`
+3. approved structured repository artifacts such as `plans/*`, `references/*`, and stable generated facts when they exist
+4. `AGENTS.md` and other execution-entry documents
+
+Important:
+- Project-specific rules belong in `docs/harness/*`.
+- `AGENTS.md` is not a rule store. It only tells agents what to read first and how to enter the work.
+- `RULES.md` is not used.
+
+## Read First
+Check the current agreement in this order:
+
+1. `HARNESS_CONSTITUTION.md`
+2. Root control layer, in this order when relevant:
+   - `BOOTSTRAP_PROJECT_PROMPT.md` for initialization or rebuild
+   - `STARTER_SPECIALIZATION_RULES.md` for project-specific rewriting of starter laws
+   - `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md` for current problems, harness escape, or repeated rule failure
+   - `MECHANICAL_ENFORCEMENT_POLICY.md` for executable enforcement decisions on mechanically detectable implementation or structure rules
+3. `docs/harness/HARNESS_SCOPE.md`
+4. `docs/harness/INPUT_OUTPUT_CONTRACT.md`
+5. `docs/harness/ORACLE_AND_JUDGMENT.md`
+6. `docs/harness/FAILURE_TAXONOMY.md`
+7. `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+8. `AGENTS.md`
+
+If the project grows in complexity, also read these when they exist and are relevant:
+- `plans/active/*`
+- `plans/completed/*`
+- `plans/tech-debt-tracker.md`
+- `references/*`
+
+Prefer them in this order:
+1. `plans/active/*` for current execution-driving work
+2. `references/*` for repository-local reference context
+3. `plans/tech-debt-tracker.md` for repeated drift or promotion candidates
+4. `plans/completed/*` only when historical decisions or finished work need to be consulted
+
+Create or update them when:
+- a multi-step change is too large or long-lived to track safely in `AGENTS.md`
+- a decision path needs durable progress tracking across sessions
+- reference material would otherwise need to be re-derived or re-read repeatedly
+- repeated drift or review failures need tracking for later promotion into stronger enforcement
+
+Move a plan from `plans/active/*` to `plans/completed/*` when:
+- the governed work is complete for its current scope
+- the main decisions and outcome are recorded clearly enough for later review
+- the plan no longer needs to drive current execution
+
+## Current Priority
+The current core work order is fixed:
+
+1. Clarify the law layer before implementation
+2. Keep `AGENTS.md` aligned as a short execution entry map only
+3. Make unresolved items explicit instead of hiding them
+4. Update `docs/harness/*` when project meaning changes
+
+## Working Rules
+- Do **document impact analysis** and **document consistency recovery** before implementation.
+- Do not treat a new request as a coding request first. Judge constitution/law document impact first.
+- Do not treat `unknown` as a confirmed fact.
+- Do not start implementation before the documentation gate is satisfied.
+- Do not grow `AGENTS.md` into a rule encyclopedia.
+- When the law layer and short execution map are no longer enough, expand through `plans/*` and `references/*` rather than overloading `AGENTS.md`.
+- Do not create new artifact directories when `docs/harness/*`, `plans/*`, or `references/*` already solve the problem.

@@ -1,0 +1,88 @@
+# Starter Specialization Rules
+
+## Purpose
+This document defines how the Harness starter skeleton may be specialized into a project-specific repository without deleting or weakening starter-level protections by default.
+
+It governs specialization of starter documents into project documents.
+
+## Core Rule
+Project-specific specialization is an overlay on the starter structure, not a replacement of that structure.
+
+Project-specific law documents may add:
+- local facts
+- local examples
+- stricter local rules
+- runtime-specific detail
+- project-specific workflow detail
+
+They must not silently remove or materially weaken starter protections by summarization, omission, or replacement.
+
+## Starter Invariants
+At minimum, the following starter protections are invariant and must carry forward unless a higher-order governing rule explicitly changes them:
+- law-versus-operational-artifact-versus-execution-entry separation
+- operational-artifact approval conditions
+- directory-creation and expansion gates
+- mandatory synchronization checks for structural changes
+- continued structural-oracle existence
+- the rule that document existence alone is not a sufficient behavioral oracle
+
+## Mandatory Carry-Forward Protections
+Project instances must keep these protections explicitly readable, not merely implied:
+- execution-entry documents are routing-only rather than rule-owning documents
+- operational artifacts are supporting rather than law-owning artifacts
+- operational artifacts require approval conditions
+- directory creation is gated rather than convenience-driven
+- pre-creation checks must happen before new structure is introduced
+- expansion decisions must prefer existing governed structure first
+- synchronization checks are required when structure or meaning changes
+- both structural and behavioral oracle layers remain usable for later review and implementation judgment
+
+## Artifact-Law Preservation
+When a project instance rewrites `REPOSITORY_ARTIFACT_RULES.md` in project-specific terms, it may add local artifact maps and local runtime examples.
+
+It must still preserve:
+- artifact approval rules
+- naming and structure gates
+- synchronization obligations
+- law/artifact/entry separation
+
+## Oracle Preservation
+When a project instance rewrites `ORACLE_AND_JUDGMENT.md` in project-specific terms:
+- structural oracle must remain present
+- behavioral oracle must become more concrete as project meaning becomes clearer
+- document existence alone must not become the final behavioral oracle
+- both oracle layers must remain reviewable and usable
+
+## Amendment, Not Replacement
+The default specialization action is amendment of the relevant starter document, not creation of parallel meaning.
+
+The default behavior is:
+- preserve the owning document
+- preserve its existing protections
+- add or strengthen only the text needed for local meaning
+
+## Allowed Weakening Threshold
+A project instance may weaken or remove one of the starter protections only when all of the following are true:
+- the change is explicit
+- the reason is justified
+- the owning higher-order layer is identified
+- the deletion impact is reviewed
+- the result is still governable and not merely shorter
+
+Silence is not permission.
+
+## Read Path Rule
+When initializing or rebuilding a project instance, read these root-level control documents before rewriting project-specific laws:
+1. `HARNESS_CONSTITUTION.md`
+2. `BOOTSTRAP_PROJECT_PROMPT.md`
+3. `STARTER_SPECIALIZATION_RULES.md`
+4. the relevant files in `docs/harness/*`
+5. `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md` when the task comes from a current problem or repeated harness failure
+6. `AGENTS.md`
+
+## Next Update Trigger
+Update this document when:
+- project instances keep dropping starter protections
+- specialization rules prove ambiguous
+- carry-forward protections need refinement
+- a repeated specialization failure should be promoted into stronger enforcement

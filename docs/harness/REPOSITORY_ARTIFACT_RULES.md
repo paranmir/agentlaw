@@ -1,0 +1,219 @@
+# Repository Artifact Rules
+
+## Purpose
+This document defines how repository artifacts are named, where they belong, and when new artifact structures may be introduced.
+
+Its goal is to prevent structural drift as the project grows.
+
+## Artifact Classes
+The default repository artifact classes are:
+- constitutional documents
+- law documents
+- execution-entry documents
+- root control documents
+- plans
+- references
+- trackers
+- generated or derived artifacts when they become necessary
+
+Every new artifact should be classified into an existing class before a new class or directory is proposed.
+
+## Execution-Entry Document Definition
+Execution-entry documents are short routing documents that tell an agent how to enter the work correctly.
+
+Their role is to:
+- point to the actual source-of-truth documents
+- define read-first order
+- state current work order or entry priorities
+- give short operational guardrails for entering the work
+
+They may include:
+- repository identity and purpose at a high level
+- source-of-truth order
+- read-first order
+- current priority
+- short working rules and anti-patterns
+
+They must not include:
+- project-specific scope details that belong in law documents
+- detailed input/output contracts
+- detailed oracle or acceptance logic
+- detailed failure rules
+- long-form plans, references, or design notes
+
+The default execution-entry document is `AGENTS.md`.
+
+## Operational Artifact Definition
+Operational artifacts are structured supporting records used to help agents work safely as a project grows.
+
+Their role is to:
+- track meaningful work over time
+- preserve searchable repository-local references
+- record debt, drift risks, and promotion candidates
+- store stable derived facts when repeated work depends on them
+
+Operational artifacts may include:
+- active plans
+- completed plans
+- reference notes
+- tracker entries
+- generated or derived repository facts that satisfy the repository rules
+
+Operational artifacts must not:
+- replace constitutional or law-layer authority
+- silently redefine scope, contracts, oracle logic, or failure handling
+- become an unstructured dump of chat history or temporary notes
+
+The default operational-artifact paths are `plans/*`, `references/*`, and stable generated-facts locations when explicitly approved by repository rules.
+
+An operational artifact counts as approved only when:
+- it fits an allowed artifact class and path
+- it passes the required pre-creation checks when a new structure or artifact type is involved
+- required governing-document synchronization has been completed or explicitly deferred with visible impact
+
+## Naming Rules
+### Law Documents
+Law documents use uppercase snake case.
+
+Examples:
+- `HARNESS_SCOPE.md`
+- `INPUT_OUTPUT_CONTRACT.md`
+- `ORACLE_AND_JUDGMENT.md`
+- `FAILURE_TAXONOMY.md`
+- `REPOSITORY_ARTIFACT_RULES.md`
+
+### Execution-Entry Documents
+Execution-entry documents use stable conventional names.
+
+Examples:
+- `AGENTS.md`
+- `BOOTSTRAP_PROJECT_PROMPT.md`
+- `STARTER_SPECIALIZATION_RULES.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+
+### Root Control Documents
+Root control documents use stable conventional names and live at repository root.
+
+Examples:
+- `HARNESS_CONSTITUTION.md`
+- `BOOTSTRAP_PROJECT_PROMPT.md`
+- `STARTER_SPECIALIZATION_RULES.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+
+### Plan Documents
+Plan documents use lowercase kebab case with names that describe the work clearly.
+
+Examples:
+- `todo-first-release-plan.md`
+- `local-persistence-rollout.md`
+- `task-filtering-followup.md`
+
+### Reference Documents
+Reference documents use lowercase kebab case and should signal their purpose when possible.
+
+Examples:
+- `local-storage-reference.md`
+- `sqlite-notes.md`
+- `design-system-reference.md`
+
+### Tracker Documents
+Trackers should prefer stable fixed names over ad hoc variants.
+
+Examples:
+- `tech-debt-tracker.md`
+
+## Naming Anti-Patterns
+Do not use:
+- ambiguous names such as `misc.md`, `stuff.md`, or `notes2.md`
+- unstable suffixes such as `final`, `final2`, `new`, or `temp`
+- names that hide the artifact class or purpose
+- multiple naming styles for the same artifact type
+
+## Default Directory Rules
+The default repository directories are:
+- `docs/harness/` for governing law documents
+- `plans/active/` for active versioned plans
+- `plans/completed/` for completed plans kept for history
+- `references/` for searchable repository-local references
+
+These default directories should be used before introducing new top-level or peer directories.
+
+The default root-level bootstrap and control-loop documents are:
+- `HARNESS_CONSTITUTION.md`
+- `AGENTS.md`
+- `BOOTSTRAP_PROJECT_PROMPT.md`
+- `STARTER_SPECIALIZATION_RULES.md`
+- `PROBLEM_ANALYSIS_AND_RULE_ADDITION.md`
+- `MECHANICAL_ENFORCEMENT_POLICY.md`
+
+## Directory Creation Gate
+Creating a new directory is not the default response to project growth.
+
+A new directory may be introduced only when:
+- the current artifact classes cannot represent the work without semantic confusion
+- the need is repeated rather than one-off
+- the new directory has a stable purpose that can be explained in repository rules
+- the change is recorded in the governing documents before it becomes normal practice
+
+Convenience alone is not enough.
+
+## Required Pre-Creation Checks
+Before creating a new directory or artifact type, the agent must:
+1. classify the change using the repository change classification rule
+2. verify that existing law documents, plans, or references cannot already hold the content safely
+3. record the need in `plans/tech-debt-tracker.md` when the structure change is likely to recur
+4. identify which governing documents must be synchronized if the structure is added
+
+## Expansion Decision Rule
+Before creating a new directory or artifact class, answer these questions:
+1. Can the content live in the existing law documents?
+2. Can the content live in `plans/active/*` or `plans/completed/*`?
+3. Can the content live in `references/*`?
+4. Can the problem be solved by a better file name instead of a new directory?
+5. Is this need likely to recur across multiple meaningful changes?
+
+If the answer to one of the first four questions is yes, do not create a new directory yet.
+
+## Promotion Rule
+When a new artifact type or structure seems necessary:
+1. Record the need in `plans/tech-debt-tracker.md`.
+2. Clarify why existing directories are insufficient.
+3. Update the law layer if the new structure affects project operation or agent routing.
+4. Only then introduce the new directory or artifact type.
+
+## Specialization Reference
+Starter-law carry-forward and project-instance specialization rules live in:
+- `STARTER_SPECIALIZATION_RULES.md`
+
+Use that document when the question is not artifact structure itself, but how starter protections must survive project-specific rewriting.
+
+## Source And Distribution Separation Rule
+If the repository has both source-repository-only artifacts and distributable artifacts, they must not silently share the same operational file set.
+
+When a change affects distributed artifacts, confirm that:
+- the distributed variant does not reference source-repository-only paths
+- the source-repository variant does not rely on distributed-project assumptions
+- packaging outputs are built from the intended distributable source set
+
+## Mandatory Synchronization Check
+When artifact structure changes, the agent must explicitly review whether updates are needed in:
+- `AGENTS.md`
+- `HARNESS_CONSTITUTION.md`
+- `docs/harness/*`
+- `plans/tech-debt-tracker.md`
+- distributable packaging inputs or outputs when they exist
+
+If any related artifact is intentionally not updated, that decision must be visible and justified.
+
+## Generated Or Derived Artifacts
+Generated or derived repository artifacts should be added only when they are:
+- important to repeated agent work
+- versionable in a stable form
+- difficult to recover reliably from external context alone
+
+Until those conditions hold, do not introduce a dedicated generated-artifacts structure.
+
+## Maintenance Rule
+If artifact naming becomes inconsistent or directories multiply without clear class boundaries, treat that as governance drift and repair it before adding more structure.
+
+Repeated failures to classify, synchronize, or separate artifact structures should themselves be recorded as promotion candidates for stronger enforcement.
