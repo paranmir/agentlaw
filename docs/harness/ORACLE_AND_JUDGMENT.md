@@ -8,7 +8,7 @@ This document defines how work in the current project is judged as acceptable, i
 - Implementation status: `blocked until clarified`
 
 ## Status Transition Rules
-- `draft`: starter skeleton state before project-specific judgment rules are added
+- `draft`: starter-kit baseline state before project-specific judgment rules are added
 - `incomplete`: some judgment rules exist, but implementation still lacks a safe oracle
 - `baseline ready`: the project has both a usable structural oracle and an initial behavioral oracle for the first-release boundary
 - `ready for initial implementation`: the current acceptance and verification baseline can judge the first release without hidden gaps
@@ -61,7 +61,7 @@ Once the first-release boundary is materially known, judgment must use both:
 - the behavioral oracle for product or system correctness
 
 ## Instance Oracle Preservation Rule
-When this starter skeleton is specialized into a project-specific law set, behavioral oracle content should become more concrete and product-facing.
+When this shared harness kit is specialized into a project-specific law set, behavioral oracle content should become more concrete and product-facing.
 
 That specialization must extend the oracle system rather than collapsing it.
 

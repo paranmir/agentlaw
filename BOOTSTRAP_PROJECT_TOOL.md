@@ -9,7 +9,7 @@ This document is a shared bootstrap entry point for any coding agent. It is not 
 Use the following prompt, adapted only as needed for the target repository path or user intent:
 
 ```text
-You are initializing this repository with the Harness starter skeleton.
+You are initializing this repository with the Harness kit.
 
 Your job is to set up or refresh the harness governance before implementation work.
 
@@ -99,4 +99,4 @@ Reuse this prompt when:
 
 - a new repository is being initialized
 - an existing repository's harness must be rebuilt from current code
-- earlier generated harness docs should be discarded and recreated from the latest starter skeleton
+- earlier generated harness docs should be discarded and recreated from the latest shared harness kit

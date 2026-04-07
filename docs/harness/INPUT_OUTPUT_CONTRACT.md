@@ -8,7 +8,7 @@ This document defines the minimum working contract for requests, inputs, outputs
 - Implementation status: `blocked until clarified`
 
 ## Status Transition Rules
-- `draft`: starter skeleton state before project-specific contract facts are added
+- `draft`: starter-kit baseline state before project-specific contract facts are added
 - `incomplete`: some inputs or outputs are identified, but key contract gaps still block implementation
 - `baseline ready`: the minimum contract expectations are documented well enough to guide the first release
 - `ready for initial implementation`: the current runtime contract is specific enough for implementation inside the documented first-release boundary

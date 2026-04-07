@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Purpose
-This document is a short execution-entry map for a project using the Harness starter skeleton. The source of truth is not `AGENTS.md`, but the constitution-root-control-law-operational-artifact-execution-entry system.
+This document is a short execution-entry map for a project using the Harness kit. The source of truth is not `AGENTS.md`, but the constitution-root-control-law-operational-artifact-execution-entry system.
 
 Any coding agent working in this repository must follow the read-first order and governing hierarchy below.
 
 ## What This Repository Is
-This repository starts from the Harness starter skeleton.
+This repository starts from the Harness kit.
 
 - Purpose of `AGENTS.md`: act as a short execution-entry map for the current project
 - Purpose of the law layer: store the real working criteria under `docs/harness/*`

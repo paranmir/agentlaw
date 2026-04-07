@@ -8,7 +8,7 @@ This document classifies harness-relevant failure modes in the current project a
 - Implementation status: `blocked until clarified`
 
 ## Status Transition Rules
-- `draft`: starter skeleton state before project-specific failure patterns are added
+- `draft`: starter-kit baseline state before project-specific failure patterns are added
 - `incomplete`: some failure classes are known, but recovery expectations are still too weak to guide implementation safely
 - `baseline ready`: the first-release failure classes and recovery directions are clear enough to govern initial work
 - `ready for initial implementation`: the current failure taxonomy is specific enough to catch likely first-release failures and guide recovery

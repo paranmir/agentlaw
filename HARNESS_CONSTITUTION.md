@@ -1,7 +1,7 @@
 # Harness Constitution
 
 ## 0. Purpose and Boundaries
-`HARNESS_CONSTITUTION.md` is the top-level governing document for the Harness starter skeleton. It fixes stable rules for document structure, document authority, documentation gates, and change handling.
+`HARNESS_CONSTITUTION.md` is the top-level governing document for the Harness kit. It fixes stable rules for document structure, document authority, documentation gates, and change handling.
 
 This document does not store project-specific real criteria, implementation detail, or local operating values. Those belong below the constitution layer.
 
@@ -64,7 +64,7 @@ Rule:
 - They are not always required as separate files and may be explicit sections inside other law documents.
 
 ## 3A. Starter Law Invariants
-Some law-layer content in the starter skeleton is invariant scaffolding rather than optional drafting style.
+Some law-layer content in the shared starter kit is invariant scaffolding rather than optional drafting style.
 
 Project-specific specialization may add local facts, local examples, and stricter local rules, but it must not silently remove or materially weaken invariant starter protections.
 
@@ -117,7 +117,7 @@ The default root control documents are:
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 Their role is to:
-- help agents initialize or rebuild a repository from the starter skeleton
+- help agents initialize or rebuild a repository from the shared harness kit
 - analyze current governance problems and place corrective additions at the correct layer
 
 They must not:

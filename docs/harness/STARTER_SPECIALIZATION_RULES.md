@@ -1,7 +1,7 @@
 # Starter Specialization Rules
 
 ## Purpose
-This document defines how the Harness starter skeleton may be specialized into a project-specific repository without deleting or weakening starter-level protections by default.
+This document defines how the Harness kit may be specialized into a project-specific repository without deleting or weakening starter-level protections by default.
 
 It governs specialization of starter documents into project documents.
 

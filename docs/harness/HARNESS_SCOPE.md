@@ -8,7 +8,7 @@ This document defines the scope boundaries for the current project.
 - Implementation status: `blocked until clarified`
 
 ## Status Transition Rules
-- `draft`: starter skeleton state before project-specific facts are added
+- `draft`: starter-kit baseline state before project-specific facts are added
 - `incomplete`: some project facts are known, but the law layer still cannot govern implementation safely
 - `baseline ready`: the project has a coherent first-release boundary and the minimum law categories are materially filled in
 - `ready for initial implementation`: the current first-release boundary is specific enough that implementation may begin without violating the documentation gate
