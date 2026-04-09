@@ -137,6 +137,8 @@ At minimum, verification should cover:
 - one persistence, reload, repeat-run, or equivalent continuity check when that behavior matters
 - one check that out-of-scope behavior was not silently introduced
 
+When the project has multiple distinct features or entry points, the minimum verification baseline should cover each feature — not just the primary one. A verification baseline that omits a shipped feature is incomplete.
+
 The minimum verification baseline should be written so that another agent can test concrete behavior, not only document completeness.
 
 ## Regression Strategy

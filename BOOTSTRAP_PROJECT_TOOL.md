@@ -38,7 +38,7 @@ If the repository already has meaningful code or runtime artifacts:
 - treat the current code and file structure as the authoritative behavioral baseline
 - rewrite `docs/harness/*` from current repository facts rather than from legacy planning prose
 - extract concrete project-specific runtime facts into the law layer instead of leaving the result at generic starter wording
-- make known mismatches between code, UI, docs, and expectations explicit
+- make known mismatches between code, interface, docs, and expectations explicit
 - record concrete known drift in `plans/tech-debt-tracker.md` when the repository already contains repeated, material, or mechanically detectable mismatches
 - use `plans/*` only when the recovery or implementation work is genuinely multi-step
 - use `references/*` only for durable non-authoritative material
@@ -56,6 +56,9 @@ Additional requirements for existing projects:
 - if the current repository exposes concrete mismatches, unstable semantics, or misleading controls, document those discrepancies explicitly in the law layer rather than smoothing them away
 - if known drift exists and the tracker remains empty, treat the bootstrap as incomplete unless the absence is explicitly justified
 - do not document every visible discrepancy by default; document the discrepancies that materially affect governed meaning, review safety, or repeated future work
+- when the project has multiple distinct features or entry points, document each feature's runtime contract — not just the primary flow; a bootstrap that covers only the main feature while leaving secondary features undocumented is incomplete
+- cross-check exposed inputs and configuration points against their actual code consumption; an input that is accepted or displayed but does not affect behavior is a mismatch that must be documented
+- when a feature uses simplified or partial logic (fixed constants, ignored parameters, hardcoded assumptions), document those simplifications explicitly so that another agent does not mistake them for configurable behavior
 
 Your first deliverable is the law layer and short entry map, not product code.
 ```
@@ -80,8 +83,10 @@ A correct bootstrap should produce:
 
 For an existing project, a correct bootstrap must also produce:
 - project-specific law text that another agent could use without re-deriving core runtime facts from code
-- explicit known mismatches when code, UI, docs, or expectations disagree
+- explicit known mismatches when code, interface, docs, or expectations disagree
 - non-empty tracked debt or promotion candidates when real repeated or structurally important drift already exists
+- runtime contract coverage for each distinct feature or entry point, not just the primary one
+- documented simplifications when a feature uses fixed constants, ignored parameters, or partial logic that differs from what the exposed interface suggests
 
 It should not:
 
@@ -92,6 +97,8 @@ It should not:
 - preserve starter form while leaving project laws generic when concrete local facts are already available
 - leave known project mismatches undocumented just because the starter structure is complete
 - flood the law layer with low-importance implementation irregularities that do not materially affect governed meaning
+- document only the primary feature when multiple distinct features or entry points exist in the project
+- accept exposed inputs or configuration points without verifying that they actually affect behavior
 - jump straight into implementation
 
 ## When To Reuse This Prompt

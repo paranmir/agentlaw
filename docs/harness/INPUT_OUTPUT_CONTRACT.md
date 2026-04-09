@@ -148,6 +148,11 @@ The default runner flow should document:
 4. how the project is stopped, reloaded, or re-entered when persistence or continuity matters
 5. how the expected result is re-checked after that round-trip
 
+When the project has multiple distinct features or entry points, the runner flow must cover each feature — not just the primary one. For each feature, document:
+- its distinct inputs and how they are provided
+- its dependencies on other features or on shared state produced by other flows
+- any simplifying assumptions or fixed parameters that limit the feature's behavior compared to what the exposed interface suggests
+
 If the project grows more complex, this content may later move into a separate `RUNNER_FLOW.md`.
 
 Early runner flow may be expressed at the currently governed level of runtime detail. It does not need final toolchain specificity before first implementation unless the runtime choice materially changes product meaning or judgment.

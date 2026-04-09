@@ -152,7 +152,7 @@ The agent should:
 - treat current code and file structure as the authoritative product baseline
 - rewrite `docs/harness/*` from repository facts
 - replace generic starter wording with concrete local meaning
-- make important code/UI/doc mismatches explicit
+- make important code/interface/doc mismatches explicit
 - use `plans/tech-debt-tracker.md` when repeated, material, or enforcement-relevant discrepancies already exist
 
 ### 6. Do not implement too early

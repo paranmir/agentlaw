@@ -94,10 +94,13 @@ When initializing or rebuilding a project instance, read these root-level contro
 Specialization is incomplete when it preserves the starter outline but fails to capture project-specific runtime meaning.
 
 Treat the result as incomplete when one or more of the following is true:
-- the resulting law could still describe many unrelated browser projects equally well
+- the resulting law could still describe many unrelated projects equally well
 - known repository-specific discrepancies are visible in code but absent from the law layer
-- concrete persistence, UI, or runtime semantics remain generic even though the repository exposes them directly
+- concrete persistence, interface, or runtime semantics remain generic even though the repository exposes them directly
 - the tracker stays empty despite visible repeated, material, or mechanically detectable discrepancies
+- the project has multiple distinct features or entry points but the law layer documents only the primary one
+- exposed inputs or configuration points exist that do not affect actual behavior, and this mismatch is not recorded
+- a feature relies on output or state from another feature, and this dependency is not documented
 
 It is not incomplete merely because every visible discrepancy in the codebase was not documented.
 
