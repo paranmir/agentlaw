@@ -94,9 +94,9 @@ Examples:
 Root control documents use stable conventional names and live at repository root.
 
 Examples:
-- `BOOTSTRAP_PROJECT_TOOL.md`
-- `UPDATE_HARNESS_TOOL.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
+- `HARNESS_INIT_TOOL.md`
+- `HARNESS_UPDATE_TOOL.md`
+- `HARNESS_FIX_TOOL.md`
 
 ### Plan Documents
 Plan documents use lowercase kebab case with names that describe the work clearly.
@@ -139,9 +139,9 @@ These default directories should be used before introducing new top-level or pee
 The default root-level constitution, entry, and control documents are:
 - `HARNESS_CONSTITUTION.md`
 - `AGENTS.md`
-- `BOOTSTRAP_PROJECT_TOOL.md`
-- `UPDATE_HARNESS_TOOL.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
+- `HARNESS_INIT_TOOL.md`
+- `HARNESS_UPDATE_TOOL.md`
+- `HARNESS_FIX_TOOL.md`
 
 ## Directory Creation Gate
 Creating a new directory is not the default response to project growth.

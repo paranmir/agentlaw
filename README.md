@@ -31,9 +31,9 @@ Its job is narrower:
 .
 ├─ HARNESS_CONSTITUTION.md
 ├─ AGENTS.md
-├─ BOOTSTRAP_PROJECT_TOOL.md
-├─ UPDATE_HARNESS_TOOL.md
-├─ PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md
+├─ HARNESS_INIT_TOOL.md
+├─ HARNESS_UPDATE_TOOL.md
+├─ HARNESS_FIX_TOOL.md
 ├─ docs/
 │  └─ harness/
 │     ├─ HARNESS_SCOPE.md
@@ -58,9 +58,9 @@ Its job is narrower:
 - top-level governance and stable structure
 
 ### Root Control Layer
-- `BOOTSTRAP_PROJECT_TOOL.md`
-- `UPDATE_HARNESS_TOOL.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
+- `HARNESS_INIT_TOOL.md`
+- `HARNESS_UPDATE_TOOL.md`
+- `HARNESS_FIX_TOOL.md`
 
 These documents help an agent:
 - initialize the harness
@@ -113,7 +113,7 @@ The target repository should end up with the files and directories shown above.
 ### 2. Start with the bootstrap entry point
 
 Read:
-- `BOOTSTRAP_PROJECT_TOOL.md`
+- `HARNESS_INIT_TOOL.md`
 
 This is the first tool-facing entry point. It tells the agent how to classify the repository and how to initialize or rebuild the harness correctly.
 
@@ -171,19 +171,19 @@ At minimum, the repository should have readable law for:
 
 ## How To Use The Root Control Documents
 
-### `BOOTSTRAP_PROJECT_TOOL.md`
+### `HARNESS_INIT_TOOL.md`
 Use this when:
 - initializing a new repository
 - rebuilding harness docs in an existing repository
 - discarding weak earlier harness output and regenerating it from the current starter
 
-### `UPDATE_HARNESS_TOOL.md`
+### `HARNESS_UPDATE_TOOL.md`
 Use this when:
 - the shared harness kit has been updated since the project was last bootstrapped or updated
 - the goal is to incorporate new shared requirements while preserving existing local facts
 - the project already has a localized law layer and does not need a full rebuild
 
-### `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
+### `HARNESS_FIX_TOOL.md`
 Use this when:
 - the agent escaped the harness
 - a repeated governance mistake appears

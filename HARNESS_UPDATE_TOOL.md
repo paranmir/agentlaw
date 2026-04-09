@@ -12,9 +12,9 @@ Use this document when:
 - the goal is incremental incorporation, not a full rebuild
 
 Do not use this document when:
-- the project has never been bootstrapped — use `BOOTSTRAP_PROJECT_TOOL.md` instead
-- the goal is to discard and recreate the law layer from scratch — use `BOOTSTRAP_PROJECT_TOOL.md` instead
-- a specific governance problem needs analysis — use `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md` instead
+- the project has never been bootstrapped — use `HARNESS_INIT_TOOL.md` instead
+- the goal is to discard and recreate the law layer from scratch — use `HARNESS_INIT_TOOL.md` instead
+- a specific governance problem needs analysis — use `HARNESS_FIX_TOOL.md` instead
 
 ## Update Prompt
 Use the following prompt, adapted only as needed for the target repository path or user intent:
@@ -40,7 +40,7 @@ Procedure:
 
 2. Replace root-level mirror files.
    - `HARNESS_CONSTITUTION.md`: replace with the new version.
-   - Root control documents (`BOOTSTRAP_PROJECT_TOOL.md`, `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`, `UPDATE_HARNESS_TOOL.md`): replace with the new versions.
+   - Root control documents (`HARNESS_INIT_TOOL.md`, `HARNESS_FIX_TOOL.md`, `HARNESS_UPDATE_TOOL.md`): replace with the new versions.
    - These are shared scaffolding, not localized content, so direct replacement is correct.
 
 3. Merge changes into the localized law layer.

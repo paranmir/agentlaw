@@ -113,9 +113,9 @@ Rules:
 Root control documents are root-level control artifacts that work beside the constitution and before detailed law reading.
 
 The default root control documents are:
-- `BOOTSTRAP_PROJECT_TOOL.md`
-- `UPDATE_HARNESS_TOOL.md`
-- `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
+- `HARNESS_INIT_TOOL.md`
+- `HARNESS_UPDATE_TOOL.md`
+- `HARNESS_FIX_TOOL.md`
 
 Their role is to:
 - help agents initialize or rebuild a repository from the shared harness kit

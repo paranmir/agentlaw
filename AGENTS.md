@@ -10,7 +10,7 @@ This repository starts from the Harness kit.
 
 - Purpose of `AGENTS.md`: act as a short execution-entry map for the current project
 - Purpose of the law layer: store the real working criteria under `docs/harness/*`
-- Purpose of `BOOTSTRAP_PROJECT_TOOL.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
+- Purpose of `HARNESS_INIT_TOOL.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
 - Purpose of the root control layer: provide starter-level bootstrap and corrective-governance guidance before detailed law work
 
 ## Source of Truth
@@ -31,9 +31,9 @@ Check the current agreement in this order:
 
 1. `HARNESS_CONSTITUTION.md`
 2. Root control tools, in this order when relevant:
-   - `BOOTSTRAP_PROJECT_TOOL.md` for initialization or rebuild
-   - `UPDATE_HARNESS_TOOL.md` for incorporating upstream harness changes into an existing project
-   - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md` for current problems, harness escape, or repeated rule failure
+   - `HARNESS_INIT_TOOL.md` for initialization or rebuild
+   - `HARNESS_UPDATE_TOOL.md` for incorporating upstream harness changes into an existing project
+   - `HARNESS_FIX_TOOL.md` for current problems, harness escape, or repeated rule failure
 3. Law layer, in this order when relevant:
    - `docs/harness/HARNESS_SCOPE.md`
    - `docs/harness/INPUT_OUTPUT_CONTRACT.md`
