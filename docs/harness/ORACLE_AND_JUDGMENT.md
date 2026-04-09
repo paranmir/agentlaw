@@ -3,16 +3,6 @@
 ## Purpose
 This document defines how work in the current project is judged as acceptable, incomplete, or incorrect.
 
-## Current Status
-- Document status: `draft`
-- Implementation status: `blocked until clarified`
-
-## Status Transition Rules
-- `draft`: starter-kit baseline state before project-specific judgment rules are added
-- `incomplete`: some judgment rules exist, but implementation still lacks a safe oracle
-- `baseline ready`: the project has both a usable structural oracle and an initial behavioral oracle for the first-release boundary
-- `ready for initial implementation`: the current acceptance and verification baseline can judge the first release without hidden gaps
-
 ## Known
 - Early judgment is based on harness readiness before product correctness.
 - Implementation is blocked until the law layer contains enough criteria to govern the work.
@@ -118,7 +108,7 @@ Regression includes:
 Initial governance completion requires:
 - the minimum law-layer set exists
 - unresolved items are visible
-- implementation status is accurately stated
+- implementation blockers are accurately stated
 
 Once the first-release boundary is materially known, completion evidence must also include a product-facing oracle that another agent could apply without inferring missing behavior.
 

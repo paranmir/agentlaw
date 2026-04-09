@@ -24,6 +24,12 @@ Review tracker entries when:
 - a structural or governance change is already being made in the same area
 - a repeated review rule looks stable enough for stronger enforcement
 
+For each review, also check whether the better outcome is:
+- merge overlapping entries
+- simplify an overgrown entry
+- close an entry because the governing text was reduced or removed rather than expanded
+- add a simplification or deletion candidate, not only a new rule candidate
+
 For each review, decide whether the item should:
 - stay open as tracked debt
 - be resolved through law-layer or structure updates

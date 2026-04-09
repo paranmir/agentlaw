@@ -68,17 +68,9 @@ Some law-layer content in the shared starter kit is invariant scaffolding rather
 
 Project-specific specialization may add local facts, local examples, and stricter local rules, but it must not silently remove or materially weaken invariant starter protections.
 
-At minimum, invariant starter protections include:
-- law-versus-operational-artifact-versus-execution-entry separation
-- operational-artifact approval conditions
-- directory-creation and expansion gates
-- mandatory synchronization checks for structural changes
-- continued structural-oracle existence
-- the rule that document existence alone is not a sufficient behavioral oracle
+The constitution fixes the existence of these invariant starter protections, but the detailed carry-forward, read-path, and project-instance specialization rules do not belong here.
 
-If a project instance needs to weaken or remove one of these protections, that decision must be explicit, justified, and traceable to the owning higher-order governing layer rather than introduced by local summarization or replacement.
-
-Detailed starter-specialization carry-forward rules live in:
+Those detailed specialization rules live in:
 - `docs/harness/STARTER_SPECIALIZATION_RULES.md`
 
 ## 4. Structured Knowledge Expansion
@@ -108,6 +100,7 @@ Rules:
 - It should point to governing documents and current work order.
 - Structured operational artifacts may be referenced by execution-entry documents when they already exist or must be created under the governing rules.
 - It must not become a rule encyclopedia or replace the constitution or laws.
+- Before adding content to an execution-entry document, classify whether the content is routing (read order, current priority, entry guardrails) or governing (scope, contract, oracle, failure, artifact structure). Governing content must be placed in the appropriate law document, not in the execution-entry document.
 
 ## 5A. Root Control Documents
 Root control documents are root-level control artifacts that work beside the constitution and before detailed law reading.

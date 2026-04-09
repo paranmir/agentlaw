@@ -43,6 +43,18 @@ They must not include:
 
 The default execution-entry document is `AGENTS.md`.
 
+## Execution-Entry Pre-Write Gate
+Before adding content to an execution-entry document, the agent must classify the content:
+
+- **Routing content** (allowed): read-first order, source-of-truth pointers, current priority, short entry guardrails
+- **Governing content** (not allowed): scope boundaries, contract details, oracle logic, failure rules, artifact structure rules, process descriptions, boundary definitions
+
+If the content is governing, place it in the owning law document instead.
+
+This gate applies to every write to an execution-entry document, not only to initial creation. Gradual accumulation of governing content through incremental additions is the primary failure mode this gate prevents.
+
+When in doubt, check whether the content would still make sense as a standalone rule in a law document. If yes, it belongs there rather than in the execution-entry document.
+
 ## Operational Artifact Definition
 Operational artifacts are structured supporting records used to help agents work safely as a project grows.
 
@@ -58,6 +70,9 @@ Operational artifacts may include:
 - reference notes
 - tracker entries
 - generated or derived repository facts that satisfy the repository rules
+
+Examples of stable derived facts include:
+- a recorded shared-harness baseline used for later incremental update comparison
 
 Operational artifacts must not:
 - replace constitutional or law-layer authority
@@ -217,6 +232,9 @@ Generated or derived repository artifacts should be added only when they are:
 - difficult to recover reliably from external context alone
 
 Until those conditions hold, do not introduce a dedicated generated-artifacts structure.
+
+When the repository must later compare against an earlier shared harness version, a stable baseline record may live in:
+- `references/SHARED_HARNESS_BASELINE.md`
 
 ## Maintenance Rule
 If artifact naming becomes inconsistent or directories multiply without clear class boundaries, treat that as governance drift and repair it before adding more structure.

@@ -1,4 +1,4 @@
-# Problem Analysis And Rule Addition
+# Harness Fix Tool
 
 ## Purpose
 Use this document as a practical decision tool when a current problem, harness escape, repeated mistake, or governance gap appears.
@@ -20,6 +20,32 @@ Use this document when one or more of the following is true:
 - you need to decide whether the response belongs in law, tracker, `AGENTS.md`, or enforcement
 
 Do not use this document as a substitute for normal project work when no current governance problem exists.
+
+## Required Inputs
+Before using this document, read:
+- `HARNESS_CONSTITUTION.md`
+- the relevant file in `docs/harness/*`
+- `plans/tech-debt-tracker.md` when repetition or promotion may already be tracked
+- `AGENTS.md` when entry routing is part of the problem
+
+## Direct Procedure
+Use the step-by-step body below as the primary procedure.
+The quick flow is a map; Steps 1 through 7 are the executable sequence.
+
+## Completion Checks
+A fix-analysis run is complete only when:
+- the observed problem is described with evidence
+- the owning layer is explicit
+- the smallest sufficient correction was chosen
+- tracker and enforcement follow-up were considered
+- related synchronization targets were checked when structure changed
+
+## Failure Conditions
+Treat the result as incomplete when:
+- the write-up starts with a new rule name instead of the observed problem
+- a higher-order rule is changed before checking lower-order corrections
+- a new rule is added without checking merge, simplification, narrowing, or deletion alternatives
+- repeated or mechanically detectable problems are left prose-only without a real reason
 
 ## Quick Use Flow
 1. Record the problem in plain terms.
@@ -88,6 +114,7 @@ Ask:
 2. Can the current rule be clarified or strengthened instead of adding a new one?
 3. Is the real issue that the rule was ignored rather than missing?
 4. Would a local amendment solve the problem without changing higher-order structure?
+5. Can an existing rule be merged, simplified, narrowed, or deleted instead of adding another layer of text?
 
 Default to amendment of existing text rather than creating parallel meaning.
 
@@ -121,6 +148,12 @@ Use:
 - `local law amendment` when the meaning clearly belongs to a law document
 - `AGENTS.md` only for short entry-order corrections
 - `constitutional amendment` only for shared structural gaps or starter invariants
+
+Before choosing any rule-adding option, explicitly check whether the better correction is:
+- merging overlapping rules
+- simplifying an overgrown rule
+- deleting stale text that no longer governs real behavior
+- narrowing an over-broad rule instead of adding a second one
 
 For existing-project bootstrap failures:
 - use at least `local law amendment` when concrete repository facts are visible but law text remains generic
@@ -164,6 +197,7 @@ When writing up the result of this process, make these explicit:
 - `analysis`
 - `repetition status`
 - `existing rule check result`
+- `merge, simplify, narrow, or delete alternative check result`
 - `owning layer`
 - `chosen target`
 - `whether tracker follow-up is needed`

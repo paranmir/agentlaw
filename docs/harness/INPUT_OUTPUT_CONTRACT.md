@@ -3,16 +3,6 @@
 ## Purpose
 This document defines the minimum working contract for requests, inputs, outputs, and document-update expectations in the current project.
 
-## Current Status
-- Document status: `draft`
-- Implementation status: `blocked until clarified`
-
-## Status Transition Rules
-- `draft`: starter-kit baseline state before project-specific contract facts are added
-- `incomplete`: some inputs or outputs are identified, but key contract gaps still block implementation
-- `baseline ready`: the minimum contract expectations are documented well enough to guide the first release
-- `ready for initial implementation`: the current runtime contract is specific enough for implementation inside the documented first-release boundary
-
 ## Known
 - The current project must follow a document-first workflow.
 - New requests must be checked for document impact before implementation begins.

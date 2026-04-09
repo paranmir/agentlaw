@@ -4,6 +4,8 @@
 This document defines how the Harness kit may be specialized into a project-specific repository without deleting or weakening starter-level protections by default.
 
 It governs specialization of starter documents into project documents.
+It is not a one-time bootstrap helper only.
+It remains authoritative whenever starter law is being interpreted, preserved, merged, rebuilt, or updated into a project instance.
 
 ## Core Rule
 Project-specific specialization is an overlay on the starter structure, not a replacement of that structure.
@@ -82,13 +84,26 @@ A project instance may weaken or remove one of the starter protections only when
 Silence is not permission.
 
 ## Read Path Rule
-When initializing or rebuilding a project instance, read these root-level control documents before rewriting project-specific laws:
+When initializing, rebuilding, or updating a project instance, read these root-level control documents before rewriting or merging project-specific laws:
 1. `HARNESS_CONSTITUTION.md`
-2. `HARNESS_INIT_TOOL.md`
-3. `docs/harness/STARTER_SPECIALIZATION_RULES.md`
-4. the relevant files in `docs/harness/*`
-5. `HARNESS_FIX_TOOL.md` when the task comes from a current problem or repeated harness failure
-6. `AGENTS.md`
+2. `HARNESS_INIT_TOOL.md` for bootstrap or rebuild flows
+3. `HARNESS_UPDATE_TOOL.md` for incremental shared-kit update flows
+4. `docs/harness/STARTER_SPECIALIZATION_RULES.md`
+5. the relevant files in `docs/harness/*`
+6. `HARNESS_FIX_TOOL.md` when the task comes from a current problem or repeated harness failure
+7. `AGENTS.md`
+
+## Lifetime And Ownership
+This document continues to govern after initial bootstrap.
+
+Use it whenever the question is how starter protections must survive:
+- first bootstrap into a target repository
+- later rebuild of localized law
+- incremental shared-kit update merges
+- corrective rewriting after a harness failure or drift event
+
+Do not treat it as disposable after the first initialization run.
+Its role is persistent interpretation of starter-law carry-forward, not project-specific runtime ownership.
 
 ## Genericization Failure Rule
 Specialization is incomplete when it preserves the starter outline but fails to capture project-specific runtime meaning.

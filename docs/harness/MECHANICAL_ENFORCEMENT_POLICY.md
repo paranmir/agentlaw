@@ -40,6 +40,7 @@ Executable enforcement may include:
 - document existence checks
 - cross-reference checks
 - tests that fail forbidden behavior directly
+- validation of stable derived facts such as a recorded shared-harness baseline when later update flow depends on it
 
 ## Governance Failure Rule
 If a mechanically detectable implementation or structure rule repeatedly remains prose-only without justification, treat that as a governance failure.
