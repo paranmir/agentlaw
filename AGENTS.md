@@ -32,6 +32,7 @@ Check the current agreement in this order:
 1. `HARNESS_CONSTITUTION.md`
 2. Root control tools, in this order when relevant:
    - `BOOTSTRAP_PROJECT_TOOL.md` for initialization or rebuild
+   - `UPDATE_HARNESS_TOOL.md` for incorporating upstream harness changes into an existing project
    - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md` for current problems, harness escape, or repeated rule failure
 3. Law layer, in this order when relevant:
    - `docs/harness/HARNESS_SCOPE.md`

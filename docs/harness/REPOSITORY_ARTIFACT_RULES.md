@@ -95,6 +95,7 @@ Root control documents use stable conventional names and live at repository root
 
 Examples:
 - `BOOTSTRAP_PROJECT_TOOL.md`
+- `UPDATE_HARNESS_TOOL.md`
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 ### Plan Documents
@@ -139,6 +140,7 @@ The default root-level constitution, entry, and control documents are:
 - `HARNESS_CONSTITUTION.md`
 - `AGENTS.md`
 - `BOOTSTRAP_PROJECT_TOOL.md`
+- `UPDATE_HARNESS_TOOL.md`
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 ## Directory Creation Gate

@@ -32,6 +32,7 @@ Its job is narrower:
 ├─ HARNESS_CONSTITUTION.md
 ├─ AGENTS.md
 ├─ BOOTSTRAP_PROJECT_TOOL.md
+├─ UPDATE_HARNESS_TOOL.md
 ├─ PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md
 ├─ docs/
 │  └─ harness/
@@ -58,10 +59,12 @@ Its job is narrower:
 
 ### Root Control Layer
 - `BOOTSTRAP_PROJECT_TOOL.md`
+- `UPDATE_HARNESS_TOOL.md`
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 These documents help an agent:
 - initialize the harness
+- incorporate upstream harness changes into an existing project
 - analyze governance problems
 - recover governance safely when something escaped the harness
 
@@ -173,6 +176,12 @@ Use this when:
 - initializing a new repository
 - rebuilding harness docs in an existing repository
 - discarding weak earlier harness output and regenerating it from the current starter
+
+### `UPDATE_HARNESS_TOOL.md`
+Use this when:
+- the shared harness kit has been updated since the project was last bootstrapped or updated
+- the goal is to incorporate new shared requirements while preserving existing local facts
+- the project already has a localized law layer and does not need a full rebuild
 
 ### `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 Use this when:

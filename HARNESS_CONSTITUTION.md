@@ -114,10 +114,12 @@ Root control documents are root-level control artifacts that work beside the con
 
 The default root control documents are:
 - `BOOTSTRAP_PROJECT_TOOL.md`
+- `UPDATE_HARNESS_TOOL.md`
 - `PROBLEM_ANALYSIS_AND_RULE_ADDITION_TOOL.md`
 
 Their role is to:
 - help agents initialize or rebuild a repository from the shared harness kit
+- help agents incorporate upstream harness changes into an already-bootstrapped project
 - analyze current governance problems and place corrective additions at the correct layer
 
 They must not:
