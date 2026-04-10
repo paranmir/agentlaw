@@ -76,10 +76,4 @@ The current core work order is fixed:
 4. Update `docs/harness/*` when project meaning changes
 
 ## Working Rules
-- Do **document impact analysis** and **document consistency recovery** before implementation.
-- Do not treat a new request as a coding request first. Judge constitution/law document impact first.
-- Do not treat `unknown` as a confirmed fact.
-- Do not start implementation before the documentation gate is satisfied.
-- Do not grow `AGENTS.md` into a rule encyclopedia.
-- When the law layer and short execution map are no longer enough, expand through `plans/*` and `references/*` rather than overloading `AGENTS.md`.
-- Do not create new artifact directories when `docs/harness/*`, `plans/*`, or `references/*` already solve the problem.
+This file is a routing map only. Governing rules live in the constitution and `docs/harness/*`. Read those before acting.
