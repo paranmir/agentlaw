@@ -41,6 +41,7 @@ An update run is complete only when:
 - root mirrors match the new shared kit
 - localized law preserves prior local facts while incorporating relevant new shared requirements
 - no localized law text reverted to generic starter wording
+- existing localized law documents were checked for genericization gaps — starter placeholder sections that remain unfilled despite concrete project facts being available
 - the shared baseline record matches the shared version now reflected in the project
 - routing and tracker follow-up were reviewed when affected
 

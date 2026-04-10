@@ -127,6 +127,31 @@ Treat the following as session continuity failures:
 - the artifact grows to contain governing content that should live in law documents
 - a session completes meaningful work without updating the artifact
 
+### Restore Request Protocol
+When an agent is asked to restore session context via a short trigger such as `restore session`, `resume`, or an equivalent phrase, the agent must follow a minimal-read, minimal-output protocol:
+
+- read only the session continuity artifact (`references/session-reminder.md`) unless that artifact itself directs further reads
+- respond with a terse summary targeting eight or fewer bullet lines, covering recent work snapshot and pending next-session items
+- do not preemptively read `plans/*`, other `docs/harness/*` files, other `references/*` files, or completed plan history unless the user explicitly asks for deeper context
+- still honor the Verification Obligation: present recorded state as stale until verified rather than asserting it as current fact
+- expand scope only on explicit follow-up from the user
+
+This protocol exists to keep session restoration cheap and repeatable across agents and across token-constrained resumption scenarios, including handoff between different agent runtimes. It is a behavior contract on the consumer side of the session continuity artifact, complementary to the Update and Verification Obligations on the producer side.
+
+### Save Request Protocol
+When an agent is asked to save session context via a short trigger such as `save session`, `session save`, or an equivalent phrase, the agent must update `references/session-reminder.md` according to the following protocol:
+
+- **Inject new state**: prepend a new dated entry to the Recent Work Snapshot covering meaningful work completed in the current session. Each entry must describe outcomes, not narration, and must include the motivation when the motivation is not obvious from the outcome.
+- **Remove stale state**: remove or collapse snapshot entries whose outcomes are now simply baseline repository state and no longer inform next-session behavior. The artifact is a recovery aid, not a changelog — git history is the authoritative changelog. Do not preserve full session history inside this file.
+- **Refresh pending list**: remove pending items completed during this session, rewrite items whose shape changed, and add new pending items discovered this session.
+- **Verify outgoing state**: the recorded state must reflect actual repository reality at save time, not conversational claims. When the session made file changes, confirm the edits landed. When the session made commits, reference them concretely.
+- **Respect content boundary**: the save operation must never introduce governing content into the artifact. If a session produced new governing rules, those rules belong in law documents; only a short pointer to the rule change belongs in the snapshot.
+- **Keep the artifact lean**: if the file grows past the point where a new session can absorb it quickly, aggressively collapse older sections rather than letting it accumulate.
+
+A save request without any new meaningful state to record is a no-op — do not write empty or filler entries.
+
+This protocol operationalizes the Update Obligation into an explicit user-invoked trigger, so that multi-session work can be handed off deliberately rather than depending on the agent remembering to update at session end.
+
 ## Naming Rules
 ### Law Documents
 Law documents use uppercase snake case.

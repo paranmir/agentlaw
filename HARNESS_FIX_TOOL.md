@@ -17,6 +17,7 @@ Use this document when one or more of the following is true:
 - a repeated mistake appeared in review
 - a current problem is visible but the owning document is unclear
 - a known rule exists but seems too weak, too hidden, or too easy to bypass
+- a localized law document retains generic starter placeholder content despite concrete project facts being available
 - you need to decide whether the response belongs in law, tracker, `AGENTS.md`, or enforcement
 
 Do not use this document as a substitute for normal project work when no current governance problem exists.
