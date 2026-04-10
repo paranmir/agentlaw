@@ -86,6 +86,47 @@ An operational artifact counts as approved only when:
 - it passes the required pre-creation checks when a new structure or artifact type is involved
 - required governing-document synchronization has been completed or explicitly deferred with visible impact
 
+## Session Continuity Artifact
+Repository work that spans multiple sessions requires a session continuity artifact so that a new session can recover the current work state quickly and reliably.
+
+The default session continuity artifact lives at `references/session-reminder.md`.
+
+### Required Content
+The session continuity artifact must record:
+- **Recent work snapshot**: what meaningful work was completed in recent sessions, dated
+- **Pending next session**: concrete open items the next session should pick up
+- **Read order for new session**: the files a new session should read first, in order
+- **First checks for new session**: concrete verification steps the new session must perform before acting
+
+### Update Obligation
+The session continuity artifact must be updated:
+- at the end of each meaningful session before context is lost
+- whenever a session produces outcomes that change what the next session should do
+- whenever pending items are completed or new ones arise
+
+A session that changes repository state without updating this artifact creates continuity drift.
+
+### Verification Obligation
+A new session must treat the artifact as **stale until verified** against current repository state. This means:
+- run the listed first checks before acting on recorded assumptions
+- when the artifact disagrees with current repository state, trust the repository state and update the artifact
+- do not treat the artifact as authoritative; it is a recovery aid, not a source of truth
+
+### Content Boundary
+The session continuity artifact is a reference, not a law document. It must not:
+- create governing meaning
+- restate rules that live in the constitution or law layer
+- become a substitute for reading the actual governing documents
+
+It may point to governing documents but must not duplicate their content.
+
+### Failure Modes
+Treat the following as session continuity failures:
+- the artifact is missing when work spans multiple sessions
+- the artifact records stale assumptions that no longer match repository state
+- the artifact grows to contain governing content that should live in law documents
+- a session completes meaningful work without updating the artifact
+
 ## Naming Rules
 ### Law Documents
 Law documents use uppercase snake case.
