@@ -1,24 +1,24 @@
 # Project Overview
 
-_This file is the rule-harness project-overview template. Fill in the required sections after `rule-harness init`. Keep optional sections only if they add real value; delete the ones that do not apply._
+_This file is the agentlaw project-overview template. Fill in the required sections after `agentlaw init`. Keep optional sections only if they add real value; delete the ones that do not apply._
 
-_Role boundary: this file is reference-layer orientation. It must not duplicate `docs/harness/HARNESS_SCOPE.md` (law-layer scope), `AGENTS.md` (execution-entry routing), or `README.md` (installation and usage)._
+_Role boundary: this file is reference-layer orientation. It must not duplicate `docs/law/SCOPE.md` (law-layer scope), `AGENTS.md` (execution-entry routing), or `README.md` (installation and usage)._
 
 ## What this is
 
-_(fill in after rule-harness init — 1 to 3 sentences summarizing what this project is. Keep it factual. Do not include installation instructions; those belong in README.)_
+_(fill in after agentlaw init — 1 to 3 sentences summarizing what this project is. Keep it factual. Do not include installation instructions; those belong in README.)_
 
 ## Why it exists
 
-_(fill in after rule-harness init — the motivation: the problem being solved or the reason the project exists. Keep it short.)_
+_(fill in after agentlaw init — the motivation: the problem being solved or the reason the project exists. Keep it short.)_
 
 ## Audience
 
-_(fill in after rule-harness init — who uses this project, who develops it, and who operates it. One line per group is usually enough.)_
+_(fill in after agentlaw init — who uses this project, who develops it, and who operates it. One line per group is usually enough.)_
 
 ## Project-specific additions to the standard Harness layout
 
-_(optional — fill in only if this project adds directories or files beyond the harness default. Do not restate the default layout defined in `docs/harness/REPOSITORY_ARTIFACT_RULES.md`. Delete this section if there are no project-specific additions.)_
+_(optional — fill in only if this project adds directories or files beyond the harness default. Do not restate the default layout defined in `docs/law/REPOSITORY_ARTIFACT_RULES.md`. Delete this section if there are no project-specific additions.)_
 
 ## Project-specific domain glossary
 
@@ -26,7 +26,7 @@ _(optional — define terms unique to this project's domain. Do not include harn
 
 ## Code architecture map
 
-_Obligation: see `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` "Code Architecture Map". Populate this section once the project has code worth mapping; leave the placeholder in place until then — the harness verifier silently skips the freshness check while no `Map scope:` block is declared._
+_Obligation: see `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` "Code Architecture Map". Populate this section once the project has code worth mapping; leave the placeholder in place until then — the harness verifier silently skips the freshness check while no `Map scope:` block is declared._
 
 _Slot-selection rationale: (fill in — one short paragraph naming which slots this project uses and why. Required slots: at least one structural (Module dependency or Class diagram) and at least one flow (Entry-point call graph, State diagram, or Data flow). Library-only projects may omit the flow slot with a one-line rationale recorded here.)_
 

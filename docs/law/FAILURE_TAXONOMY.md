@@ -20,7 +20,7 @@ This document classifies governance and execution failures in the current projec
 The document order becomes unclear or is violated.
 
 Examples:
-- `AGENTS.md` contradicts `HARNESS_CONSTITUTION.md`
+- `AGENTS.md` contradicts `AGENTLAW_CONSTITUTION.md`
 - a lower-order file is treated as the governing source
 - a document refers to obsolete priority rules
 
@@ -125,7 +125,7 @@ Expected recovery:
 Continuity or memory records are treated as stronger authority than file-based governance.
 
 Examples:
-- memory summary overrides `docs/harness/*`
+- memory summary overrides `docs/law/*`
 - stale memory is presented as current truth
 - wrong-scope memory affects a decision
 - hidden runtime state carries governing meaning that is absent from repository files

@@ -19,7 +19,7 @@ Use this document when one or more of the following is true:
 - a known rule exists but seems too weak, too hidden, or too easy to bypass
 - a localized law document retains generic starter placeholder content despite concrete project facts being available
 - installer, memory, or continuity state appears to be bypassing file-based governance
-- the MCP memory tool surface is being bypassed (raw SQL against `.harness/index/meta.db`, direct file reads where a memory tool exists, or hand-rolled walks where `harness_session_restore` / `harness_session_save` should be used)
+- the MCP memory tool surface is being bypassed (raw SQL against `.harness/index/meta.db`, direct file reads where a memory tool exists, or hand-rolled walks where `agentlaw_session_restore` / `agentlaw_session_save` should be used)
 - the canonical Markdown layer under `memory/*` and the index under `.harness/index/meta.db` have drifted apart
 - you need to decide whether the response belongs in law, tracker, `AGENTS.md`, or enforcement
 
@@ -27,8 +27,8 @@ Do not use this document as a substitute for normal project work when no current
 
 ## Required Inputs
 Before using this document, read:
-- `HARNESS_CONSTITUTION.md`
-- the relevant file in `docs/harness/*`
+- `AGENTLAW_CONSTITUTION.md`
+- the relevant file in `docs/law/*`
 - `plans/tech-debt-tracker.md` when repetition or promotion may already be tracked
 - `AGENTS.md` when entry routing is part of the problem
 
@@ -111,12 +111,12 @@ Do not treat a discrepancy as law-worthy by default when it is:
 
 ## Step 4. Check Existing Rules First
 Before adding a new rule, review:
-- `HARNESS_CONSTITUTION.md`
-- the relevant file in `docs/harness/*`
+- `AGENTLAW_CONSTITUTION.md`
+- the relevant file in `docs/law/*`
 - `AGENTS.md` if the issue concerns read-first order or short entry guardrails
 - `plans/tech-debt-tracker.md` if the issue may already be tracked
 
-The review must use **multiple synonym variants of the proposed rule's title and intent**, not a single keyword pass. A search that uses only the phrasing the agent has in mind will systematically miss rules whose original authors used different phrasing for the same intent. Concrete example: a proposed `Comment Self-Narration Prohibition` rule must also grep for `implementation history`, `changelog`, `narration`, `rename history`, `historical context`, and the specific anti-patterns the proposed rule would prohibit. Without the synonym sweep, near-duplicate § s land and the law layer drifts into self-contradiction. The full version of this obligation lives in `docs/harness/REPOSITORY_ARTIFACT_RULES.md` `§New Section / Rule Addition Rule`.
+The review must use **multiple synonym variants of the proposed rule's title and intent**, not a single keyword pass. A search that uses only the phrasing the agent has in mind will systematically miss rules whose original authors used different phrasing for the same intent. Concrete example: a proposed `Comment Self-Narration Prohibition` rule must also grep for `implementation history`, `changelog`, `narration`, `rename history`, `historical context`, and the specific anti-patterns the proposed rule would prohibit. Without the synonym sweep, near-duplicate § s land and the law layer drifts into self-contradiction. The full version of this obligation lives in `docs/law/REPOSITORY_ARTIFACT_RULES.md` `§New Section / Rule Addition Rule`.
 
 Ask:
 1. Does an existing rule already govern this problem?
@@ -129,18 +129,18 @@ Default to amendment of existing text rather than creating parallel meaning.
 
 ## Step 5. Choose The Owning Layer
 Use this ownership map:
-- constitutional structure and invariant starter protections -> `HARNESS_CONSTITUTION.md`
-- starter carry-forward and project-instance preservation rules -> `docs/harness/STARTER_SPECIALIZATION_RULES.md`
-- scope and repository boundary -> `docs/harness/HARNESS_SCOPE.md`
-- inputs, outputs, execution flow, regression expectations, readiness -> `docs/harness/INPUT_OUTPUT_CONTRACT.md`
-- structural and behavioral judgment -> `docs/harness/ORACLE_AND_JUDGMENT.md`
-- failure classes and recovery interpretation -> `docs/harness/FAILURE_TAXONOMY.md`
-- artifact structure, approval, synchronization, directory growth, law/artifact/entry separation -> `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
-- installer behavior and runtime input/output expectations -> `docs/harness/INPUT_OUTPUT_CONTRACT.md`
-- memory authority, layout, conflict handling, and session restore behavior -> `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
-- MCP memory tool surface bypass and `.harness/index/meta.db` source-drift -> `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
-- memory authority, installer judgment, and recursive promotion judgment -> `docs/harness/ORACLE_AND_JUDGMENT.md`
-- installer drift, memory authority failure, and recursive promotion failure classes -> `docs/harness/FAILURE_TAXONOMY.md`
+- constitutional structure and invariant starter protections -> `AGENTLAW_CONSTITUTION.md`
+- starter carry-forward and project-instance preservation rules -> `docs/law/STARTER_SPECIALIZATION_RULES.md`
+- scope and repository boundary -> `docs/law/SCOPE.md`
+- inputs, outputs, execution flow, regression expectations, readiness -> `docs/law/INPUT_OUTPUT_CONTRACT.md`
+- structural and behavioral judgment -> `docs/law/ORACLE_AND_JUDGMENT.md`
+- failure classes and recovery interpretation -> `docs/law/FAILURE_TAXONOMY.md`
+- artifact structure, approval, synchronization, directory growth, law/artifact/entry separation -> `docs/law/REPOSITORY_ARTIFACT_RULES.md`
+- installer behavior and runtime input/output expectations -> `docs/law/INPUT_OUTPUT_CONTRACT.md`
+- memory authority, layout, conflict handling, and session restore behavior -> `docs/law/MEMORY_AND_CONTINUITY_RULES.md`
+- MCP memory tool surface bypass and `.harness/index/meta.db` source-drift -> `docs/law/MEMORY_AND_CONTINUITY_RULES.md`
+- memory authority, installer judgment, and recursive promotion judgment -> `docs/law/ORACLE_AND_JUDGMENT.md`
+- installer drift, memory authority failure, and recursive promotion failure classes -> `docs/law/FAILURE_TAXONOMY.md`
 - short read-first routing and short entry guardrails -> `AGENTS.md`
 - repeated debt, unresolved drift, promotion candidates -> `plans/tech-debt-tracker.md`
 - multi-step active corrective work -> `plans/active/*`
@@ -155,7 +155,7 @@ Use this ladder:
 3. local law amendment
 4. short `AGENTS.md` guardrail addition
 5. constitutional amendment
-6. enforcement follow-up under `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+6. enforcement follow-up under `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md`
 
 Use:
 - `tracker only` when the issue is real but not stable enough for a governing rule
@@ -186,18 +186,18 @@ After making the correction, check:
 
 If document movement, splitting, renaming, or relocation happened, also check:
 - `AGENTS.md`
-- `HARNESS_CONSTITUTION.md`
-- the affected files in `docs/harness/*`
+- `AGENTLAW_CONSTITUTION.md`
+- the affected files in `docs/law/*`
 - tracker or plan references
 
 Detailed structural synchronization rules live in:
-- `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+- `docs/law/REPOSITORY_ARTIFACT_RULES.md`
 
 ## When To Escalate To Enforcement
 If the same problem keeps recurring and is mechanically detectable, do not keep solving it only with prose.
 
 Use:
-- `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+- `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md`
 
 Especially when:
 - the problem is repeated

@@ -12,32 +12,32 @@ Use this document when:
 - the goal is incremental incorporation, not a full rebuild
 
 Do not use this document when:
-- the project has never been bootstrapped — use `HARNESS_INIT_TOOL.md` instead
-- the goal is to discard and recreate the law layer from scratch — use `HARNESS_INIT_TOOL.md` instead
-- a specific governance problem needs analysis — use `HARNESS_FIX_TOOL.md` instead
+- the project has never been bootstrapped — use `AGENTLAW_INIT_TOOL.md` instead
+- the goal is to discard and recreate the law layer from scratch — use `AGENTLAW_INIT_TOOL.md` instead
+- a specific governance problem needs analysis — use `AGENTLAW_FIX_TOOL.md` instead
 
 ## Full Update Cycle
 
 The full update cycle has three steps. Steps 1 and 3 are user-driven (terminal commands). Step 2 is LLM-driven and is the substance of this document.
 
-1. **Infrastructure update (terminal)**: `pipx upgrade rule-harness`. Replaces the pip package code (CLI, MCP server, schema files), brings the new bundled shared kit into the package's `scaffold/` directory, and automatically applies any pending schema migrations to `.harness/index/meta.db`.
+1. **Infrastructure update (terminal)**: `pipx upgrade agentlaw`. Replaces the pip package code (CLI, MCP server, schema files), brings the new bundled shared kit into the package's `scaffold/` directory, and automatically applies any pending schema migrations to `.harness/index/meta.db`.
 2. **Governance content merge (LLM-driven)**: invoke an LLM with this document. The LLM follows the Direct Procedure below — read the recorded baseline, compare new shared kit against it, replace root mirrors, merge new requirements into local law without losing local facts, refresh the baseline record.
-3. **Verification (terminal)**: `rule-harness verify` (or `python verify_harness.py` before the package command is available). Confirms root mirrors match the new shared kit, local facts and behavioral oracle content were preserved, new shared requirements are present, and the shared baseline record matches.
+3. **Verification (terminal)**: `agentlaw verify` (or `python verify_agentlaw.py` before the package command is available). Confirms root mirrors match the new shared kit, local facts and behavioral oracle content were preserved, new shared requirements are present, and the shared baseline record matches.
 
 The Direct Procedure below is a self-contained version of step 2 that begins with a step 0 reminder to run step 1 first. The Responsibility Split, Failure Modes, and Non-Pip Distribution sections at the bottom of this document supplement the cycle for non-default situations.
 
 ## Required Inputs
 Before using this document, read:
-- `HARNESS_CONSTITUTION.md`
-- `references/shared-harness-baseline.md` when it exists
-- the current localized law layer in `docs/harness/*`
+- `AGENTLAW_CONSTITUTION.md`
+- `references/shared-agentlaw-baseline.md` when it exists
+- the current localized law layer in `docs/law/*`
 - the new shared-kit versions of the root and law documents
 - `AGENTS.md` when routing may need to change
 
 ## Direct Procedure
 Use this document as a direct procedure even if no prompt block is reused.
 
-0. Run `pipx upgrade rule-harness` first when the project is using the pip-package distribution. This step (a) replaces the pip package code (CLI, MCP server, schema files), (b) brings the new bundled shared kit into the package's `scaffold/` directory, and (c) automatically applies any pending schema migrations to `.harness/index/meta.db`. After this completes, proceed with the LLM-driven steps below. Skip step 0 only when the project does not use the pip package and the shared kit is delivered through another channel (git clone, manual copy).
+0. Run `pipx upgrade agentlaw` first when the project is using the pip-package distribution. This step (a) replaces the pip package code (CLI, MCP server, schema files), (b) brings the new bundled shared kit into the package's `scaffold/` directory, and (c) automatically applies any pending schema migrations to `.harness/index/meta.db`. After this completes, proceed with the LLM-driven steps below. Skip step 0 only when the project does not use the pip package and the shared kit is delivered through another channel (git clone, manual copy).
 1. Read the recorded shared baseline if available.
 2. Identify shared-kit changes relative to the prior baseline, or fall back to law-gap comparison if no precise baseline exists.
 3. Replace root mirror files with the new shared versions.
@@ -79,25 +79,25 @@ Follow these rules:
 - Do not re-derive local facts from code unless a new shared requirement specifically demands new code inspection.
 - Do not replace localized law documents with fresh starter templates.
 - Do not treat this as a bootstrap. The project already has project-specific law.
-- Prefer the recorded shared-harness baseline in `references/shared-harness-baseline.md` when identifying the previous shared version.
+- Prefer the recorded shared-harness baseline in `references/shared-agentlaw-baseline.md` when identifying the previous shared version.
 
 Procedure:
 
-0. If the project uses the pip-package distribution, run `pipx upgrade rule-harness` before invoking the LLM-driven steps. The pipx upgrade replaces pip package code, brings the new bundled shared kit into the package, and automatically applies any pending schema migrations to `.harness/index/meta.db`. Skip this step only when the shared kit is delivered through another channel.
+0. If the project uses the pip-package distribution, run `pipx upgrade agentlaw` before invoking the LLM-driven steps. The pipx upgrade replaces pip package code, brings the new bundled shared kit into the package, and automatically applies any pending schema migrations to `.harness/index/meta.db`. Skip this step only when the shared kit is delivered through another channel.
 
 1. Identify what changed in the shared kit.
-   - First read `references/shared-harness-baseline.md` if it exists.
+   - First read `references/shared-agentlaw-baseline.md` if it exists.
    - Compare the new shared kit files against the baseline commit or tag the project was last bootstrapped or updated from.
    - If the baseline file is missing or incomplete, read the new shared kit files and compare their requirements against the current project law layer to identify gaps.
    - Categorize each change as: new requirement, strengthened requirement, relaxed requirement, structural change, or wording-only clarification.
 
 2. Replace root-level mirror files.
-   - `HARNESS_CONSTITUTION.md`: replace with the new version.
-   - Root control documents (`HARNESS_INIT_TOOL.md`, `HARNESS_FIX_TOOL.md`, `HARNESS_UPDATE_TOOL.md`): replace with the new versions.
+   - `AGENTLAW_CONSTITUTION.md`: replace with the new version.
+   - Root control documents (`AGENTLAW_INIT_TOOL.md`, `AGENTLAW_FIX_TOOL.md`, `AGENTLAW_UPDATE_TOOL.md`): replace with the new versions.
    - These are shared scaffolding, not localized content, so direct replacement is correct.
 
 3. Merge changes into the localized law layer.
-   - For each file in `docs/harness/*`, compare the new shared starter template against the current project-specific version.
+   - For each file in `docs/law/*`, compare the new shared starter template against the current project-specific version.
    - Add new sections or requirements from the shared template that the project law does not yet address.
    - Strengthen existing sections when the shared template now requires more than the project law currently provides.
    - Preserve all existing local facts, local examples, local mismatches, and project-specific behavioral oracle content.
@@ -107,10 +107,10 @@ Procedure:
 4. Review tracker and enforcement entries.
    - Check whether any existing tracker entries are now governed by the new shared rules and can be promoted or resolved.
    - Check whether new shared requirements create new tracker candidates for the project.
-   - Update `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md` if new enforcement-relevant requirements appeared.
+   - Update `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md` if new enforcement-relevant requirements appeared.
 
 5. Refresh the shared baseline record.
-   - Update `references/shared-harness-baseline.md` to record the shared source repository and the commit or tag now reflected in the project.
+   - Update `references/shared-agentlaw-baseline.md` to record the shared source repository and the commit or tag now reflected in the project.
    - If the exact baseline is still uncertain, keep the uncertainty explicit in the notes.
 
 6. Update `AGENTS.md` if needed.
@@ -130,9 +130,9 @@ A correct update should produce:
 - updated root-level mirror files matching the new shared kit
 - localized law documents that incorporate new shared requirements while preserving all prior local facts
 - reviewed tracker entries with promotions or new items when applicable
-- refreshed `references/shared-harness-baseline.md`
+- refreshed `references/shared-agentlaw-baseline.md`
 - updated `AGENTS.md` routing if the read-first order changed
-- when the update introduces or modifies the "Code architecture map" obligation in shared law, populate or refresh the corresponding section in the local `project-overview` reference before the next `rule-harness verify`; leaving the `Map scope:` block undeclared keeps the Layer 2 freshness check in skip mode
+- when the update introduces or modifies the "Code architecture map" obligation in shared law, populate or refresh the corresponding section in the local `project-overview` reference before the next `agentlaw verify`; leaving the `Map scope:` block undeclared keeps the Layer 2 freshness check in skip mode
 
 It should not:
 - replace localized law documents with fresh starter templates
@@ -156,10 +156,10 @@ It should not:
 
 | Layer | Owner | What it does |
 | --- | --- | --- |
-| Pip package code (CLI, MCP server) | `pipx upgrade rule-harness` | Replaces binaries / Python source |
+| Pip package code (CLI, MCP server) | `pipx upgrade agentlaw` | Replaces binaries / Python source |
 | Binary schema migration on `.harness/index/meta.db` | Pip package startup hook | Runs migration scripts in lexical order |
-| Bundled new shared kit delivery | `pipx upgrade rule-harness` | Updates `scaffold/` inside the package |
-| Local governance content merge (`docs/harness/*`, root mirrors, `AGENTS.md`, tracker, baseline) | LLM via this document | Incremental merge, preserves local facts |
+| Bundled new shared kit delivery | `pipx upgrade agentlaw` | Updates `scaffold/` inside the package |
+| Local governance content merge (`docs/law/*`, root mirrors, `AGENTS.md`, tracker, baseline) | LLM via this document | Incremental merge, preserves local facts |
 | Final integrity verification | User via verify command | Confirms the update produced a valid state |
 
 The split is hard: the LLM does not perform binary DB ALTER directly under any circumstance, and the pip package does not perform governance content merges. Step 2 of the cycle (LLM merge) must run only after step 1 (pipx upgrade) has completed cleanly — running step 2 over a half-migrated database produces silent inconsistencies between the binary state and the law layer.
@@ -178,7 +178,7 @@ The Completion Checks above describe what a successful update looks like. These 
 
 When the project does not use the pip-package distribution (the shared kit was delivered through git clone, archive download, or manual copy), step 1 of the cycle changes:
 
-- Replace `pipx upgrade rule-harness` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
+- Replace `pipx upgrade agentlaw` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
 - Schema migrations must be applied by another mechanism documented at the project level. The LLM still does not perform binary DB ALTER directly.
 
 The LLM-driven step 2 (this document's Direct Procedure) and the verification step 3 are unchanged.

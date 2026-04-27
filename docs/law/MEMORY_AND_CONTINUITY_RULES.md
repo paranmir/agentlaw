@@ -13,19 +13,19 @@ Every Harness installation should treat the following as default subsystems:
 - exact lookup, FTS, and vector indexes co-located in `.harness/index/meta.db` (vector via the `sqlite-vec` extension; no separate vector directory)
 - embedding model artifacts under `.harness/models/embedding/<model-name>/`
 - runtime job and cache paths under `.harness/jobs/` and `.harness/cache/`
-- the bundled MCP server (shipped with the `rule-harness` pip package) as the LLM's only access path to indexed memory; raw SQL access is prohibited
+- the bundled MCP server (shipped with the `agentlaw` pip package) as the LLM's only access path to indexed memory; raw SQL access is prohibited
 - session restore behavior that can start, validate, repair, or degrade memory runtime components
 
 Default subsystem status does not require every runtime process to stay hot. Runtime components may be idle, missing, repairing, or degraded as long as the canonical memory layer remains inspectable and the failure is handled as lower-authority runtime state.
 
 ## Canonical Memory Operation Path
-Memory operations are canonical when they go through the bundled Harness Memory MCP tools. CLI fallback surfaces (`rule-harness session-restore`, `rule-harness memory-runtime-check`, `rule-harness memory-runtime-repair`, `rule-harness mcp-recover`) are explicit recovery and diagnostic entry points for sessions where MCP is not available. They are not parallel memory authorities.
+Memory operations are canonical when they go through the bundled Harness Memory MCP tools. CLI fallback surfaces (`agentlaw session-restore`, `agentlaw memory-runtime-check`, `agentlaw memory-runtime-repair`, `agentlaw mcp-recover`) are explicit recovery and diagnostic entry points for sessions where MCP is not available. They are not parallel memory authorities.
 
 ### Session Path Disclosure
 A session that performs memory read or write operations without the Harness Memory MCP registered is operating in a **degraded memory session**. Degraded status must be visible, not hidden:
 
 - Every restore (MCP or fallback) must state the path it used. MCP restores state `via MCP`. Fallback restores state `via recovery fallback (MCP unavailable)` and surface the degraded status in the summary, not only in runtime internals.
-- Before initiating any memory-write operation, the agent must declare which path it will use. "Declare" means name the specific tool or command about to run (for example, `memory_save_item`, `harness_session_save`, or `rule-harness mcp-recover`), so that accidental fallback writes are visible before the write happens, not after.
+- Before initiating any memory-write operation, the agent must declare which path it will use. "Declare" means name the specific tool or command about to run (for example, `memory_save_item`, `agentlaw_session_save`, or `agentlaw mcp-recover`), so that accidental fallback writes are visible before the write happens, not after.
 - If the declared path is a fallback surface, the session is degraded and the write is subject to the recovery-only rules below.
 
 ### Fallback Self-Labeling
@@ -34,7 +34,7 @@ CLI fallback commands must carry a visible recovery or degraded-mode label in th
 ### Write-Path Boundary
 The only sanctioned memory-write paths are:
 
-1. The MCP write tools (`memory_save_item`, `memory_append_log`, `memory_set_status`, `memory_supersede`, `memory_propose_promotion`, `harness_session_save`).
+1. The MCP write tools (`memory_save_item`, `memory_append_log`, `memory_set_status`, `memory_supersede`, `memory_propose_promotion`, `agentlaw_session_save`).
 2. `memory_runtime_repair` / `memory_runtime_repair_start` (from canonical Markdown; these repair derived state, not canonical content).
 
 Direct edits to files under `memory/*` outside these paths are governance drift unless paired with an explicit `memory_runtime_repair` invocation in the same change, so that derived DB, chunk, FTS, and vector state is not left silently out of sync with canonical Markdown. The pairing must be visible in the change record (plan, commit, or save log), not assumed.
@@ -54,7 +54,7 @@ Memory may:
 - propose recursive-improvement candidates
 
 Memory must not:
-- override the constitution, root control documents, or `docs/harness/*`
+- override the constitution, root control documents, or `docs/law/*`
 - silently promote preferences into law
 - replace plans, references, generated facts, or git history when durable reviewable records are needed
 - treat SQL, vector indexes, caches, or MCP outputs as governing authority
@@ -81,25 +81,25 @@ Derived runtime and index state belongs under `.harness/`:
     meta.db                # SQLite + FTS5 + sqlite-vec virtual tables
   models/
     embedding/
-      <model-name>/        # downloaded by rule-harness init
+      <model-name>/        # downloaded by agentlaw init
   jobs/
   cache/
 ```
 
 `memory/*` is the source layer. `.harness/*` is derived runtime or index state and may be repaired from source material.
 
-The current default embedding model is `intfloat/multilingual-e5-small` (384-dim, multilingual). The `sqlite-vec` extension requires `sqlite3.enable_load_extension(True)` in the host Python binding; the `rule-harness` pip package must verify this capability at install and surface a clear error if disabled.
+The current default embedding model is `intfloat/multilingual-e5-small` (384-dim, multilingual). The `sqlite-vec` extension requires `sqlite3.enable_load_extension(True)` in the host Python binding; the `agentlaw` pip package must verify this capability at install and surface a clear error if disabled.
 
 ## Memory Types
 `memory/known-facts/` stores currently remembered facts. Known facts are memory records, not governing rules. Each known fact must carry source, status, and verification metadata once the format is defined.
 
 `memory/logs/` stores historical events. Logs are append-oriented. Incorrect past conclusions should be corrected by later log entries rather than erased by default.
 
-`memory/rules/` stores project-local governance rules. Rules are distinct from known facts: facts are remembered state, rules are local law-level policy for the repository's own authoring workflow. Rules sit below shared `docs/harness/*` in authority and above known facts and preferences. Full framework in the "Local Rule Memory Type" section below.
+`memory/rules/` stores project-local governance rules. Rules are distinct from known facts: facts are remembered state, rules are local law-level policy for the repository's own authoring workflow. Rules sit below shared `docs/law/*` in authority and above known facts and preferences. Full framework in the "Local Rule Memory Type" section below.
 
 `memory/preferences.md` stores user or maintainer preferences. Preferences may guide style and workflow, but they lose to law, current explicit instruction, and safety or verification requirements.
 
-`memory/working-set.md` stores current active context for low-token session continuity. It must be refreshed when active plans, current decisions, or next actions change. The working-set file is rewritten in full on every `harness_session_save`; bullets inside the file are not separately addressable as item-level records and are not declared as a memory item type.
+`memory/working-set.md` stores current active context for low-token session continuity. It must be refreshed when active plans, current decisions, or next actions change. The working-set file is rewritten in full on every `agentlaw_session_save`; bullets inside the file are not separately addressable as item-level records and are not declared as a memory item type.
 
 The declared item types are exactly three: `fact`, `preference`, and `rule`. Each type has a defined write path under `memory_save_item`. No other types are declared; calls with any other `type` value return `memory.invalid_params`.
 
@@ -116,13 +116,13 @@ Rules are project-local governance items: persistent policy that applies within 
 The three types are stored separately so that status transitions, retrieval treatment, and write-path obligations can differ without role-mixing.
 
 ### Authority Position
-Rules sit strictly below shared `docs/harness/*` and root control documents, and strictly above known facts, preferences, logs, and working-set entries. Conflicts resolve as follows:
+Rules sit strictly below shared `docs/law/*` and root control documents, and strictly above known facts, preferences, logs, and working-set entries. Conflicts resolve as follows:
 
 - Shared law vs. local rule → shared law wins. The rule must be updated or marked `superseded` to align.
 - Local rule vs. known fact → the rule wins. A known fact that contradicts an active rule must be reconciled (fact becomes `stale`, or the rule is revised).
 - Local rule vs. preference → the rule wins.
 - Local rule vs. working set → the rule wins; the working set must not assert content that contradicts an active rule.
-- Two active rules in the same scope in genuine conflict → governance drift. Resolve through `HARNESS_FIX_TOOL.md`, not by silent status change.
+- Two active rules in the same scope in genuine conflict → governance drift. Resolve through `AGENTLAW_FIX_TOOL.md`, not by silent status change.
 
 Rules do not override current explicit user instruction within a single session, but they do survive it: an agent that takes a one-off instruction contradicting an active rule must surface the conflict rather than quietly comply.
 
@@ -157,7 +157,7 @@ memory/rules/release-readiness-gate.md
 ```
 
 ### Discoverability Obligations
-- **Session restore**: `harness_session_restore` must include active rules matching the packet's scope under an `active_rules` field (see "Session Restore Packet Format" below).
+- **Session restore**: `agentlaw_session_restore` must include active rules matching the packet's scope under an `active_rules` field (see "Session Restore Packet Format" below).
 - **Lookup read order**: `memory/LOOKUP_RULES.md` must consult rules before known facts when both are relevant. Active rules with `applies_when: [always]` are always in-scope for the current session.
 - **Trigger matching**: non-`always` tags are matched as exact strings against the current trigger context. Law does not define fuzzy matching, hierarchy, or wildcards for trigger tags. A project that needs a taxonomy defines it inside its own rule bodies.
 
@@ -173,10 +173,10 @@ Rules are created, updated, and lifecycled through the same MCP tools that handl
 Direct file edits under `memory/rules/` are subject to the same Write-Path Boundary as other memory layers: they are governance drift unless paired with an explicit `memory_runtime_repair` invocation in the same change.
 
 ### Distribution Boundary
-`publish-repo/memory/rules/` must not contain this authoring workspace's local rule content. Target projects that install via the `rule-harness` pip package or `rule-harness init` inherit an empty rules directory (with at most a one-paragraph starter README explaining the directory's purpose). They populate their own rules locally. The `rule-harness verify` publish-seed leak detector scans this path for authoring-specific marker phrases and fails closed on leaks.
+`publish-repo/memory/rules/` must not contain this authoring workspace's local rule content. Target projects that install via the `agentlaw` pip package or `agentlaw init` inherit an empty rules directory (with at most a one-paragraph starter README explaining the directory's purpose). They populate their own rules locally. The `agentlaw verify` publish-seed leak detector scans this path for authoring-specific marker phrases and fails closed on leaks.
 
 ### Schema Storage Note
-The `memory_items.type` column in `.harness/index/meta.db` is constrained by a CHECK that admits `fact`, `preference`, `rule`, and `working_set_entry`. The runtime tool layer accepts only the first three; calls to `memory_save_item(type="working_set_entry")` are rejected with `memory.invalid_params` before they reach the DB, and the working-set file is rewritten in full by `harness_session_save` rather than addressed at item-level. The CHECK retains the fourth value so that databases written by older binaries continue to read; rows of that type are dormant and not produced by any current write path.
+The `memory_items.type` column in `.harness/index/meta.db` is constrained by a CHECK that admits `fact`, `preference`, `rule`, and `working_set_entry`. The runtime tool layer accepts only the first three; calls to `memory_save_item(type="working_set_entry")` are rejected with `memory.invalid_params` before they reach the DB, and the working-set file is rewritten in full by `agentlaw_session_save` rather than addressed at item-level. The CHECK retains the fourth value so that databases written by older binaries continue to read; rows of that type are dormant and not produced by any current write path.
 
 ## Canonical File Formats
 Canonical memory files use Markdown with YAML front matter when item-level metadata is needed.
@@ -291,7 +291,7 @@ Minimum entry format:
 - status: recorded
 - source:
   - conversation
-  - docs/harness/MEMORY_AND_CONTINUITY_RULES.md
+  - docs/law/MEMORY_AND_CONTINUITY_RULES.md
 
 Harness Memory was accepted as a default Harness subsystem. This log is historical and must not be retrieved as current truth without checking current law and active plans.
 ```
@@ -371,9 +371,9 @@ The working set is current-context state, not a long-term changelog. It should b
 
 #### Working Set Field Discipline
 
-The fields written through `harness_session_save` (`current_goal`, `active_plans`, `current_decisions`, `open_questions`, `next_actions`, `authority_warnings`) carry the **current snapshot only**. Each field is a short list. Each entry is one or two short lines describing a current state: a standing decision, an open question, a next action. The substantive narrative of what happened in this session — Finding / Evidence / Resolution prose, decision rationale, change history, file paths exhibited, evidence cited — does **not** belong in working-set fields.
+The fields written through `agentlaw_session_save` (`current_goal`, `active_plans`, `current_decisions`, `open_questions`, `next_actions`, `authority_warnings`) carry the **current snapshot only**. Each field is a short list. Each entry is one or two short lines describing a current state: a standing decision, an open question, a next action. The substantive narrative of what happened in this session — Finding / Evidence / Resolution prose, decision rationale, change history, file paths exhibited, evidence cited — does **not** belong in working-set fields.
 
-That narrative belongs in the optional `log_entry` argument to `harness_session_save`. The argument is appended to `memory/logs/YYYY-MM/YYYY-MM-DD.md` and indexed for full-text and vector retrieval. Future agents searching for "what happened on 2026-04-26" or "why was Slice 7.5 added" use `memory_search` or `memory_recent_logs` against the log layer; they do not search the working-set, and the working-set is not indexed.
+That narrative belongs in the optional `log_entry` argument to `agentlaw_session_save`. The argument is appended to `memory/logs/YYYY-MM/YYYY-MM-DD.md` and indexed for full-text and vector retrieval. Future agents searching for "what happened on 2026-04-26" or "why was Slice 7.5 added" use `memory_search` or `memory_recent_logs` against the log layer; they do not search the working-set, and the working-set is not indexed.
 
 Concrete pattern:
 
@@ -400,7 +400,7 @@ Concrete pattern:
 
 The same discipline applies to every other working-set field. When in doubt: if the entry is longer than two short lines or contains words like "after", "because", "this slice", "evidence", it belongs in the `log_entry.body` and a one-line summary belongs in the working-set field.
 
-This discipline matters because the working set is read at every `harness_session_restore`, the response packet's token cost scales with every additional character, and bloated fields slow every session start. The log layer absorbs as much narrative as needed without any of those costs because logs are indexed and retrievable, not always-loaded.
+This discipline matters because the working set is read at every `agentlaw_session_restore`, the response packet's token cost scales with every additional character, and bloated fields slow every session start. The log layer absorbs as much narrative as needed without any of those costs because logs are indexed and retrievable, not always-loaded.
 
 ## `LOOKUP_RULES.md` Syntax
 `memory/LOOKUP_RULES.md` defines retrieval policy with predictable Markdown sections.
@@ -453,7 +453,7 @@ A session restore operation should return a compact packet rather than dumping m
 Required packet fields:
 
 ```yaml
-packet_type: harness_session_restore
+packet_type: agentlaw_session_restore
 generated_at: 2026-04-20T14:30:00+09:00
 scope: repository
 runtime_status:
@@ -483,7 +483,7 @@ next_actions:
   - action: string
     source: path-or-memory-id
 relevant_sources:
-  - path: docs/harness/MEMORY_AND_CONTINUITY_RULES.md
+  - path: docs/law/MEMORY_AND_CONTINUITY_RULES.md
     reason: owns memory operating rules
 excluded_memory:
   - id: fact/obsolete-example
@@ -554,7 +554,7 @@ Retrieval treatment:
 ## Type-Specific Conflict Handling
 Known facts that conflict with law, approved artifacts, or current repository files must not remain `active`.
 
-Rules that conflict with shared law (`docs/harness/*`, `HARNESS_CONSTITUTION.md`) must not remain `active`. Revise the rule to align with shared law, or mark it `superseded` with a pointer to the law section that replaced it. Rules that conflict with an active known fact win the conflict (the rule is policy; the fact is observation) — the fact must be reconciled by status transition, not the rule.
+Rules that conflict with shared law (`docs/law/*`, `AGENTLAW_CONSTITUTION.md`) must not remain `active`. Revise the rule to align with shared law, or mark it `superseded` with a pointer to the law section that replaced it. Rules that conflict with an active known fact win the conflict (the rule is policy; the fact is observation) — the fact must be reconciled by status transition, not the rule.
 
 Preferences that conflict with law or current explicit instruction should become `suppressed` for the current context rather than deleted by default.
 
@@ -567,14 +567,14 @@ Indexes that disagree with canonical memory files or repository files are source
 ## Canonical Restore Route
 Session restore must follow a fixed two-tier route. The mandatory tier is identical for every restore so harness behavior is deterministic across sessions, agents, and runtimes. The conditional tier expands only along pointers found in the mandatory tier.
 
-When the bundled MCP server is available, the `harness_session_restore` tool implements this route end-to-end and returns the assembled packet. When the MCP server is unavailable, the agent must walk the same route manually against the canonical Markdown layer (degraded mode).
+When the bundled MCP server is available, the `agentlaw_session_restore` tool implements this route end-to-end and returns the assembled packet. When the MCP server is unavailable, the agent must walk the same route manually against the canonical Markdown layer (degraded mode).
 
 ### Mandatory Tier
 Every restore must perform these steps in order. The Mandatory Tier covers the body-level reads of every artifact whose substance the next response is likely to depend on, so that an agent following the procedure has a complete working picture before composing the first answer.
 
 1. Run the workspace's harness verification command (or the equivalent integrity check exposed by the runtime). Record the result in the packet's `runtime_status`.
 2. Read `memory/working-set.md` in full.
-3. Read the body of every law file in full — `HARNESS_CONSTITUTION.md` and every file under `docs/harness/*`. The law layer is short and binding; rules that the session must apply must live in the agent's working context, not just as paths.
+3. Read the body of every law file in full — `AGENTLAW_CONSTITUTION.md` and every file under `docs/law/*`. The law layer is short and binding; rules that the session must apply must live in the agent's working context, not just as paths.
 4. Read the body of every active plan — every file under `docs/plans/active/*`. Active plans are the work currently in flight; titles alone do not carry slices, contracts, or non-goals.
 5. Read the body of the most recent `session_save` log entry — the single newest `memory/logs/YYYY-MM/YYYY-MM-DD.md` entry of `kind: session_save`. This is the directly preceding session's wrap-up summary, the most concentrated source of "what landed last" and "what is open right now".
 6. List `memory/logs/*` entries dated within `log_lookback_days_default` (from `LOOKUP_RULES.md`, default 14 days) for the broader timeline. Titles only at this step — body reads for entries other than the most recent `session_save` (already covered by step 5) belong to the Conditional Tier.
@@ -583,8 +583,8 @@ Every restore must perform these steps in order. The Mandatory Tier covers the b
 9. Read `memory/LOOKUP_RULES.md` in full. The retrieval policy (read order, trigger map, budgets, exclusions, escalation) governs how the agent uses memory throughout the session and must live in the agent's working context, not be re-derived turn by turn.
 10. Scan the known-facts manifest — collect the id, title, scope, and last_checked timestamp of every file under `memory/known-facts/*.md` whose status is `active`. **Bodies are not read at this step.** The manifest gives the agent a complete catalog of "what facts are remembered" so it does not invent or contradict known state; bodies are fetched on demand under step 11 or via working-frame search at step 11a.
 11. Run a working-frame search against the indexed memory. Compose a query from `current_goal` plus `next_actions` plus `open_questions`, call `memory_search(query=<that text>, types=["fact"])` and surface the top hits with `id`, `title`, `path`, and snippet. The hits guide which known-facts the agent should fetch in full from the manifest assembled at step 10. The search is the layer's intended retrieval path; the manifest scan is the safety net that ensures nothing relevant is missed because of a query phrasing gap.
-12. Detect governance drift: list `docs/harness/*` and `HARNESS_CONSTITUTION.md` files modified after the working set's `updated_at` timestamp. Flag any drift in `authority_warnings`.
-13. Assemble the `harness_session_restore` packet (see "Session Restore Packet Format") including `authority_warnings`, the `stale-until-verified` flag, the source pointers gathered above, and the body fields produced by steps 3, 4, 5, 7, 8, 9, 10, and 11.
+12. Detect governance drift: list `docs/law/*` and `AGENTLAW_CONSTITUTION.md` files modified after the working set's `updated_at` timestamp. Flag any drift in `authority_warnings`.
+13. Assemble the `agentlaw_session_restore` packet (see "Session Restore Packet Format") including `authority_warnings`, the `stale-until-verified` flag, the source pointers gathered above, and the body fields produced by steps 3, 4, 5, 7, 8, 9, 10, and 11.
 14. Surface gaps before composing a substantive response. If any of the above steps could not complete (missing file, ambiguous pointer, working-set referencing an artifact that no longer exists, rule body that fails to load, search engine unavailable), the agent must surface the gap to the user before answering. This applies the §Consult-Before-Answer Rule at session start: an honest "I cannot find what `current_goal` points at" beats a confident answer built on a partial restore.
 
 ### Conditional Tier
@@ -600,12 +600,12 @@ Expand only when the mandatory tier surfaces a concrete need:
 - If runtime components (MCP server, indexes, embedding model) are missing or failing, degrade to the Markdown-only path. Do not treat missing runtime as higher authority than canonical Markdown.
 
 ### MCP Unavailable Recovery Route
-When `harness-memory` MCP tools are not visible in a new agent session, agents must not assume memory is unavailable and must not silently bypass the memory subsystem. They must treat the condition as a startup, runtime, or agent-registration recovery problem.
+When `agentlaw-memory` MCP tools are not visible in a new agent session, agents must not assume memory is unavailable and must not silently bypass the memory subsystem. They must treat the condition as a startup, runtime, or agent-registration recovery problem.
 
 The canonical recovery entry point is:
 
 ```text
-rule-harness mcp-recover --target . --client auto --json
+agentlaw mcp-recover --target . --client auto --json
 ```
 
 This command restores session context through the CLI fallback equivalent of the Canonical Restore Route, checks Harness runtime readiness, inspects agent MCP registration when the agent host exposes an inspection command, and returns concrete recovery actions.
@@ -627,9 +627,9 @@ Recovery rules:
 ## Canonical Save Route
 Session save must follow a fixed two-tier route. The mandatory tier always runs when save is invoked; the conditional tier writes additional records only when the session produced material change.
 
-When the bundled MCP server is available, the `harness_session_save` tool writes the canonical working set, optionally appends the session log entry, and surfaces the post-save verification obligation. It does not execute project verification commands itself. When unavailable, the agent must walk the same route manually against the canonical Markdown layer.
+When the bundled MCP server is available, the `agentlaw_session_save` tool writes the canonical working set, optionally appends the session log entry, and surfaces the post-save verification obligation. It does not execute project verification commands itself. When unavailable, the agent must walk the same route manually against the canonical Markdown layer.
 
-`harness_session_save` is a material-boundary tool, not a heartbeat. Call it after major milestone completion, important decision changes, handoff points, or before stopping work. Do not call it after every small edit or routine verification, because save payloads and log entries consume context and create unnecessary continuity noise.
+`agentlaw_session_save` is a material-boundary tool, not a heartbeat. Call it after major milestone completion, important decision changes, handoff points, or before stopping work. Do not call it after every small edit or routine verification, because save payloads and log entries consume context and create unnecessary continuity noise.
 
 ### Mandatory Tier
 Every save must perform these steps in order:
@@ -664,7 +664,7 @@ An agent must call `memory_propose_promotion` when the information has all three
 
 Do not propose promotion for routine progress updates, one-off instructions, temporary debugging observations, unverified guesses, or facts already represented at the correct authority level.
 
-Use existing source ids from `memory_save_item`, `memory_append_log`, `memory_get`, `memory_search`, `memory_list`, `memory_recent_logs`, or `harness_session_save.log_entry_id`. Do not invent source ids. A proposal remains an append-only memory log entry and must not directly edit law, plans, references, shared artifacts, or durable memory items.
+Use existing source ids from `memory_save_item`, `memory_append_log`, `memory_get`, `memory_search`, `memory_list`, `memory_recent_logs`, or `agentlaw_session_save.log_entry_id`. Do not invent source ids. A proposal remains an append-only memory log entry and must not directly edit law, plans, references, shared artifacts, or durable memory items.
 
 ## Memory Intent Rule
 An agent must not promise or accept durable memory without resolving that memory intent.
@@ -673,7 +673,7 @@ Memory intent exists when the user or agent expresses an intent to remember, per
 
 Before final response, memory intent must resolve to one of:
 
-- **`memory_write`** — call an appropriate memory write tool such as `memory_save_item`, `memory_append_log`, or `harness_session_save`. Use when the substance is not yet captured anywhere durable and the memory layer is the right home for it.
+- **`memory_write`** — call an appropriate memory write tool such as `memory_save_item`, `memory_append_log`, or `agentlaw_session_save`. Use when the substance is not yet captured anywhere durable and the memory layer is the right home for it.
 - **`promotion_proposal`** — call `memory_propose_promotion` when the information belongs in law, plan, reference, or shared artifact. Use when the substance has elevated authority (multi-session governance, project-wide constraint, structural rule).
 - **`associative_marker`** — call `memory_save_item(type="fact", tags=["user-requested-memory", ...])` to write a short navigation breadcrumb pointing at the substance's existing location. Use when (a) the substance is already captured in another durable artifact (tracker entry, plan section, law clause, code path, or even a prior memory item / log entry) AND (b) the user expresses an intent to retrieve it later via a query like "what did I ask to remember", "we agreed earlier", or similar associative recall. The marker body is short (2-5 lines): the trigger phrase, the date, the topic, and a pointer to the substance. Vector + FTS indexing on the marker body lets future `memory_search("user requested memory")` or `memory_list(tags=["user-requested-memory"])` queries surface the marker, and the marker's pointer takes the agent to the real artifact. The marker does not duplicate the substance.
 - **`explicit_non_save`** — explicitly state that the information is transient, already represented at the correct authority level, or otherwise not durable and will not be saved. Use when the substance is already adequately governed (e.g., the immediately surrounding code expresses it) **and** there is no associative-recall expectation. If the user might later ask "what did I ask to remember", `associative_marker` is the correct path instead.
@@ -754,16 +754,16 @@ Every timestamp written into a memory record must be the **actual wall-clock tim
 
 Timestamps are load-bearing: the Canonical Restore Route uses the working set's `updated_at` to detect governance drift (law files modified after that time are flagged); `memory_recent_logs` uses `occurred_at` for time-window filtering; conflict resolution uses `recency` as the final tiebreaker after authority and scope. Fabricated timestamps silently break every one of these mechanisms.
 
-Agents and tools that write memory records must obtain the current time from the operating system (e.g., `date` on a shell, `datetime.now(timezone.utc)` in Python) at write time. Sequencing several log entries with `+15 minutes` increments, copying a prior timestamp, or estimating a timestamp from context is a governance violation and should be corrected through `HARNESS_FIX_TOOL.md`.
+Agents and tools that write memory records must obtain the current time from the operating system (e.g., `date` on a shell, `datetime.now(timezone.utc)` in Python) at write time. Sequencing several log entries with `+15 minutes` increments, copying a prior timestamp, or estimating a timestamp from context is a governance violation and should be corrected through `AGENTLAW_FIX_TOOL.md`.
 
-When the `rule-harness` CLI is available, agents should prefer `rule-harness now --json` for manual timestamp lookup before writing memory records by hand. The command returns compact OS-clock UTC and local timestamps so agents do not spend prompt tokens composing ad hoc date commands or infer dates from conversation context. MCP tools and package code may continue to call the host language's clock directly when they write timestamps internally.
+When the `agentlaw` CLI is available, agents should prefer `agentlaw now --json` for manual timestamp lookup before writing memory records by hand. The command returns compact OS-clock UTC and local timestamps so agents do not spend prompt tokens composing ad hoc date commands or infer dates from conversation context. MCP tools and package code may continue to call the host language's clock directly when they write timestamps internally.
 
 Pre-existing records with known-fabricated timestamps may be left in place when the order is still correct and the cost of rewriting exceeds the diagnostic value, but any new writes must use actual wall-clock time.
 
 ## Memory Tool Surface (MCP)
 The LLM accesses indexed memory through the bundled MCP server only. Raw SQL against `.harness/index/meta.db` and direct file reads of derived state are prohibited.
 
-The full tool surface is exposed as default capabilities. The signature reference (parameters, return shapes, error semantics) lives at `docs/references/harness-mcp-tools.md`. This document owns *when* and *why* to use each tool.
+The full tool surface is exposed as default capabilities. The signature reference (parameters, return shapes, error semantics) lives at `docs/references/agentlaw-mcp-tools.md`. This document owns *when* and *why* to use each tool.
 
 ### Read Tools
 - **`memory_search`** — combined FTS + vector search over memory item chunks. Use when the agent needs semantic or lexical recall across current memory; prefer it over reading full files. Logs remain historical records and are fetched through log-specific tools or known ids, not default semantic recall.
@@ -773,7 +773,7 @@ The full tool surface is exposed as default capabilities. The signature referenc
 - **`memory_recent_logs`** — recent log entries within a time window. Use for "what happened in the last N days" rather than scanning files.
 
 ### Write Tools
-- **`memory_save_item`** — create or update a `fact`, `preference`, or `rule`. Writes canonical Markdown first, then updates derived DB/chunk/tag/vector rows. If the derived update fails after the Markdown write, the tool must report `memory.derived_index_drift` and point to `memory_runtime_repair`. Rules follow the rule front matter schema defined in "Local Rule Memory Type". Preferences follow the section-aware grammar defined under "Preferences File / Machine-Writable Grammar". Calls with `type="working_set_entry"` return `memory.invalid_params`; the working-set file is rewritten in full by `harness_session_save` rather than addressed at item-level.
+- **`memory_save_item`** — create or update a `fact`, `preference`, or `rule`. Writes canonical Markdown first, then updates derived DB/chunk/tag/vector rows. If the derived update fails after the Markdown write, the tool must report `memory.derived_index_drift` and point to `memory_runtime_repair`. Rules follow the rule front matter schema defined in "Local Rule Memory Type". Preferences follow the section-aware grammar defined under "Preferences File / Machine-Writable Grammar". Calls with `type="working_set_entry"` return `memory.invalid_params`; the working-set file is rewritten in full by `agentlaw_session_save` rather than addressed at item-level.
 - **`memory_append_log`** — append a log entry to today's log file. Append-only; cannot edit prior entries. Writes canonical Markdown first, then updates derived DB/chunk/tag rows. V1 does not create log vector rows.
 
 ### Lifecycle Tools
@@ -784,8 +784,8 @@ The full tool surface is exposed as default capabilities. The signature referenc
 - **`memory_propose_promotion`** — create a candidate for reviewed promotion of memory into law, plan, reference, or shared artifact. **Must not** directly promote; only proposes for review through the normal change path.
 
 ### Session Tools
-- **`harness_session_restore`** — implements the Canonical Restore Route above; returns the compact packet and runtime `authority_recall` guidance, including the Memory Intent Rule.
-- **`harness_session_save`** — implements the Canonical Save Route above and returns `promotion_reminder` plus `memory_intent_reminder` reminders without runtime-selected candidates.
+- **`agentlaw_session_restore`** — implements the Canonical Restore Route above; returns the compact packet and runtime `authority_recall` guidance, including the Memory Intent Rule.
+- **`agentlaw_session_save`** — implements the Canonical Save Route above and returns `promotion_reminder` plus `memory_intent_reminder` reminders without runtime-selected candidates.
 
 ### Operational Tools
 - **`memory_runtime_check`** — preview a memory runtime repair from canonical Markdown without creating a job row or mutating DB, FTS, or vector tables. Use before repair when source drift is suspected and the agent needs counts/warnings only.

@@ -2,11 +2,11 @@
 
 ## Authority
 This document is a contract document. It is the source of truth
-for the distribution contract between rule-harness and target projects, shared with target projects via `publish-repo/`,
+for the distribution contract between agentlaw and target projects, shared with target projects via `publish-repo/`,
 and its consistency with the `publish-repo/` tree and target project layout is mechanically enforced
-by `rule-harness verify` (`_test_scaffold_drift` + `_test_publish_seed_contract_finite_set`).
+by `agentlaw verify` (`_test_scaffold_drift` + `_test_publish_seed_contract_finite_set`).
 
-Governing law: `docs/harness/REPOSITORY_ARTIFACT_RULES.md`. Amendments land
+Governing law: `docs/law/REPOSITORY_ARTIFACT_RULES.md`. Amendments land
 through a plan that updates this file and any dependent law
 clause in the same change.
 
@@ -16,8 +16,8 @@ This local workspace is itself a bootstrapped project instance of the shared Har
 This file records the shared-kit baseline currently reflected in the workspace.
 
 ## Baseline Record
-- Shared source repository: `https://github.com/paranmir/rule-harness.git`
-- Baseline commit SHA: `2d7b12d`
+- Shared source repository: `https://github.com/paranmir/agentlaw.git`
+- Baseline commit SHA: `f811f78`
 - Baseline tag: `unknown`
 - Baseline recorded on: `2026-04-27`
 - Recorded by: `readme-polish-and-publish-repo-sync plan`

@@ -11,7 +11,7 @@ This directory stores repository-local reference material that agents may need r
 
 ## What Does Not Belong Here
 - temporary chat context
-- project rules that belong in `docs/harness/*`
+- project rules that belong in `docs/law/*`
 - active plans that belong in `plans/active/*`
 
 ## Usage Rule

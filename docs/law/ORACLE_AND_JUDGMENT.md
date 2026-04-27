@@ -85,7 +85,7 @@ If a test intentionally covers multiple contracts, its assertions must make the 
 When the shipped surface grows large enough that coverage is hard to see from test names alone, add or update a structured coverage matrix under an approved repository artifact path such as `docs/references/*` or `docs/plans/*`. The matrix is supporting evidence, not a replacement for executable tests.
 
 ### Code Authorship Oracle
-Code work is governed by `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`.
+Code work is governed by `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`.
 
 Tests for code work must identify the behavioral oracle before asserting expected behavior. The oracle priority and test-anchored development rules live in that document.
 

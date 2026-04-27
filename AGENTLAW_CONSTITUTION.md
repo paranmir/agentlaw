@@ -1,7 +1,7 @@
 # Harness Constitution
 
 ## 0. Purpose and Boundaries
-`HARNESS_CONSTITUTION.md` is the top-level governing document for the Harness kit. It fixes stable rules for document structure, document authority, documentation gates, and change handling.
+`AGENTLAW_CONSTITUTION.md` is the top-level governing document for the Harness kit. It fixes stable rules for document structure, document authority, documentation gates, and change handling.
 
 This document does not store project-specific real criteria, implementation detail, or local operating values. Those belong below the constitution layer.
 
@@ -10,9 +10,9 @@ These rules are intended to govern any coding agent working in the repository, n
 ## 1. Governance Hierarchy
 The repository follows a 5-layer written-governance structure. The hierarchy is:
 
-1. Root-level constitutional documents (`HARNESS_CONSTITUTION.md`)
-2. Root-level control documents (`HARNESS_INIT_TOOL.md`, `HARNESS_UPDATE_TOOL.md`, `HARNESS_FIX_TOOL.md`)
-3. Law documents (`docs/harness/*`)
+1. Root-level constitutional documents (`AGENTLAW_CONSTITUTION.md`)
+2. Root-level control documents (`AGENTLAW_INIT_TOOL.md`, `AGENTLAW_UPDATE_TOOL.md`, `AGENTLAW_FIX_TOOL.md`)
+3. Law documents (`docs/law/*`)
 4. Approved structured repository artifacts (`docs/contracts/*`, `docs/plans/*`, `docs/references/*`, and stable generated facts when they exist)
 5. Approved continuity or memory records (`memory/*`)
 6. Execution-entry documents (`AGENTS.md`) and `README.md`
@@ -20,7 +20,7 @@ The repository follows a 5-layer written-governance structure. The hierarchy is:
 Rules:
 - The constitution defines stable top-level rules.
 - Root control documents are starter-level control documents that live beside the constitution and guide initialization and corrective-governance loops without replacing the law layer.
-- Project-specific real working criteria belong in `docs/harness/*`.
+- Project-specific real working criteria belong in `docs/law/*`.
 - Structured repository artifacts may store durable planning, reference, or derived context, but they do not override the law layer.
 - A structured repository artifact is approved only when it is created under the repository artifact rules and any required synchronization impact has been handled or explicitly recorded.
 - Continuity or memory records are derived aids for restoring and assembling context. They do not override constitutional documents, root control documents, law documents, or approved structured repository artifacts.
@@ -39,7 +39,7 @@ The constitution layer fixes the following principles:
 - Repository growth must reuse existing approved artifact classes and paths before introducing new structure.
 - New structure is allowed only when the current governed structure is shown to be insufficient.
 - Stable shared rules belong in the constitution layer.
-- Project-specific real criteria belong in `docs/harness/*`.
+- Project-specific real criteria belong in `docs/law/*`.
 - Execution-entry documents may direct work, but may not create higher-order rules.
 - Repeated stable constraints should later be promoted to mechanical enforcement when appropriate.
 - Repeated prohibited actions that are mechanically detectable must not remain prose-only when executable enforcement is feasible.
@@ -63,7 +63,7 @@ Code must be written for future review as well as execution. Agents must preserv
 Non-trivial implementation work must leave enough durable context for a later human or agent to reconstruct the intended behavior, affected surfaces, verification oracle, and design constraints without relying on conversation history.
 
 ## 3. Law Document System
-The law layer defines the real working criteria for a project through `docs/harness/*`.
+The law layer defines the real working criteria for a project through `docs/law/*`.
 
 The minimum law-document categories are:
 - `HARNESS_SCOPE`: scope, non-scope, and target boundaries
@@ -93,7 +93,7 @@ Project-specific specialization may add local facts, local examples, and stricte
 The constitution fixes the existence of these invariant starter protections, but the detailed carry-forward, read-path, and project-instance specialization rules do not belong here.
 
 Those detailed specialization rules live in:
-- `docs/harness/STARTER_SPECIALIZATION_RULES.md`
+- `docs/law/STARTER_SPECIALIZATION_RULES.md`
 
 ## 4. Structured Knowledge Expansion
 As a project grows, agents must not compensate by turning `AGENTS.md` into a larger rule store.
@@ -141,9 +141,9 @@ Rules:
 Root control documents are root-level control artifacts that work beside the constitution and before detailed law reading.
 
 The default root control documents are:
-- `HARNESS_INIT_TOOL.md`
-- `HARNESS_UPDATE_TOOL.md`
-- `HARNESS_FIX_TOOL.md`
+- `AGENTLAW_INIT_TOOL.md`
+- `AGENTLAW_UPDATE_TOOL.md`
+- `AGENTLAW_FIX_TOOL.md`
 
 Their role is to:
 - help agents initialize or rebuild a repository from the shared harness kit
@@ -151,7 +151,7 @@ Their role is to:
 - analyze current governance problems and place corrective additions at the correct layer
 
 They must not:
-- replace `docs/harness/*` as the project law layer
+- replace `docs/law/*` as the project law layer
 - silently redefine project-specific scope, contract, oracle, or failure meaning
 - become substitutes for execution-entry documents or operational artifacts
 

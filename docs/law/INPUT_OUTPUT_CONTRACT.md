@@ -32,9 +32,9 @@ This document defines the minimum working contract for requests, inputs, outputs
 
 ## Required Inputs
 - the current request
-- `HARNESS_CONSTITUTION.md`
+- `AGENTLAW_CONSTITUTION.md`
 - `AGENTS.md`
-- the current `docs/harness/*` law documents
+- the current `docs/law/*` law documents
 - `memory/working-set.md` for primary session context when present
 - `memory/LOOKUP_RULES.md` for session lookup policy
 - install metadata when the repository was created through an installer and that metadata exists
@@ -82,9 +82,9 @@ Outputs must:
 When a change is `structure-affecting`, `shared-artifact-affecting`, or `governance-affecting`, the agent must check whether related governing artifacts also require updates.
 
 At minimum, check the relevant combination of:
-- `HARNESS_CONSTITUTION.md`
+- `AGENTLAW_CONSTITUTION.md`
 - `AGENTS.md`
-- `docs/harness/*`
+- `docs/law/*`
 - `docs/plans/tech-debt-tracker.md`
 - `docs/references/*`
 - derived outputs or parallel shared artifact sets when they exist
@@ -152,7 +152,7 @@ The first implementation must document:
 - the expected result when invalid input is rejected or blocked
 
 ### Harness Time Output Contract
-`rule-harness now --json` outputs one compact JSON object based on the host operating system clock. It is intended for timestamp integrity workflows, especially when an agent must manually write `memory/*` timestamps.
+`agentlaw now --json` outputs one compact JSON object based on the host operating system clock. It is intended for timestamp integrity workflows, especially when an agent must manually write `memory/*` timestamps.
 
 Required keys:
 - `utc` — current UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form
@@ -196,8 +196,8 @@ The default regression strategy should document:
 - the invalid inputs or edge cases that must stay rejected or controlled
 - the persisted, repeated, or round-trip behaviors that must remain stable
 - the conditions that require the regression set to expand
-- when the repository ships executable code or a runtime (pip-buildable source, bundled CLI, server, MCP runtime, etc.), a committed automated test runner that a fresh agent or CI can execute without session-specific context. Structural checks (file presence, mirror sync) alone are insufficient once behavior is observable. See `docs/harness/ORACLE_AND_JUDGMENT.md` "Executable-Code Oracle Requirement".
-- representative smoke tests may verify startup, transport, or one fresh-install round trip, but they do not satisfy the behavioral oracle for every shipped feature. The regression set must either test each shipped feature contract directly or keep an explicit coverage matrix that maps features to their valid, invalid, state-change, persistence, and boundary checks. See `docs/harness/ORACLE_AND_JUDGMENT.md` "Representative Smoke Test Boundary".
+- when the repository ships executable code or a runtime (pip-buildable source, bundled CLI, server, MCP runtime, etc.), a committed automated test runner that a fresh agent or CI can execute without session-specific context. Structural checks (file presence, mirror sync) alone are insufficient once behavior is observable. See `docs/law/ORACLE_AND_JUDGMENT.md` "Executable-Code Oracle Requirement".
+- representative smoke tests may verify startup, transport, or one fresh-install round trip, but they do not satisfy the behavioral oracle for every shipped feature. The regression set must either test each shipped feature contract directly or keep an explicit coverage matrix that maps features to their valid, invalid, state-change, persistence, and boundary checks. See `docs/law/ORACLE_AND_JUDGMENT.md` "Representative Smoke Test Boundary".
 
 If the project grows more complex, this content may later move into a separate `REGRESSION_STRATEGY.md`.
 

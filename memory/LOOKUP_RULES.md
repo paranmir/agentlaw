@@ -1,19 +1,19 @@
 # Lookup Rules
 
-This file is starter seed memory. The authoritative session-level workflow lives in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` ("Canonical Restore Route" and "Canonical Save Route"); this file aligns to that workflow at the lookup-policy level. Specialize values for the local project after install.
+This file is starter seed memory. The authoritative session-level workflow lives in `docs/law/MEMORY_AND_CONTINUITY_RULES.md` ("Canonical Restore Route" and "Canonical Save Route"); this file aligns to that workflow at the lookup-policy level. Specialize values for the local project after install.
 
 ## Read Order
 1. `memory/working-set.md`
 2. `memory/LOOKUP_RULES.md` when a retrieval choice needs explicit policy
-3. active rules under `memory/rules/` whose scope matches the session and whose `applies_when` is `always` or matches a current trigger; the restore packet surfaces these in its `active_rules` field so this step is effectively free when restoring via `harness_session_restore`
+3. active rules under `memory/rules/` whose scope matches the session and whose `applies_when` is `always` or matches a current trigger; the restore packet surfaces these in its `active_rules` field so this step is effectively free when restoring via `agentlaw_session_restore`
 4. relevant active known facts under `memory/known-facts/`
 5. relevant preferences in `memory/preferences.md`
 6. recent logs under `memory/logs/*` only when current state is insufficient
 7. source files referenced by selected memory
 
 ## Trigger Map
-- session_restore: walk the Canonical Restore Route in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`. Use `harness_session_restore` MCP tool when available; otherwise walk the route manually.
-- session_save: walk the Canonical Save Route in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`. Use `harness_session_save` MCP tool when available; otherwise walk the route manually.
+- session_restore: walk the Canonical Restore Route in `docs/law/MEMORY_AND_CONTINUITY_RULES.md`. Use `agentlaw_session_restore` MCP tool when available; otherwise walk the route manually.
+- session_save: walk the Canonical Save Route in `docs/law/MEMORY_AND_CONTINUITY_RULES.md`. Use `agentlaw_session_save` MCP tool when available; otherwise walk the route manually.
 - law_question: read law files first; use memory only as pointers
 - implementation_question: working set, active plan, known facts, then source files
 - user_preference: preferences, then source check if preference conflicts

@@ -26,9 +26,9 @@ Before writing or changing tests, agents must identify the behavioral oracle: th
 Oracle priority is:
 
 1. The user's explicit current request.
-2. `HARNESS_CONSTITUTION.md`.
+2. `AGENTLAW_CONSTITUTION.md`.
 3. Root control documents.
-4. `docs/harness/*` law documents.
+4. `docs/law/*` law documents.
 5. Public contracts, API references, MCP tool references, CLI help, schemas, and documented return shapes.
 6. Existing committed tests and existing public behavior, when characterization is the goal.
 7. Domain standards, protocols, invariants, and compatibility requirements.
@@ -74,9 +74,9 @@ Before any artifact publish — PyPI / package-registry upload, GitHub release t
 The gate applies to two categories, with different "test" satisfiers:
 
 - **Runtime source code** under the published package tree (e.g. `src/<package>/*.py`, excluding the bundled scaffold and `__init__.py`-only edits). Pairing satisfier: a modified file under `tests/`. The mechanical check is `_test_publish_oracle_pairing`.
-- **Harness governance content** that ships to downstream projects: the law layer under `docs/harness/`, contracts under `docs/contracts/`, root control documents (`HARNESS_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, `AGENTS.md`), the public seed under `publish-repo/`, and the bundled scaffold copy under `src/<package>/scaffold/`. Pairing satisfier: a modified file under `tests/` **or** a modified `src/<package>/verify_cmd.py` (counting a new or updated verifier check as the oracle for a new or updated mechanical rule). The mechanical check is `_test_harness_content_oracle_pairing`.
+- **Harness governance content** that ships to downstream projects: the law layer under `docs/law/`, contracts under `docs/contracts/`, root control documents (`AGENTLAW_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, `AGENTS.md`), the public seed under `publish-repo/`, and the bundled scaffold copy under `src/<package>/scaffold/`. Pairing satisfier: a modified file under `tests/` **or** a modified `src/<package>/verify_cmd.py` (counting a new or updated verifier check as the oracle for a new or updated mechanical rule). The mechanical check is `_test_harness_content_oracle_pairing`.
 
-The harness-content category exists because every fresh agent reads the law layer on every session restore; a textual change there changes governance behavior across every downstream project that installs the kit, so the §Test-Anchored Development Rule extends past Python source. A refactor that touches only mirrored copies (e.g. `publish-repo/` or scaffold without the authoring source under `docs/harness/`) still trips this gate unless paired — by design, because mirror drift is the classic governance failure mode the gate exists to catch.
+The harness-content category exists because every fresh agent reads the law layer on every session restore; a textual change there changes governance behavior across every downstream project that installs the kit, so the §Test-Anchored Development Rule extends past Python source. A refactor that touches only mirrored copies (e.g. `publish-repo/` or scaffold without the authoring source under `docs/law/`) still trips this gate unless paired — by design, because mirror drift is the classic governance failure mode the gate exists to catch.
 
 A single ad-hoc smoke invocation against a freshly built wheel does not satisfy this clause for new branching logic. Smoke checks startup integrity; the oracle checks per-branch behavior.
 
@@ -183,7 +183,7 @@ Module docstrings should state the module responsibility, main inputs, outputs, 
 
 Function docstrings should be used when the function owns a boundary, invariant, or public behavior. They are not required for every small helper.
 
-Comments must not become implementation history, excuses, stale TODOs, work logs, or duplicated plans. Specific anti-patterns: "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD as part of subplan Z", "this used to be Y until the field rename", "the earlier formulation returned a tuple but was changed", or any equivalent in-comment changelog narration. History lives in git blame, plan documents, memory log entries, and tracker entries — not in comment bodies. A reader who genuinely needs "why was this renamed?" follows pointers into those layers, not the docstring. This is the code-side equivalent of `docs/harness/REPOSITORY_ARTIFACT_RULES.md` §"Self-Narration Prohibition" for governed artifact bodies. If behavior changes, the agent must update or remove affected comments and design context in the same change.
+Comments must not become implementation history, excuses, stale TODOs, work logs, or duplicated plans. Specific anti-patterns: "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD as part of subplan Z", "this used to be Y until the field rename", "the earlier formulation returned a tuple but was changed", or any equivalent in-comment changelog narration. History lives in git blame, plan documents, memory log entries, and tracker entries — not in comment bodies. A reader who genuinely needs "why was this renamed?" follows pointers into those layers, not the docstring. This is the code-side equivalent of `docs/law/REPOSITORY_ARTIFACT_RULES.md` §"Self-Narration Prohibition" for governed artifact bodies. If behavior changes, the agent must update or remove affected comments and design context in the same change.
 
 ## Implementation Design Context
 Non-trivial implementation work must create or update implementation context before completion.
@@ -221,7 +221,7 @@ Requirements:
 - Format: Mermaid only. ASCII diagrams are not valid slots for this section, because uniform rendering keeps cross-diagram references unambiguous.
 - Update obligation: when a change within the declared Map scope adds, removes, renames, or reshuffles modules, classes, or user-facing entry points, the same commit must update the affected diagrams. Layer 2 enforcement: the harness verifier compares the latest modification time of files matched by the `Map scope:` block against the modification time of the `project-overview` reference file and fails when any scoped file is newer.
 
-The obligation applies to the `project-overview` reference role named in `docs/harness/REPOSITORY_ARTIFACT_RULES.md`. Projects that have not yet declared a `Map scope:` block pass the Layer 2 check silently, so newly initialized targets are not forced into FAIL until they opt in by populating the section.
+The obligation applies to the `project-overview` reference role named in `docs/law/REPOSITORY_ARTIFACT_RULES.md`. Projects that have not yet declared a `Map scope:` block pass the Layer 2 check silently, so newly initialized targets are not forced into FAIL until they opt in by populating the section.
 
 ## SOLID Interpretation
 SOLID is a named source for the structure obligations above, not a requirement to introduce classes, inheritance, interfaces, factories, or pattern-shaped code.

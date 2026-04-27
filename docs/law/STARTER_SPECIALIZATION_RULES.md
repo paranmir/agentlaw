@@ -100,12 +100,12 @@ Silence is not permission.
 
 ## Read Path Rule
 When initializing, rebuilding, or updating a project instance, read these root-level control documents before rewriting or merging project-specific laws:
-1. `HARNESS_CONSTITUTION.md`
-2. `HARNESS_INIT_TOOL.md` for bootstrap or rebuild flows
-3. `HARNESS_UPDATE_TOOL.md` for incremental shared-kit update flows
-4. `docs/harness/STARTER_SPECIALIZATION_RULES.md`
-5. the relevant files in `docs/harness/*`
-6. `HARNESS_FIX_TOOL.md` when the task comes from a current problem or repeated harness failure
+1. `AGENTLAW_CONSTITUTION.md`
+2. `AGENTLAW_INIT_TOOL.md` for bootstrap or rebuild flows
+3. `AGENTLAW_UPDATE_TOOL.md` for incremental shared-kit update flows
+4. `docs/law/STARTER_SPECIALIZATION_RULES.md`
+5. the relevant files in `docs/law/*`
+6. `AGENTLAW_FIX_TOOL.md` when the task comes from a current problem or repeated harness failure
 7. `AGENTS.md`
 
 ## Lifetime And Ownership

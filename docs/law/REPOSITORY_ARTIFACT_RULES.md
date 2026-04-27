@@ -115,7 +115,7 @@ memory/
     meta.db                # SQLite + FTS5 + sqlite-vec virtual tables
   models/
     embedding/
-      <model-name>/        # downloaded by rule-harness init
+      <model-name>/        # downloaded by agentlaw init
   cache/
   jobs/
 ```
@@ -126,7 +126,7 @@ In this model, `memory/*` is the human-reviewable canonical memory layer and `.h
 
 `memory/` is a governed default canonical memory path. It stores lower-authority memory records, not law.
 
-`memory/rules/` is the default path for project-local governance rules (the `rule` memory type). Rules sit below shared `docs/harness/*` in authority and above known facts and preferences. Full framework — front matter schema, authority position, discoverability obligations, and distribution-boundary rule for `publish-repo/memory/rules/` — lives in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` under "Local Rule Memory Type".
+`memory/rules/` is the default path for project-local governance rules (the `rule` memory type). Rules sit below shared `docs/law/*` in authority and above known facts and preferences. Full framework — front matter schema, authority position, discoverability obligations, and distribution-boundary rule for `publish-repo/memory/rules/` — lives in `docs/law/MEMORY_AND_CONTINUITY_RULES.md` under "Local Rule Memory Type".
 
 Memory source files, databases, indexes, logs, and context packets must not:
 
@@ -142,7 +142,7 @@ Earlier or narrower prototypes may use a reduced layout such as:
 ```text
 .harness/
   memory/
-    harness-memory.sqlite
+    agentlaw-memory.sqlite
 ```
 
 Such a reduced layout must be documented as a prototype-specific implementation choice, not as the final general memory architecture.
@@ -150,7 +150,7 @@ Such a reduced layout must be documented as a prototype-specific implementation 
 ## Session Continuity Artifacts
 Repository work that spans multiple sessions requires a session continuity path so that a new session can recover the current work state quickly and reliably.
 
-Harness Memory restore behavior is governed by `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`.
+Harness Memory restore behavior is governed by `docs/law/MEMORY_AND_CONTINUITY_RULES.md`.
 
 The canonical session continuity artifacts live under `memory/*`.
 
@@ -198,14 +198,14 @@ The agent must follow a minimal-read, minimal-output protocol:
 - read `memory/LOOKUP_RULES.md` only when lookup policy or escalation decisions are needed
 - read `memory/logs/*` only when the working set is insufficient
 - respond with a terse summary targeting eight or fewer bullet lines, covering current goal, current decisions, open questions, and next actions
-- do not preemptively read `docs/plans/*`, other `docs/harness/*` files, other `docs/references/*` files, or completed plan history unless the user explicitly asks for deeper context
+- do not preemptively read `docs/plans/*`, other `docs/law/*` files, other `docs/references/*` files, or completed plan history unless the user explicitly asks for deeper context
 - still honor the Verification Obligation: present recorded state as stale until verified rather than asserting it as current fact
 - expand scope only on explicit follow-up from the user
 
 This protocol exists to keep session restoration cheap and repeatable across agents and across token-constrained resumption scenarios, including handoff between different agent runtimes. It is a behavior contract on the consumer side of memory continuity, complementary to the Update and Verification Obligations on the producer side.
 
 ### Save Request Protocol
-When an agent is asked to save session context via a short trigger such as `save session`, `session save`, or an equivalent phrase, the agent should use the Harness Memory save protocol in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`.
+When an agent is asked to save session context via a short trigger such as `save session`, `session save`, or an equivalent phrase, the agent should use the Harness Memory save protocol in `docs/law/MEMORY_AND_CONTINUITY_RULES.md`.
 
 The agent must update memory continuity according to the following protocol:
 
@@ -225,7 +225,7 @@ This protocol operationalizes the Update Obligation into an explicit user-invoke
 Law documents use uppercase snake case.
 
 Examples:
-- `HARNESS_SCOPE.md`
+- `SCOPE.md`
 - `INPUT_OUTPUT_CONTRACT.md`
 - `ORACLE_AND_JUDGMENT.md`
 - `FAILURE_TAXONOMY.md`
@@ -243,11 +243,11 @@ Examples:
 Root control documents use stable conventional names and live at repository root.
 
 Examples:
-- `HARNESS_INIT_TOOL.md`
-- `HARNESS_UPDATE_TOOL.md`
-- `HARNESS_FIX_TOOL.md`
+- `AGENTLAW_INIT_TOOL.md`
+- `AGENTLAW_UPDATE_TOOL.md`
+- `AGENTLAW_FIX_TOOL.md`
 
-Harness bootstraps from upstream are performed via `HARNESS_INIT_TOOL.md`; that document carries its own Full Bootstrap Cycle, Responsibility Split, and Non-Pip Distribution sections. Harness updates from upstream are performed via `HARNESS_UPDATE_TOOL.md`; that document carries its own Full Update Cycle, Responsibility Split, Failure Modes, and Non-Pip Distribution sections. The pip package's `pipx upgrade rule-harness` brings the new shared kit and applies binary schema migrations; the LLM-driven `HARNESS_UPDATE_TOOL.md` procedure incorporates governance content into local law and artifacts. Skipping the LLM-driven procedure after a `pipx upgrade` is a governance violation: it leaves binary infrastructure ahead of local law.
+Harness bootstraps from upstream are performed via `AGENTLAW_INIT_TOOL.md`; that document carries its own Full Bootstrap Cycle, Responsibility Split, and Non-Pip Distribution sections. Harness updates from upstream are performed via `AGENTLAW_UPDATE_TOOL.md`; that document carries its own Full Update Cycle, Responsibility Split, Failure Modes, and Non-Pip Distribution sections. The pip package's `pipx upgrade agentlaw` brings the new shared kit and applies binary schema migrations; the LLM-driven `AGENTLAW_UPDATE_TOOL.md` procedure incorporates governance content into local law and artifacts. Skipping the LLM-driven procedure after a `pipx upgrade` is a governance violation: it leaves binary infrastructure ahead of local law.
 
 ### Plan Documents
 Plan documents use lowercase kebab case with names that describe the work clearly.
@@ -296,7 +296,7 @@ Do not use:
 
 ## Default Directory Rules
 The default repository directories are:
-- `docs/harness/` for governing law documents
+- `docs/law/` for governing law documents
 - `docs/plans/active/` for active versioned plans
 - `docs/plans/completed/` for completed plans kept for history
 - `docs/references/` for searchable repository-local references
@@ -306,11 +306,11 @@ These default directories should be used before introducing new top-level or pee
 `memory/` and `.harness/` are part of the default Harness memory structure. They remain governed lower-authority paths and must not become hidden law.
 
 The default root-level constitution, entry, and control documents are:
-- `HARNESS_CONSTITUTION.md`
+- `AGENTLAW_CONSTITUTION.md`
 - `AGENTS.md`
-- `HARNESS_INIT_TOOL.md`
-- `HARNESS_UPDATE_TOOL.md`
-- `HARNESS_FIX_TOOL.md`
+- `AGENTLAW_INIT_TOOL.md`
+- `AGENTLAW_UPDATE_TOOL.md`
+- `AGENTLAW_FIX_TOOL.md`
 
 ## Directory Creation Gate
 Creating a new directory is not the default response to project growth.
@@ -338,7 +338,7 @@ Before creating a new file under `docs/references/`, the agent must identify any
 - The justification must be visible in the plan, not only in conversation or commit messages.
 
 ### New Section / Rule Addition Rule
-Before adding a new section (`##` or `###`), rule, or sub-section to a law document under `docs/harness/*`, a root control document (`HARNESS_CONSTITUTION.md`, `HARNESS_INIT_TOOL.md`, `HARNESS_UPDATE_TOOL.md`, `HARNESS_FIX_TOOL.md`), a contract document under `docs/contracts/*`, or a reference document under `docs/references/*`, the agent must first search the target artifact (and its sibling artifacts in the same class) for any existing rule whose **intent** overlaps with the proposed content.
+Before adding a new section (`##` or `###`), rule, or sub-section to a law document under `docs/law/*`, a root control document (`AGENTLAW_CONSTITUTION.md`, `AGENTLAW_INIT_TOOL.md`, `AGENTLAW_UPDATE_TOOL.md`, `AGENTLAW_FIX_TOOL.md`), a contract document under `docs/contracts/*`, or a reference document under `docs/references/*`, the agent must first search the target artifact (and its sibling artifacts in the same class) for any existing rule whose **intent** overlaps with the proposed content.
 
 The search obligation is satisfied only when the agent has used **multiple synonym variants of the intended rule title and intent**, not a single keyword. A search that uses only the title the agent has in mind will systematically miss rules whose authors used different phrasing for the same intent. Concrete example: a proposed "Comment Self-Narration Prohibition" must also search the artifact for `implementation history`, `changelog`, `narration`, `rename history`, `historical context`, and the specific anti-patterns the proposed rule would prohibit. The obligation extends across the entire governed artifact set in scope, not only the file the new rule would land in.
 
@@ -350,9 +350,9 @@ When the search surfaces an existing rule whose intent overlaps:
 
 This rule does not apply to factual material additions inside an existing § (adding a missing parameter to a contract document's parameter list, adding a new entry to a finite enumeration, fixing a typo). It applies to **rule** additions — text that imposes a new obligation, prohibition, or behavioral expectation.
 
-Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `shared-harness-baseline`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `rule-harness verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `HARNESS_SCOPE.md` and the publish-seed boundary, not a new sibling file.
+Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `shared-harness-baseline`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `agentlaw verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `SCOPE.md` and the publish-seed boundary, not a new sibling file.
 
-The `project-overview` role additionally carries a "Code architecture map" subsection. Its obligations — slot menu, minimum structure-plus-flow coverage, slot-selection rationale, `Map scope:` declaration, density cap, Mermaid-only format, slot-name headings, and the mtime-based Layer 2 staleness check — are specified in `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` under "Code Architecture Map".
+The `project-overview` role additionally carries a "Code architecture map" subsection. Its obligations — slot menu, minimum structure-plus-flow coverage, slot-selection rationale, `Map scope:` declaration, density cap, Mermaid-only format, slot-name headings, and the mtime-based Layer 2 staleness check — are specified in `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` under "Code Architecture Map".
 
 ## Expansion Decision Rule
 Before creating a new directory or artifact class, answer these questions:
@@ -373,13 +373,13 @@ When a new artifact type or structure seems necessary:
 
 ## Specialization Reference
 Starter-law carry-forward and project-instance specialization rules live in:
-- `docs/harness/STARTER_SPECIALIZATION_RULES.md`
+- `docs/law/STARTER_SPECIALIZATION_RULES.md`
 
 Use that document when the question is not artifact structure itself, but how starter protections must survive project-specific rewriting.
 
 ## Mechanical Enforcement Reference
 Executable enforcement requirements for mechanically detectable constraints live in:
-- `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+- `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md`
 
 Use that document when the question is not artifact structure itself, but whether prose must become tests, lint, CI, or structural checks.
 
@@ -396,8 +396,8 @@ Installable package templates, if introduced, count as a shared artifact set or 
 ## Mandatory Synchronization Check
 When artifact structure changes, the agent must explicitly review whether updates are needed in:
 - `AGENTS.md`
-- `HARNESS_CONSTITUTION.md`
-- `docs/harness/*`
+- `AGENTLAW_CONSTITUTION.md`
+- `docs/law/*`
 - `docs/plans/tech-debt-tracker.md`
 - other shared artifact sets or derived outputs when they exist
 
@@ -421,10 +421,10 @@ Generated or derived repository artifacts should be added only when they are:
 Until those conditions hold, do not introduce a dedicated generated-artifacts structure.
 
 When the repository must later compare against an earlier shared harness version, a stable baseline record may live in:
-- `docs/references/shared-harness-baseline.md`
+- `docs/references/shared-agentlaw-baseline.md`
 
 ## Self-Narration Prohibition
-Governed artifact bodies — law documents under `docs/harness/*`, root control documents, contract documents under `docs/contracts/*`, and reference documents under `docs/references/*` — must describe the **current state** only. They must not narrate their own revision history inside the body. Phrases like "previously declared but never implemented", "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD", "the earlier formulation was Y", "as of YYYY-MM-DD this section was strengthened", or any equivalent in-body changelog narration are prohibited.
+Governed artifact bodies — law documents under `docs/law/*`, root control documents, contract documents under `docs/contracts/*`, and reference documents under `docs/references/*` — must describe the **current state** only. They must not narrate their own revision history inside the body. Phrases like "previously declared but never implemented", "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD", "the earlier formulation was Y", "as of YYYY-MM-DD this section was strengthened", or any equivalent in-body changelog narration are prohibited.
 
 The reason: artifact bodies are read by every new agent on every session restore. Self-narration inflates the read budget on signal that is operationally irrelevant for the current state, biases the agent toward the historical formulation, and pollutes search retrieval with timestamps that should belong to a different layer.
 
@@ -432,7 +432,7 @@ History lives in the layers built for it. Plan documents under `docs/plans/activ
 
 This rule does not prohibit example anti-patterns shown inside fenced quotes (a body may demonstrate "do not write entries shaped like this" with a quoted example), reference-style cross-pointers ("see `docs/plans/completed/...` for the change history"), or stable terminology that incidentally contains a year (a feature name like `2024-rollover-spec` is naming, not narration). The rule prohibits in-body sentences that describe the artifact's own revision arc as part of the artifact's content.
 
-The same prohibition extends to source-code comments and docstrings under `src/*` and to test comments under `tests/*` — see `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` §"Reasoning-Critical Inline Comments" (the self-narration bullet) for the parallel ruling on the code side.
+The same prohibition extends to source-code comments and docstrings under `src/*` and to test comments under `tests/*` — see `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` §"Reasoning-Critical Inline Comments" (the self-narration bullet) for the parallel ruling on the code side.
 
 ## Maintenance Rule
 If artifact naming becomes inconsistent or directories multiply without clear class boundaries, treat that as governance drift and repair it before adding more structure.

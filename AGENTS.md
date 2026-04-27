@@ -9,22 +9,22 @@ Any coding agent working in this repository must follow the read-first order and
 This repository starts from the Harness kit.
 
 - Purpose of `AGENTS.md`: act as a short execution-entry map for the current project
-- Purpose of the law layer: store the real working criteria under `docs/harness/*`
-- Purpose of `HARNESS_INIT_TOOL.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
+- Purpose of the law layer: store the real working criteria under `docs/law/*`
+- Purpose of `AGENTLAW_INIT_TOOL.md`: provide a shared bootstrap entry point for empty, near-empty, or already-existing target repositories
 - Purpose of the root control layer: provide starter-level bootstrap and corrective-governance guidance before detailed law work
 
 ## Source of Truth
 Document priority is:
 
-1. `HARNESS_CONSTITUTION.md`
+1. `AGENTLAW_CONSTITUTION.md`
 2. root control documents
-3. `docs/harness/*`
+3. `docs/law/*`
 4. approved structured repository artifacts such as `plans/*`, `references/*`, and stable generated facts when they exist
 5. approved continuity or memory records
 6. `AGENTS.md` and other execution-entry documents
 
 Important:
-- Project-specific rules belong in `docs/harness/*`.
+- Project-specific rules belong in `docs/law/*`.
 - Continuity or memory records are derived context below file-based governance.
 - `AGENTS.md` is not a rule store. It only tells agents what to read first and how to enter the work.
 - `RULES.md` is not used.
@@ -32,21 +32,21 @@ Important:
 ## Read First
 Check the current agreement in this order:
 
-1. `HARNESS_CONSTITUTION.md`
+1. `AGENTLAW_CONSTITUTION.md`
 2. Root control tools, in this order when relevant:
-   - `HARNESS_INIT_TOOL.md` for initialization or rebuild
-   - `HARNESS_UPDATE_TOOL.md` for incorporating upstream harness changes into an existing project
-   - `HARNESS_FIX_TOOL.md` for current problems, harness escape, or repeated rule failure
+   - `AGENTLAW_INIT_TOOL.md` for initialization or rebuild
+   - `AGENTLAW_UPDATE_TOOL.md` for incorporating upstream harness changes into an existing project
+   - `AGENTLAW_FIX_TOOL.md` for current problems, harness escape, or repeated rule failure
 3. Law layer, in this order when relevant:
-   - `docs/harness/HARNESS_SCOPE.md`
-   - `docs/harness/INPUT_OUTPUT_CONTRACT.md`
-   - `docs/harness/ORACLE_AND_JUDGMENT.md`
-   - `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`
-   - `docs/harness/FAILURE_TAXONOMY.md`
-   - `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
-   - `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
-   - `docs/harness/STARTER_SPECIALIZATION_RULES.md`
-   - `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
+   - `docs/law/SCOPE.md`
+   - `docs/law/INPUT_OUTPUT_CONTRACT.md`
+   - `docs/law/ORACLE_AND_JUDGMENT.md`
+   - `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`
+   - `docs/law/FAILURE_TAXONOMY.md`
+   - `docs/law/REPOSITORY_ARTIFACT_RULES.md`
+   - `docs/law/MEMORY_AND_CONTINUITY_RULES.md`
+   - `docs/law/STARTER_SPECIALIZATION_RULES.md`
+   - `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md`
 4. `AGENTS.md`
 
 If the project grows in complexity, also read these when they exist and are relevant:
@@ -81,7 +81,7 @@ The current core work order is fixed:
 1. Clarify the law layer before implementation
 2. Keep `AGENTS.md` aligned as a short execution entry map only
 3. Make unresolved items explicit instead of hiding them
-4. Update `docs/harness/*` when project meaning changes
+4. Update `docs/law/*` when project meaning changes
 
 ## Working Rules
-This file is a routing map only. Governing rules live in the constitution and `docs/harness/*`. Read those before acting.
+This file is a routing map only. Governing rules live in the constitution and `docs/law/*`. Read those before acting.
