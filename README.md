@@ -89,9 +89,7 @@ The agent reads law and routing on every session restore; you do not maintain a 
 
 ### Links
 
-- **PyPI**: https://pypi.org/project/harness-kit/
-- **Source / Issues**: https://github.com/paranmir/harness-kit
-- **Authoring workspace** (where the kit develops): https://github.com/paranmir/harness-kit-workspace
+- **PyPI**: https://pypi.org/project/harness-kit/ — for source repository and issue tracker, follow the links on the PyPI project page.
 
 ---
 

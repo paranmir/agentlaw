@@ -17,10 +17,10 @@ This file records the shared-kit baseline currently reflected in the workspace.
 
 ## Baseline Record
 - Shared source repository: `https://github.com/paranmir/harness-kit.git`
-- Baseline commit SHA: `270a7f2`
+- Baseline commit SHA: `e7d6821`
 - Baseline tag: `unknown`
-- Baseline recorded on: `2026-04-10`
-- Recorded by: `update`
+- Baseline recorded on: `2026-04-27`
+- Recorded by: `readme-polish-and-publish-repo-sync plan`
 - Notes:
   - Root constitution and root control documents are mirrors of `publish-repo/*`.
   - The baseline commit was read from `publish-repo/.git`.
