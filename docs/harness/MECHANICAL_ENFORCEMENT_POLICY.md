@@ -48,7 +48,7 @@ Executable enforcement may include:
 - required code-authorship law presence and read-first routing checks
 - tests, lint rules, verifier checks, or CI checks for repeated code-authorship violations when they become mechanically detectable
 - plan-preflight checks that scan `docs/plans/active/*.md` for the required fields enumerated in `REPOSITORY_ARTIFACT_RULES.md` §"Active Plan Preflight Fields", failing the verifier when a plan omits a field without an explicit "not applicable" note
-- publish-gate oracle pairing checks that, when the `pyproject.toml` version differs from a recorded baseline (the bump commit), enumerate `git diff <bump-commit>..HEAD -- src/<package>/` and fail when any modified runtime module lacks a corresponding modified file under `tests/`, per `CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` §"Publish Gate Oracle Pairing"
+- publish-gate oracle pairing checks that, when the `pyproject.toml` version differs from a recorded baseline (the bump commit), enumerate `git diff <bump-commit>..HEAD` and fail when modifications appear without paired oracle changes. Two checks per `CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` §"Publish Gate Oracle Pairing": runtime-source pairing (`src/<package>/*.py` modifications must be paired with `tests/` modifications) and harness-content pairing (modifications under `docs/harness/`, `docs/contracts/`, `HARNESS_*.md`, `AGENTS.md`, `publish-repo/`, or `src/<package>/scaffold/` must be paired with `tests/` modifications **or** `src/<package>/verify_cmd.py` modifications, the latter counting a new verifier check as the oracle for a new mechanical rule)
 
 ## Code Authorship Enforcement
 Code-authorship rules are governed by `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`.

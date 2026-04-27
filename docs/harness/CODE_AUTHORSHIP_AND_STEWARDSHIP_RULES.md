@@ -69,13 +69,20 @@ Focused verification must be executable or mechanically checkable. Manual inspec
 
 ### Publish Gate Oracle Pairing
 
-Before any artifact publish — PyPI / package-registry upload, GitHub release tag, or scaffold mirror push — the agent must explicitly enumerate every source file under the published package tree (e.g. `src/<package>/`) that has been modified since the prior published version, and confirm that each modified module has corresponding test coverage that did not exist at that prior version. The enumeration must be visible in the change record (plan body, save log, or commit message), not assumed.
+Before any artifact publish — PyPI / package-registry upload, GitHub release tag, or scaffold mirror push — the agent must explicitly enumerate every file in scope (defined below) that has been modified since the prior published version, and confirm that each scope category has corresponding test or verifier coverage that did not exist at that prior version. The enumeration must be visible in the change record (plan body, save log, or commit message), not assumed.
+
+The gate applies to two categories, with different "test" satisfiers:
+
+- **Runtime source code** under the published package tree (e.g. `src/<package>/*.py`, excluding the bundled scaffold and `__init__.py`-only edits). Pairing satisfier: a modified file under `tests/`. The mechanical check is `_test_publish_oracle_pairing`.
+- **Harness governance content** that ships to downstream projects: the law layer under `docs/harness/`, contracts under `docs/contracts/`, root control documents (`HARNESS_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, `AGENTS.md`), the public seed under `publish-repo/`, and the bundled scaffold copy under `src/<package>/scaffold/`. Pairing satisfier: a modified file under `tests/` **or** a modified `src/<package>/verify_cmd.py` (counting a new or updated verifier check as the oracle for a new or updated mechanical rule). The mechanical check is `_test_harness_content_oracle_pairing`.
+
+The harness-content category exists because every fresh agent reads the law layer on every session restore; a textual change there changes governance behavior across every downstream project that installs the kit, so the §Test-Anchored Development Rule extends past Python source. A refactor that touches only mirrored copies (e.g. `publish-repo/` or scaffold without the authoring source under `docs/harness/`) still trips this gate unless paired — by design, because mirror drift is the classic governance failure mode the gate exists to catch.
 
 A single ad-hoc smoke invocation against a freshly built wheel does not satisfy this clause for new branching logic. Smoke checks startup integrity; the oracle checks per-branch behavior.
 
-Discovering a missing oracle for the first time after publish-readiness checks have already started is itself a fail-the-publish condition: the publish must pause until the pairing is restored as committed tests in the same change-set that introduced the new behavior. Bumping the package version solely to ship the missing oracle later is not an acceptable substitute, because v0.X.Y on a registry remains addressable forever and downstream installers may pin to it.
+Discovering a missing oracle for the first time after publish-readiness checks have already started is itself a fail-the-publish condition: the publish must pause until the pairing is restored as committed tests (or, for harness-content changes, a committed verifier check) in the same change-set that introduced the new behavior. Bumping the package version solely to ship the missing oracle later is not an acceptable substitute, because v0.X.Y on a registry remains addressable forever and downstream installers may pin to it.
 
-The enumeration scope is the source tree that ships in the published artifact. Test files (`tests/`), plan bodies, memory logs, and the verifier itself are out of scope for this gate because they are not bundled into the wheel; their own discipline is governed by the rules above.
+Out-of-scope edits that legitimately do not need pairing — for example, tightening a comment in `tests/`, touching a memory log, or updating a plan body — are detected by the gate's filters and do not trigger the failure condition. The gate's heuristics produce some false positives (a purely textual law clarification, with no new mechanical aspect, must still be paired with a trivial `tests/` or verifier-check edit acknowledging the change); this is the documented price of mechanical enforcement at the change-set granularity.
 
 Executable or mechanically checkable verification includes:
 
