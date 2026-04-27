@@ -12,17 +12,31 @@ Before using this document, read:
 - the current target repository files that expose actual product or runtime meaning
 - `AGENTS.md` when a short execution-entry map already exists
 
+## Full Bootstrap Cycle
+
+The full bootstrap cycle has four steps. Step 0 is user-driven (terminal command). Steps 1-2 are LLM-driven and form the substance of this document. Step 3 is verification.
+
+0. **Infrastructure setup (terminal)**: `pipx install harness-kit` (once, globally), then `cd <target-project>` and `harness-kit init [--setup-agents prompt|auto|none]`. The pip package unpacks the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) into the target repository and creates the runtime tree at `.harness/index/meta.db`. Optional sub-steps: download the embedding model, register the harness-memory MCP server with the agent host (depending on `--setup-agents` mode).
+1. **Law specialization (LLM-driven)**: invoke an LLM with this document. The LLM follows the Direct Procedure below — classify the target, specialize the generic starter law (already on disk from step 0) into project-specific law, record the shared baseline, document scope/contract/oracle/failure/execution/regression/memory authority before implementation. This is the substance of the bootstrap.
+2. **Runtime context load (LLM-driven, applicable when MCP is registered)**: after registration in step 0 (if `--setup-agents prompt` or `auto`) and after specialization in step 1, the LLM calls `harness_session_restore` (MCP) or `harness-kit session-restore` (CLI fallback). The response carries the runtime reminder packet — authority recall, write discipline, memory intent rule with multilingual trigger keywords. Until this step has run, the agent has the law layer specialized but no runtime reminders loaded into working context.
+3. **Verification (terminal)**: `harness-kit verify` (or `python verify_harness.py` before the package command is available). Confirms the law layer, baseline record, and memory subsystem are coherent.
+
+The Direct Procedure below is a self-contained version of step 1, beginning with a step 0 reminder. The Responsibility Split and Non-Pip Distribution sections at the bottom of this document supplement the cycle for non-default situations.
+
 ## Direct Procedure
 Use this document as a direct procedure even if no prompt block is reused.
 
+0. Run `pipx install harness-kit` (once, globally) and `harness-kit init` in the target project directory before invoking the LLM-driven steps. The pip package places the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) on disk and creates `.harness/index/meta.db`. The LLM-driven steps below specialize that scaffold for the target project. Skip step 0 only when the project does not use the pip package distribution and the shared kit is delivered through another channel (git clone, manual copy) — see Non-Pip Distribution at the bottom.
 1. Classify the repository as `empty or near-empty project` or `existing project with meaningful code or runtime artifacts`.
-2. Instantiate the starter law layer without deleting starter protections.
+2. Specialize the starter law layer (the pip package's scaffold copy in step 0 placed the generic starter on disk; this step specializes that text without deleting starter protections). For empty / near-empty projects, fill `docs/harness/*` around the intended first-release boundary while keeping unknowns explicit. For existing projects, rewrite `docs/harness/*` from current repository facts rather than from legacy planning prose.
 3. For existing projects, derive project law from current repository facts rather than legacy planning prose.
-4. Record the shared-harness baseline in `references/SHARED_HARNESS_BASELINE.md` when the repository is being bootstrapped from a shared-kit commit or tag that can be identified.
-5. Document scope, contract, oracle, failure handling, execution flow, and regression expectations before implementation.
-6. Record important mismatches and repeated or structurally important drift in the tracker when needed.
-7. Keep `AGENTS.md` short and routing-only.
-8. Treat the law layer and short entry map as the first deliverable, not product code.
+4. Record the shared-harness baseline in `references/shared-harness-baseline.md` when the repository is being bootstrapped from a shared-kit commit or tag that can be identified.
+5. Document scope, contract, oracle, failure handling, execution flow, regression expectations, and memory authority before implementation.
+6. Treat memory, indexes, protocol surfaces, runtime jobs/cache, and session restore as default Harness subsystems below law.
+7. Record important mismatches and repeated or structurally important drift in the tracker when needed.
+8. Keep `AGENTS.md` short and routing-only.
+9. Treat the law layer and short entry map as the first deliverable, not product code.
+10. Load runtime reminders. After law specialization, register the harness-memory MCP server (when applicable — typically by following the instructions emitted by `harness-kit init --setup-agents prompt`, or by running `harness-kit agent-setup --client <host> --target . --apply --yes` for direct config writes), then call `harness_session_restore` (MCP) or `harness-kit session-restore --target . --json` (CLI fallback). The response carries authority recall, write discipline, and memory intent rule reminders — including the multilingual trigger keyword list. The session is not "fully bootstrapped" until these reminders are loaded into the agent's working context, since otherwise the agent operates without the framework guidance the rest of the harness depends on.
 
 ## Completion Checks
 A bootstrap run is complete only when:
@@ -32,6 +46,7 @@ A bootstrap run is complete only when:
 - the shared baseline record exists or an explicit reason for deferral is visible
 - important mismatches are explicit when they materially affect governed meaning or review safety
 - implementation has not started ahead of the documentation gate
+- memory runtime state is documented as derived continuity below repository files and law
 
 ## Failure Conditions
 Treat the bootstrap as failed or incomplete when:
@@ -41,6 +56,7 @@ Treat the bootstrap as failed or incomplete when:
 - only the primary feature was documented while other distinct entry points remained unguided
 - exposed inputs or configuration points were accepted without checking whether they affect behavior
 - implementation started before the law layer was ready
+- memory runtime paths were created or trusted without artifact-rule and authority-boundary coverage
 
 ## Bootstrap Prompt
 Use the following prompt only as an adapter when a model benefits from a direct handoff block.
@@ -65,13 +81,13 @@ First classify the target repository:
 2. `existing project with meaningful code or runtime artifacts`
 
 If the repository is empty or near-empty:
-- instantiate the starter law layer
+- specialize the starter law layer (the pip package's scaffold copy already placed the generic starter on disk; this step specializes that text)
 - fill `docs/harness/*` around the intended first-release boundary
 - keep unknowns explicit
 - do not invent extra structure unless the starter rules require it
 
 If the repository already has meaningful code or runtime artifacts:
-- instantiate the starter law layer
+- specialize the starter law layer (the pip package's scaffold copy already placed the generic starter on disk; this step specializes that text)
 - preserve the starter structure and starter protections while specializing it into project law
 - treat the current code and file structure as the authoritative behavioral baseline
 - rewrite `docs/harness/*` from current repository facts rather than from legacy planning prose
@@ -83,7 +99,8 @@ If the repository already has meaningful code or runtime artifacts:
 
 In both cases:
 - preserve starter form and starter protections while filling that form with repository-local facts
-- when the shared-kit source commit or tag is identifiable, create `references/SHARED_HARNESS_BASELINE.md` and record it as the current bootstrap baseline
+- when the shared-kit source commit or tag is identifiable, create `references/shared-harness-baseline.md` and record it as the current bootstrap baseline
+- treat memory as official derived continuity rather than law; document its runtime path and conflict behavior before use
 - preserve starter-level structural protections in `REPOSITORY_ARTIFACT_RULES.md`
 - preserve both structural and behavioral oracle layers in `ORACLE_AND_JUDGMENT.md`
 - document scope, contract, oracle, failure handling, execution flow, and regression expectations before implementation
@@ -111,6 +128,13 @@ Use this bootstrap entry point when the target repository falls into one of thes
 
 The bootstrap must not assume that all target repositories start from zero.
 
+## Default Memory Subsystem Rule
+Harness bootstrap includes default memory and continuity structure.
+
+Memory, exact indexes, semantic indexes, runtime job/cache paths, protocol surfaces, and session restore behavior are default Harness subsystems. They do not make memory authoritative.
+
+Do not trust memory runtime state merely because an installer creates it. The target law layer must preserve the memory authority boundary and the artifact rules must cover runtime paths before memory becomes normal operation.
+
 ## Expected Output Of A Good Bootstrap
 A correct bootstrap should produce:
 
@@ -120,8 +144,12 @@ A correct bootstrap should produce:
 - `plans/*` only when complexity justifies them
 - `references/*` only when durable repository-local references are needed
 
+A correct bootstrap may also produce the canonical memory path `memory/*` — the human-reviewable Markdown layer (working-set, known-facts, logs, preferences, lookup rules) seeded from the shared kit. The derived runtime tree `.harness/*` (SQLite index `meta.db`, embedding model artifacts, caches, jobs) is produced by the `harness-kit` pip package's install/init step, not by this LLM-driven tool. Do not author or edit `.harness/*` contents directly from this flow; see the Responsibility Split section below for the boundary between the pip package and the LLM-driven bootstrap.
+
 When the shared-kit source baseline is identifiable, a correct bootstrap should also produce:
-- `references/SHARED_HARNESS_BASELINE.md`
+- `references/shared-harness-baseline.md`
+
+First-time init leaves the `project-overview` reference's "Code architecture map" subsection as the shipped template placeholder (no `Map scope:` glob declared yet). Populate it later, once the project has code worth mapping; until then the harness verifier silently skips the Layer 2 freshness check instead of forcing a FAIL on a brand-new target.
 
 For an existing project, a correct bootstrap must also produce:
 - project-specific law text that another agent could use without re-deriving core runtime facts from code
@@ -142,6 +170,7 @@ It should not:
 - document only the primary feature when multiple distinct features or entry points exist in the project
 - accept exposed inputs or configuration points without verifying that they actually affect behavior
 - jump straight into implementation
+- treat memory records, installer manifests, or runtime state as higher authority than repository files
 
 ## When To Reuse This Prompt
 Reuse this prompt when:
@@ -149,3 +178,34 @@ Reuse this prompt when:
 - a new repository is being initialized
 - an existing repository's harness must be rebuilt from current code
 - earlier generated harness docs should be discarded and recreated from the latest shared harness kit
+
+## Responsibility Split
+
+| Layer | Owner | What it does |
+| --- | --- | --- |
+| Pip package install | `pipx install harness-kit` | Makes the CLI / MCP entry points available globally |
+| Scaffold copy onto disk (`HARNESS_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, generic starter `docs/harness/*`, `memory/*` seed) | `harness-kit init` | Lays down shared scaffolding without project specialization |
+| Runtime tree creation (`.harness/index/meta.db`, embedding artifacts, caches) | `harness-kit init` | Initializes the binary memory subsystem at the canonical location |
+| Optional embedding model download | `harness-kit init` (when network and `--download-model` flag allow) | Pre-warms semantic search; skipping it leaves the system in FTS-only mode until the model arrives |
+| Optional MCP server registration with the agent host | `harness-kit init --setup-agents prompt\|auto` | Either emits LLM-actionable instructions (`prompt`) or writes the host config directly (`auto`) |
+| Law specialization (`docs/harness/*` rewrite from project facts), shared baseline record, scope/contract/oracle/failure/execution/regression/memory authority documentation | LLM via this document | Project-specific specialization on top of the generic starter |
+| Runtime context load (`harness_session_restore`) | LLM (after MCP registration) | Pulls authority recall, write discipline, memory intent reminders into the agent's working context |
+| Final integrity verification | User via `harness-kit verify` | Confirms the bootstrap produced a coherent state |
+
+The split is hard: the LLM does not create or alter `.harness/index/meta.db` directly under any circumstance, and the pip package does not perform law specialization. Step 1 of the cycle (LLM specialization) must run only after step 0 (pipx install + harness-kit init) has completed cleanly — running step 1 without the scaffold on disk produces files that drift from the shared starter structure.
+
+## Non-Pip Distribution
+
+When the project does not use the pip-package distribution (the shared kit was delivered through git clone, archive download, or manual copy), step 0 of the cycle changes:
+
+- Replace `pipx install harness-kit` + `harness-kit init` with whatever places the shared kit on disk (e.g., `git clone`, manual file copy, archive extraction).
+- The runtime tree at `.harness/index/meta.db` must be created by another mechanism documented at the project level (manual `python -m harness_kit.cli init` against a local checkout, scripted equivalent, etc.). The LLM still does not create or alter `.harness/index/meta.db` directly.
+- MCP server registration must be performed manually if the project still wants to use the MCP route; otherwise the agent operates in CLI-fallback mode.
+
+The LLM-driven step 1 (this document's Direct Procedure), step 2 (runtime context load), and step 3 (verification) are unchanged.
+
+## Next Update Trigger
+Update this document when:
+- the bootstrap process proves unclear in real use
+- the responsibility split between pip package and LLM specialization needs refinement
+- new shared subsystems need explicit bootstrap routing

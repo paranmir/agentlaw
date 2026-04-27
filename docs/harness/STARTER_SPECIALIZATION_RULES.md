@@ -16,6 +16,7 @@ Project-specific law documents may add:
 - stricter local rules
 - runtime-specific detail
 - project-specific workflow detail
+- local runtime or memory detail
 
 They must not silently remove or materially weaken starter protections by summarization, omission, or replacement.
 
@@ -26,6 +27,7 @@ At minimum, the following starter protections are invariant and must carry forwa
 - law-versus-operational-artifact-versus-execution-entry separation
 - operational-artifact approval conditions
 - directory-creation and expansion gates
+- continuity and memory authority boundaries
 - mandatory synchronization checks for structural changes
 - continued structural-oracle existence
 - the rule that document existence alone is not a sufficient behavioral oracle
@@ -42,6 +44,7 @@ Project instances must keep these protections explicitly readable, not merely im
 - both structural and behavioral oracle layers remain usable for later review and implementation judgment
 - project-specific law must become concretely more local as repository facts become available
 - known runtime discrepancies must remain explicit rather than being smoothed into generic readiness prose
+- default subsystem operation must remain distinct from project-specific law specialization
 
 ## Artifact-Law Preservation
 When a project instance rewrites `REPOSITORY_ARTIFACT_RULES.md` in project-specific terms, it may add local artifact maps and local runtime examples.
@@ -51,6 +54,8 @@ It must still preserve:
 - naming and structure gates
 - synchronization obligations
 - law/artifact/entry separation
+
+If a project uses runtime memory or continuity data, the project-specific artifact rules may add the local runtime path and examples. They must still preserve that runtime memory is derived, lower-authority, and not a replacement for law, plans, references, or generated facts.
 
 ## Oracle Preservation
 When a project instance rewrites `ORACLE_AND_JUDGMENT.md` in project-specific terms:
@@ -72,6 +77,16 @@ For existing projects, this also means:
 - prefer code-backed local detail over reusable starter wording
 - treat undocumented known discrepancies as an incomplete specialization result
 - avoid inflating the law layer with local irregularities that do not materially affect governed meaning or review safety
+
+## Default Subsystem Operation Versus Specialization
+Operating a default Harness subsystem is not the same thing as specializing project law.
+
+Rules:
+- specialization adapts the law layer to project facts
+- default subsystem operation provides governed capability or runtime paths
+- memory operation does not by itself prove the project law is complete
+- degraded or unavailable memory runtime does not make the repository less governed when the file-based harness is otherwise intact
+- repositories must still document project-specific scope, contracts, oracle, failure handling, execution flow, and regression expectations in the law layer
 
 ## Allowed Weakening Threshold
 A project instance may weaken or remove one of the starter protections only when all of the following are true:

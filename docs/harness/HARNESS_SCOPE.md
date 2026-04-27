@@ -6,6 +6,8 @@ This document defines the scope boundaries for the current project.
 ## Known
 - This repository is using the Harness document structure.
 - Scope must be clarified before implementation begins.
+- Harness includes default memory and continuity subsystems when applied to a repository.
+- Continuity and memory are official Harness capability classes, but runtime memory state is derived context rather than law.
 
 ## Unknown
 - final product or system goal
@@ -40,6 +42,7 @@ This document defines the scope boundaries for the current project.
 - production implementation before the law layer is clarified
 - undocumented feature work
 - silent expansion of scope without document updates
+- treating memory or installer metadata as project authority above file-based governance
 
 ## Non-Goals
 - choosing a stack by default
@@ -58,7 +61,15 @@ The first release should define:
 The first release does not need to define:
 - later-stage feature expansion
 - advanced integrations that are not required for the first useful outcome
-- optional complexity that does not help establish a stable baseline
+- advanced complexity that does not help establish a stable baseline
+
+## Continuity And Memory Boundary
+Memory and continuity support are default Harness subsystems. This document must clarify how they relate to the current project scope.
+
+Rules:
+- memory runtime state is lower-authority derived continuity
+- memory must not silently expand project scope or override repository files
+- runtime memory paths belong in artifact rules before they become normal practice
 
 ## Implementation Readiness Rule
 Open questions may remain after this document is updated.

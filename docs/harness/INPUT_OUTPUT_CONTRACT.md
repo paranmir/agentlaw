@@ -6,12 +6,16 @@ This document defines the minimum working contract for requests, inputs, outputs
 ## Known
 - The current project must follow a document-first workflow.
 - New requests must be checked for document impact before implementation begins.
+- Installable distribution, if used, is a bootstrap convenience and not a semantic judge.
+- Continuity and memory are official default Harness capability classes; indexed memory runtime is derived infrastructure below canonical memory files.
+- Session continuity uses Harness Memory as the canonical path.
 
 ## Unknown
 - stable product requirements
 - authoritative external inputs
 - required interfaces
 - expected delivery artifacts beyond the initial law layer
+- installer channel, package template source, canonical memory-file layout, and index bootstrap mechanism when installable distribution is in scope
 
 ## Assumptions
 - The current request and repository contents are the initial available inputs.
@@ -31,6 +35,9 @@ This document defines the minimum working contract for requests, inputs, outputs
 - `HARNESS_CONSTITUTION.md`
 - `AGENTS.md`
 - the current `docs/harness/*` law documents
+- `memory/working-set.md` for primary session context when present
+- `memory/LOOKUP_RULES.md` for session lookup policy
+- install metadata when the repository was created through an installer and that metadata exists
 
 ## Available Inputs
 - repository root
@@ -62,6 +69,7 @@ This classification must be made before implementation or restructuring work pro
 - visible open questions
 - explicit implementation blockers when criteria are missing
 - governed implementation only after the documentation gate is satisfied
+- updated `memory/working-set.md` when session state changes
 
 ## Output Quality Requirements
 Outputs must:
@@ -77,8 +85,8 @@ At minimum, check the relevant combination of:
 - `HARNESS_CONSTITUTION.md`
 - `AGENTS.md`
 - `docs/harness/*`
-- `plans/tech-debt-tracker.md`
-- `references/*`
+- `docs/plans/tech-debt-tracker.md`
+- `docs/references/*`
 - derived outputs or parallel shared artifact sets when they exist
 
 A change is not complete if it leaves known related governing artifacts outdated without explicitly recording the deferred impact.
@@ -117,12 +125,45 @@ The first implementation must document:
 - the invalid or unsupported inputs that must be rejected, prevented, or deferred
 - any persisted or external inputs that must be loaded before the main flow works
 
+## Installable Distribution Contract
+If the project uses or builds an installer, the contract must distinguish:
+
+- default Harness outputs, including memory structure
+- existing-file collision behavior
+- manifest or version metadata behavior
+- unsupported semantic-verification claims
+
+An installer may prepare Harness files and approved runtime paths, but it must not decide project-specific law correctness without agent review.
+
+## Memory Subsystem Contract
+If the project uses indexed memory or continuity runtime state, the contract must document:
+
+- canonical memory files, SQL/FTS index behavior, vector index behavior, and any memory-ready schema/config artifacts
+- where runtime data is stored
+- how memory authority is labeled as derived continuity
+- how conflicts with repository files are handled
+- what reset, export, audit, and repair expectations exist at the current maturity level
+
 ## Runtime Output Contract
 The first implementation must document:
 - the visible or observable outputs of the main flow
 - the persisted or transmitted outputs that must remain correct after execution
 - the expected result when no usable data exists yet
 - the expected result when invalid input is rejected or blocked
+
+### Harness Time Output Contract
+`harness-kit now --json` outputs one compact JSON object based on the host operating system clock. It is intended for timestamp integrity workflows, especially when an agent must manually write `memory/*` timestamps.
+
+Required keys:
+- `utc` — current UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form
+- `local` — current local timestamp with UTC offset
+- `date_utc` — UTC date
+- `date_local` — local date
+- `utc_offset` — local UTC offset in `+HH:MM` or `-HH:MM` form
+- `tzname` — host timezone display name when available
+- `epoch_seconds` — integer Unix epoch seconds
+
+The command must not infer time from model context, prior logs, or repository state.
 
 ## Minimal Execution Flow
 1. Read the governing documents.
@@ -147,12 +188,16 @@ If the project grows more complex, this content may later move into a separate `
 
 Early runner flow may be expressed at the currently governed level of runtime detail. It does not need final toolchain specificity before first implementation unless the runtime choice materially changes product meaning or judgment.
 
+When a Harness repository uses the default memory structure, session restore should read `memory/working-set.md` first and use `memory/LOOKUP_RULES.md` for lookup decisions. Session save should update `memory/working-set.md` first and append a short `memory/logs/*` entry when durable decisions or handoff items were produced.
+
 ## Regression Strategy
 The default regression strategy should document:
 - the smallest set of behaviors that must keep working after any meaningful change
 - the invalid inputs or edge cases that must stay rejected or controlled
 - the persisted, repeated, or round-trip behaviors that must remain stable
 - the conditions that require the regression set to expand
+- when the repository ships executable code or a runtime (pip-buildable source, bundled CLI, server, MCP runtime, etc.), a committed automated test runner that a fresh agent or CI can execute without session-specific context. Structural checks (file presence, mirror sync) alone are insufficient once behavior is observable. See `docs/harness/ORACLE_AND_JUDGMENT.md` "Executable-Code Oracle Requirement".
+- representative smoke tests may verify startup, transport, or one fresh-install round trip, but they do not satisfy the behavioral oracle for every shipped feature. The regression set must either test each shipped feature contract directly or keep an explicit coverage matrix that maps features to their valid, invalid, state-change, persistence, and boundary checks. See `docs/harness/ORACLE_AND_JUDGMENT.md` "Representative Smoke Test Boundary".
 
 If the project grows more complex, this content may later move into a separate `REGRESSION_STRATEGY.md`.
 
@@ -164,10 +209,10 @@ The repository should add structured planning or reference artifacts when:
 - generated or derived facts become important to repeated agent work
 
 At that point, the project may add:
-- `plans/active/*`
-- `plans/completed/*`
-- `plans/tech-debt-tracker.md`
-- `references/*`
+- `docs/plans/active/*`
+- `docs/plans/completed/*`
+- `docs/plans/tech-debt-tracker.md`
+- `docs/references/*`
 
 These additions support the law layer; they do not replace it.
 

@@ -33,7 +33,7 @@ Work crosses the project boundary incorrectly.
 
 Examples:
 - a shared/public artifact becomes project-specific without explicit intent
-- `references/*` is treated as the active output target
+- `docs/references/*` is treated as the active output target
 - implementation starts before scope is clarified
 
 Expected recovery:
@@ -106,10 +106,55 @@ Expected recovery:
 - add or update artifact rules before continuing the pattern
 - synchronize affected artifact sets if more than one is involved
 
+### 8. Installer Drift
+An installable distribution path creates, overwrites, or represents Harness artifacts in a way not governed by the law layer.
+
+Examples:
+- installer templates diverge from the intended shared source
+- an installer silently overwrites localized law
+- an installer claims semantic verification when it only performed structural setup
+- default install creates runtime memory state without artifact-rule coverage or authority labeling
+
+Expected recovery:
+- restore source-of-truth clarity for installer templates
+- document or repair collision handling
+- correct misleading installer claims
+- update artifact and contract rules before resuming installer work
+
+### 9. Memory Authority Failure
+Continuity or memory records are treated as stronger authority than file-based governance.
+
+Examples:
+- memory summary overrides `docs/harness/*`
+- stale memory is presented as current truth
+- wrong-scope memory affects a decision
+- hidden runtime state carries governing meaning that is absent from repository files
+- conflicting memory remains `active` after a higher-authority source contradicts it
+- indexes are used after source drift is detected
+
+Expected recovery:
+- trust repository files over memory
+- mark or repair the memory item as stale, superseded, disputed, suppressed, quarantined, or excluded
+- add missing provenance, scope, or conflict-handling rules
+- promote durable governing meaning into law, plans, references, or generated facts only through reviewed changes
+
+### 10. Recursive Promotion Failure
+Recursive improvement moves from observation to governance without the reviewed promotion path.
+
+Examples:
+- memory-derived suggestions directly edit law
+- repeated failures are applied to shared artifacts without shared/local boundary review
+- improvement candidates bypass plans, trackers, or law-layer judgment
+
+Expected recovery:
+- move the candidate back into a plan, tracker, or reference
+- review whether it is local or generalizable
+- update law and shared artifacts only through the normal synchronization path
+
 ## Severity Interpretation
 - Critical: hierarchy failure or scope failure that changes the governing source
 - High: contract failure or oracle failure that allows work without proper documentation
-- Medium: execution drift, shared-artifact drift, or artifact drift that misroutes future work but does not yet alter the governing source
+- Medium: execution drift, shared-artifact drift, artifact drift, installer drift, or contained memory drift that misroutes future work but does not yet alter the governing source
 - Low: wording or reference defects that do not currently change behavior
 
 ## Recovery And Regression Expectations
@@ -119,7 +164,7 @@ Every identified failure should produce:
 - the required recovery action
 - a check that similar drift is less likely after the fix
 
-Regression review should explicitly check for repeated hierarchy, scope, contract, oracle, execution-drift, shared-artifact-drift, and artifact-drift failures after each governance change.
+Regression review should explicitly check for repeated hierarchy, scope, contract, oracle, execution-drift, shared-artifact-drift, artifact-drift, installer-drift, memory-authority, and recursive-promotion failures after each governance change.
 
 ## Runner Failure Checks
 The runner flow should explicitly check for:

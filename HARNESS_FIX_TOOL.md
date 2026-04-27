@@ -18,6 +18,9 @@ Use this document when one or more of the following is true:
 - a current problem is visible but the owning document is unclear
 - a known rule exists but seems too weak, too hidden, or too easy to bypass
 - a localized law document retains generic starter placeholder content despite concrete project facts being available
+- installer, memory, or continuity state appears to be bypassing file-based governance
+- the MCP memory tool surface is being bypassed (raw SQL against `.harness/index/meta.db`, direct file reads where a memory tool exists, or hand-rolled walks where `harness_session_restore` / `harness_session_save` should be used)
+- the canonical Markdown layer under `memory/*` and the index under `.harness/index/meta.db` have drifted apart
 - you need to decide whether the response belongs in law, tracker, `AGENTS.md`, or enforcement
 
 Do not use this document as a substitute for normal project work when no current governance problem exists.
@@ -76,6 +79,9 @@ Classify the current problem as one or more of:
 - `failure problem`
 - `entry problem`
 - `execution tracking problem`
+- `installer problem`
+- `memory authority problem`
+- `recursive promotion problem`
 - `discipline problem`
 
 Then decide which of these best describes the gap:
@@ -110,6 +116,8 @@ Before adding a new rule, review:
 - `AGENTS.md` if the issue concerns read-first order or short entry guardrails
 - `plans/tech-debt-tracker.md` if the issue may already be tracked
 
+The review must use **multiple synonym variants of the proposed rule's title and intent**, not a single keyword pass. A search that uses only the phrasing the agent has in mind will systematically miss rules whose original authors used different phrasing for the same intent. Concrete example: a proposed `Comment Self-Narration Prohibition` rule must also grep for `implementation history`, `changelog`, `narration`, `rename history`, `historical context`, and the specific anti-patterns the proposed rule would prohibit. Without the synonym sweep, near-duplicate § s land and the law layer drifts into self-contradiction. The full version of this obligation lives in `docs/harness/REPOSITORY_ARTIFACT_RULES.md` `§New Section / Rule Addition Rule`.
+
 Ask:
 1. Does an existing rule already govern this problem?
 2. Can the current rule be clarified or strengthened instead of adding a new one?
@@ -128,6 +136,11 @@ Use this ownership map:
 - structural and behavioral judgment -> `docs/harness/ORACLE_AND_JUDGMENT.md`
 - failure classes and recovery interpretation -> `docs/harness/FAILURE_TAXONOMY.md`
 - artifact structure, approval, synchronization, directory growth, law/artifact/entry separation -> `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+- installer behavior and runtime input/output expectations -> `docs/harness/INPUT_OUTPUT_CONTRACT.md`
+- memory authority, layout, conflict handling, and session restore behavior -> `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
+- MCP memory tool surface bypass and `.harness/index/meta.db` source-drift -> `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
+- memory authority, installer judgment, and recursive promotion judgment -> `docs/harness/ORACLE_AND_JUDGMENT.md`
+- installer drift, memory authority failure, and recursive promotion failure classes -> `docs/harness/FAILURE_TAXONOMY.md`
 - short read-first routing and short entry guardrails -> `AGENTS.md`
 - repeated debt, unresolved drift, promotion candidates -> `plans/tech-debt-tracker.md`
 - multi-step active corrective work -> `plans/active/*`

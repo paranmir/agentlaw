@@ -41,6 +41,20 @@ Executable enforcement may include:
 - cross-reference checks
 - tests that fail forbidden behavior directly
 - validation of stable derived facts such as a recorded shared-harness baseline when later update flow depends on it
+- package-template or installer-asset sync checks when installable distribution exists
+- `.harness/` path checks for governed runtime/index/cache/job purposes
+- memory manifest/config shape, authority-label, source-precedence, and status checks when memory formats exist
+- leak checks that prevent product-specific, project-specific, or authoring-only facts from entering generalized shared artifacts
+- required code-authorship law presence and read-first routing checks
+- tests, lint rules, verifier checks, or CI checks for repeated code-authorship violations when they become mechanically detectable
+- plan-preflight checks that scan `docs/plans/active/*.md` for the required fields enumerated in `REPOSITORY_ARTIFACT_RULES.md` §"Active Plan Preflight Fields", failing the verifier when a plan omits a field without an explicit "not applicable" note
+
+## Code Authorship Enforcement
+Code-authorship rules are governed by `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`.
+
+Repeated violations of test anchoring, behavioral-oracle use, public-surface coverage, schema migration coverage, or high-risk-code verification must be evaluated for mechanical enforcement.
+
+If a violation can be detected through committed tests, static checks, verifier rules, lint rules, or CI, the repository should prefer that executable enforcement over repeated prose reminders.
 
 ## Governance Failure Rule
 If a mechanically detectable implementation or structure rule repeatedly remains prose-only without justification, treat that as a governance failure.

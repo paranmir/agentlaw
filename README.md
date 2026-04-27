@@ -4,213 +4,152 @@ A law-first governance kit for AI coding agents — install governance structure
 
 `harness-kit` gives any repository a governed starting structure that AI coding agents can read, follow, and maintain. It works for brand-new repositories and already-existing codebases alike. Drop it in, run the bootstrap, and the agent knows what the rules are before it writes a single line.
 
-## Quick Start
-
-### 1. Place harness-kit at the root of your target repository
-
-Copy or extract these files into the repository root. The target repository should end up with the structure shown in [Repository Structure](#repository-structure) below.
-
-### 2. Point the agent at the bootstrap entry
-
-Tell the agent to read `HARNESS_INIT_TOOL.md`. This is the first tool-facing entry point — it classifies the repository and runs the correct initialization.
-
-### 3. Let the agent bootstrap
-
-The agent will:
-- classify the repository as `empty`, `near-empty`, or `existing`
-- generate a localized law layer under `docs/harness/*`
-- produce a short `AGENTS.md` as the execution-entry map
-- leave explicit blockers where meaning is still missing
-
-After bootstrap, the law layer is ready and implementation can begin under governance.
-
 ---
 
-## Abstract
+## For Humans
 
-### The Problem
+### Install
 
-AI coding agents can generate large volumes of code quickly, but without structure they drift. A massive `AGENTS.md` file becomes stale. Rules that live only in prose get ignored. Architecture decisions made in chat threads are invisible to the next agent session. The codebase accumulates entropy faster than humans can review it.
-
-### The Origin
-
-`harness-kit` implements the principles from OpenAI's [harness engineering technical article](https://openai.com/index/harness-engineering/), which describes the approach they developed while building a product entirely with Codex agents — zero hand-written code. The core insight: when agents do the coding, the engineer's job shifts from writing code to **designing the environment, expressing intent clearly, and building feedback loops** so agents can work reliably.
-
-Key principles from that approach:
-- **AGENTS.md is a map, not an encyclopedia** — short entry point that routes to deeper docs
-- **The repository is the record system** — structured docs, versioned plans, quality grades, all in-repo
-- **Progressive disclosure** — agents start from a small stable entry point, then drill deeper as needed
-- **Mechanical enforcement** — repeated rules graduate from prose to linters, CI, and structural tests
-- **Garbage collection** — regular cleanup of drift, not quarterly debt sprints
-
-### What harness-kit Does
-
-`harness-kit` packages these principles into a reusable starter kit that any project can adopt immediately:
-
-| Principle | harness-kit mechanism |
-|---|---|
-| Map, not encyclopedia | Short `AGENTS.md` routes to `docs/harness/*` |
-| Repository as record system | Constitution → law layer → operational artifacts hierarchy |
-| Progressive disclosure | Read-order from constitution down to plans/references |
-| Mechanical enforcement | `MECHANICAL_ENFORCEMENT_POLICY.md` + promotion rules |
-| Garbage collection | `HARNESS_FIX_TOOL.md` + tech-debt tracker |
-| Protect invariants during growth | `STARTER_SPECIALIZATION_RULES.md` + carry-forward rules |
-
-It adds two things the original article leaves to each team:
-1. **A portable starter structure** — so you don't have to design the governance layout from scratch
-2. **Root control tools** — so the agent can initialize, update, and repair governance itself
-
----
-
-## Repository Structure
-
-```text
-.
-├─ HARNESS_CONSTITUTION.md
-├─ AGENTS.md
-├─ HARNESS_INIT_TOOL.md
-├─ HARNESS_UPDATE_TOOL.md
-├─ HARNESS_FIX_TOOL.md
-├─ docs/
-│  └─ harness/
-│     ├─ HARNESS_SCOPE.md
-│     ├─ INPUT_OUTPUT_CONTRACT.md
-│     ├─ ORACLE_AND_JUDGMENT.md
-│     ├─ FAILURE_TAXONOMY.md
-│     ├─ REPOSITORY_ARTIFACT_RULES.md
-│     ├─ STARTER_SPECIALIZATION_RULES.md
-│     └─ MECHANICAL_ENFORCEMENT_POLICY.md
-├─ plans/
-│  ├─ active/
-│  ├─ completed/
-│  └─ tech-debt-tracker.md
-└─ references/
-   └─ README.md
+```bash
+pipx install harness-kit
 ```
 
-## What Each Layer Does
+### Quick Start
 
-### Constitution
+```bash
+# 1. Place harness-kit governance into your project
+harness-kit init <your-project-dir>
 
-`HARNESS_CONSTITUTION.md` — the top-level governing document. It fixes stable rules for document structure, authority hierarchy, documentation gates, and change handling. It does not contain project-specific detail.
+# 2. Register the harness-memory MCP server with your AI agent host.
+#    The default `--setup-agents prompt` mode emits LLM-actionable
+#    instructions — copy them into your agent and let it edit its host
+#    config. Restart the host after the edit lands.
 
-### Root Control Tools
+# 3. Open a fresh chat with your AI agent on the project and say:
+#       Restore the session
+#    The agent loads the harness context and you can start work.
+```
 
-Three tool-facing documents that help agents manage the harness itself:
+### Using harness-kit in Your AI Coding Session
 
-| Tool | When to use |
-|---|---|
-| `HARNESS_INIT_TOOL.md` | Initializing a new repository, or rebuilding harness docs in an existing one |
-| `HARNESS_UPDATE_TOOL.md` | Incorporating upstream harness changes while preserving existing local facts |
-| `HARNESS_FIX_TOOL.md` | Analyzing governance problems, classifying gaps, placing corrections at the right layer |
+Once harness-kit is initialized in your project and the `harness-memory` MCP server is registered with your agent host, you drive the harness through natural-language triggers in your conversation. The agent maps each trigger to one of the harness's MCP tools and follows the procedure that the kit ships.
 
-### Law Layer
+**Triggering session restore** — at the start of any new conversation on the project, say one of:
 
-`docs/harness/*` — where the real project meaning belongs. This is the source of truth for:
+- "Restore the session" / "세션 복원해봐"
+- "Pick up where we left off"
+- "지금 어디까지 했어?"
 
-| Document | Governs |
-|---|---|
-| `HARNESS_SCOPE` | Scope, non-scope, and target boundaries |
-| `INPUT_OUTPUT_CONTRACT` | Required inputs, outputs, and interface expectations |
-| `ORACLE_AND_JUDGMENT` | Judgment logic, oracle rules, and acceptance criteria |
-| `FAILURE_TAXONOMY` | Failure classes, error interpretation, and handling boundaries |
-| `REPOSITORY_ARTIFACT_RULES` | Artifact naming, structure, and expansion rules |
-| `STARTER_SPECIALIZATION_RULES` | How starter protections survive project-specific rewriting |
-| `MECHANICAL_ENFORCEMENT_POLICY` | When and how prose rules graduate to executable enforcement |
+The agent calls `harness_session_restore`, the response packet carries your project's working set, every active plan body, the most recent session_save log entry, framework reminders (memory intent rule, write discipline, consult-before-answer rule), and a step-by-step reminder of the §Canonical Restore Route Mandatory Tier the agent must follow before answering. The first turn of every session is a context-loading turn; substantive work starts on turn two.
 
-### Operational Artifacts
+**Triggering session save** — when ending a session, before context compaction, or at any milestone, say one of:
 
-- `plans/*` — versioned execution plans (active, completed, tech-debt tracker)
-- `references/*` — searchable repository-local context
+- "Save the session" / "세션 저장해줘"
+- "Wrap up and save state"
+- "Snapshot what we did"
 
-These support the law layer. They do not replace it.
+The agent calls `harness_session_save` with the working frame, and the save tool surfaces a post-save verification obligation that you run after.
 
-### Execution Entry
+**When something feels off** — if the agent appears to be answering with stale context or missing rules, ask it to call `harness_session_restore` again, or run `harness-kit mcp-recover --target . --client auto --json` to diagnose MCP connectivity from the shell side.
 
-`AGENTS.md` — stays short and routes the agent into the right files. Never a rule encyclopedia.
+### What This Project Is
 
-## Governing Hierarchy
+**The problem.** AI coding agents arrive at a repository without governance. They make plausible-looking changes that violate invariants the team has not written down. The team adds a CLAUDE.md or AGENTS.md to capture rules; the file grows; the agent reads less of it; the rules silently stop applying. The agent and the team need shared structure they can both rely on.
 
-The authority order, from highest to lowest:
+**The kit.** harness-kit installs that structure as governance scaffolding: a constitution, a law layer (memory, artifact, oracle, failure rules), root control tools (init / update / fix), contract documents, a memory subsystem (working set, logs, rules, preferences), and a runtime MCP server that surfaces the rules every session. The agent reads the law before it writes; the kit's verifier mechanically catches drift between the rules and the code.
+
+**Recursive improvement.** The kit develops by using itself. Every plan that lands in the source repository goes through the same `HARNESS_INIT_TOOL.md` / `HARNESS_UPDATE_TOOL.md` / `HARNESS_FIX_TOOL.md` rules the kit ships. Every law change is mirrored to the public seed (this repository) and to the bundled package scaffold. The same `harness-kit verify` you run against your project also runs against the kit itself.
+
+### Requirements
+
+- **Python** 3.11 or newer.
+- **Operating systems**: Windows, Ubuntu, and macOS supported.
+- **Disk**: the embedding model occupies roughly 500 MB once downloaded (cached under `<your-project>/.harness/models/`).
+- **Runtime dependencies** are installed automatically by `pipx install harness-kit` and declared in `pyproject.toml`.
+
+### What You Get After `harness-kit init`
+
+```
+<your-project>/
+├── HARNESS_CONSTITUTION.md         # highest authority
+├── HARNESS_INIT_TOOL.md            # bootstrap entry
+├── HARNESS_UPDATE_TOOL.md          # update flow
+├── HARNESS_FIX_TOOL.md             # gap-fix flow
+├── AGENTS.md                       # routing-only entry map for agents
+├── docs/
+│   ├── harness/                    # law layer
+│   ├── contracts/                  # boundary contracts
+│   └── references/                 # local references
+├── memory/                         # working-set, logs, rules, preferences
+├── docs/plans/                     # plans (initially empty)
+└── .harness/                       # runtime tree (DB, embedding model)
+```
+
+The agent reads law and routing on every session restore; you do not maintain a separate CLAUDE.md / AGENTS.md / .cursorrules.
+
+### Links
+
+- **PyPI**: https://pypi.org/project/harness-kit/
+- **Source / Issues**: https://github.com/paranmir/harness-kit
+- **Authoring workspace** (where the kit develops): https://github.com/paranmir/harness-kit-workspace
+
+---
+
+## For AI Agents
+
+This section is the agent-facing reading order for first-time entry into a project that uses harness-kit. If you are reading this README as a new session, follow the §Canonical Restore Route Mandatory Tier in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` instead — that procedure is the binding one. This README is the on-ramp; the law file is the substance.
+
+### Agent Bootstrap (first install)
+
+When the user asks you to set up harness-kit in a project:
+
+1. Install harness-kit: `pipx install harness-kit`.
+2. Run `harness-kit init <target-project> --setup-agents prompt` in the target. The `prompt` default emits LLM-actionable instructions for registering the `harness-memory` MCP server in your host config; read those instructions and edit your host config rather than letting init auto-write to user-level config (that requires `--setup-agents auto --yes`).
+3. Restart your host after the config edit so the new MCP registration is picked up.
+4. On the next agent session, call `harness_session_restore` (MCP) or `harness-kit session-restore --target . --json` (CLI fallback) and follow the §Canonical Restore Route Mandatory Tier in the response.
+5. If the MCP server is not visible in a new session despite restart, run `harness-kit mcp-recover --target . --client auto --json` to diagnose runtime + registration state.
+
+### Layer-by-layer map (what each artifact class is for)
+
+- **`HARNESS_CONSTITUTION.md`** — highest authority; structural invariants. Rare changes; never violate.
+- **Root control tools** (`HARNESS_INIT_TOOL.md`, `HARNESS_UPDATE_TOOL.md`, `HARNESS_FIX_TOOL.md`) — agent-facing procedure documents. Init bootstraps a fresh project, Update incorporates kit upgrades into an existing target, Fix runs the gap-resolution protocol.
+- **`docs/harness/*` (law layer)** — rules every session reads: memory and continuity, artifact rules, oracle and judgment, code authorship and stewardship, failure taxonomy, mechanical enforcement policy, starter specialization rules, scope, input/output contract.
+- **`docs/contracts/*`** — boundary surfaces shared with the kit (MCP tool surface, shared baseline, update workflow).
+- **`docs/references/*`** — research-and-context references; not authoritative.
+- **`memory/*`** — derived continuity (working-set, logs, rules, preferences, lookup rules). Below law in authority.
+- **`docs/plans/active/*` and `docs/plans/completed/*`** — work-in-flight and historical work. Active plans are read-on-restore.
+
+### Governing hierarchy
+
+Authority flows top-down:
 
 1. `HARNESS_CONSTITUTION.md`
-2. Root control tools (`HARNESS_INIT_TOOL`, `HARNESS_UPDATE_TOOL`, `HARNESS_FIX_TOOL`)
-3. `docs/harness/*` (law layer)
-4. `plans/*`, `references/*` (operational artifacts)
-5. `AGENTS.md` (execution entry)
+2. Root control tools
+3. `docs/harness/*` (law)
+4. `docs/contracts/*`
+5. `docs/references/*` (non-authoritative)
+6. `memory/*`
+7. `AGENTS.md` (routing only — never a rule store)
 
-Higher layers override lower layers. Project-specific criteria live in the law layer, not in the constitution or execution entry.
+When two artifacts seem to conflict, the higher one wins. Memory never overrides law; references never override contracts; AGENTS.md is the entry map, not a source of rules.
 
-## Three Modes of Use
+### Restore procedure on every session start
 
-### Bootstrap (`HARNESS_INIT_TOOL.md`)
+§Canonical Restore Route Mandatory Tier (full body in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`) requires 14 steps before composing a substantive response. Summary: confirm runtime integrity, read the working set, read every law file, read every active plan body, read the most recent session_save log entry, scan recent_logs titles, read every active rule's body, read `memory/preferences.md`, read `memory/LOOKUP_RULES.md`, scan the known-facts manifest, run a working-frame `memory_search` over `current_goal + next_actions + open_questions`, inspect governance drift, assemble the packet, surface gaps to the user. The runtime pre-fetches body fields into the restore packet so the substance is in your context without extra `Read` calls; the procedure is binding regardless.
 
-For first-time setup. The agent classifies the repository and generates the initial law layer.
+### Critical rules — quick reference
 
-**Empty / near-empty repositories:**
-- Instantiate starter law layer
-- Define initial first-release boundary
-- Keep unknowns explicit
-- Avoid inventing structure without need
+One-line restatements; the binding text lives at the anchors.
 
-**Existing repositories:**
-- Preserve starter structure and protections
-- Rewrite `docs/harness/*` from actual repository code and runtime facts
-- Replace generic starter wording with concrete local meaning
-- Document important code/interface/doc mismatches
-- Use `plans/tech-debt-tracker.md` for repeated or material discrepancies
+- **Memory Intent Rule** — when the user expresses intent to remember, persist, or carry forward, resolve to one of `memory_write` / `promotion_proposal` / `associative_marker` / `explicit_non_save` before final response. Anchor: `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` §Memory Intent Rule.
+- **Write Discipline** — silence is a valid answer; a write must clear the §Log Write Criterion three-question gate (and the §Item Write Criterion applicability gate for items). Volume is not the target; selectivity is. Anchor: §Write Discipline.
+- **Read Routing Criterion** — classify the question (prior judgment / cross-session / current source) before reaching for `memory_search` vs `Grep`/`Read`. Anchor: §Read Routing Criterion.
+- **Consult-Before-Answer Rule** — for memory-routed questions, consult memory **before** composing the answer, not after. Anchor: §Consult-Before-Answer Rule.
+- **Self-Narration Prohibition** — governed artifact bodies and code comments describe current state only; revision history lives in plans, tracker entries, memory logs, and git, not in the body. Anchor: `docs/harness/REPOSITORY_ARTIFACT_RULES.md` §Self-Narration Prohibition (paired with §Reasoning-Critical Inline Comments in `CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`).
+- **Promotion Proposal Protocol** — runtime never selects promotion candidates; the agent judges whether durability + future operational relevance + authority gap all hold, then calls `memory_propose_promotion`. Anchor: §Promotion Proposal Protocol.
 
-### Update (`HARNESS_UPDATE_TOOL.md`)
+---
 
-For incorporating upstream harness changes into an already-bootstrapped project. Merges new shared requirements while preserving local facts — no full rebuild needed.
+## License
 
-### Fix (`HARNESS_FIX_TOOL.md`)
-
-For when the agent escapes the harness or a governance gap appears. Step-by-step flow:
-1. Record the problem
-2. Classify the gap
-3. Check existing rules
-4. Choose the owning layer
-5. Apply the smallest sufficient correction
-6. Verify references and follow-up
-
-## Core Principles
-
-- **Law before implementation** — document scope, contract, judgment, and failure handling before coding starts
-- **Short AGENTS.md** — entry routing only, never a rule store
-- **Starter protections survive specialization** — project-specific rewriting adds local meaning without deleting structural safeguards
-- **Existing projects rewrite from facts** — concrete code and runtime details replace generic starter prose
-- **Prose graduates to enforcement** — repeated mechanically detectable violations become linters, CI checks, or structural tests
-
-## Expected Result of a Good Bootstrap
-
-For any repository:
-- A short `AGENTS.md`
-- A readable law layer under `docs/harness/*`
-- Explicit blockers where meaning is still missing
-- No premature implementation
-
-For existing repositories, additionally:
-- Concrete local law text (not generic starter wording)
-- Explicit important mismatches
-- Non-empty tracker entries when real repeated or material drift already exists
-
-## Compatible Agents
-
-`harness-kit` is designed for any coding agent with direct repository access:
-- Codex
-- Claude Code
-- Gemini CLI
-- other agents that can read and rewrite files
-
-It is not a framework, scaffold, build system, or test runner. It governs — the agent implements.
-
-## Beta Status
-
-`harness-kit` is still in beta. It is currently strongest for:
-- Repository initialization
-- Governance scaffolding
-- Law-first project setup
-- Rebuilding structure around existing codebases
-
-It evolves through recursive improvement based on real agent failures and bootstrap results.
+MIT.

@@ -17,12 +17,15 @@ This repository starts from the Harness kit.
 Document priority is:
 
 1. `HARNESS_CONSTITUTION.md`
-2. `docs/harness/*`
-3. approved structured repository artifacts such as `plans/*`, `references/*`, and stable generated facts when they exist
-4. `AGENTS.md` and other execution-entry documents
+2. root control documents
+3. `docs/harness/*`
+4. approved structured repository artifacts such as `plans/*`, `references/*`, and stable generated facts when they exist
+5. approved continuity or memory records
+6. `AGENTS.md` and other execution-entry documents
 
 Important:
 - Project-specific rules belong in `docs/harness/*`.
+- Continuity or memory records are derived context below file-based governance.
 - `AGENTS.md` is not a rule store. It only tells agents what to read first and how to enter the work.
 - `RULES.md` is not used.
 
@@ -38,22 +41,27 @@ Check the current agreement in this order:
    - `docs/harness/HARNESS_SCOPE.md`
    - `docs/harness/INPUT_OUTPUT_CONTRACT.md`
    - `docs/harness/ORACLE_AND_JUDGMENT.md`
+   - `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`
    - `docs/harness/FAILURE_TAXONOMY.md`
    - `docs/harness/REPOSITORY_ARTIFACT_RULES.md`
+   - `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`
    - `docs/harness/STARTER_SPECIALIZATION_RULES.md`
    - `docs/harness/MECHANICAL_ENFORCEMENT_POLICY.md`
 4. `AGENTS.md`
 
 If the project grows in complexity, also read these when they exist and are relevant:
+- `memory/working-set.md`
+- `memory/LOOKUP_RULES.md`
 - `plans/active/*`
 - `plans/completed/*`
 - `plans/tech-debt-tracker.md`
 - `references/*`
 
 Prefer them in this order:
-1. `plans/active/*` for current execution-driving work
-2. `references/*` for repository-local reference context
-3. `plans/tech-debt-tracker.md` for repeated drift or promotion candidates
+1. `memory/working-set.md` and `memory/LOOKUP_RULES.md` for session continuity
+2. `plans/active/*` for current execution-driving work
+3. `references/*` for repository-local reference context
+4. `plans/tech-debt-tracker.md` for repeated drift or promotion candidates
 4. `plans/completed/*` only when historical decisions or finished work need to be consulted
 
 Create or update them when:
