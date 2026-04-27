@@ -48,6 +48,7 @@ Executable enforcement may include:
 - required code-authorship law presence and read-first routing checks
 - tests, lint rules, verifier checks, or CI checks for repeated code-authorship violations when they become mechanically detectable
 - plan-preflight checks that scan `docs/plans/active/*.md` for the required fields enumerated in `REPOSITORY_ARTIFACT_RULES.md` §"Active Plan Preflight Fields", failing the verifier when a plan omits a field without an explicit "not applicable" note
+- publish-gate oracle pairing checks that, when the `pyproject.toml` version differs from a recorded baseline (the bump commit), enumerate `git diff <bump-commit>..HEAD -- src/<package>/` and fail when any modified runtime module lacks a corresponding modified file under `tests/`, per `CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` §"Publish Gate Oracle Pairing"
 
 ## Code Authorship Enforcement
 Code-authorship rules are governed by `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`.

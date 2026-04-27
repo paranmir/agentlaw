@@ -67,6 +67,16 @@ Existing coverage is adequate only when it exercises the behavior affected by th
 
 Focused verification must be executable or mechanically checkable. Manual inspection alone is not sufficient for non-trivial code work.
 
+### Publish Gate Oracle Pairing
+
+Before any artifact publish — PyPI / package-registry upload, GitHub release tag, or scaffold mirror push — the agent must explicitly enumerate every source file under the published package tree (e.g. `src/<package>/`) that has been modified since the prior published version, and confirm that each modified module has corresponding test coverage that did not exist at that prior version. The enumeration must be visible in the change record (plan body, save log, or commit message), not assumed.
+
+A single ad-hoc smoke invocation against a freshly built wheel does not satisfy this clause for new branching logic. Smoke checks startup integrity; the oracle checks per-branch behavior.
+
+Discovering a missing oracle for the first time after publish-readiness checks have already started is itself a fail-the-publish condition: the publish must pause until the pairing is restored as committed tests in the same change-set that introduced the new behavior. Bumping the package version solely to ship the missing oracle later is not an acceptable substitute, because v0.X.Y on a registry remains addressable forever and downstream installers may pin to it.
+
+The enumeration scope is the source tree that ships in the published artifact. Test files (`tests/`), plan bodies, memory logs, and the verifier itself are out of scope for this gate because they are not bundled into the wheel; their own discipline is governed by the rules above.
+
 Executable or mechanically checkable verification includes:
 
 - unit tests
