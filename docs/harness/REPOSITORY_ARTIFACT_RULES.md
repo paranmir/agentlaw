@@ -115,7 +115,7 @@ memory/
     meta.db                # SQLite + FTS5 + sqlite-vec virtual tables
   models/
     embedding/
-      <model-name>/        # downloaded by harness-kit init
+      <model-name>/        # downloaded by rule-harness init
   cache/
   jobs/
 ```
@@ -247,7 +247,7 @@ Examples:
 - `HARNESS_UPDATE_TOOL.md`
 - `HARNESS_FIX_TOOL.md`
 
-Harness bootstraps from upstream are performed via `HARNESS_INIT_TOOL.md`; that document carries its own Full Bootstrap Cycle, Responsibility Split, and Non-Pip Distribution sections. Harness updates from upstream are performed via `HARNESS_UPDATE_TOOL.md`; that document carries its own Full Update Cycle, Responsibility Split, Failure Modes, and Non-Pip Distribution sections. The pip package's `pipx upgrade harness-kit` brings the new shared kit and applies binary schema migrations; the LLM-driven `HARNESS_UPDATE_TOOL.md` procedure incorporates governance content into local law and artifacts. Skipping the LLM-driven procedure after a `pipx upgrade` is a governance violation: it leaves binary infrastructure ahead of local law.
+Harness bootstraps from upstream are performed via `HARNESS_INIT_TOOL.md`; that document carries its own Full Bootstrap Cycle, Responsibility Split, and Non-Pip Distribution sections. Harness updates from upstream are performed via `HARNESS_UPDATE_TOOL.md`; that document carries its own Full Update Cycle, Responsibility Split, Failure Modes, and Non-Pip Distribution sections. The pip package's `pipx upgrade rule-harness` brings the new shared kit and applies binary schema migrations; the LLM-driven `HARNESS_UPDATE_TOOL.md` procedure incorporates governance content into local law and artifacts. Skipping the LLM-driven procedure after a `pipx upgrade` is a governance violation: it leaves binary infrastructure ahead of local law.
 
 ### Plan Documents
 Plan documents use lowercase kebab case with names that describe the work clearly.
@@ -350,7 +350,7 @@ When the search surfaces an existing rule whose intent overlaps:
 
 This rule does not apply to factual material additions inside an existing § (adding a missing parameter to a contract document's parameter list, adding a new entry to a finite enumeration, fixing a typo). It applies to **rule** additions — text that imposes a new obligation, prohibition, or behavioral expectation.
 
-Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `shared-harness-baseline`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `harness-kit verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `HARNESS_SCOPE.md` and the publish-seed boundary, not a new sibling file.
+Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `shared-harness-baseline`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `rule-harness verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `HARNESS_SCOPE.md` and the publish-seed boundary, not a new sibling file.
 
 The `project-overview` role additionally carries a "Code architecture map" subsection. Its obligations — slot menu, minimum structure-plus-flow coverage, slot-selection rationale, `Map scope:` declaration, density cap, Mermaid-only format, slot-name headings, and the mtime-based Layer 2 staleness check — are specified in `docs/harness/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` under "Code Architecture Map".
 

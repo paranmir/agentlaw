@@ -20,9 +20,9 @@ Do not use this document when:
 
 The full update cycle has three steps. Steps 1 and 3 are user-driven (terminal commands). Step 2 is LLM-driven and is the substance of this document.
 
-1. **Infrastructure update (terminal)**: `pipx upgrade harness-kit`. Replaces the pip package code (CLI, MCP server, schema files), brings the new bundled shared kit into the package's `scaffold/` directory, and automatically applies any pending schema migrations to `.harness/index/meta.db`.
+1. **Infrastructure update (terminal)**: `pipx upgrade rule-harness`. Replaces the pip package code (CLI, MCP server, schema files), brings the new bundled shared kit into the package's `scaffold/` directory, and automatically applies any pending schema migrations to `.harness/index/meta.db`.
 2. **Governance content merge (LLM-driven)**: invoke an LLM with this document. The LLM follows the Direct Procedure below — read the recorded baseline, compare new shared kit against it, replace root mirrors, merge new requirements into local law without losing local facts, refresh the baseline record.
-3. **Verification (terminal)**: `harness-kit verify` (or `python verify_harness.py` before the package command is available). Confirms root mirrors match the new shared kit, local facts and behavioral oracle content were preserved, new shared requirements are present, and the shared baseline record matches.
+3. **Verification (terminal)**: `rule-harness verify` (or `python verify_harness.py` before the package command is available). Confirms root mirrors match the new shared kit, local facts and behavioral oracle content were preserved, new shared requirements are present, and the shared baseline record matches.
 
 The Direct Procedure below is a self-contained version of step 2 that begins with a step 0 reminder to run step 1 first. The Responsibility Split, Failure Modes, and Non-Pip Distribution sections at the bottom of this document supplement the cycle for non-default situations.
 
@@ -37,7 +37,7 @@ Before using this document, read:
 ## Direct Procedure
 Use this document as a direct procedure even if no prompt block is reused.
 
-0. Run `pipx upgrade harness-kit` first when the project is using the pip-package distribution. This step (a) replaces the pip package code (CLI, MCP server, schema files), (b) brings the new bundled shared kit into the package's `scaffold/` directory, and (c) automatically applies any pending schema migrations to `.harness/index/meta.db`. After this completes, proceed with the LLM-driven steps below. Skip step 0 only when the project does not use the pip package and the shared kit is delivered through another channel (git clone, manual copy).
+0. Run `pipx upgrade rule-harness` first when the project is using the pip-package distribution. This step (a) replaces the pip package code (CLI, MCP server, schema files), (b) brings the new bundled shared kit into the package's `scaffold/` directory, and (c) automatically applies any pending schema migrations to `.harness/index/meta.db`. After this completes, proceed with the LLM-driven steps below. Skip step 0 only when the project does not use the pip package and the shared kit is delivered through another channel (git clone, manual copy).
 1. Read the recorded shared baseline if available.
 2. Identify shared-kit changes relative to the prior baseline, or fall back to law-gap comparison if no precise baseline exists.
 3. Replace root mirror files with the new shared versions.
@@ -83,7 +83,7 @@ Follow these rules:
 
 Procedure:
 
-0. If the project uses the pip-package distribution, run `pipx upgrade harness-kit` before invoking the LLM-driven steps. The pipx upgrade replaces pip package code, brings the new bundled shared kit into the package, and automatically applies any pending schema migrations to `.harness/index/meta.db`. Skip this step only when the shared kit is delivered through another channel.
+0. If the project uses the pip-package distribution, run `pipx upgrade rule-harness` before invoking the LLM-driven steps. The pipx upgrade replaces pip package code, brings the new bundled shared kit into the package, and automatically applies any pending schema migrations to `.harness/index/meta.db`. Skip this step only when the shared kit is delivered through another channel.
 
 1. Identify what changed in the shared kit.
    - First read `references/shared-harness-baseline.md` if it exists.
@@ -132,7 +132,7 @@ A correct update should produce:
 - reviewed tracker entries with promotions or new items when applicable
 - refreshed `references/shared-harness-baseline.md`
 - updated `AGENTS.md` routing if the read-first order changed
-- when the update introduces or modifies the "Code architecture map" obligation in shared law, populate or refresh the corresponding section in the local `project-overview` reference before the next `harness-kit verify`; leaving the `Map scope:` block undeclared keeps the Layer 2 freshness check in skip mode
+- when the update introduces or modifies the "Code architecture map" obligation in shared law, populate or refresh the corresponding section in the local `project-overview` reference before the next `rule-harness verify`; leaving the `Map scope:` block undeclared keeps the Layer 2 freshness check in skip mode
 
 It should not:
 - replace localized law documents with fresh starter templates
@@ -156,9 +156,9 @@ It should not:
 
 | Layer | Owner | What it does |
 | --- | --- | --- |
-| Pip package code (CLI, MCP server) | `pipx upgrade harness-kit` | Replaces binaries / Python source |
+| Pip package code (CLI, MCP server) | `pipx upgrade rule-harness` | Replaces binaries / Python source |
 | Binary schema migration on `.harness/index/meta.db` | Pip package startup hook | Runs migration scripts in lexical order |
-| Bundled new shared kit delivery | `pipx upgrade harness-kit` | Updates `scaffold/` inside the package |
+| Bundled new shared kit delivery | `pipx upgrade rule-harness` | Updates `scaffold/` inside the package |
 | Local governance content merge (`docs/harness/*`, root mirrors, `AGENTS.md`, tracker, baseline) | LLM via this document | Incremental merge, preserves local facts |
 | Final integrity verification | User via verify command | Confirms the update produced a valid state |
 
@@ -178,7 +178,7 @@ The Completion Checks above describe what a successful update looks like. These 
 
 When the project does not use the pip-package distribution (the shared kit was delivered through git clone, archive download, or manual copy), step 1 of the cycle changes:
 
-- Replace `pipx upgrade harness-kit` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
+- Replace `pipx upgrade rule-harness` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
 - Schema migrations must be applied by another mechanism documented at the project level. The LLM still does not perform binary DB ALTER directly.
 
 The LLM-driven step 2 (this document's Direct Procedure) and the verification step 3 are unchanged.

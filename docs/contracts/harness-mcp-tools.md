@@ -10,14 +10,14 @@ scope: repository
 This document is a contract document. It is the source of truth
 for the MCP tool surface exposed by the harness-memory server, shared with target projects via `publish-repo/`,
 and its consistency with `src/harness_kit/server/tools/` is mechanically enforced
-by `harness-kit verify` (`_test_publish_seed_contract_finite_set` and tool-coverage check).
+by `rule-harness verify` (`_test_publish_seed_contract_finite_set` and tool-coverage check).
 
 Governing law: `docs/harness/MEMORY_AND_CONTINUITY_RULES.md`. Amendments land
 through a plan that updates this file and any dependent law
 clause in the same change.
 
 ## Purpose
-Implementation reference for the MCP tools exposed by the `harness-kit` pip package's bundled MCP server. This document defines the *signature* of each tool: name, parameters, return shape, error semantics. The *when and why* for each tool is governed by [`docs/harness/MEMORY_AND_CONTINUITY_RULES.md`](../harness/MEMORY_AND_CONTINUITY_RULES.md) ("Memory Tool Surface (MCP)" section).
+Implementation reference for the MCP tools exposed by the `rule-harness` pip package's bundled MCP server. This document defines the *signature* of each tool: name, parameters, return shape, error semantics. The *when and why* for each tool is governed by [`docs/harness/MEMORY_AND_CONTINUITY_RULES.md`](../harness/MEMORY_AND_CONTINUITY_RULES.md) ("Memory Tool Surface (MCP)" section).
 
 This is a draft and lives in `docs/contracts/`. Once stable it moves to `docs/harness/` as a governed protocol document.
 
@@ -347,7 +347,7 @@ Implements the Canonical Restore Route in `MEMORY_AND_CONTINUITY_RULES.md`.
 **Parameters**
 - `log_lookback_days` (integer, optional) — overrides the default from `LOOKUP_RULES.md`.
 - `include_drift_check` (boolean, optional, default true).
-- `recent_logs_limit` (integer, optional, default `15`) — cap `recent_logs` at the most-recent N entries within the lookback window. Pass `0` for unlimited (returns every entry inside the lookback window, matching the historical pre-cap behavior). The cap keeps a typical restore packet compact; use `0` only when a specific task genuinely needs the full history. The same flag exists on the CLI fallback as `harness-kit session-restore --recent-logs-limit N`.
+- `recent_logs_limit` (integer, optional, default `15`) — cap `recent_logs` at the most-recent N entries within the lookback window. Pass `0` for unlimited (returns every entry inside the lookback window, matching the historical pre-cap behavior). The cap keeps a typical restore packet compact; use `0` only when a specific task genuinely needs the full history. The same flag exists on the CLI fallback as `rule-harness session-restore --recent-logs-limit N`.
 
 **Returns**
 - The full `harness_session_restore` packet defined in `MEMORY_AND_CONTINUITY_RULES.md` ("Session Restore Packet Format"). Always includes `runtime_status`, `authority_warnings`, source pointers, excluded memory, and `token_estimate`.
@@ -529,13 +529,13 @@ Report runtime status.
 - `meta_db` — `ready` / `missing` / `corrupt` / `migration_required`.
 - `fts_index` — `ready` / `missing` / `rebuilding` / `stale`.
 - `vector_index` — `ready` / `missing` / `rebuilding` / `stale`.
-- `embedding_model` — `loaded` / `on_disk` / `incomplete` / `missing`. `loaded` means the model is in the MCP server's in-memory cache and ready for inference without a disk read. `on_disk` means the files are fully present but nothing is loaded yet (e.g. startup warmup failed or the server is in a read-only phase). `incomplete` means files exist but the set is partial — run `harness-kit init` (without `--skip-model`) to repair. `missing` means no model directory.
+- `embedding_model` — `loaded` / `on_disk` / `incomplete` / `missing`. `loaded` means the model is in the MCP server's in-memory cache and ready for inference without a disk read. `on_disk` means the files are fully present but nothing is loaded yet (e.g. startup warmup failed or the server is in a read-only phase). `incomplete` means files exist but the set is partial — run `rule-harness init` (without `--skip-model`) to repair. `missing` means no model directory.
 - `embedding_model_on_disk` — `present` / `incomplete` / `missing`. Separates the file-presence signal from the in-memory signal above, so a client can tell whether a `missing`-on-memory state is caused by missing files or a failed load.
 - `schema_version` (integer).
 - `kit_version` (string).
 - `embedding_runtime` — object containing `model_id`, `dimension`, `status`, `last_rebuild_at`, and `last_error` for the active vector-index contract.
 
-**Offline inference by design**: the MCP server sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `HF_HUB_DOWNLOAD_TIMEOUT=5`, and `HF_HUB_DISABLE_TELEMETRY=1` at entry-point top and passes `local_files_only=True` to the embedding loader, so no Hugging Face Hub contact occurs while serving requests. The initial model download is a separate path handled by `harness-kit init`. If a manual rebuild against Hub is ever needed, set these env vars externally before invoking `run-mcp`.
+**Offline inference by design**: the MCP server sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `HF_HUB_DOWNLOAD_TIMEOUT=5`, and `HF_HUB_DISABLE_TELEMETRY=1` at entry-point top and passes `local_files_only=True` to the embedding loader, so no Hugging Face Hub contact occurs while serving requests. The initial model download is a separate path handled by `rule-harness init`. If a manual rebuild against Hub is ever needed, set these env vars externally before invoking `run-mcp`.
 
 ---
 

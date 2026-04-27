@@ -16,17 +16,17 @@ Before using this document, read:
 
 The full bootstrap cycle has four steps. Step 0 is user-driven (terminal command). Steps 1-2 are LLM-driven and form the substance of this document. Step 3 is verification.
 
-0. **Infrastructure setup (terminal)**: `pipx install harness-kit` (once, globally), then `cd <target-project>` and `harness-kit init [--setup-agents prompt|auto|none]`. The pip package unpacks the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) into the target repository and creates the runtime tree at `.harness/index/meta.db`. Optional sub-steps: download the embedding model, register the harness-memory MCP server with the agent host (depending on `--setup-agents` mode).
+0. **Infrastructure setup (terminal)**: `pipx install rule-harness` (once, globally), then `cd <target-project>` and `rule-harness init [--setup-agents prompt|auto|none]`. The pip package unpacks the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) into the target repository and creates the runtime tree at `.harness/index/meta.db`. Optional sub-steps: download the embedding model, register the harness-memory MCP server with the agent host (depending on `--setup-agents` mode).
 1. **Law specialization (LLM-driven)**: invoke an LLM with this document. The LLM follows the Direct Procedure below — classify the target, specialize the generic starter law (already on disk from step 0) into project-specific law, record the shared baseline, document scope/contract/oracle/failure/execution/regression/memory authority before implementation. This is the substance of the bootstrap.
-2. **Runtime context load (LLM-driven, applicable when MCP is registered)**: after registration in step 0 (if `--setup-agents prompt` or `auto`) and after specialization in step 1, the LLM calls `harness_session_restore` (MCP) or `harness-kit session-restore` (CLI fallback). The response carries the runtime reminder packet — authority recall, write discipline, memory intent rule with multilingual trigger keywords. Until this step has run, the agent has the law layer specialized but no runtime reminders loaded into working context.
-3. **Verification (terminal)**: `harness-kit verify` (or `python verify_harness.py` before the package command is available). Confirms the law layer, baseline record, and memory subsystem are coherent.
+2. **Runtime context load (LLM-driven, applicable when MCP is registered)**: after registration in step 0 (if `--setup-agents prompt` or `auto`) and after specialization in step 1, the LLM calls `harness_session_restore` (MCP) or `rule-harness session-restore` (CLI fallback). The response carries the runtime reminder packet — authority recall, write discipline, memory intent rule with multilingual trigger keywords. Until this step has run, the agent has the law layer specialized but no runtime reminders loaded into working context.
+3. **Verification (terminal)**: `rule-harness verify` (or `python verify_harness.py` before the package command is available). Confirms the law layer, baseline record, and memory subsystem are coherent.
 
 The Direct Procedure below is a self-contained version of step 1, beginning with a step 0 reminder. The Responsibility Split and Non-Pip Distribution sections at the bottom of this document supplement the cycle for non-default situations.
 
 ## Direct Procedure
 Use this document as a direct procedure even if no prompt block is reused.
 
-0. Run `pipx install harness-kit` (once, globally) and `harness-kit init` in the target project directory before invoking the LLM-driven steps. The pip package places the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) on disk and creates `.harness/index/meta.db`. The LLM-driven steps below specialize that scaffold for the target project. Skip step 0 only when the project does not use the pip package distribution and the shared kit is delivered through another channel (git clone, manual copy) — see Non-Pip Distribution at the bottom.
+0. Run `pipx install rule-harness` (once, globally) and `rule-harness init` in the target project directory before invoking the LLM-driven steps. The pip package places the bundled scaffold (constitution, root control documents, generic starter `docs/harness/*`, `memory/*` seed) on disk and creates `.harness/index/meta.db`. The LLM-driven steps below specialize that scaffold for the target project. Skip step 0 only when the project does not use the pip package distribution and the shared kit is delivered through another channel (git clone, manual copy) — see Non-Pip Distribution at the bottom.
 1. Classify the repository as `empty or near-empty project` or `existing project with meaningful code or runtime artifacts`.
 2. Specialize the starter law layer (the pip package's scaffold copy in step 0 placed the generic starter on disk; this step specializes that text without deleting starter protections). For empty / near-empty projects, fill `docs/harness/*` around the intended first-release boundary while keeping unknowns explicit. For existing projects, rewrite `docs/harness/*` from current repository facts rather than from legacy planning prose.
 3. For existing projects, derive project law from current repository facts rather than legacy planning prose.
@@ -36,7 +36,7 @@ Use this document as a direct procedure even if no prompt block is reused.
 7. Record important mismatches and repeated or structurally important drift in the tracker when needed.
 8. Keep `AGENTS.md` short and routing-only.
 9. Treat the law layer and short entry map as the first deliverable, not product code.
-10. Load runtime reminders. After law specialization, register the harness-memory MCP server (when applicable — typically by following the instructions emitted by `harness-kit init --setup-agents prompt`, or by running `harness-kit agent-setup --client <host> --target . --apply --yes` for direct config writes), then call `harness_session_restore` (MCP) or `harness-kit session-restore --target . --json` (CLI fallback). The response carries authority recall, write discipline, and memory intent rule reminders — including the multilingual trigger keyword list. The session is not "fully bootstrapped" until these reminders are loaded into the agent's working context, since otherwise the agent operates without the framework guidance the rest of the harness depends on.
+10. Load runtime reminders. After law specialization, register the harness-memory MCP server (when applicable — typically by following the instructions emitted by `rule-harness init --setup-agents prompt`, or by running `rule-harness agent-setup --client <host> --target . --apply --yes` for direct config writes), then call `harness_session_restore` (MCP) or `rule-harness session-restore --target . --json` (CLI fallback). The response carries authority recall, write discipline, and memory intent rule reminders — including the multilingual trigger keyword list. The session is not "fully bootstrapped" until these reminders are loaded into the agent's working context, since otherwise the agent operates without the framework guidance the rest of the harness depends on.
 
 ## Completion Checks
 A bootstrap run is complete only when:
@@ -144,7 +144,7 @@ A correct bootstrap should produce:
 - `plans/*` only when complexity justifies them
 - `references/*` only when durable repository-local references are needed
 
-A correct bootstrap may also produce the canonical memory path `memory/*` — the human-reviewable Markdown layer (working-set, known-facts, logs, preferences, lookup rules) seeded from the shared kit. The derived runtime tree `.harness/*` (SQLite index `meta.db`, embedding model artifacts, caches, jobs) is produced by the `harness-kit` pip package's install/init step, not by this LLM-driven tool. Do not author or edit `.harness/*` contents directly from this flow; see the Responsibility Split section below for the boundary between the pip package and the LLM-driven bootstrap.
+A correct bootstrap may also produce the canonical memory path `memory/*` — the human-reviewable Markdown layer (working-set, known-facts, logs, preferences, lookup rules) seeded from the shared kit. The derived runtime tree `.harness/*` (SQLite index `meta.db`, embedding model artifacts, caches, jobs) is produced by the `rule-harness` pip package's install/init step, not by this LLM-driven tool. Do not author or edit `.harness/*` contents directly from this flow; see the Responsibility Split section below for the boundary between the pip package and the LLM-driven bootstrap.
 
 When the shared-kit source baseline is identifiable, a correct bootstrap should also produce:
 - `references/shared-harness-baseline.md`
@@ -183,22 +183,22 @@ Reuse this prompt when:
 
 | Layer | Owner | What it does |
 | --- | --- | --- |
-| Pip package install | `pipx install harness-kit` | Makes the CLI / MCP entry points available globally |
-| Scaffold copy onto disk (`HARNESS_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, generic starter `docs/harness/*`, `memory/*` seed) | `harness-kit init` | Lays down shared scaffolding without project specialization |
-| Runtime tree creation (`.harness/index/meta.db`, embedding artifacts, caches) | `harness-kit init` | Initializes the binary memory subsystem at the canonical location |
-| Optional embedding model download | `harness-kit init` (when network and `--download-model` flag allow) | Pre-warms semantic search; skipping it leaves the system in FTS-only mode until the model arrives |
-| Optional MCP server registration with the agent host | `harness-kit init --setup-agents prompt\|auto` | Either emits LLM-actionable instructions (`prompt`) or writes the host config directly (`auto`) |
+| Pip package install | `pipx install rule-harness` | Makes the CLI / MCP entry points available globally |
+| Scaffold copy onto disk (`HARNESS_CONSTITUTION.md`, `HARNESS_*_TOOL.md`, generic starter `docs/harness/*`, `memory/*` seed) | `rule-harness init` | Lays down shared scaffolding without project specialization |
+| Runtime tree creation (`.harness/index/meta.db`, embedding artifacts, caches) | `rule-harness init` | Initializes the binary memory subsystem at the canonical location |
+| Optional embedding model download | `rule-harness init` (when network and `--download-model` flag allow) | Pre-warms semantic search; skipping it leaves the system in FTS-only mode until the model arrives |
+| Optional MCP server registration with the agent host | `rule-harness init --setup-agents prompt\|auto` | Either emits LLM-actionable instructions (`prompt`) or writes the host config directly (`auto`) |
 | Law specialization (`docs/harness/*` rewrite from project facts), shared baseline record, scope/contract/oracle/failure/execution/regression/memory authority documentation | LLM via this document | Project-specific specialization on top of the generic starter |
 | Runtime context load (`harness_session_restore`) | LLM (after MCP registration) | Pulls authority recall, write discipline, memory intent reminders into the agent's working context |
-| Final integrity verification | User via `harness-kit verify` | Confirms the bootstrap produced a coherent state |
+| Final integrity verification | User via `rule-harness verify` | Confirms the bootstrap produced a coherent state |
 
-The split is hard: the LLM does not create or alter `.harness/index/meta.db` directly under any circumstance, and the pip package does not perform law specialization. Step 1 of the cycle (LLM specialization) must run only after step 0 (pipx install + harness-kit init) has completed cleanly — running step 1 without the scaffold on disk produces files that drift from the shared starter structure.
+The split is hard: the LLM does not create or alter `.harness/index/meta.db` directly under any circumstance, and the pip package does not perform law specialization. Step 1 of the cycle (LLM specialization) must run only after step 0 (pipx install + rule-harness init) has completed cleanly — running step 1 without the scaffold on disk produces files that drift from the shared starter structure.
 
 ## Non-Pip Distribution
 
 When the project does not use the pip-package distribution (the shared kit was delivered through git clone, archive download, or manual copy), step 0 of the cycle changes:
 
-- Replace `pipx install harness-kit` + `harness-kit init` with whatever places the shared kit on disk (e.g., `git clone`, manual file copy, archive extraction).
+- Replace `pipx install rule-harness` + `rule-harness init` with whatever places the shared kit on disk (e.g., `git clone`, manual file copy, archive extraction).
 - The runtime tree at `.harness/index/meta.db` must be created by another mechanism documented at the project level (manual `python -m harness_kit.cli init` against a local checkout, scripted equivalent, etc.). The LLM still does not create or alter `.harness/index/meta.db` directly.
 - MCP server registration must be performed manually if the project still wants to use the MCP route; otherwise the agent operates in CLI-fallback mode.
 

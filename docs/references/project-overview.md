@@ -1,20 +1,20 @@
 # Project Overview
 
-_This file is the harness-kit project-overview template. Fill in the required sections after `harness-kit init`. Keep optional sections only if they add real value; delete the ones that do not apply._
+_This file is the rule-harness project-overview template. Fill in the required sections after `rule-harness init`. Keep optional sections only if they add real value; delete the ones that do not apply._
 
 _Role boundary: this file is reference-layer orientation. It must not duplicate `docs/harness/HARNESS_SCOPE.md` (law-layer scope), `AGENTS.md` (execution-entry routing), or `README.md` (installation and usage)._
 
 ## What this is
 
-_(fill in after harness-kit init — 1 to 3 sentences summarizing what this project is. Keep it factual. Do not include installation instructions; those belong in README.)_
+_(fill in after rule-harness init — 1 to 3 sentences summarizing what this project is. Keep it factual. Do not include installation instructions; those belong in README.)_
 
 ## Why it exists
 
-_(fill in after harness-kit init — the motivation: the problem being solved or the reason the project exists. Keep it short.)_
+_(fill in after rule-harness init — the motivation: the problem being solved or the reason the project exists. Keep it short.)_
 
 ## Audience
 
-_(fill in after harness-kit init — who uses this project, who develops it, and who operates it. One line per group is usually enough.)_
+_(fill in after rule-harness init — who uses this project, who develops it, and who operates it. One line per group is usually enough.)_
 
 ## Project-specific additions to the standard Harness layout
 

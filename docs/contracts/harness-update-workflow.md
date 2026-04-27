@@ -10,7 +10,7 @@ seed_reference: true
 This document is a contract document. It is the source of truth
 for the update procedure propagating upstream harness changes into target projects, shared with target projects via `publish-repo/`,
 and its consistency with `HARNESS_UPDATE_TOOL.md` procedural alignment is mechanically enforced
-by `harness-kit verify` (`_test_publish_seed_contract_finite_set`).
+by `rule-harness verify` (`_test_publish_seed_contract_finite_set`).
 
 Governing law: `docs/harness/REPOSITORY_ARTIFACT_RULES.md`. Amendments land
 through a plan that updates this file and any dependent law
@@ -18,13 +18,13 @@ clause in the same change.
 
 ## Purpose
 
-Single reference describing the full update cycle for a Harness-governed project that uses the `harness-kit` pip-package distribution. It explains how the binary infrastructure update (pipx) and the governance content update (`HARNESS_UPDATE_TOOL.md`) fit together.
+Single reference describing the full update cycle for a Harness-governed project that uses the `rule-harness` pip-package distribution. It explains how the binary infrastructure update (pipx) and the governance content update (`HARNESS_UPDATE_TOOL.md`) fit together.
 
 This document is operational reference, not law. The governing procedure for the LLM-driven step is [`HARNESS_UPDATE_TOOL.md`](../HARNESS_UPDATE_TOOL.md). Authority order applies as usual: constitution > law > approved artifacts > memory.
 
 ## When To Update
 
-- A new `harness-kit` version is published upstream and the project should incorporate the changes.
+- A new `rule-harness` version is published upstream and the project should incorporate the changes.
 - Time has passed since the last update and the project is suspected to lag behind the shared kit.
 - A new shared requirement (law clause, MCP tool, schema migration) is needed for current work.
 
@@ -39,7 +39,7 @@ The cycle has three steps. Steps 1 and 3 are user-driven (terminal commands). St
 ### Step 1 — Infrastructure update (terminal)
 
 ```bash
-pipx upgrade harness-kit
+pipx upgrade rule-harness
 ```
 
 This single command:
@@ -82,9 +82,9 @@ If verification fails, treat the update as incomplete and resolve the gap before
 
 | Layer | Owner | What it does |
 | --- | --- | --- |
-| Pip package code (CLI, MCP server) | `pipx upgrade harness-kit` | Replaces binaries / Python source |
+| Pip package code (CLI, MCP server) | `pipx upgrade rule-harness` | Replaces binaries / Python source |
 | Binary schema migration on `.harness/index/meta.db` | Pip package startup hook | Runs migration scripts in lexical order |
-| Bundled new shared kit delivery | `pipx upgrade harness-kit` | Updates `scaffold/` inside the package |
+| Bundled new shared kit delivery | `pipx upgrade rule-harness` | Updates `scaffold/` inside the package |
 | Local governance content merge | LLM via [`HARNESS_UPDATE_TOOL.md`](../HARNESS_UPDATE_TOOL.md) | Incremental merge, preserves local facts |
 | Final integrity verification | User via verify command | Confirms the update produced a valid state |
 
@@ -100,7 +100,7 @@ If verification fails, treat the update as incomplete and resolve the gap before
 
 When the project does not use the pip-package distribution (the shared kit was delivered through git clone, archive download, or manual copy), step 1 changes:
 
-- Replace `pipx upgrade harness-kit` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
+- Replace `pipx upgrade rule-harness` with whatever pulls in the new shared kit (e.g., `git pull`, manual file replacement).
 - Schema migrations must be applied by another mechanism documented at the project level. The LLM still does not perform binary DB ALTER directly.
 
 The LLM-driven step 2 (`HARNESS_UPDATE_TOOL.md` procedure) and the verification step 3 are unchanged.

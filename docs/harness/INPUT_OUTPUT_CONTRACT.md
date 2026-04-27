@@ -152,7 +152,7 @@ The first implementation must document:
 - the expected result when invalid input is rejected or blocked
 
 ### Harness Time Output Contract
-`harness-kit now --json` outputs one compact JSON object based on the host operating system clock. It is intended for timestamp integrity workflows, especially when an agent must manually write `memory/*` timestamps.
+`rule-harness now --json` outputs one compact JSON object based on the host operating system clock. It is intended for timestamp integrity workflows, especially when an agent must manually write `memory/*` timestamps.
 
 Required keys:
 - `utc` — current UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form

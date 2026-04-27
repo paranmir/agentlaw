@@ -1,8 +1,8 @@
-# harness-kit
+# rule-harness
 
 A law-first governance kit for AI coding agents — install governance structure before writing code.
 
-`harness-kit` gives any repository a governed starting structure that AI coding agents can read, follow, and maintain. It works for brand-new repositories and already-existing codebases alike. Drop it in, run the bootstrap, and the agent knows what the rules are before it writes a single line.
+`rule-harness` gives any repository a governed starting structure that AI coding agents can read, follow, and maintain. It works for brand-new repositories and already-existing codebases alike. Drop it in, run the bootstrap, and the agent knows what the rules are before it writes a single line.
 
 ---
 
@@ -11,14 +11,14 @@ A law-first governance kit for AI coding agents — install governance structure
 ### Install
 
 ```bash
-pipx install harness-kit
+pipx install rule-harness
 ```
 
 ### Quick Start
 
 ```bash
-# 1. Place harness-kit governance into your project
-harness-kit init <your-project-dir>
+# 1. Place rule-harness governance into your project
+rule-harness init <your-project-dir>
 
 # 2. Register the harness-memory MCP server with your AI agent host.
 #    The default `--setup-agents prompt` mode emits LLM-actionable
@@ -30,9 +30,9 @@ harness-kit init <your-project-dir>
 #    The agent loads the harness context and you can start work.
 ```
 
-### Using harness-kit in Your AI Coding Session
+### Using rule-harness in Your AI Coding Session
 
-Once harness-kit is initialized in your project and the `harness-memory` MCP server is registered with your agent host, you drive the harness through natural-language triggers in your conversation. The agent maps each trigger to one of the harness's MCP tools and follows the procedure that the kit ships.
+Once rule-harness is initialized in your project and the `harness-memory` MCP server is registered with your agent host, you drive the harness through natural-language triggers in your conversation. The agent maps each trigger to one of the harness's MCP tools and follows the procedure that the kit ships.
 
 **Triggering session restore** — at the start of any new conversation on the project, say one of:
 
@@ -50,24 +50,24 @@ The agent calls `harness_session_restore`, the response packet carries your proj
 
 The agent calls `harness_session_save` with the working frame, and the save tool surfaces a post-save verification obligation that you run after.
 
-**When something feels off** — if the agent appears to be answering with stale context or missing rules, ask it to call `harness_session_restore` again, or run `harness-kit mcp-recover --target . --client auto --json` to diagnose MCP connectivity from the shell side.
+**When something feels off** — if the agent appears to be answering with stale context or missing rules, ask it to call `harness_session_restore` again, or run `rule-harness mcp-recover --target . --client auto --json` to diagnose MCP connectivity from the shell side.
 
 ### What This Project Is
 
 **The problem.** AI coding agents arrive at a repository without governance. They make plausible-looking changes that violate invariants the team has not written down. The team adds a CLAUDE.md or AGENTS.md to capture rules; the file grows; the agent reads less of it; the rules silently stop applying. The agent and the team need shared structure they can both rely on.
 
-**The kit.** harness-kit installs that structure as governance scaffolding: a constitution, a law layer (memory, artifact, oracle, failure rules), root control tools (init / update / fix), contract documents, a memory subsystem (working set, logs, rules, preferences), and a runtime MCP server that surfaces the rules every session. The agent reads the law before it writes; the kit's verifier mechanically catches drift between the rules and the code.
+**The kit.** rule-harness installs that structure as governance scaffolding: a constitution, a law layer (memory, artifact, oracle, failure rules), root control tools (init / update / fix), contract documents, a memory subsystem (working set, logs, rules, preferences), and a runtime MCP server that surfaces the rules every session. The agent reads the law before it writes; the kit's verifier mechanically catches drift between the rules and the code.
 
-**Recursive improvement.** The kit develops by using itself. Every plan that lands in the source repository goes through the same `HARNESS_INIT_TOOL.md` / `HARNESS_UPDATE_TOOL.md` / `HARNESS_FIX_TOOL.md` rules the kit ships. Every law change is mirrored to the public seed (this repository) and to the bundled package scaffold. The same `harness-kit verify` you run against your project also runs against the kit itself.
+**Recursive improvement.** The kit develops by using itself. Every plan that lands in the source repository goes through the same `HARNESS_INIT_TOOL.md` / `HARNESS_UPDATE_TOOL.md` / `HARNESS_FIX_TOOL.md` rules the kit ships. Every law change is mirrored to the public seed (this repository) and to the bundled package scaffold. The same `rule-harness verify` you run against your project also runs against the kit itself.
 
 ### Requirements
 
 - **Python** 3.11 or newer.
 - **Operating systems**: Windows, Ubuntu, and macOS supported.
 - **Disk**: the embedding model occupies roughly 500 MB once downloaded (cached under `<your-project>/.harness/models/`).
-- **Runtime dependencies** are installed automatically by `pipx install harness-kit` and declared in `pyproject.toml`.
+- **Runtime dependencies** are installed automatically by `pipx install rule-harness` and declared in `pyproject.toml`.
 
-### What You Get After `harness-kit init`
+### What You Get After `rule-harness init`
 
 ```
 <your-project>/
@@ -89,23 +89,23 @@ The agent reads law and routing on every session restore; you do not maintain a 
 
 ### Links
 
-- **PyPI**: https://pypi.org/project/harness-kit/ — for source repository and issue tracker, follow the links on the PyPI project page.
+- **PyPI**: https://pypi.org/project/rule-harness/ — for source repository and issue tracker, follow the links on the PyPI project page.
 
 ---
 
 ## For AI Agents
 
-This section is the agent-facing reading order for first-time entry into a project that uses harness-kit. If you are reading this README as a new session, follow the §Canonical Restore Route Mandatory Tier in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` instead — that procedure is the binding one. This README is the on-ramp; the law file is the substance.
+This section is the agent-facing reading order for first-time entry into a project that uses rule-harness. If you are reading this README as a new session, follow the §Canonical Restore Route Mandatory Tier in `docs/harness/MEMORY_AND_CONTINUITY_RULES.md` instead — that procedure is the binding one. This README is the on-ramp; the law file is the substance.
 
 ### Agent Bootstrap (first install)
 
-When the user asks you to set up harness-kit in a project:
+When the user asks you to set up rule-harness in a project:
 
-1. Install harness-kit: `pipx install harness-kit`.
-2. Run `harness-kit init <target-project> --setup-agents prompt` in the target. The `prompt` default emits LLM-actionable instructions for registering the `harness-memory` MCP server in your host config; read those instructions and edit your host config rather than letting init auto-write to user-level config (that requires `--setup-agents auto --yes`).
+1. Install rule-harness: `pipx install rule-harness`.
+2. Run `rule-harness init <target-project> --setup-agents prompt` in the target. The `prompt` default emits LLM-actionable instructions for registering the `harness-memory` MCP server in your host config; read those instructions and edit your host config rather than letting init auto-write to user-level config (that requires `--setup-agents auto --yes`).
 3. Restart your host after the config edit so the new MCP registration is picked up.
-4. On the next agent session, call `harness_session_restore` (MCP) or `harness-kit session-restore --target . --json` (CLI fallback) and follow the §Canonical Restore Route Mandatory Tier in the response.
-5. If the MCP server is not visible in a new session despite restart, run `harness-kit mcp-recover --target . --client auto --json` to diagnose runtime + registration state.
+4. On the next agent session, call `harness_session_restore` (MCP) or `rule-harness session-restore --target . --json` (CLI fallback) and follow the §Canonical Restore Route Mandatory Tier in the response.
+5. If the MCP server is not visible in a new session despite restart, run `rule-harness mcp-recover --target . --client auto --json` to diagnose runtime + registration state.
 
 ### Layer-by-layer map (what each artifact class is for)
 

@@ -13,19 +13,19 @@ Every Harness installation should treat the following as default subsystems:
 - exact lookup, FTS, and vector indexes co-located in `.harness/index/meta.db` (vector via the `sqlite-vec` extension; no separate vector directory)
 - embedding model artifacts under `.harness/models/embedding/<model-name>/`
 - runtime job and cache paths under `.harness/jobs/` and `.harness/cache/`
-- the bundled MCP server (shipped with the `harness-kit` pip package) as the LLM's only access path to indexed memory; raw SQL access is prohibited
+- the bundled MCP server (shipped with the `rule-harness` pip package) as the LLM's only access path to indexed memory; raw SQL access is prohibited
 - session restore behavior that can start, validate, repair, or degrade memory runtime components
 
 Default subsystem status does not require every runtime process to stay hot. Runtime components may be idle, missing, repairing, or degraded as long as the canonical memory layer remains inspectable and the failure is handled as lower-authority runtime state.
 
 ## Canonical Memory Operation Path
-Memory operations are canonical when they go through the bundled Harness Memory MCP tools. CLI fallback surfaces (`harness-kit session-restore`, `harness-kit memory-runtime-check`, `harness-kit memory-runtime-repair`, `harness-kit mcp-recover`) are explicit recovery and diagnostic entry points for sessions where MCP is not available. They are not parallel memory authorities.
+Memory operations are canonical when they go through the bundled Harness Memory MCP tools. CLI fallback surfaces (`rule-harness session-restore`, `rule-harness memory-runtime-check`, `rule-harness memory-runtime-repair`, `rule-harness mcp-recover`) are explicit recovery and diagnostic entry points for sessions where MCP is not available. They are not parallel memory authorities.
 
 ### Session Path Disclosure
 A session that performs memory read or write operations without the Harness Memory MCP registered is operating in a **degraded memory session**. Degraded status must be visible, not hidden:
 
 - Every restore (MCP or fallback) must state the path it used. MCP restores state `via MCP`. Fallback restores state `via recovery fallback (MCP unavailable)` and surface the degraded status in the summary, not only in runtime internals.
-- Before initiating any memory-write operation, the agent must declare which path it will use. "Declare" means name the specific tool or command about to run (for example, `memory_save_item`, `harness_session_save`, or `harness-kit mcp-recover`), so that accidental fallback writes are visible before the write happens, not after.
+- Before initiating any memory-write operation, the agent must declare which path it will use. "Declare" means name the specific tool or command about to run (for example, `memory_save_item`, `harness_session_save`, or `rule-harness mcp-recover`), so that accidental fallback writes are visible before the write happens, not after.
 - If the declared path is a fallback surface, the session is degraded and the write is subject to the recovery-only rules below.
 
 ### Fallback Self-Labeling
@@ -81,14 +81,14 @@ Derived runtime and index state belongs under `.harness/`:
     meta.db                # SQLite + FTS5 + sqlite-vec virtual tables
   models/
     embedding/
-      <model-name>/        # downloaded by harness-kit init
+      <model-name>/        # downloaded by rule-harness init
   jobs/
   cache/
 ```
 
 `memory/*` is the source layer. `.harness/*` is derived runtime or index state and may be repaired from source material.
 
-The current default embedding model is `intfloat/multilingual-e5-small` (384-dim, multilingual). The `sqlite-vec` extension requires `sqlite3.enable_load_extension(True)` in the host Python binding; the `harness-kit` pip package must verify this capability at install and surface a clear error if disabled.
+The current default embedding model is `intfloat/multilingual-e5-small` (384-dim, multilingual). The `sqlite-vec` extension requires `sqlite3.enable_load_extension(True)` in the host Python binding; the `rule-harness` pip package must verify this capability at install and surface a clear error if disabled.
 
 ## Memory Types
 `memory/known-facts/` stores currently remembered facts. Known facts are memory records, not governing rules. Each known fact must carry source, status, and verification metadata once the format is defined.
@@ -173,7 +173,7 @@ Rules are created, updated, and lifecycled through the same MCP tools that handl
 Direct file edits under `memory/rules/` are subject to the same Write-Path Boundary as other memory layers: they are governance drift unless paired with an explicit `memory_runtime_repair` invocation in the same change.
 
 ### Distribution Boundary
-`publish-repo/memory/rules/` must not contain this authoring workspace's local rule content. Target projects that install via the `harness-kit` pip package or `harness-kit init` inherit an empty rules directory (with at most a one-paragraph starter README explaining the directory's purpose). They populate their own rules locally. The `harness-kit verify` publish-seed leak detector scans this path for authoring-specific marker phrases and fails closed on leaks.
+`publish-repo/memory/rules/` must not contain this authoring workspace's local rule content. Target projects that install via the `rule-harness` pip package or `rule-harness init` inherit an empty rules directory (with at most a one-paragraph starter README explaining the directory's purpose). They populate their own rules locally. The `rule-harness verify` publish-seed leak detector scans this path for authoring-specific marker phrases and fails closed on leaks.
 
 ### Schema Storage Note
 The `memory_items.type` column in `.harness/index/meta.db` is constrained by a CHECK that admits `fact`, `preference`, `rule`, and `working_set_entry`. The runtime tool layer accepts only the first three; calls to `memory_save_item(type="working_set_entry")` are rejected with `memory.invalid_params` before they reach the DB, and the working-set file is rewritten in full by `harness_session_save` rather than addressed at item-level. The CHECK retains the fourth value so that databases written by older binaries continue to read; rows of that type are dormant and not produced by any current write path.
@@ -605,7 +605,7 @@ When `harness-memory` MCP tools are not visible in a new agent session, agents m
 The canonical recovery entry point is:
 
 ```text
-harness-kit mcp-recover --target . --client auto --json
+rule-harness mcp-recover --target . --client auto --json
 ```
 
 This command restores session context through the CLI fallback equivalent of the Canonical Restore Route, checks Harness runtime readiness, inspects agent MCP registration when the agent host exposes an inspection command, and returns concrete recovery actions.
@@ -756,7 +756,7 @@ Timestamps are load-bearing: the Canonical Restore Route uses the working set's 
 
 Agents and tools that write memory records must obtain the current time from the operating system (e.g., `date` on a shell, `datetime.now(timezone.utc)` in Python) at write time. Sequencing several log entries with `+15 minutes` increments, copying a prior timestamp, or estimating a timestamp from context is a governance violation and should be corrected through `HARNESS_FIX_TOOL.md`.
 
-When the `harness-kit` CLI is available, agents should prefer `harness-kit now --json` for manual timestamp lookup before writing memory records by hand. The command returns compact OS-clock UTC and local timestamps so agents do not spend prompt tokens composing ad hoc date commands or infer dates from conversation context. MCP tools and package code may continue to call the host language's clock directly when they write timestamps internally.
+When the `rule-harness` CLI is available, agents should prefer `rule-harness now --json` for manual timestamp lookup before writing memory records by hand. The command returns compact OS-clock UTC and local timestamps so agents do not spend prompt tokens composing ad hoc date commands or infer dates from conversation context. MCP tools and package code may continue to call the host language's clock directly when they write timestamps internally.
 
 Pre-existing records with known-fabricated timestamps may be left in place when the order is still correct and the cost of rewriting exceeds the diagnostic value, but any new writes must use actual wall-clock time.
 
