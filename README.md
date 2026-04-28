@@ -52,6 +52,20 @@ The agent calls `agentlaw_session_save` with the working frame, and the save too
 
 **When something feels off** — if the agent appears to be answering with stale context or missing rules, ask it to call `agentlaw_session_restore` again, or run `agentlaw mcp-recover --target . --client auto --json` to diagnose MCP connectivity from the shell side.
 
+### Multi-project usage
+
+Install `agentlaw` once with `pipx install agentlaw`, then bootstrap each project independently with `agentlaw init <dir> --setup-agents prompt`. Each initialized project gets its own `<dir>/.harness/index/meta.db`; the memory index is not shared across projects.
+
+Host registration scope differs by agent host:
+
+| Host | Registration scope | Multi-project behavior |
+| --- | --- | --- |
+| Claude Code | local, per-project and keyed by project path | each project sees only its own `.harness/index/meta.db` |
+| Gemini CLI | project-local `.gemini/settings.json` | each project sees only its own `.harness/index/meta.db` |
+| Codex | user-level, one global entry | the registration omits `--target`; `agentlaw run-mcp` resolves the target from the cwd where Codex is opened |
+
+`agentlaw verify` checks target scaffold integrity; it does not enforce host MCP scope. Use `agentlaw agent-setup --verify` to check the host registration contract.
+
 ### What This Project Is
 
 **The problem.** AI coding agents arrive at a repository without governance. They make plausible-looking changes that violate invariants the team has not written down. The team adds a CLAUDE.md or AGENTS.md to capture rules; the file grows; the agent reads less of it; the rules silently stop applying. The agent and the team need shared structure they can both rely on.
