@@ -161,29 +161,29 @@ When writing or modifying code, agents must keep structure obligations visible:
 - Dependency direction should keep domain behavior testable without requiring real external systems where fakes or controlled fixtures are appropriate.
 
 ## Review-Friendly Implementation Context
-Agents must make non-trivial code understandable to future reviewers. The required context may live in code comments, docstrings, tests, active plans, or design/reference documents, depending on the size and durability of the change.
 
-Comments and docstrings must explain reasoning-critical context: why a boundary exists, why ordering matters, what invariant must hold, what failure mode is being contained, or why a dependency direction is intentional.
+Agents must make non-trivial code understandable to future reviewers. Context must be preserved through self-documenting code, formal API documentation, and reasoning-critical comments. The project mandates strict adherence to the established documentation standard of the target language (e.g., Google Style for Python, TSDoc for TypeScript, Rustdoc for Rust).
 
-Comments must not merely restate obvious code behavior.
+### 1. Mandatory Type Contracts and Self-Documenting Code
+- All language surfaces that support static typing or type hints must be fully annotated (e.g., return types, parameter types, struct/class attributes).
+- Explicitly declare void returns if the language standard expects it.
+- Variables and functions must have descriptive, unambiguous names. Code boundaries must document themselves structurally before relying on comments.
+- **Prohibited:** Redundant comments that merely restate type signatures or variable names.
 
-Agents should add or update comments or docstrings when code involves:
+### 2. Formal API Documentation Specification
+All public modules, classes, and functions—as well as non-trivial internal boundaries—must carry formal, tooling-compatible API documentation.
+- **Summary Line:** The first sentence must be a concise summary in the imperative mood.
+- **Detailed Description:** Provide context on *why* this abstraction exists and explicitly define any invariants, critical edge cases, or failure modes.
+- **Parameters/Arguments:** List and describe what each parameter controls or affects. Do not repeat the type if the language signature already enforces it.
+- **Return Values:** Describe the semantic meaning of the return value, not just its type.
+- **Errors/Exceptions:** Explicitly enumerate error states, exceptions raised, and the conditions that trigger them.
 
-- authority boundaries
-- security boundaries
-- persistence or write ordering
-- canonical source versus derived state
-- schema or data migration behavior
-- platform-specific behavior
-- non-obvious failure handling
-- public API, CLI, MCP, package, or protocol contract behavior
-- cross-module responsibility boundaries
-
-Module docstrings should state the module responsibility, main inputs, outputs, side effects, and explicit non-goals when those are not obvious.
-
-Function docstrings should be used when the function owns a boundary, invariant, or public behavior. They are not required for every small helper.
-
-Comments must not become implementation history, excuses, stale TODOs, work logs, or duplicated plans. Specific anti-patterns: "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD as part of subplan Z", "this used to be Y until the field rename", "the earlier formulation returned a tuple but was changed", or any equivalent in-comment changelog narration. History lives in git blame, plan documents, memory log entries, and tracker entries — not in comment bodies. A reader who genuinely needs "why was this renamed?" follows pointers into those layers, not the docstring. This is the code-side equivalent of `docs/law/REPOSITORY_ARTIFACT_RULES.md` §"Self-Narration Prohibition" for governed artifact bodies. If behavior changes, the agent must update or remove affected comments and design context in the same change.
+### 3. Reasoning-Critical Inline Comments
+Inline comments must explain *why* code does something, not *what* it does.
+- Comments must document authority boundaries, security boundaries, write ordering, schema migration constraints, platform-specific workarounds, and non-obvious failure handling.
+- **Prohibited:** Routine operational comments (e.g., "Initialize the connection" or "Close the file") unless the operation involves counter-intuitive side effects.
+- **Prohibited:** Self-narration of the code's revision history. Comments must not become implementation history, stale TODOs, work logs, or duplicated active plans. Specific anti-patterns: "renamed from X on YYYY-MM-DD", "added on YYYY-MM-DD as part of subplan Z", "this used to be Y until the field rename", "the earlier formulation returned a tuple but was changed", or any equivalent in-comment changelog narration. History lives in git blame, plan documents, memory log entries, and tracker entries — not in comment bodies. A reader who genuinely needs "why was this renamed?" follows pointers into those layers, not the docstring. This is the code-side equivalent of `docs/law/REPOSITORY_ARTIFACT_RULES.md` §"Self-Narration Prohibition" for governed artifact bodies.
+- If behavior changes, the agent must update or remove affected comments in the same commit.
 
 ## Implementation Design Context
 Non-trivial implementation work must create or update implementation context before completion.
@@ -219,7 +219,7 @@ Requirements:
 - Map scope: the section declares a `Map scope:` block listing the repository paths the map covers as glob patterns (one pattern per bullet). Files outside the declared scope are not expected to appear in the map.
 - Density cap: each diagram contains at most fifteen nodes and at most twenty-five edges. When a diagram would exceed the cap, split it via boundary nodes (dashed-border placeholders that appear in both the parent and child diagrams) and add a node index table identifying the primary-home diagram for each node.
 - Format: Mermaid only. ASCII diagrams are not valid slots for this section, because uniform rendering keeps cross-diagram references unambiguous.
-- Update obligation: when a change within the declared Map scope adds, removes, renames, or reshuffles modules, classes, or user-facing entry points, the same commit must update the affected diagrams. Layer 2 enforcement: the harness verifier compares the latest modification time of files matched by the `Map scope:` block against the modification time of the `project-overview` reference file and fails when any scoped file is newer.
+- Update obligation: when a change within the declared Map scope adds, removes, renames, or reshuffles modules, classes, or user-facing entry points, the same commit must update the affected diagrams. Layer 2 enforcement: the harness verifier checks scoped-file freshness against the `project-overview` reference file and fails when any scoped file appears newer than the reference. The specific freshness signal is an implementation detail of the verifier and may evolve; the current method is documented in the verifier source.
 
 The obligation applies to the `project-overview` reference role named in `docs/law/REPOSITORY_ARTIFACT_RULES.md`. Projects that have not yet declared a `Map scope:` block pass the Layer 2 check silently, so newly initialized targets are not forced into FAIL until they opt in by populating the section.
 
@@ -277,5 +277,6 @@ Before declaring code work complete, the agent must report:
 - any broader verification run
 - any test gaps, skipped slow tests, or accepted residual risks
 - any enabling refactor performed before the requested behavior
+
 
 If verification cannot be run, the agent must say why and identify the remaining risk.

@@ -110,7 +110,7 @@ Rules are project-local governance items: persistent policy that applies within 
 
 ### Purpose And Distinction From Facts
 - A known fact is a remembered observation about current state (for example, "the current active plan is X"). It loses to new observation.
-- A rule is a standing policy about how work is done inside this repository (for example, "authoring-workspace distribution topology must be verified before release"). It loses only to higher authority, not to new observation.
+- A rule is a standing policy about how work is done inside this repository (for example, "release-readiness checks must pass before publishing"). It loses only to higher authority, not to new observation.
 - A log records that an event happened. A rule says what should happen.
 
 The three types are stored separately so that status transitions, retrieval treatment, and write-path obligations can differ without role-mixing.
@@ -152,8 +152,8 @@ Required keys: `id`, `type`, `status`, `scope`, `summary`, `applies_when`, `sour
 One rule per file under `memory/rules/`. File names are lowercase kebab-case and describe the rule's scope or subject:
 
 ```text
-memory/rules/authoring-workspace-operations.md
 memory/rules/release-readiness-gate.md
+memory/rules/dependency-pinning-policy.md
 ```
 
 ### Discoverability Obligations
@@ -234,29 +234,29 @@ Known facts must not be used for ordinary retrieval when `status` is `stale`, `s
 Rules use one rule per file under `memory/rules/`. File names are lowercase kebab-case and describe the rule's subject:
 
 ```text
-memory/rules/authoring-workspace-operations.md
 memory/rules/release-readiness-gate.md
+memory/rules/dependency-pinning-policy.md
 ```
 
 Minimum format:
 
 ```markdown
 ---
-id: rule/authoring-workspace-operations
+id: rule/release-readiness-gate
 type: rule
 status: active
 scope: repository
-summary: Authoring workspace operations contract for this repository.
+summary: Release-readiness checks for this repository's publish workflow.
 applies_when: [always]
 source:
-  - path: docs/plans/completed/2026-04-24-local-rule-memory-type-plan.md
+  - path: docs/plans/completed/<plan-that-introduced-this-rule>.md
     relation: derived_from
-last_checked: 2026-04-24
+last_checked: YYYY-MM-DD
 supersedes: []
-tags: [authoring, operations]
+tags: [release, gate]
 ---
 
-# Authoring Workspace Operations
+# Release Readiness Gate
 
 Body describes the rule in prose. Keep it short enough that a session-
 restore consumer can read the file without expanding a separate budget.
@@ -471,7 +471,7 @@ last_decisions:
     source: path-or-memory-id
     status: active
 active_rules:
-  - id: rule/authoring-workspace-operations
+  - id: rule/release-readiness-gate
     scope: repository
     summary: string
     applies_when: [always]

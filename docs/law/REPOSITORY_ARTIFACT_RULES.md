@@ -9,6 +9,7 @@ Its goal is to prevent structural drift as the project grows.
 The default repository artifact classes are:
 - constitutional documents
 - law documents
+- contract documents
 - execution-entry documents
 - root control documents
 - plans
@@ -273,8 +274,19 @@ For active plans that govern non-trivial or high-risk implementation work, the p
 
 Plans for trivial cleanup may stay smaller, but they must not hide public-contract, runtime, package, configuration, schema, or cross-component impact.
 
+The `Affected surfaces` bullet list must contain repo-relative paths or globs as inline-code (backticks). Free-form prose may surround each path, but each bullet must include at least one path or glob in backticks. The verifier extracts the backticked tokens and matches them against changed-file paths via Python's `pathlib.PurePath.match`, with directory-prefix shortcut: a token ending in `/` matches any descendant. This is the parseable contract that a mechanical plan-coverage check relies on; bullets that name no path in backticks contribute nothing to coverage.
+
+### Contract Documents
+Contract documents use lowercase kebab case. They describe a boundary surface shared with target projects and must carry an authority header declaring their domain, verification check, and governing law anchor.
+They must reside in `docs/contracts/` and be mirrored to `publish-repo/docs/contracts/`.
+
+Examples:
+- `shared-agentlaw-baseline.md`
+- `agentlaw-update-workflow.md`
+- `agentlaw-mcp-tools.md`
+
 ### Reference Documents
-Reference documents use lowercase kebab case and should signal their purpose when possible.
+Reference documents use lowercase kebab case and should signal their purpose when possible. They are local to the authoring repository by default.
 
 Examples:
 - `local-storage-reference.md`
@@ -297,6 +309,7 @@ Do not use:
 ## Default Directory Rules
 The default repository directories are:
 - `docs/law/` for governing law documents
+- `docs/contracts/` for contract documents shared with target projects
 - `docs/plans/active/` for active versioned plans
 - `docs/plans/completed/` for completed plans kept for history
 - `docs/references/` for searchable repository-local references
@@ -350,7 +363,7 @@ When the search surfaces an existing rule whose intent overlaps:
 
 This rule does not apply to factual material additions inside an existing § (adding a missing parameter to a contract document's parameter list, adding a new entry to a finite enumeration, fixing a typo). It applies to **rule** additions — text that imposes a new obligation, prohibition, or behavioral expectation.
 
-Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `shared-harness-baseline`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `agentlaw verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `SCOPE.md` and the publish-seed boundary, not a new sibling file.
+Law defines the following finite set of shared reference roles distributed in `publish-repo/docs/references/`: `README`, `project-overview`. Adding, renaming, or removing a role requires a plan that edits this enumeration in the same change; `agentlaw verify` mechanically asserts that `publish-repo/docs/references/` contains no files outside this set (plus the local-only references under `docs/references/` in the authoring repo, which are unbounded by design and not part of this enumeration). Splitting a single named role across sibling files without law backing is governance drift. When authoring-workspace content and distribution-template content share the same role, they remain one file by role and must follow the mirror rules in `SCOPE.md` and the publish-seed boundary, not a new sibling file.
 
 The `project-overview` role additionally carries a "Code architecture map" subsection. Its obligations — slot menu, minimum structure-plus-flow coverage, slot-selection rationale, `Map scope:` declaration, density cap, Mermaid-only format, slot-name headings, and the mtime-based Layer 2 staleness check — are specified in `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md` under "Code Architecture Map".
 

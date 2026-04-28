@@ -17,10 +17,10 @@ This file records the shared-kit baseline currently reflected in the workspace.
 
 ## Baseline Record
 - Shared source repository: `https://github.com/paranmir/agentlaw.git`
-- Baseline commit SHA: `87db83f`
+- Baseline commit SHA: `0af5f9b`
 - Baseline tag: `unknown`
 - Baseline recorded on: `2026-04-27`
-- Recorded by: `readme-polish-and-publish-repo-sync plan`
+- Recorded by: `v0.1.1 deployment execution plan`
 - Notes:
   - Root constitution and root control documents are mirrors of `publish-repo/*`.
   - The baseline commit was read from `publish-repo/.git`.
