@@ -45,6 +45,33 @@ the plan:
 The revised plan is the execution plan. Persona review comments are not the goal;
 they are inputs for improving the plan.
 
+Plan documents must not preserve long duplicate "draft plan" and "revised plan"
+bodies by default. That duplicates content and makes plans harder to maintain.
+Instead, review-required plans must record compact review evidence fields:
+
+- `Review required`
+- `Plan reviewed`
+- `Personas applied`
+- `Revised after review`
+
+When review is not required, the plan must record `Review exemption reason`.
+
+Review-required plans must also include a short `Separate Persona Review
+Passes` section. Each persona pass must record concrete findings using the
+review-method fields: severity, plan risk found, required plan change,
+verification or gate to add, and residual risk if accepted.
+
+The plan may include short review notes when useful, but the evidence fields and
+the separate persona-pass section are the parseable contract that proves the
+plan was not treated as ready before review. An agent must not mark `Plan
+reviewed: yes` before those persona passes are actually performed and recorded.
+
+If the agent discovers during implementation that review was skipped, compressed
+into a retrospective claim, or falsely marked complete, implementation must stop.
+The agent must return to plan correction, record the failure when it is
+governance-relevant, re-run the applicable persona review, and only then resume
+execution from the revised plan.
+
 ## Operational Sources
 
 The canonical operational planning sources are:
@@ -72,6 +99,8 @@ The `plan_discipline_reminder` returned by `agentlaw_session_restore` and
 - `review_method_source`: `docs/planning-protocol/review-method.md`
 - `persona_deck_sources`: `docs/planning-protocol/persona-decks-core.md` and
   `docs/planning-protocol/persona-decks-specialized.md`
+- `review_evidence_fields`: the compact field names that make a plan ready
+  plus the `Separate Persona Review Passes` evidence section name
 
 Runtime surfaces the reminder; the agent remains responsible for judging
 whether planning is required and applying the workflow.

@@ -278,6 +278,30 @@ Plans for trivial cleanup may stay smaller, but they must not hide public-contra
 
 The `Affected surfaces` bullet list must contain repo-relative paths or globs as inline-code (backticks). Free-form prose may surround each path, but each bullet must include at least one path or glob in backticks. The verifier extracts the backticked tokens and matches them against changed-file paths via Python's `pathlib.PurePath.match`, with directory-prefix shortcut: a token ending in `/` matches any descendant. This is the parseable contract that a mechanical plan-coverage check relies on; bullets that name no path in backticks contribute nothing to coverage.
 
+Active plans must also carry compact review evidence fields:
+
+- `Review required`
+- `Plan reviewed`
+- `Personas applied`
+- `Revised after review`
+
+When `Review required` is `no`, the plan must carry `Review exemption reason`
+instead of the other review-completion evidence. The verifier treats these
+fields as parseable contract, not decorative prose.
+
+When `Review required` is `yes`, the plan must also carry a short `Separate
+Persona Review Passes` section with one block per persona and these parseable
+fields in each block:
+
+- `Severity`
+- `Plan risk found`
+- `Required plan change`
+- `Verification or gate to add`
+- `Residual risk if accepted`
+
+The section is evidence that persona review was run as separate passes. It is
+not a place to preserve long duplicate draft and revised plan bodies.
+
 ### Contract Documents
 Contract documents use lowercase kebab case. They describe a boundary surface shared with target projects and must carry an authority header declaring their domain, verification check, and governing law anchor.
 They must reside in `docs/contracts/` and be mirrored to `publish-repo/docs/contracts/`.

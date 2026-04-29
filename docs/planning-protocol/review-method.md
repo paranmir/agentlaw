@@ -20,6 +20,50 @@ Use this sequence when `task-classification.md` says planning is required:
 6. Revise the plan once.
 7. Execute the revised plan or ask for user approval when required.
 
+Do not store long duplicate draft and revised plan bodies unless the task is so
+high-risk that preserving both bodies is itself useful evidence. The default
+plan artifact should keep the final executable plan plus compact review evidence
+fields and short notes.
+
+Required review evidence fields for review-required plans:
+
+```text
+Review required: yes
+Plan reviewed: yes
+Personas applied: <non-empty persona list>
+Revised after review: yes
+```
+
+Review-required plans must also include a short section:
+
+```text
+## Separate Persona Review Passes
+
+### <Persona name>
+
+- Severity: must-change / should-change / note
+- Plan risk found: <concrete risk>
+- Required plan change: <specific plan edit>
+- Verification or gate to add: <test, check, approval, or explicit none>
+- Residual risk if accepted: <remaining risk>
+```
+
+If review is not required, record:
+
+```text
+Review required: no
+Review exemption reason: <short reason>
+```
+
+Use `Revised after review: no changes required` only when the separate persona
+passes found no must-change or should-change items.
+
+Do not mark `Plan reviewed: yes` until the separate persona passes are actually
+performed and recorded. If a skipped, compressed, or falsely completed review is
+discovered after implementation has begun, stop implementation, record the
+correction in the active plan when governance-relevant, re-run persona review on
+the changed plan, then resume only from the revised plan.
+
 ## Persona Review Contract
 
 Each persona review must produce plan edits, not general commentary.
@@ -64,6 +108,14 @@ After persona reviews, consolidate findings into these buckets:
 
 Then revise the plan once. Avoid another review loop unless a must-change item
 creates a new irreversible or high-stakes risk.
+
+The consolidation output should be short:
+
+- must-change findings
+- changes applied
+- residual risks
+
+Avoid copying the full pre-review plan into the final plan body.
 
 ## Finding Quality Bar
 

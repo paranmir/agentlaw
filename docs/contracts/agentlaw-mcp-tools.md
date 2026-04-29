@@ -398,6 +398,7 @@ These fields are runtime-generated reminders bundled by `runtime_reminders_for_r
   - `classification_source` (string) — `docs/planning-protocol/task-classification.md`.
   - `review_method_source` (string) — `docs/planning-protocol/review-method.md`.
   - `persona_deck_sources` (array of strings) — `docs/planning-protocol/persona-decks-core.md` and `docs/planning-protocol/persona-decks-specialized.md`.
+  - `review_evidence_fields` (array of strings) — compact plan fields and section names that make review readiness parseable: `Review required`, `Plan reviewed`, `Personas applied`, `Revised after review`, `Review exemption reason`, and `Separate Persona Review Passes`.
   - `mechanical_consequence` (string) — explains the plan-coverage verifier consequence for uncovered non-trivial changes.
   - `anchor` (string) — governing law anchors for the pre-edit and active-plan-field obligations.
 
