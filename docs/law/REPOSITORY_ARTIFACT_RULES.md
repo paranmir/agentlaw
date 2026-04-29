@@ -83,7 +83,9 @@ Operational artifacts must not:
 - silently redefine scope, contracts, oracle logic, or failure handling
 - become an unstructured dump of chat history or temporary notes
 
-The default operational-artifact paths are `docs/plans/*`, `docs/references/*`, and stable generated-facts locations when explicitly approved by repository rules.
+The default operational-artifact paths are `docs/plans/*`, `docs/references/*`,
+`docs/planning-protocol/*`, and stable generated-facts locations when explicitly
+approved by repository rules.
 
 An operational artifact counts as approved only when:
 - it fits an allowed artifact class and path
@@ -299,6 +301,22 @@ Trackers should prefer stable fixed names over ad hoc variants.
 Examples:
 - `tech-debt-tracker.md`
 
+### Planning Protocol Documents
+Planning protocol documents use lowercase kebab case and live under
+`docs/planning-protocol/`.
+
+They provide operational guidance for request classification, plan review
+method, and persona deck selection. They are shared with downstream projects,
+but they remain below the law layer.
+
+Law defines the following finite set of shared planning protocol files
+distributed in `publish-repo/docs/planning-protocol/`: `README.md`,
+`task-classification.md`, `review-method.md`, `persona-decks-core.md`,
+`persona-decks-specialized.md`. Adding, renaming, or removing a file requires a
+plan that edits this enumeration in the same change; `agentlaw verify`
+mechanically asserts that `publish-repo/docs/planning-protocol/` contains this
+exact set and no unratified sibling files.
+
 ## Naming Anti-Patterns
 Do not use:
 - ambiguous names such as `misc.md`, `stuff.md`, or `notes2.md`
@@ -313,6 +331,7 @@ The default repository directories are:
 - `docs/plans/active/` for active versioned plans
 - `docs/plans/completed/` for completed plans kept for history
 - `docs/references/` for searchable repository-local references
+- `docs/planning-protocol/` for shared operational planning classification and review protocol
 
 These default directories should be used before introducing new top-level or peer directories.
 

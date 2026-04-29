@@ -361,7 +361,7 @@ Implements the Canonical Restore Route in `MEMORY_AND_CONTINUITY_RULES.md`.
 - `token_estimate.packet_tokens` reflects the **full serialized packet** — including `runtime_status`, `authority_recall`, `governance_drift`, every per-entry field, and the body-level payloads (`active_plan_bodies`, `active_rule_bodies`, `preferences_body`, `lookup_rules_body`, `known_facts_manifest`, `working_frame_memory_hits`, `latest_session_save_body`). Clients comparing this figure against a fixed context-window budget must account for body-level reads on every restore; the Mandatory Tier guarantees the packet carries substance, not just paths.
 **Framework reminder fields (always present on every restore packet)**
 
-The next three fields are runtime-generated reminders bundled by `runtime_reminders_for_restore()` in `authority.py`. They do not persist to disk and do not depend on `memory/working-set.md` content; they are regenerated fresh on every restore so each session starts with the same framework guidance.
+These fields are runtime-generated reminders bundled by `runtime_reminders_for_restore()` in `authority.py`. They do not persist to disk and do not depend on `memory/working-set.md` content; they are regenerated fresh on every restore so each session starts with the same framework guidance.
 
 - `authority_recall` (object) — compact runtime guidance pointing to governing sources and the promotion protocol. Sub-keys:
   - `governing_sources` (array) — list of `{path, reason}` entries for the law layer (constitution, MEMORY_AND_CONTINUITY_RULES.md, REPOSITORY_ARTIFACT_RULES.md, agentlaw-mcp-tools.md).
@@ -388,6 +388,18 @@ The next three fields are runtime-generated reminders bundled by `runtime_remind
   - `applies_when` (string) — trigger signal vocabulary (Q1/Q2 of §Read Routing Criterion: 'we', 'previously', 'earlier', '왜', '근거', '어디까지', 'outstanding', plus multilingual analogues). Q3 (current source / law fact) does NOT trigger.
   - `anchor` (string) — `docs/law/MEMORY_AND_CONTINUITY_RULES.md §Consult-Before-Answer Rule`.
   - `runtime_boundary` (string) — runtime surfaces the rule; the agent judges whether the question's shape triggers it and which read tool to call.
+
+- `plan_discipline_reminder` (object) — planning workflow reminder for non-trivial work. Sub-keys:
+  - `rule` (string) — compact plan-first obligation.
+  - `non_trivial_triggers` (array of strings) — common cases that require a plan, such as law/root-control edits, public runtime surface changes, schema additions, and cross-concern commits.
+  - `trivial_exemptions` (array of strings) — narrow cases where a repository-tracked plan is normally not required.
+  - `anti_rationalization` (array of strings) — clauses that prevent auto-mode, broad user authorization, or elastic "trivial" interpretation from bypassing the plan gate.
+  - `planning_workflow` (array of strings) — canonical sequence: `classify_request`, `draft_plan`, `review_with_persona_decks`, `synthesize_review_findings`, `produce_revised_plan`.
+  - `classification_source` (string) — `docs/planning-protocol/task-classification.md`.
+  - `review_method_source` (string) — `docs/planning-protocol/review-method.md`.
+  - `persona_deck_sources` (array of strings) — `docs/planning-protocol/persona-decks-core.md` and `docs/planning-protocol/persona-decks-specialized.md`.
+  - `mechanical_consequence` (string) — explains the plan-coverage verifier consequence for uncovered non-trivial changes.
+  - `anchor` (string) — governing law anchors for the pre-edit and active-plan-field obligations.
 
 - `suggested_queries` (array of strings) — topic-mined phrase list from recent log entries within the lookback window. Empty list when no recent logs exist (fresh session, fresh project, or `memory_logs` table missing). Otherwise, the top-K most-frequent tokens (default K=5) extracted from log titles + tags, weighted with linear recency decay so newer entries outrank older ones. The list is a starting-point reminder, not a curated retrieval — agents may use it to seed `memory_search` queries or ignore it if irrelevant. The phrase shape is short tokens (lowercased ASCII for English / digits, raw Hangul for Korean) suitable for direct use as `memory_search.query` substrings.
 
@@ -439,6 +451,7 @@ All working-set fields below carry the **current snapshot only** — each entry 
   - `runtime_boundary` (string).
 
 - `memory_intent_reminder` (object) — save-time reminder of the Memory Intent Rule. Same schema as the `memory_intent_reminder` field on the `agentlaw_session_restore` packet (see Read Tools section above).
+- `plan_discipline_reminder` (object) — save-time planning workflow reminder. Same schema as the `plan_discipline_reminder` field on the `agentlaw_session_restore` packet (see Read Tools section above).
 - `degraded` and `log_error` when the working set was written but a requested log append failed.
 - `runtime_status`.
 

@@ -44,6 +44,7 @@ Check the current agreement in this order:
    - `docs/law/CODE_AUTHORSHIP_AND_STEWARDSHIP_RULES.md`
    - `docs/law/FAILURE_TAXONOMY.md`
    - `docs/law/REPOSITORY_ARTIFACT_RULES.md`
+   - `docs/law/PLANNING_AND_REVIEW_RULES.md`
    - `docs/law/MEMORY_AND_CONTINUITY_RULES.md`
    - `docs/law/STARTER_SPECIALIZATION_RULES.md`
    - `docs/law/MECHANICAL_ENFORCEMENT_POLICY.md`

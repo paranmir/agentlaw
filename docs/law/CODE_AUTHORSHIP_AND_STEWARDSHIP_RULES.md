@@ -54,6 +54,11 @@ This gate applies to first implementation, modification, refactoring, deletion, 
 
 The gate does not require a long plan for trivial mechanical edits, but the agent must still run or identify the smallest relevant verification.
 
+When code work is non-trivial, the planning workflow in
+`docs/law/PLANNING_AND_REVIEW_RULES.md` also applies. The pre-edit gate supplies
+the code-specific affected surfaces, oracle, verification target, risk, slice,
+and non-goals that the revised plan must carry.
+
 ## Test-Anchored Development Rule
 All non-trivial code work must be anchored by executable verification.
 

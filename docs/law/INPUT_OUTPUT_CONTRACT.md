@@ -64,6 +64,11 @@ Before making meaningful changes, classify the request as one or more of:
 
 This classification must be made before implementation or restructuring work proceeds.
 
+Planning classification is a separate gate. For non-trivial, high-risk,
+state-changing, current-source-dependent, or governance-affecting work, follow
+`docs/law/PLANNING_AND_REVIEW_RULES.md` before execution. The operational
+classification and persona-review details live in `docs/planning-protocol/*`.
+
 ## Expected Outputs
 - clarified law-layer documents
 - visible open questions
@@ -213,6 +218,8 @@ At that point, the project may add:
 - `docs/plans/completed/*`
 - `docs/plans/tech-debt-tracker.md`
 - `docs/references/*`
+- `docs/planning-protocol/*` when reusable planning classification and
+  persona-review protocol must be shared with downstream agents
 
 These additions support the law layer; they do not replace it.
 

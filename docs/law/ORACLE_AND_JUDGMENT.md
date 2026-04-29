@@ -94,6 +94,12 @@ When a code-authorship rule and a product-specific behavioral oracle both apply,
 ### Reviewable Verification Context
 For non-trivial work, the verification oracle must be documented before completion. The oracle may live in tests, an active plan, or a design/reference document, but it must identify what regression, contract, or invariant the verification protects.
 
+For plan-required work, the planning review workflow in
+`docs/law/PLANNING_AND_REVIEW_RULES.md` is an oracle-strengthening step. Persona
+review findings should improve the plan's verification, source, rollback, and
+user-gate coverage before execution; they do not replace executable tests,
+citations, previews, calculations, or other task-appropriate evidence.
+
 Test comments should explain the protected regression or contract only when that oracle is not obvious from the test name and assertions.
 
 ### Affected Surface Preflight
