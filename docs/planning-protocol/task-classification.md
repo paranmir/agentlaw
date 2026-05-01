@@ -102,18 +102,104 @@ they become large, consequential, state-changing, or formal.
 | `image_visual_work` | brand, commercial, UI, exact text, or artifact editing |
 | `personal_advice_coaching` | safety, mental health, life decision, money, employment, or abuse risk |
 
+## Non-Trivial Triggers
+
+For plan-required work, classify further as **trivial** or **non-trivial**.
+A task is non-trivial when it matches at least one of the following structural
+triggers. The matched triggers must be cited explicitly in the plan's preflight
+fields (`Risk triggers matched`).
+
+When zero triggers match, the work is **trivial**: it still produces a plan
+record using the minimum sections of `plan-template.md` and skips the full
+persona review per `docs/law/PLANNING_AND_REVIEW_RULES.md` § Required Planning
+Workflow. The Trigger Coverage Verifier persona is the only required review
+pass for trivial plans, to confirm the classification is correct.
+
+The triggers are deliberately phrased to apply across project domains (software,
+governance, research, content, advisory, legal, etc.). Each is followed by
+cross-domain examples; the trigger fires whenever the structural condition is
+met, regardless of domain vocabulary.
+
+1. **Irreversible action**: the plan executes an action that cannot be undone
+   within ordinary repository or system operations.
+   - Examples: external publication or release; data migration execution;
+     account or permission modification; user-visible notification dispatch;
+     irreversible approval issuance; hardware or device actuation; legally
+     binding commitment.
+
+2. **External-interface contract change**: the plan modifies a surface that
+   consumers outside the immediate codebase or context depend on.
+   - Examples: API endpoint shape, CLI flags, library function signatures,
+     file format schemas, network protocols, contractual obligations,
+     publicly referenced document structure, agreed conventions between
+     teams or systems.
+
+3. **Governing-artifact change**: the plan modifies a rule, policy, contract,
+   charter, architectural decision record, or other artifact that constrains
+   future work or other actors.
+   - Examples: legal/policy text, governance rules, internal standards,
+     architectural decisions, escalation procedures, eligibility criteria,
+     review protocols.
+
+4. **Trust-boundary-crossing data or control flow change**: the plan modifies
+   how data or control crosses a boundary between regions of different trust
+   levels.
+   - Examples: authentication or authorization flow, credential or secret
+     handling, sandboxed-vs-privileged operations, cross-tenant data flow,
+     handling of privileged communications, sensitive-data ingress/egress,
+     external system invocation from a trusted region.
+
+5. **State migration**: the plan executes a transformation of existing
+   persistent state that cannot be undone by re-running the prior code path
+   or by a single revert.
+   - Examples: database schema migration with backfill, configuration format
+     upgrade with rewrite, document layout migration, record-format
+     conversion, business process state transition that touches in-flight
+     instances.
+
+6. **Distribution-boundary content change**: the plan modifies content that
+   is directly used, copied, referenced, or instantiated in other codebases,
+   projects, teams, or contexts beyond the producing one.
+   - Examples: library or SDK code, distributed templates or starter kits,
+     style guides distributed across an organization, distributed standards
+     or specifications, content meant to be reused as a building block in
+     other-codebase form.
+   - Not examples: a deploy branch of the same project (the consumer is the
+     same project's runtime, not a different codebase).
+
+7. **Multi-class plan-required composite**: the plan-required task spans two
+   or more plan-required classes simultaneously (e.g., `coding_implementation`
+   + `release_deploy_external_action`, or `legal_financial_medical_sensitive`
+   + `decision_support_high_impact`).
+
+8. **Multi-file or multi-surface change**: the plan touches multiple files,
+   modules, components, documents, or other discrete surfaces in coordination,
+   beyond a single trivially mechanical edit.
+
+9. **Behavioral or functional change**: the plan changes what the system or
+   artifact does, not only how it is structured. Pure rename, reformatting,
+   or comment-only edits do not match this trigger; logic changes, output
+   changes, capability additions, and interaction-pattern changes match.
+
 ## Classification Output
 
-Use this internally for simple tasks. Surface it when it helps the user evaluate
-the plan.
+Use this internally for simple tasks. Surface it when it helps the user
+evaluate the plan.
 
 ```text
 Task class:
 Plan required: yes/no
 Reason:
-Risk level: low/medium/high
+Risk triggers matched:        # cited triggers from § Non-Trivial Triggers
+Importance/Risk: trivial / non-trivial
 Primary output contract:
 State changes:
 Freshness/source requirement:
 User gate required:
 ```
+
+The legacy `Risk level: low/medium/high` field is deprecated in favor of the
+binary `Importance/Risk: trivial / non-trivial` derived from the trigger
+list. Plans authored before the new rules land may continue to use the
+legacy field per the bootstrap transitional exemption (see
+`docs/law/PLANNING_AND_REVIEW_RULES.md` § Bootstrap Transitional Exemption).

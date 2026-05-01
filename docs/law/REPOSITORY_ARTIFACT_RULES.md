@@ -336,7 +336,8 @@ but they remain below the law layer.
 Law defines the following finite set of shared planning protocol files
 distributed in `publish-repo/docs/planning-protocol/`: `README.md`,
 `task-classification.md`, `review-method.md`, `persona-decks-core.md`,
-`persona-decks-specialized.md`. Adding, renaming, or removing a file requires a
+`persona-decks-specialized.md`, `plan-template.md`,
+`persona-section-map.md`. Adding, renaming, or removing a file requires a
 plan that edits this enumeration in the same change; `agentlaw verify`
 mechanically asserts that `publish-repo/docs/planning-protocol/` contains this
 exact set and no unratified sibling files.
