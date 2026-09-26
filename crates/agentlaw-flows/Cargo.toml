@@ -1,0 +1,20 @@
+[package]
+name = "agentlaw-flows"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+agentlaw-contracts = { path = "../agentlaw-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+agentlaw-storage = { path = "../agentlaw-storage" }
+agentlaw-search = { path = "../agentlaw-search" }
+agentlaw-worker = { path = "../agentlaw-worker" }
+time = { version = "0.3", features = ["formatting"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

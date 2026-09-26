@@ -1,0 +1,8 @@
+numpy==1.26.4
+onnx==1.18.0
+onnxruntime==1.22.0
+tokenizers==0.21.4
+protobuf==7.36.2
+flatbuffers==25.12.19
+sympy==1.14.0
+packaging==26.3

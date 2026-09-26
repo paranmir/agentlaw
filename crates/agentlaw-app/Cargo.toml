@@ -1,0 +1,31 @@
+[package]
+name = "agentlaw-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "agentlaw"
+path = "src/main.rs"
+
+[dependencies]
+agentlaw-contracts = { path = "../agentlaw-contracts" }
+agentlaw-storage = { path = "../agentlaw-storage" }
+agentlaw-flows = { path = "../agentlaw-flows" }
+agentlaw-worker = { path = "../agentlaw-worker" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+fs2.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+time = { version = "0.3", features = ["formatting"] }
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }

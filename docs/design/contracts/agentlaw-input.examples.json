@@ -1,0 +1,713 @@
+{
+  "$comment": "Design fixtures only; valid means JSON shape, not successful storage or resolved user intent.",
+  "schema": "agentlaw-input.draft.schema.json",
+  "examples": [
+    {
+      "id": "recall-query",
+      "valid": true,
+      "input": {
+        "action": "recall",
+        "recall_for": "Which interpreter should this machine use?"
+      },
+      "reason": "Ordinary discovery."
+    },
+    {
+      "id": "recall-context",
+      "valid": true,
+      "input": {
+        "action": "recall",
+        "project_path": "C:/work/app",
+        "recall_for": "Resume payment retry work.",
+        "restore_context": true,
+        "include_active_tasks": true,
+        "work_targets": [
+          {
+            "path": "src/payment",
+            "kind": "directory"
+          }
+        ]
+      },
+      "reason": "Context reconstruction and explicit Task request."
+    },
+    {
+      "id": "recall-exact-mixed",
+      "valid": true,
+      "input": {
+        "action": "recall",
+        "memory_ids": [
+          "11111111-1111-4111-8111-111111111111"
+        ],
+        "procedure_ids": [
+          "22222222-2222-4222-8222-222222222222"
+        ]
+      },
+      "reason": "Both exact identity kinds, with no discovery."
+    },
+    {
+      "id": "recall-project-selection",
+      "valid": true,
+      "input": {
+        "action": "recall",
+        "recall_for": "Deployment constraints",
+        "project_hint": "billing",
+        "selected_project_id": "22222222-2222-4222-8222-222222222222",
+        "memory_candidate_limit": 10,
+        "procedure_candidate_limit": 5
+      },
+      "reason": "Known returned project selected without rebinding."
+    },
+    {
+      "id": "remember-create",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "The user corrected the interpreter path after a failed command.",
+            "applies_to": [
+              "machine"
+            ]
+          }
+        ]
+      },
+      "reason": "Create declares applicability."
+    },
+    {
+      "id": "remember-evolve",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ],
+            "what_to_remember": "Use the verified interpreter. Check the environment after a machine change.",
+            "evidence": "The user added a machine-change condition."
+          }
+        ]
+      },
+      "reason": "Complete replacement text, version copied from recall."
+    },
+    {
+      "id": "remember-consolidate",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "consolidate",
+            "consolidation_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              },
+              {
+                "memory_id": "22222222-2222-4222-8222-222222222222",
+                "observed_version": "example-other-version"
+              }
+            ],
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "Both source memories describe the same established procedure.",
+            "applies_to": [
+              "machine"
+            ]
+          }
+        ]
+      },
+      "reason": "At least two references; distinct resolved identities are checked by Runtime."
+    },
+    {
+      "id": "remember-task",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "project_path": "C:/work/app",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "## Objective\nFinish payment retry handling.\n\n## Current position\nCancellation exception confirmed; implementation not started.\n\n## Resume point\nInspect the existing retry entry point.\n\n## References\nUser clarification in this conversation.",
+            "evidence": "The user accepted this objective and exception.",
+            "applies_to": [
+              "project"
+            ],
+            "in_working_set": true
+          }
+        ]
+      },
+      "reason": "Task shares the memory proposal; exact heading validation belongs to Runtime structural preflight."
+    },
+    {
+      "id": "remember-clear-related-links",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ],
+            "what_to_remember": "The previously linked topic is independent.",
+            "evidence": "The user clarified the topics are independent.",
+            "related_memory_ids": []
+          }
+        ]
+      },
+      "reason": "Explicit empty relation set clears the set."
+    },
+    {
+      "id": "pending-inspect",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "example-pending-version"
+        },
+        "pending_action": "inspect"
+      },
+      "reason": "Read retained draft without publishing."
+    },
+    {
+      "id": "pending-judgment",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "example-pending-version"
+        },
+        "pending_action": "continue",
+        "review_judgments": [
+          {
+            "review_ref": "example-review-ref",
+            "decision": "unchanged"
+          }
+        ]
+      },
+      "reason": "Copy Runtime review reference; no new memory for unchanged judgment."
+    },
+    {
+      "id": "pending-replace",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "example-pending-version"
+        },
+        "pending_action": "continue",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "The user corrected the interpreter path after a failed command.",
+            "applies_to": [
+              "machine"
+            ],
+            "proposal_id": "example-returned-proposal-id"
+          }
+        ]
+      },
+      "reason": "Replace one retained proposal, not the whole batch."
+    },
+    {
+      "id": "pending-discard",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "example-pending-version"
+        },
+        "pending_action": "discard",
+        "discard_reason": "The user chose to abandon this uncommitted review.",
+        "user_confirmed": true
+      },
+      "reason": "User confirmation assertion is not proof of a UI action."
+    },
+    {
+      "id": "procedure-authoring",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "procedure": {
+          "operation": "create",
+          "evidence_memory_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ]
+        }
+      },
+      "reason": "Request built-in authoring context before writing."
+    },
+    {
+      "id": "procedure-create",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "authoring_ref": "example-authoring-ref",
+        "procedure": {
+          "operation": "create",
+          "evidence_memory_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ],
+          "applies_to": [
+            "machine"
+          ],
+          "name": "Select the verified interpreter",
+          "use_when": "Before running Python commands on this machine.",
+          "instructions": "Read the verified interpreter memory and use its exact path.",
+          "evidence": "Repeated command failures established this reusable correction."
+        }
+      },
+      "reason": "Instruction-only procedure, separate field names from memory."
+    },
+    {
+      "id": "procedure-evolve-start",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "procedure": {
+          "operation": "evolve",
+          "parent_refs": [
+            {
+              "procedure_id": "22222222-2222-4222-8222-222222222222",
+              "observed_version": "example-procedure-version"
+            }
+          ],
+          "evidence_memory_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ]
+        }
+      },
+      "reason": "Copy all current procedure parents."
+    },
+    {
+      "id": "history-recent",
+      "valid": true,
+      "input": {
+        "action": "history",
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "context_layers": 2
+      },
+      "reason": "Recent causal context."
+    },
+    {
+      "id": "history-search",
+      "valid": true,
+      "input": {
+        "action": "history",
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "context_layers": 2,
+        "history_for": "When did the interpreter change?",
+        "max_matches": 3
+      },
+      "reason": "Search with context windows."
+    },
+    {
+      "id": "history-range",
+      "valid": true,
+      "input": {
+        "action": "history",
+        "procedure_id": "22222222-2222-4222-8222-222222222222",
+        "start_change_id": "example-root-change",
+        "end_change_id": "example-head-change"
+      },
+      "reason": "Exact causal endpoints, no discovery fields."
+    },
+    {
+      "id": "connect-discover",
+      "valid": true,
+      "input": {
+        "action": "connect_project_memory",
+        "project_path": "C:/work/app",
+        "clues": {
+          "repository_url": "https://example.invalid/team/app.git"
+        }
+      },
+      "reason": "Observed clues alone do not bind or create."
+    },
+    {
+      "id": "connect-existing",
+      "valid": true,
+      "input": {
+        "action": "connect_project_memory",
+        "intent": "connect",
+        "project_path": "C:/work/app",
+        "project_id": "22222222-2222-4222-8222-222222222222",
+        "restore_context": true,
+        "recall_for": "Resume the payment retry work."
+      },
+      "reason": "Explicit connection and one logical restore operation."
+    },
+    {
+      "id": "connect-create",
+      "valid": true,
+      "input": {
+        "action": "connect_project_memory",
+        "intent": "create",
+        "project_path": "C:/work/app",
+        "project_name": "Payments"
+      },
+      "reason": "Confirmed first-adoption intent. Description is optional observed context."
+    },
+    {
+      "id": "reject-empty-recall",
+      "valid": false,
+      "input": {
+        "action": "recall"
+      },
+      "reason": "Must have a query or exact IDs."
+    },
+    {
+      "id": "reject-exact-with-restore",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "memory_ids": [
+          "11111111-1111-4111-8111-111111111111"
+        ],
+        "restore_context": true
+      },
+      "reason": "Draft restore option requires a query."
+    },
+    {
+      "id": "reject-exact-with-search-terms",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "memory_ids": [
+          "11111111-1111-4111-8111-111111111111"
+        ],
+        "search_terms": [
+          "python"
+        ]
+      },
+      "reason": "No discovery fields on exact-only."
+    },
+    {
+      "id": "reject-null",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "recall_for": null
+      },
+      "reason": "Omit optional values, never null."
+    },
+    {
+      "id": "reject-duplicate-ids",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "memory_ids": [
+          "11111111-1111-4111-8111-111111111111",
+          "11111111-1111-4111-8111-111111111111"
+        ]
+      },
+      "reason": "Identity arrays are unique."
+    },
+    {
+      "id": "reject-unknown-action",
+      "valid": false,
+      "input": {
+        "action": "recall.expand",
+        "memory_ids": [
+          "11111111-1111-4111-8111-111111111111"
+        ]
+      },
+      "reason": "No new expansion action."
+    },
+    {
+      "id": "reject-request-id",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "request_id": "invented",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "The user corrected the interpreter path after a failed command.",
+            "applies_to": [
+              "machine"
+            ]
+          }
+        ]
+      },
+      "reason": "LLM does not generate runtime execution IDs."
+    },
+    {
+      "id": "reject-create-parent",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "The user corrected the interpreter path after a failed command.",
+            "applies_to": [
+              "machine"
+            ],
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ]
+          }
+        ]
+      },
+      "reason": "Create cannot claim a current parent."
+    },
+    {
+      "id": "reject-create-without-scope",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Known condition.",
+            "evidence": "Observed."
+          }
+        ]
+      },
+      "reason": "Create requires applicability."
+    },
+    {
+      "id": "reject-evolve-without-parent",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "what_to_remember": "Changed.",
+            "evidence": "Observed."
+          }
+        ]
+      },
+      "reason": "Evolve requires copied reference(s)."
+    },
+    {
+      "id": "reject-consolidate-typo",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "consolidate",
+            "consolidate_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              },
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ],
+            "what_to_remember": "Combined.",
+            "evidence": "Observed."
+          }
+        ]
+      },
+      "reason": "Only consolidation_refs is recognized."
+    },
+    {
+      "id": "reject-structured-evidence",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": {
+              "source": "user"
+            },
+            "applies_to": [
+              "machine"
+            ]
+          }
+        ]
+      },
+      "reason": "Evidence remains a string."
+    },
+    {
+      "id": "reject-opaque-memory-ref",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "parent_refs": [
+              "opaque-whole-ref"
+            ],
+            "what_to_remember": "Changed.",
+            "evidence": "Observed."
+          }
+        ]
+      },
+      "reason": "Memory reference is the explicit two-field object."
+    },
+    {
+      "id": "reject-initial-proposal-id",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "what_to_remember": "Use the verified interpreter for this machine.",
+            "evidence": "The user corrected the interpreter path after a failed command.",
+            "applies_to": [
+              "machine"
+            ],
+            "proposal_id": "made-up"
+          }
+        ]
+      },
+      "reason": "Only retained pending proposals have proposal_id."
+    },
+    {
+      "id": "reject-pending-empty-continue",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "v"
+        },
+        "pending_action": "continue"
+      },
+      "reason": "Continue must submit a change or judgment."
+    },
+    {
+      "id": "reject-unconfirmed-discard",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "v"
+        },
+        "pending_action": "discard",
+        "discard_reason": "Old draft",
+        "user_confirmed": false
+      },
+      "reason": "Unconfirmed discard cannot be submitted."
+    },
+    {
+      "id": "reject-procedure-without-authoring",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "procedure": {
+          "operation": "create",
+          "name": "X",
+          "instructions": "Y",
+          "use_when": "Z",
+          "evidence": "Observed.",
+          "evidence_memory_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ],
+          "applies_to": [
+            "user"
+          ]
+        }
+      },
+      "reason": "Final procedure content requires the authoring reference branch."
+    },
+    {
+      "id": "reject-history-two-targets",
+      "valid": false,
+      "input": {
+        "action": "history",
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "procedure_id": "22222222-2222-4222-8222-222222222222",
+        "context_layers": 2
+      },
+      "reason": "Exactly one history target."
+    },
+    {
+      "id": "reject-history-mixed-modes",
+      "valid": false,
+      "input": {
+        "action": "history",
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "context_layers": 2,
+        "start_change_id": "a",
+        "end_change_id": "b"
+      },
+      "reason": "Range and context modes cannot be mixed."
+    },
+    {
+      "id": "reject-history-search-without-limit",
+      "valid": false,
+      "input": {
+        "action": "history",
+        "memory_id": "11111111-1111-4111-8111-111111111111",
+        "context_layers": 2,
+        "history_for": "Change"
+      },
+      "reason": "Search must state max_matches."
+    },
+    {
+      "id": "reject-auto-project-binding",
+      "valid": false,
+      "input": {
+        "action": "connect_project_memory",
+        "project_path": "C:/work/app",
+        "project_id": "22222222-2222-4222-8222-222222222222"
+      },
+      "reason": "Selected identity requires explicit connect intent."
+    },
+    {
+      "id": "reject-count-zero",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "recall_for": "Python",
+        "memory_candidate_limit": 0
+      },
+      "reason": "This draft proposes positive display limits."
+    },
+    {
+      "id": "reject-unknown-key",
+      "valid": false,
+      "input": {
+        "action": "recall",
+        "recall_for": "Python",
+        "query": "extra"
+      },
+      "reason": "Unknown fields must not silently change behavior."
+    },
+    {
+      "id": "pending-retain-after-overlap-review",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "pending_batch_ref": {
+          "pending_batch_id": "22222222-2222-4222-8222-222222222222",
+          "observed_version": "example-pending-version"
+        },
+        "pending_action": "continue",
+        "resolution_ref": "example-returned-resolution-ref"
+      },
+      "reason": "Acknowledge a reviewed overlap without resending unchanged retained proposals. Current-state checks still run."
+    }
+  ]
+}

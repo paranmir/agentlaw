@@ -1,0 +1,14 @@
+/target/
+/.tools/
+/test-output/
+/dist/
+/.agentlaw/
+/.codex/
+/.claude/
+/.agents/
+.env
+.env.*
+!.env.example
+*.onnx
+*.onnx_data
+*.safetensors
