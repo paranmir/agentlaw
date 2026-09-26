@@ -136,7 +136,35 @@ end-to-end validation is deferred; configuration tests are not live-model valida
 
 These are separate steps. Registering MCP does not select a memory store or
 associate your working folder with a project. It installs MCP configuration and
-a short managed `AGENTS.md` bootstrap, not a separate skill.
+a short managed `AGENTS.md` bootstrap. The companion usage skill below is installed
+separately; neither bootstrap nor skill installation establishes a project binding.
+
+#### Install the Agentlaw usage skill
+
+The [Agentlaw skill](skills/agentlaw/SKILL.md) teaches when to recall, save, inspect
+history, use learned procedures and resolve connection problems. In particular,
+"Is Agentlaw connected?" must check the actual project's recall, not merely whether
+the tool exists. It complements the short bootstrap and live tool schema.
+
+In Codex, ask its skill installer:
+
+```text
+Install the agentlaw skill from https://github.com/paranmir/agentlaw,
+using the folder skills/agentlaw.
+```
+
+Alternatively, copy `skills/agentlaw` from a trusted checkout into
+`$CODEX_HOME/skills/agentlaw` (normally `~/.codex/skills/agentlaw`). If that folder
+already exists, review it before replacing anything. Restart Codex to load the
+skill, then ask "Is Agentlaw connected to this project?" Other skill-capable
+harnesses can install the same folder using their documented skill location;
+this does not imply tested compatibility with every harness.
+
+The skill is plain Markdown: no extra runtime or model is installed, no memory is
+created, and MCP registration is unchanged. Install only the skill folder, not
+the repository's contributor `AGENTS.md` as global instructions.
+
+#### Complete Codex setup
 
 1. Prepare the model assets using [model setup](crates/agentlaw-worker/ARTIFACTS.md).
    Preview registration with `agentlaw install --harness codex`, then confirm:
@@ -161,8 +189,8 @@ a short managed `AGENTS.md` bootstrap, not a separate skill.
    this command. Keep the same `AGENTLAW_HOME` for CLI setup and the MCP process.
 
 3. Restart Codex so it loads the installed executable and refreshed tool schema.
-   `agentlaw schema` shows the executable contract with all local references
-   expanded; `agentlaw doctor` checks local setup without resetting memory.
+   `agentlaw schema` shows the public tool's typed input fields and usage guidance;
+   `agentlaw doctor` checks local setup without resetting memory.
 
 4. Have the agent verify the **project's actual root folder** with its workspace
    tools, then call the single MCP tool `agentlaw` to discover project identities:
@@ -233,8 +261,13 @@ and confirmation questions should use the user's language.
 `agentlaw mcp serve --stdio` exposes the MCP server.
 `agentlaw call --json -` reads a request from stdin and writes its result to stdout.
 The [usage guide](docs/usage.md) covers setup, installation, history and Git sharing.
-The [input schema](docs/design/contracts/agentlaw-input.schema.json) and
-[examples](docs/design/contracts/agentlaw-input.examples.json) are included in this repository.
+The [public tool schema](docs/design/contracts/agentlaw-tool.schema.json) explicitly
+describes each field, type and action. The separate
+[runtime validation schema](docs/design/contracts/agentlaw-input.schema.json)
+enforces action-specific requirements and rejects incompatible combinations
+before execution. [Examples](docs/design/contracts/agentlaw-input.examples.json)
+cover both valid and invalid requests. There is still only one MCP tool, and
+the CLI uses the same JSON requests; unused fields should be omitted.
 
 ## Architecture
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Agentlaw action input",
   "description": "Executable contract shared by MCP and CLI. Choose the action and supply its required fields. Use recall for context, remember_this for memory and procedure updates, history for past changes, and connect_project_memory for a verified project folder.",
-  "$comment": "The runtime additionally validates identity existence, current heads, scope, confirmation, review references, Task Markdown headings and publication safety. MCP and CLI schema output inline local references for clients that cannot resolve definitions.",
+  "$comment": "Runtime validation contract, not the model-facing tool descriptor. agentlaw-tool.schema.json presents explicit typed fields and usage guidance. Runtime also validates identity existence, current heads, scope, confirmation, review references, Task Markdown headings and publication safety.",
   "type": "object",
   "oneOf": [
     {

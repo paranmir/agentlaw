@@ -1,4 +1,4 @@
-# Agentlaw Rust rewrite
+# Agentlaw usage
 
 Agentlaw attaches to an existing agent harness. One MCP tool, `agentlaw`, provides
 recall, deliberate memory updates, history and learned procedures. The CLI uses
@@ -54,12 +54,17 @@ see [model artifacts](../crates/agentlaw-worker/ARTIFACTS.md).
 
 Set `AGENTLAW_HOME` to an absolute installation-local state directory for a
 development trial. Keep it separate from legacy data and canonical memory.
-Defaults are `%LOCALAPPDATA%\AgentlawNext` on Windows and
-`$XDG_STATE_HOME/AgentlawNext` (or `~/.local/state/AgentlawNext`) on Unix-like systems.
-The `AgentlawNext` state-directory name is intentionally retained to keep existing
-Rust state stable and separate from legacy Python data. Renaming the executable
-does not migrate or overwrite either data set. These path conventions are not
-evidence of cross-platform testing.
+Defaults are `%LOCALAPPDATA%\Agentlaw` on Windows and
+`$XDG_STATE_HOME/Agentlaw` (or `~/.local/state/Agentlaw`) on Unix-like systems.
+`AGENTLAW_HOME` continues to override the installation state directory. Changing
+the default does not move existing data or rewrite registered harness commands.
+Before upgrading an installation using a former default, stop its Agentlaw
+processes and preserve its state and machine-local source-coordination registry.
+Transfer the registry to the new location without overwriting existing bindings;
+update configured paths explicitly if moving installation state. Do not run old
+and new binaries against the same store with separate coordination registries.
+Legacy Python data must not be adopted as Rust state. These path conventions are
+not evidence of cross-platform testing.
 
 ```text
 agentlaw store propose-location

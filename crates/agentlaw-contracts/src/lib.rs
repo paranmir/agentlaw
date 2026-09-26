@@ -5,49 +5,13 @@ pub mod validation;
 pub const INPUT_SCHEMA: &str =
     include_str!("../../../docs/design/contracts/agentlaw-input.schema.json");
 
-/// Publish the same contract without local references: clients can see every
-/// action and nested field without implementing JSON Schema reference resolution.
+/// Model-facing field descriptions, separate from the stricter runtime validator.
+/// Keep the public schema explicit: typed properties, enums and nested objects.
+pub const TOOL_INPUT_SCHEMA: &str =
+    include_str!("../../../docs/design/contracts/agentlaw-tool.schema.json");
+
 pub fn tool_input_schema() -> Value {
-    fn inline(node: &Value, root: &Value, stack: &mut Vec<String>) -> Value {
-        match node {
-            Value::Object(object) => {
-                if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-                    assert!(
-                        !stack.iter().any(|r| r == reference),
-                        "recursive tool schema"
-                    );
-                    let pointer = reference.strip_prefix('#').expect("local schema reference");
-                    let target = root.pointer(pointer).expect("resolved schema reference");
-                    stack.push(reference.to_owned());
-                    let mut expanded = inline(target, root, stack);
-                    stack.pop();
-                    // Current contract uses description siblings, which must survive.
-                    for (key, value) in object.iter().filter(|(k, _)| *k != "$ref") {
-                        assert!(
-                            !expanded.as_object().unwrap().contains_key(key),
-                            "conflicting reference sibling"
-                        );
-                        expanded[key] = inline(value, root, stack);
-                    }
-                    expanded
-                } else {
-                    Value::Object(
-                        object
-                            .iter()
-                            .filter(|(k, _)| *k != "$defs")
-                            .map(|(k, v)| (k.clone(), inline(v, root, stack)))
-                            .collect(),
-                    )
-                }
-            }
-            Value::Array(values) => {
-                Value::Array(values.iter().map(|v| inline(v, root, stack)).collect())
-            }
-            _ => node.clone(),
-        }
-    }
-    let root: Value = serde_json::from_str(INPUT_SCHEMA).expect("bundled schema");
-    inline(&root, &root, &mut Vec::new())
+    serde_json::from_str(TOOL_INPUT_SCHEMA).expect("bundled tool schema")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]

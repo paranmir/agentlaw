@@ -295,44 +295,80 @@ mod tests {
         }
     }
     #[test]
-    fn published_schema_is_self_contained_and_preserves_validation() {
-        let published = crate::tool_input_schema();
-        ensure_supported(&published).unwrap();
-        fn assert_inline(value: &Value) {
-            match value {
-                Value::Object(object) => {
-                    assert!(!object.contains_key("$ref"));
-                    assert!(!object.contains_key("$defs"));
-                    for child in object.values() {
-                        assert_inline(child);
-                    }
+    fn tool_schema_is_explicit_and_runtime_still_enforces_action_rules() {
+        let public = crate::tool_input_schema();
+        fn check_shape(schema: &Value) {
+            for key in schema.as_object().unwrap().keys() {
+                assert!(
+                    [
+                        "type",
+                        "properties",
+                        "items",
+                        "enum",
+                        "required",
+                        "additionalProperties",
+                        "description",
+                        "title"
+                    ]
+                    .contains(&key.as_str()),
+                    "not a public tool keyword: {key}"
+                );
+            }
+            assert!(
+                schema["type"].is_string(),
+                "every field needs an explicit type"
+            );
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for child in properties.values() {
+                    check_shape(child);
                 }
-                Value::Array(values) => {
-                    for child in values {
-                        assert_inline(child);
-                    }
-                }
-                _ => {}
+            }
+            if let Some(items) = schema.get("items") {
+                check_shape(items);
             }
         }
-        assert_inline(&published);
-        assert_eq!(published["title"], "Agentlaw action input");
+        check_shape(&public);
+        let internal: Value = serde_json::from_str(INPUT_SCHEMA).unwrap();
+        // Every action field remains callable through the public descriptor.
+        for variant in internal["oneOf"].as_array().unwrap() {
+            let branch = internal
+                .pointer(variant["$ref"].as_str().unwrap().trim_start_matches('#'))
+                .unwrap();
+            for name in branch["properties"].as_object().unwrap().keys() {
+                assert!(
+                    public["properties"].get(name).is_some(),
+                    "missing field: {name}"
+                );
+            }
+        }
         let fixtures: Value = serde_json::from_str(include_str!(
             "../../../docs/design/contracts/agentlaw-input.examples.json"
         ))
         .unwrap();
         for example in fixtures["examples"].as_array().unwrap() {
-            assert_eq!(
-                accepts(&published, &example["input"], &published),
-                validate_input(&example["input"]).is_ok(),
-                "{}",
-                example["id"]
-            );
+            if example["valid"] == true {
+                assert!(
+                    accepts(&public, &example["input"], &public),
+                    "{}",
+                    example["id"]
+                );
+            }
         }
-        let recall = &published["oneOf"][0];
-        assert_eq!(recall["properties"]["action"]["const"], "recall");
-        assert_eq!(recall["properties"]["recall_for"]["type"], "string");
-        assert!(recall["properties"]["recall_for"]["description"].is_string());
+        // Public shape is descriptive, not a replacement for cross-field validation.
+        let invalid = serde_json::json!({"action":"connect_project_memory",
+            "project_path":"C:/work/project","intent":"connect"});
+        assert!(accepts(&public, &invalid, &public));
+        assert!(crate::parse_request(&invalid.to_string()).is_err());
+        let wrong_type = serde_json::json!({"action":"recall","recall_for":42});
+        assert!(!accepts(&public, &wrong_type, &public));
+        assert!(crate::parse_request(&wrong_type.to_string()).is_err());
+        assert_eq!(public["properties"]["action"]["type"], "string");
+        assert_eq!(public["properties"]["recall_for"]["type"], "string");
+        assert!(
+            public["properties"]["memories"]["items"]["properties"]["what_to_remember"]
+                ["description"]
+                .is_string()
+        );
     }
     #[test]
     fn duplicate_keys_rejected() {

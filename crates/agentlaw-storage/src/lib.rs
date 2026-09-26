@@ -584,7 +584,7 @@ impl Store {
             .ok_or_else(|| {
                 Error::RecoveryRequired("machine-local state directory unavailable".into())
             })?
-            .join("AgentlawNext/source-coordination");
+            .join("Agentlaw/source-coordination");
         let identity = self.root.to_string_lossy().to_string();
         #[cfg(windows)]
         let identity = identity.to_lowercase();

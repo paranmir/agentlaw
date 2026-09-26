@@ -274,7 +274,7 @@ mod tests {
             schema()["inputSchema"]
         );
         assert_eq!(
-            r["result"]["tools"][0]["inputSchema"]["oneOf"][0]["properties"]["recall_for"]["type"],
+            r["result"]["tools"][0]["inputSchema"]["properties"]["recall_for"]["type"],
             "string"
         );
     }

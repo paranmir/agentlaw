@@ -236,10 +236,20 @@ supported boundaries but are not required and do not provide semantic judgment.
 
 ## Executable schema and connection recovery
 
-MCP tools/list and CLI schema publish the same executable input contract with
-local schema references expanded inline. Keep action discriminators, field
-descriptions, required fields and validation constraints; do not publish draft
-metadata or replace the contract with an untyped input bag.
+MCP tools/list and CLI schema publish agentlaw-tool.schema.json: a single object
+with explicit typed properties, primitive enums and typed nested objects/arrays.
+Keep one agentlaw tool and existing request field names. Describe each field's
+action, required companions and usage in English. Do not expose top-level union
+branches, schema references, or conditional validation machinery to the model.
+
+agentlaw-input.schema.json remains the internal validator for both MCP and CLI.
+It enforces action-specific required/forbidden fields, scope combinations and
+review requirements before execution. The public schema describes a usable
+input surface; it does not replace runtime validation or claim API strict-mode
+compatibility. Do not force irrelevant fields or null placeholders into calls.
+Check that valid contract examples fit the public shape and that runtime still
+rejects invalid combinations. Codex model-visible rendering is a separate check
+after local installation and restart, before release.
 
 When project context is unavailable because a folder is not connected, explain
 that project memory has not been retrieved and give a concrete

@@ -6,13 +6,14 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
-For 0.2.1, the local Windows workspace suite passed **145 ordinary tests** with
+For the first 0.2.1 candidate, the local Windows workspace suite passed **145 ordinary tests** with
 zero failures (the same three opt-in real-model tests remain ignored). New checks
 cover inline schema visibility and equivalence for valid/invalid contract
 fixtures, parseable connection recovery instructions, and discovery without
 implicit binding. The application tests verify MCP tools/list uses that schema.
-The current already-open Codex session may retain its previous tool declaration;
-its final model-visible rendering must be checked after restart.
+After restart, actual MCP calls worked but the model-visible declaration still
+showed args: unknown. Inlining references alone did not fix visibility. The
+release run was cancelled and no 0.2.1 release was published.
 
 The 0.2.1 optimized local build was installed through `install --harness codex
 --confirm-install`. Memory-store selection, machine identity/name, model manifest
@@ -65,6 +66,21 @@ measure semantic retrieval quality or establish a latency SLA.
 
 ## Still unverified
 
+### Explicit public tool schema candidate (2026-09-26)
+
+The next local 0.2.1 candidate separates the explicit, typed model-facing schema
+from runtime validation. `cargo fmt --all -- --check` and the 24 contract/app
+library tests passed, including valid fixtures, wrong field types and runtime
+rejection of invalid action combinations. `cargo build --locked --release
+--workspace` passed. This was a targeted rerun, not another full-suite run.
+
+Installed with `install --harness codex --confirm-install` at
+`0.2.1-6be0c43fa2a43fbb`; global CLI/worker binaries were also updated. Configuration,
+machine identity, model-assets state and unrelated Codex configuration/instructions
+were preserved. The installed `schema` command exposes 36 root properties without
+schema composition/ref keywords. Actual tool rendering after a Codex restart is
+still pending. No release was published for this candidate.
+
 - Live Codex Desktop conversations and actual Oh My Pi model turns. Isolated
   adapter/configuration tests are not the same thing.
 - Real-model/live-harness behavior on Linux/macOS/Arm and actual GPU execution.
@@ -74,6 +90,23 @@ measure semantic retrieval quality or establish a latency SLA.
 - Every idle/reattach/orphan and control-channel-loss interleaving.
 - Whether a particular LLM will always recall and save at the intended moments.
 
-Ordinary installation preserves the `AgentlawNext` state-directory name to avoid
-silently moving existing Rust state or consuming legacy Python memory. Source
-publication does not install into an active user profile or migrate old data.
+Default state and source-coordination paths now use `Agentlaw`. After this change,
+`cargo fmt --all -- --check` and the full workspace suite passed: 145 tests,
+with three opt-in real-model tests skipped. The release build also passed.
+
+The user's local Windows installation was explicitly migrated offline with a
+complete backup, preserving machine identity, project association and memory
+source bytes. Local path metadata, recovery manifest checksums/decisions, ledger
+paths and the source-coordination binding were updated together. Codex config,
+its managed AGENTS.md block and global binaries now use the installed candidate
+`0.2.1-18a1cb61ca113ab9`. Unrelated Codex settings/instructions were preserved.
+CLI recall of Personal Workspace succeeded after model warm-up without diagnostics;
+doctor reported valid source/local DB integrity and a ready embedding worker.
+After Codex restart, the model-visible MCP schema exposed typed input fields and
+an actual project recall succeeded without diagnostics. The worker was ready and
+local database integrity passed. The migration backup was then moved to Recycle
+Bin at the user's request. These checks preceded the 0.2.1 release submission.
+
+This was a one-off authorized migration, not an automatic upgrade feature.
+Other installations require the explicit path/coordination handoff in usage.md;
+source publication does not migrate data or adopt legacy Python memory.

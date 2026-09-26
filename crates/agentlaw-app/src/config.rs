@@ -73,7 +73,7 @@ pub fn state_root() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")));
-    base.map(|p| p.join("AgentlawNext")).ok_or_else(|| {
+    base.map(|p| p.join("Agentlaw")).ok_or_else(|| {
         DomainError::new(
             "configuration_required",
             "Set AGENTLAW_HOME to an absolute local state directory.",

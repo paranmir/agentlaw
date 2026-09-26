@@ -1,0 +1,467 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "recall",
+        "remember_this",
+        "history",
+        "connect_project_memory"
+      ],
+      "description": "recall: supply recall_for or memory_ids/procedure_ids. remember_this: submit memories OR procedure; for retained work use pending_batch_ref and pending_action instead. history: supply one memory_id or procedure_id and either context_layers, context_layers+history_for+max_matches, or start_change_id+end_change_id. connect_project_memory: supply project_path; discover before explicitly connecting or creating."
+    },
+    "project_path": {
+      "type": "string",
+      "description": "Verified absolute root of the project being worked on, not Agentlaw's process cwd. Required for connect_project_memory; supported for recall and new/continued remember_this work."
+    },
+    "project_hint": {
+      "type": "string",
+      "description": "recall only. Observed name or description of a different project to query; this does not rebind the current folder."
+    },
+    "selected_project_id": {
+      "type": "string",
+      "description": "recall only. Copy a project candidate ID and repeat the same project_hint."
+    },
+    "machine_id": {
+      "type": "string",
+      "description": "recall only. Copy a known machine ID for explicit cross-machine lookup; omission uses the installation environment."
+    },
+    "recall_for": {
+      "type": "string",
+      "description": "For recall, describe the current task/question and new observations; omit for ID-only lookup. For connect_project_memory, supply together with restore_context=true to recall after connecting."
+    },
+    "search_terms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Use known literal terms such as commands, paths, names, or error messages; these are search clues, not returned IDs."
+      },
+      "description": "recall only. Optional literal search clues such as known commands, paths, names or error messages; use with recall_for."
+    },
+    "memory_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Copy a returned identity; do not invent one."
+      },
+      "description": "recall only. Retrieve complete current memories by known returned IDs; omit recall_for for ID-only lookup."
+    },
+    "procedure_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Copy a returned identity; do not invent one."
+      },
+      "description": "recall only. Retrieve learned procedures by known returned IDs; omit recall_for for ID-only lookup."
+    },
+    "restore_context": {
+      "type": "boolean",
+      "description": "recall or connect_project_memory only. Set true when project context is missing or incomplete. Requires recall_for; omit for ID-only or focused follow-up."
+    },
+    "include_active_tasks": {
+      "type": "boolean",
+      "description": "recall only."
+    },
+    "memory_candidate_limit": {
+      "type": "integer",
+      "description": "recall only. Positive maximum number of memory candidates to show; omit to use the configured default."
+    },
+    "procedure_candidate_limit": {
+      "type": "integer",
+      "description": "recall only. Positive maximum number of learned-procedure candidates to show; omit to use the configured default."
+    },
+    "work_targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Verified project-relative path. No absolute path or parent traversal."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "kind"
+        ],
+        "additionalProperties": false
+      },
+      "description": "recall only."
+    },
+    "resolution_ref": {
+      "type": "string",
+      "description": "remember_this memory review only. Copy the returned reference unchanged when instructed; do not invent it."
+    },
+    "memories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "description": "create: requires applies_to and no parent/consolidation refs. evolve: requires parent_refs for every current head of one memory, no consolidation_refs. consolidate: requires consolidation_refs for every current head of at least two memories, no parent_refs.",
+            "enum": [
+              "create",
+              "evolve",
+              "consolidate"
+            ]
+          },
+          "what_to_remember": {
+            "type": "string",
+            "description": "Write the complete, coherent current understanding, preserving applicable conditions and exceptions. When evolving a memory, replace its current text rather than appending a chronological log. For task memory, use Objective / Current position / Resume point / References to capture user intent, the current choice and rationale, verification status, unresolved questions, and the next check. Keep the rationale needed to continue in the task itself; reference independent memories and the Plan without duplicating their full texts."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Record observations, user corrections or decisions, and verification supporting this update. Preserve new occurrences, conditions, and supporting evidence even when the conclusion is unchanged. Distinguish observations from hypotheses."
+          },
+          "applies_to": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "user",
+                "project",
+                "machine"
+              ]
+            },
+            "description": "For create, choose exactly [user], [project], [machine], or [project, machine]. For evolve/consolidate, omit to inherit applicability or supply the intended scope explicitly."
+          },
+          "parent_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "memory_id": {
+                  "type": "string",
+                  "description": "Copy memory_id from the returned memory_ref."
+                },
+                "observed_version": {
+                  "type": "string",
+                  "description": "Copy observed_version unchanged. Never compute or guess it."
+                }
+              },
+              "required": [
+                "memory_id",
+                "observed_version"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "consolidation_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "memory_id": {
+                  "type": "string",
+                  "description": "Copy memory_id from the returned memory_ref."
+                },
+                "observed_version": {
+                  "type": "string",
+                  "description": "Copy observed_version unchanged. Never compute or guess it."
+                }
+              },
+              "required": [
+                "memory_id",
+                "observed_version"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "in_working_set": {
+            "type": "boolean",
+            "description": "Omit for non-Task memory. For a Task, true means future work must resume it; false means it has completed, been cancelled, or been superseded. Use Objective / Current position / Resume point / References headings exactly once in that order."
+          },
+          "is_rule": {
+            "type": "boolean",
+            "description": "Use true only for explicitly established standing rules; evidence must support that intent."
+          },
+          "related_memory_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_memory_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "work_targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "project_id": {
+                  "type": "string",
+                  "description": "Copy the target project's known identity."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Project-relative path."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "file",
+                    "directory"
+                  ]
+                },
+                "reading": {
+                  "type": "string",
+                  "enum": [
+                    "related",
+                    "required"
+                  ]
+                }
+              },
+              "required": [
+                "project_id",
+                "path",
+                "kind",
+                "reading"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "proposal_id": {
+            "type": "string",
+            "description": "Only copy an existing proposal_id when replacing a retained pending proposal. Omit for a new proposal."
+          }
+        },
+        "required": [
+          "operation",
+          "what_to_remember",
+          "evidence"
+        ],
+        "additionalProperties": false
+      },
+      "description": "remember_this only. Submit one or more complete memory proposals. For initial memory writes this is required; do not combine with procedure. For pending_action=continue, omit unchanged proposals."
+    },
+    "pending_batch_ref": {
+      "type": "object",
+      "properties": {
+        "pending_batch_id": {
+          "type": "string"
+        },
+        "observed_version": {
+          "type": "string",
+          "description": "Copy the latest returned pending batch version."
+        }
+      },
+      "required": [
+        "pending_batch_id",
+        "observed_version"
+      ],
+      "additionalProperties": false,
+      "description": "remember_this only. Copy the returned pending_batch_id and observed_version together; requires pending_action."
+    },
+    "pending_action": {
+      "type": "string",
+      "enum": [
+        "inspect",
+        "continue",
+        "discard"
+      ],
+      "description": "remember_this retained work only; requires pending_batch_ref. inspect: no other write fields. continue: submit changed memories and/or review_judgments as instructed. discard: requires discard_reason and user_confirmed=true; do not submit edits."
+    },
+    "review_judgments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "review_ref": {
+            "type": "string",
+            "description": "Copy the review reference for the exact presented dependency state."
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "unchanged"
+            ]
+          }
+        },
+        "required": [
+          "review_ref",
+          "decision"
+        ],
+        "additionalProperties": false
+      },
+      "description": "remember_this with pending_action=continue only. For a dependency that remains valid, copy its returned review_ref and set decision=unchanged. If it needs revision, submit the complete updated memory through memories instead."
+    },
+    "discard_reason": {
+      "type": "string",
+      "description": "Required only for remember_this with pending_action=discard. Explain the user-approved reason for discarding retained work."
+    },
+    "user_confirmed": {
+      "type": "boolean",
+      "enum": [
+        true
+      ],
+      "description": "Set true only after the user confirms discarding a pending batch; use only with pending_action=discard."
+    },
+    "procedure": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "create",
+            "evolve"
+          ]
+        },
+        "parent_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "procedure_id": {
+                "type": "string"
+              },
+              "observed_version": {
+                "type": "string",
+                "description": "Copy the returned procedure version unchanged."
+              }
+            },
+            "required": [
+              "procedure_id",
+              "observed_version"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "evidence_memory_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "description": "Copy a returned identity; do not invent one."
+          }
+        },
+        "applies_to": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "user",
+              "project",
+              "machine"
+            ]
+          },
+          "description": "For procedure publication, choose exactly [user], [project], [machine], or [project, machine]. Omit during the authoring request."
+        },
+        "name": {
+          "type": "string",
+          "description": "Action-oriented procedure name."
+        },
+        "use_when": {
+          "type": "string",
+          "description": "One sentence describing when to use this procedure."
+        },
+        "instructions": {
+          "type": "string",
+          "description": "Complete instruction-only procedure, coherently rewritten rather than appended."
+        },
+        "evidence": {
+          "type": "string",
+          "description": "Record observations, user corrections or decisions, and verification supporting this update. Preserve new occurrences, conditions, and supporting evidence even when the conclusion is unchanged. Distinguish observations from hypotheses."
+        }
+      },
+      "required": [
+        "operation",
+        "evidence_memory_ids"
+      ],
+      "additionalProperties": false,
+      "description": "remember_this learned procedure only; never combine with memories or pending work. First submit operation and evidence_memory_ids, plus parent_refs for evolve, to obtain authoring_ref. Then submit that authoring_ref with operation, evidence_memory_ids, name, use_when, instructions and evidence; create also requires applies_to, evolve requires parent_refs. Follow the returned authoring guidance."
+    },
+    "authoring_ref": {
+      "type": "string",
+      "description": "remember_this procedure publication only. Copy the returned authoring reference; submit it with the completed procedure, not memories."
+    },
+    "memory_id": {
+      "type": "string",
+      "description": "history only. Copy a known memory ID. Supply exactly one of memory_id or procedure_id."
+    },
+    "procedure_id": {
+      "type": "string",
+      "description": "history only. Copy a known learned procedure ID. Supply exactly one of memory_id or procedure_id."
+    },
+    "context_layers": {
+      "type": "integer",
+      "description": "history only. Nonnegative ancestor-context depth for recent history or history_for search. Use 0 for no additional ancestor context. Do not combine with start_change_id/end_change_id."
+    },
+    "history_for": {
+      "type": "string",
+      "description": "history only. Describe the past change to find within the selected memory/procedure. Requires context_layers and positive max_matches; do not combine with exact range fields."
+    },
+    "max_matches": {
+      "type": "integer",
+      "description": "history only. Positive maximum search matches; requires history_for and context_layers. Do not use for recent history or exact ranges."
+    },
+    "start_change_id": {
+      "type": "string",
+      "description": "history only. Copy a returned change ID for the inclusive range start; requires end_change_id. Omit context_layers, history_for and max_matches for exact ranges."
+    },
+    "end_change_id": {
+      "type": "string",
+      "description": "history only. Copy a returned change ID for the inclusive range end; requires start_change_id."
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "discover",
+        "connect",
+        "create"
+      ],
+      "description": "connect_project_memory only. discover returns candidates without binding (default). connect requires a user-selected project_id. create requires project_name and confirmed first-time adoption; no candidates alone is not permission to create."
+    },
+    "clues": {
+      "type": "object",
+      "properties": {
+        "repository_url": {
+          "type": "string",
+          "description": "Only an observed repository URL, not Agentlaw's or the memory store's remote."
+        },
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "additionalProperties": false,
+      "description": "connect_project_memory only."
+    },
+    "project_id": {
+      "type": "string",
+      "description": "connect_project_memory with intent=connect only. Copy the candidate ID explicitly selected by the user, even for one candidate."
+    },
+    "project_name": {
+      "type": "string",
+      "description": "connect_project_memory with intent=create only. Required name for a confirmed new project identity."
+    },
+    "project_description": {
+      "type": "string",
+      "description": "connect_project_memory with intent=create only. Optional description of the new project identity."
+    },
+    "memory_store_path": {
+      "type": "string",
+      "description": "connect_project_memory only. Verified existing local memory store path. Does not authorize switching away from another selected store."
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "additionalProperties": false,
+  "title": "Agentlaw tool input",
+  "description": "Choose an action. Supply only fields belonging to that action and omit unused fields. Action-dependent requirements are described below and validated by Agentlaw before execution."
+}

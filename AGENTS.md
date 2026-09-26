@@ -5,8 +5,10 @@ Do not reinstall old governance files, run legacy Python initialization, or trea
 older tags as the current runtime contract.
 
 - Start with `README.md`, `docs/usage.md` and the crate READMEs.
-- `docs/design/contracts/agentlaw-input.schema.json` and its examples are
-  executable input contracts. `docs/contracts/agentlaw-llm-guidance.md` contains
+- `docs/design/contracts/agentlaw-tool.schema.json` is the public typed tool surface;
+  `agentlaw-input.schema.json` in that directory and its examples define runtime
+  validation. Keep both aligned without exposing conditional validation as the
+  model's input description. `docs/contracts/agentlaw-llm-guidance.md` contains
   the accepted tool/bootstrap guidance compiled into the product.
 - Preserve complete Markdown memory, history and pending proposals. Runtime
   validates mechanical conditions; it must not invent semantic merge decisions.

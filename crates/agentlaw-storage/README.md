@@ -17,7 +17,7 @@ units are latest units at the returned source position, deduplicated within a
 page, not a historical snapshot for each sequence. Journal loss does not prevent
 current reads; it does prevent an empty-success change stream.
 
-The machine-local `AgentlawNext/source-coordination` registry pins an exact
+The machine-local `Agentlaw/source-coordination` registry pins an exact
 canonicalized source path to one local control directory. A second local control
 directory fails closed. Registry bindings deliberately do not auto-expire:
 relocation/rebinding/reuse of an old path needs an explicit recovery workflow.
