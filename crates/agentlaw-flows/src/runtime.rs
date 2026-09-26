@@ -539,7 +539,22 @@ impl Runtime {
         result
     }
     fn recall_request(&self, r: RecallRequest) -> Result<Value> {
-        let context = resolve_context(self, r.project_path.as_deref())?;
+        let context = match resolve_context(self, r.project_path.as_deref()) {
+            Ok(context) => context,
+            Err(error) if error.code == "project_connection_required" => {
+                // Discovery is read-only. A candidate, even a sole candidate, is not a binding.
+                let candidates = self.discover(None)?;
+                return Ok(json!({
+                    "status":"needs_user_input",
+                    "code":"project_connection_required",
+                    "message":"Choose a project memory for this folder.",
+                    "candidates":candidates,
+                    "project_path":r.project_path,
+                    "turn_instruction":"Project memory has not been retrieved. Use an already explicit user choice, or ask the user to select a candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, use its recall_result if requested; otherwise repeat the original recall."
+                }));
+            }
+            Err(error) => return Err(error),
+        };
         self.recall_with_context(r, context)
     }
     fn connect_request(&mut self, mut request: ConnectRequest) -> Result<Value> {
@@ -552,7 +567,7 @@ impl Runtime {
             .map(|p| p.project_id.clone());
         let mut result = to_value(connected)?;
         if project.is_none() {
-            result["next_action"] = json!("No project was connected and project memory has not been retrieved. Explain candidates in the user's language and ask the user which project to connect, even for one candidate. Call agentlaw with action=\"connect_project_memory\", the same verified project_path, intent=\"connect\", and the selected project_id. Only after first-time adoption is confirmed, use intent=\"create\" and project_name instead. No candidates alone is not permission to create. After connection, retry the original recall; alternatively include restore_context=true and recall_for in the connection call to restore context there.");
+            result["next_action"] = json!("No project was connected and project memory has not been retrieved. Explain candidates in the user's language and ask the user which project to connect, even for one candidate. Call agentlaw with action=\"connect_project_memory\" and a connect_project_memory object containing the same verified project_path, intent=\"connect\", and the selected project_id. Only after first-time adoption is confirmed, use intent=\"create\" and project_name instead. No candidates alone is not permission to create. After connection, retry the original recall; alternatively include restore_context=true and recall_for in the connection call to restore context there.");
         }
         if restore {
             if let Some(project) = project {

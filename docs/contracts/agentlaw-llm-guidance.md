@@ -10,9 +10,13 @@ Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
 ```text
 Use recall to retrieve saved memory and procedures when starting or resuming a task, when needed context is missing, or before changing a code or document area not yet checked through recall for this task. Recall again with new observations that change what needs checking—constraints, dependencies, counterevidence, changed assumptions, or failure evidence—even without known memory links.
 
+Set action and supply exactly its same-named input object. For example: {"action":"recall","recall":{"recall_for":"Current work"}}. Put every action field inside that object; omit other action objects. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search.
+
 For project work, pass the actual project path verified from workspace information or work tools; reuse it while valid. Set restore_context=true when project context is missing or incomplete. Use ordinary recall for focused follow-up.
 
-Use remember_this to preserve corrections, decisions, unresolved questions, progress, and command/tool friction, including small mistakes and repeated failures. Save changed understanding before extended work that depends on it and at progress checkpoints. Before the final response, check for and save any remaining updates to understanding, evidence, or task state. Keep active tasks current. Batch updates; skip only redundant re-saves, not new occurrences or evidence. Use history to inspect past changes and their evidence.
+Start with recall, not a routine connection preflight. If it returns project candidates, use an already explicit user choice or ask the user to select one, approve a new project, or skip; never auto-select merely because one candidate exists. After an approved connection, use its recall_result if requested or repeat the original recall. Omit optional candidate limits unless needed; their values must be positive integers.
+
+Use remember_this to preserve corrections, decisions, unresolved questions, progress, and command/tool friction that can affect later work, including one small reusable correction or a repeated failure. Preserve findings with their verification status; distinguish user decisions from assistant proposals and unverified inferences. Save clear corrections before dependent work and other useful changes at progress checkpoints. Before the final response, save remaining unsaved updates to understanding, evidence, or task state. Keep active tasks current. Batch updates; skip incidental chatter and redundant re-saves, not new relevant occurrences or evidence. A write attempt is not proof of saving. Use history to inspect past changes and their evidence.
 ```
 
 Here “task” means the work being undertaken, not a prerequisite to create a
@@ -64,7 +68,7 @@ unassociated project location, use the following result guidance, adapted only
 to information actually missing from that result:
 
 ```text
-This project folder is not yet connected to an Agentlaw project. Connect it to use its saved context before continuing project work. Use your workspace information or work tools to verify the actual project root and, when available, that project's Git remote. Call agentlaw with action="connect_project_memory", supplying the verified project path and any known repository address, name, or description. Select an existing project from the returned candidates. Create a new project identity only when first-time adoption is established; missing candidates alone do not establish that. If the memory store is unavailable, connect it before deciding whether the project already exists.
+Project memory has not been retrieved because this folder has no approved connection. Explain the returned candidates. Use an already explicit user choice or ask the user to select one, approve a new project, or skip for now. Do not auto-select merely because one candidate exists. Use connect_project_memory only after approval; use its recall_result if requested, otherwise retry recall. No candidates alone is not permission to create. If discovery was incomplete or the memory store unavailable, do not claim there is no existing project.
 ```
 
 Project observations come from the LLM's actual work environment. Runtime must
@@ -155,16 +159,23 @@ preservation remains applicable when no active Task is needed.
 
 ## Bootstrap
 
-The following accepted bootstrap is for an installation bound to a project
-context. It does not alter `include_active_tasks`; project reconstruction is
-requested independently through `restore_context` (ADR-0141).
+The installer uses the following bootstrap for project work and for user/machine
+recall when no project is confirmed. It does not alter `include_active_tasks`;
+project reconstruction is requested independently through `restore_context`
+(ADR-0141). The exact CLI line is generated from installed paths.
 
 ```text
-When starting or resuming a task, or when task context is missing, call agentlaw with action="recall", recall_for describing the current request, and include_active_tasks=true. Set restore_context=true when project context is missing or incomplete. If agentlaw is not exposed, use the host's tool discovery only if available; if it remains unavailable, use the installed CLI at {AGENTLAW_CLI_PATH}. Follow the available tool description and schema. Do not add routine memory-management reports.
+When starting or resuming work, or when context is missing, call agentlaw with action="recall" and a recall object whose recall_for describes the current request. Put all action inputs inside the same-named object; omit other action objects.
+For project work, confirm the actual working folder using the harness, not the MCP location or home cwd alone. In recall, supply project_path and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Without a confirmed project, recall only user/machine memory without inventing a project binding.
+Recall again when new work areas, changed assumptions, constraints, dependencies, contradictions, or failures may affect the next action.
+Use action="remember_this" for changes worth carrying forward: user decisions/corrections, reusable preferences, verified findings, friction, and active-task progress/open issues, including small reusable corrections. Save clear corrections before dependent work; batch other unsaved changes at progress boundaries, before long dependent work, and before the final response. Skip incidental chat and changes already reflected in current memory. Distinguish explicit user decisions from proposals and unverified inferences.
+If agentlaw is not exposed, try host tool discovery if available; if still unavailable (not denied), use the installed CLI. Follow the tool description/schema and any returned instructions. Do not add routine memory-management reports.
+
+CLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` before authoring a request when its contract is unavailable. The CLI and MCP use the same installation.
 ```
 
-The installer replaces `{AGENTLAW_CLI_PATH}` with the actual properly quoted
-executable path and supplies its actual operation invocation/input mechanism;
+The installer replaces `{state_assignment}` and `{invocation}` with the actual
+state assignment and properly quoted executable invocation;
 it must not leave a placeholder or guessed CLI syntax for the LLM. A non-project
 installation must not invent a project binding or require active-task lookup
 without one; it retains ordinary context recall and the same action contract.
@@ -237,11 +248,14 @@ supported boundaries but are not required and do not provide semantic judgment.
 ## Executable schema and connection recovery
 
 MCP tools/list and CLI schema publish agentlaw-tool.schema.json: a single object
-with explicit typed properties, primitive enums and typed nested objects/arrays.
-Keep one agentlaw tool and existing request field names. Describe each field's
+with action and four explicitly typed, same-named action input objects. Supply
+exactly the selected object. Existing leaf field names stay inside their action
+namespace. No top-level action-specific fields are advertised. Describe each field's
 action, required companions and usage in English. Do not expose top-level union
 branches, schema references, or conditional validation machinery to the model.
 
+Both MCP and CLI normalize grouped requests to the internal flat domain contract;
+legacy flat requests remain accepted, but mixed/group-mismatched requests fail.
 agentlaw-input.schema.json remains the internal validator for both MCP and CLI.
 It enforces action-specific required/forbidden fields, scope combinations and
 review requirements before execution. The public schema describes a usable

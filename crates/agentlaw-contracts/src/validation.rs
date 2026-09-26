@@ -306,6 +306,7 @@ mod tests {
                         "items",
                         "enum",
                         "required",
+                        "minimum",
                         "additionalProperties",
                         "description",
                         "title"
@@ -335,8 +336,14 @@ mod tests {
                 .pointer(variant["$ref"].as_str().unwrap().trim_start_matches('#'))
                 .unwrap();
             for name in branch["properties"].as_object().unwrap().keys() {
+                if name == "action" {
+                    continue;
+                }
+                let action = branch["properties"]["action"]["const"].as_str().unwrap();
                 assert!(
-                    public["properties"].get(name).is_some(),
+                    public["properties"][action]["properties"]
+                        .get(name)
+                        .is_some(),
                     "missing field: {name}"
                 );
             }
@@ -346,27 +353,44 @@ mod tests {
         ))
         .unwrap();
         for example in fixtures["examples"].as_array().unwrap() {
+            let action = example["input"]["action"].as_str().unwrap();
+            let mut fields = example["input"].as_object().unwrap().clone();
+            fields.remove("action");
+            let grouped = serde_json::json!({"action":action, action:fields});
+            assert_eq!(
+                crate::parse_request(&grouped.to_string()).is_ok(),
+                example["valid"] == true,
+                "{}",
+                example["id"]
+            );
             if example["valid"] == true {
-                assert!(
-                    accepts(&public, &example["input"], &public),
-                    "{}",
-                    example["id"]
+                assert!(accepts(&public, &grouped, &public), "{}", example["id"]);
+                assert_eq!(
+                    serde_json::to_value(crate::parse_request(&grouped.to_string()).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(
+                        crate::parse_request(&example["input"].to_string()).unwrap()
+                    )
+                    .unwrap()
                 );
             }
         }
         // Public shape is descriptive, not a replacement for cross-field validation.
         let invalid = serde_json::json!({"action":"connect_project_memory",
-            "project_path":"C:/work/project","intent":"connect"});
+            "connect_project_memory":{"project_path":"C:/work/project","intent":"connect"}});
         assert!(accepts(&public, &invalid, &public));
         assert!(crate::parse_request(&invalid.to_string()).is_err());
-        let wrong_type = serde_json::json!({"action":"recall","recall_for":42});
+        let wrong_type = serde_json::json!({"action":"recall","recall":{"recall_for":42}});
         assert!(!accepts(&public, &wrong_type, &public));
         assert!(crate::parse_request(&wrong_type.to_string()).is_err());
         assert_eq!(public["properties"]["action"]["type"], "string");
-        assert_eq!(public["properties"]["recall_for"]["type"], "string");
+        assert_eq!(
+            public["properties"]["recall"]["properties"]["recall_for"]["type"],
+            "string"
+        );
         assert!(
-            public["properties"]["memories"]["items"]["properties"]["what_to_remember"]
-                ["description"]
+            public["properties"]["remember_this"]["properties"]["memories"]["items"]["properties"]
+                ["what_to_remember"]["description"]
                 .is_string()
         );
     }

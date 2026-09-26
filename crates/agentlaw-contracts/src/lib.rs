@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub mod validation;
+mod wire;
 pub const INPUT_SCHEMA: &str =
     include_str!("../../../docs/design/contracts/agentlaw-input.schema.json");
 
@@ -20,6 +21,8 @@ pub struct DomainError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 impl DomainError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -27,7 +30,12 @@ impl DomainError {
             code: code.into(),
             message: message.into(),
             retryable: false,
+            details: None,
         }
+    }
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new("unsupported", message)
@@ -226,7 +234,7 @@ pub enum Request {
     ConnectProjectMemory(ConnectRequest),
 }
 pub fn parse_request(json: &str) -> Result<Request> {
-    let value = validation::decode_unique(json)?;
+    let value = wire::normalize(validation::decode_unique(json)?)?;
     validation::validate_input(&value)?;
     serde_json::from_value(value).map_err(|_| {
         DomainError::new(

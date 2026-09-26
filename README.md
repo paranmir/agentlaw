@@ -198,8 +198,10 @@ the repository's contributor `AGENTS.md` as global instructions.
    ```json
    {
      "action": "connect_project_memory",
-     "project_path": "C:/work/my-project",
-     "intent": "discover"
+     "connect_project_memory": {
+       "project_path": "C:/work/my-project",
+       "intent": "discover"
+     }
    }
    ```
 
@@ -214,11 +216,13 @@ the repository's contributor `AGENTS.md` as global instructions.
    ```json
    {
      "action": "connect_project_memory",
-     "project_path": "C:/work/my-project",
-     "intent": "connect",
-     "project_id": "<selected candidate project_id>",
-     "restore_context": true,
-     "recall_for": "Current project context, decisions and unfinished work"
+     "connect_project_memory": {
+       "project_path": "C:/work/my-project",
+       "intent": "connect",
+       "project_id": "<selected candidate project_id>",
+       "restore_context": true,
+       "recall_for": "Current project context, decisions and unfinished work"
+     }
    }
    ```
 
@@ -231,10 +235,12 @@ the repository's contributor `AGENTS.md` as global instructions.
    ```json
    {
      "action": "recall",
-     "project_path": "C:/work/my-project",
-     "recall_for": "Context needed for the current request",
-     "include_active_tasks": true,
-     "restore_context": true
+     "recall": {
+       "project_path": "C:/work/my-project",
+       "recall_for": "Context needed for the current request",
+       "include_active_tasks": true,
+       "restore_context": true
+     }
    }
    ```
 
@@ -250,6 +256,12 @@ discover and explicitly connect a project, then retry the original recall.
 and confirmation questions should use the user's language.
 
 ## One tool, deliberate operations
+
+Set `action` and put its inputs inside the same-named object; omit the other
+action objects. Every nested field has an explicit type in the MCP schema.
+For recall, use `memory_candidate_limit` or `procedure_candidate_limit`;
+`max_matches` is only available inside `history`. Older flat requests remain
+accepted for compatibility, but new integrations should use the grouped form.
 
 | Action | Purpose |
 | --- | --- |

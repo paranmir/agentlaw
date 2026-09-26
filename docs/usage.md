@@ -118,7 +118,7 @@ from stdin and emits one result on stdout; progress goes to stderr. Use `schema`
 for the current contract. Do not fabricate IDs or observed versions.
 
 ```json
-{"action":"recall","recall_for":"What context should inform this work?"}
+{"action":"recall","recall":{"recall_for":"What context should inform this work?"}}
 ```
 
 For project work the agent supplies the actual folder observed through its

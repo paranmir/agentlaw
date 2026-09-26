@@ -9,6 +9,12 @@ Agentlaw preserves context; the LLM judges meaning and applicability. Follow the
 single `agentlaw` tool's current schema. Learned procedures are saved instructions,
 not installed harness skills. Answer in the user's language without routine memory reports.
 
+Use exactly the action's same-named input object, for example
+`{"action":"recall","recall":{"recall_for":"Current work"}}`. All fields below
+belong inside that object. Recall limits are `memory_candidate_limit` and
+`procedure_candidate_limit`; `max_matches` belongs only to `history` search.
+Follow the exposed schema on older installations rather than sending unsupported nesting.
+
 ## Establish the right context
 
 Verify the working project folder through harness/work tools, not the MCP location
@@ -29,10 +35,14 @@ or an empty store. Never save a dummy memory as a connectivity test.
   state directory and `agentlaw schema`. CLI success does not prove MCP connectivity.
 - Store unavailable: follow returned recovery guidance. Connect a local Markdown
   store or confirm creation/location. A GitHub URL is not its local path. Do not reset state.
-- `project_connection_required`: call `connect_project_memory` with the verified
-  `project_path` and `intent="discover"`. Ask the user to select even a single
-  candidate; then `intent="connect"` with its `project_id`. Only confirmed first
-  adoption permits `intent="create"` with `project_name`. Retry recall.
+- `project_connection_required` with `status="needs_user_input"`: recall has
+  already discovered candidates. Use an explicit user choice if given; otherwise
+  ask which candidate to connect, whether to create a new project, or whether to
+  skip. A sole candidate is not permission to auto-connect. Use
+  `connect_project_memory` with `intent="connect"` and the selected `project_id`,
+  or `intent="create"` and `project_name` only after confirmed first adoption.
+  Use any returned `recall_result`; otherwise retry recall. Call
+  `intent="discover"` only if candidates are missing or need fresh discovery.
 - Existing folder binding: reuse it across sessions; do not reconnect routinely.
 
 Report verified access, project folder, recall outcome and degraded/unverified
@@ -44,7 +54,7 @@ capabilities. Without a project, explicitly say project connection was not check
 | --- | --- |
 | New code/document area, changed assumption, dependency, contradiction or failure | `recall` with the new observation and what needs checking, even without known links. |
 | Need a known memory/procedure | `recall` by returned IDs; obtain required missing references using returned guidance. |
-| Decision, correction, new evidence, command/tool friction or progress worth carrying forward | `remember_this`; small or repeated mistakes still count. Batch related updates. |
+| Decision, correction, new evidence, command/tool friction or progress worth carrying forward | `remember_this`; a single small mistake counts when its correction is reusable. Preserve its scope and corrected behavior; batch related updates. |
 | Need past decisions or changes | `history` for the known memory/procedure, using its schema and returned range/search guidance. |
 | Repeated friction suggests a reusable procedure | Review the evidence and use `remember_this`'s procedure-authoring flow; follow returned instructions rather than inventing a tool. |
 
@@ -52,8 +62,11 @@ Choose `create`, `evolve` or `consolidate` explicitly. Copy returned IDs/version
 Evolve complete current content, preserving exceptions; do not append a log.
 Separate understanding from evidence and select user/project/machine scope deliberately.
 Maintain unfinished Tasks and record closure using the schema's headings, without
-copying the Plan. Save at progress boundaries and before the final response when
-understanding, evidence or task state changed; skip only redundant saves.
+copying the Plan. Save clear corrections before dependent work; at progress
+boundaries and before the final response, save only useful changes not already
+reflected in current memory. Skip incidental chatter, not new relevant evidence.
+Label assistant proposals and unverified inferences; do not present them as user
+decisions or verified facts. A write attempt is not a successful save.
 
 ## Resolve, do not conceal
 

@@ -6,6 +6,8 @@ older tags as the current runtime contract.
 
 - Start with `README.md`, `docs/usage.md` and the crate READMEs.
 - `docs/design/contracts/agentlaw-tool.schema.json` is the public typed tool surface;
+  use `action` plus its same-named typed input object. Legacy flat calls are
+  normalized internally, not advertised as a second model-facing format.
   `agentlaw-input.schema.json` in that directory and its examples define runtime
   validation. Keep both aligned without exposing conditional validation as the
   model's input description. `docs/contracts/agentlaw-llm-guidance.md` contains

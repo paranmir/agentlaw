@@ -379,6 +379,35 @@ fn project_discovery_does_not_create_identity() {
     assert_eq!(created["project_connection"], again["project_connection"]);
 }
 #[test]
+fn first_recall_discovers_without_binding_even_one_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let created = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","project_path":"C:/work/original","intent":"create","project_name":"Example"}),
+    );
+    let first = call(
+        &mut runtime,
+        json!({"action":"recall","recall_for":"Continue work","project_path":"C:/work/copy"}),
+    );
+    assert_eq!(first["status"], "needs_user_input");
+    assert_eq!(first["code"], "project_connection_required");
+    assert_eq!(
+        first["candidates"][0]["project_id"],
+        created["project_connection"]["project_id"]
+    );
+    assert!(first["turn_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("not been retrieved"));
+    let second = call(
+        &mut runtime,
+        json!({"action":"recall","recall_for":"Continue work","project_path":"C:/work/copy"}),
+    );
+    assert_eq!(second["status"], "needs_user_input");
+}
+#[test]
 fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =

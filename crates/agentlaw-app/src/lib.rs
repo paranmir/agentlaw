@@ -159,13 +159,19 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 pub fn error_payload(error: &DomainError) -> Value {
     let next_action = match error.code.as_str() {
         "project_connection_required" | "project_location_required" =>
-            "Project memory has not been retrieved. Verify the actual project root using the harness workspace or shell, not the MCP process directory. Call the same agentlaw tool with {\"action\":\"connect_project_memory\",\"project_path\":\"<verified absolute project root>\",\"intent\":\"discover\"}; replace the placeholder with that verified path. Optionally supply clues: {\"repository_url\":\"<observed project remote>\",\"name\":\"<known project name>\"}, omitting unknown values. Discovery does not bind a project. Explain returned candidates in the user's language and ask the user which project to connect, even if there is only one. Use intent=\"connect\" with the selected project_id. Use intent=\"create\" with project_name only after first-time adoption is confirmed; no candidates alone is not permission to create. Then retry the original recall. If the memory store is unavailable, connect it first.",
+            "Project memory has not been retrieved. Verify the actual project root using the harness workspace or shell, not the MCP process directory. Call the same agentlaw tool with {\"action\":\"connect_project_memory\",\"connect_project_memory\":{\"project_path\":\"<verified absolute project root>\",\"intent\":\"discover\"}}; replace the placeholder with that verified path. Inside that connect_project_memory object, optionally supply clues: {\"repository_url\":\"<observed project remote>\",\"name\":\"<known project name>\"}, omitting unknown values. Discovery does not bind a project. Explain returned candidates in the user's language and ask the user which project to connect, even if there is only one. Use intent=\"connect\" with the selected project_id. Use intent=\"create\" with project_name only after first-time adoption is confirmed; no candidates alone is not permission to create. Then retry the original recall. If the memory store is unavailable, connect it first.",
         "memory_store_connection_required" =>
             "Memory is unavailable until a local memory store is connected. Explain this in the user's language. Use the installed CLI: agentlaw store propose-location. Ask the user to confirm a new location or provide an existing local memory store. After confirmation, run agentlaw store create --path <confirmed-absolute-path> --confirm-create, or agentlaw store connect --path <existing-local-memory-store>. These are local paths, not GitHub URLs. Then retry the original request. Do not create a project identity before connecting the memory store.",
+        "invalid_input" if error.details.is_some() =>
+            "Correct the listed field and retry. Optional recall candidate limits may be omitted for their configured defaults; zero is not a disable value.",
         _ => "Explain the issue in the user's language. Do not treat it as an empty or successful result.",
     };
-    json!({"code":error.code,"message":error.message,"retryable":error.retryable,
-        "next_action":next_action})
+    let mut payload = json!({"code":error.code,"message":error.message,"retryable":error.retryable,
+        "next_action":next_action});
+    if let Some(details) = &error.details {
+        payload["errors"] = details.clone();
+    }
+    payload
 }
 
 pub fn exit_code(error: &DomainError) -> i32 {
@@ -274,7 +280,8 @@ mod tests {
             schema()["inputSchema"]
         );
         assert_eq!(
-            r["result"]["tools"][0]["inputSchema"]["properties"]["recall_for"]["type"],
+            r["result"]["tools"][0]["inputSchema"]["properties"]["recall"]["properties"]
+                ["recall_for"]["type"],
             "string"
         );
     }
@@ -287,9 +294,13 @@ mod tests {
         let guidance = error["next_action"].as_str().unwrap();
         assert!(guidance.contains("Project memory has not been retrieved"));
         let start = guidance.find('{').unwrap();
-        let end = guidance[start..].find('}').unwrap() + start + 1;
-        let example =
-            guidance[start..end].replace("<verified absolute project root>", "C:/work/project");
+        let example = serde_json::Deserializer::from_str(&guidance[start..])
+            .into_iter::<Value>()
+            .next()
+            .unwrap()
+            .unwrap()
+            .to_string()
+            .replace("<verified absolute project root>", "C:/work/project");
         assert!(matches!(
             parse_request(&example).unwrap(),
             Request::ConnectProjectMemory(_)
@@ -305,6 +316,20 @@ mod tests {
             .contains("store propose-location"));
         let unknown = error_payload(&DomainError::new("other_failure", "Failure."));
         assert!(!unknown["next_action"].as_str().unwrap().contains("intent="));
+    }
+    #[test]
+    fn invalid_limit_error_exposes_field_diagnostic() {
+        let error = parse_request(
+            r#"{"action":"recall","recall":{"recall_for":"x","procedure_candidate_limit":0}}"#,
+        )
+        .unwrap_err();
+        let payload = error_payload(&error);
+        assert_eq!(
+            payload["errors"][0]["path"],
+            "/recall/procedure_candidate_limit"
+        );
+        assert_eq!(payload["errors"][0]["constraint"]["minimum"], 1);
+        assert!(payload["next_action"].as_str().unwrap().contains("omitted"));
     }
     #[test]
     fn description_accepts_git_line_endings_and_requires_complete_fences() {
@@ -329,7 +354,7 @@ mod tests {
         let mut s = McpSession::default();
         let mut b = TestBackend(0);
         ready(&mut s, &mut b);
-        let r=s.handle(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","memory_ids":["m"]}}}"#,&mut b).unwrap();
+        let r=s.handle(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"memory_ids":["m"]}}}}"#,&mut b).unwrap();
         assert_eq!(b.0, 1);
         assert_eq!(r["result"]["isError"], false);
         let text: Value =
@@ -345,6 +370,10 @@ mod tests {
         assert_eq!(r["result"]["isError"], true);
         assert_eq!(b.0, 0);
         assert!(s.handle(r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall_for":"x"}}}"#,&mut b).is_none());
+        assert_eq!(b.0, 0);
+        let r=s.handle(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"recall_for":"x","max_matches":10}}}}"#,&mut b).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r.to_string().contains("recall.memory_candidate_limit"));
         assert_eq!(b.0, 0);
     }
     #[test]
