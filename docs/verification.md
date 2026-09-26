@@ -6,6 +6,22 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
+For 0.2.1, the local Windows workspace suite passed **145 ordinary tests** with
+zero failures (the same three opt-in real-model tests remain ignored). New checks
+cover inline schema visibility and equivalence for valid/invalid contract
+fixtures, parseable connection recovery instructions, and discovery without
+implicit binding. The application tests verify MCP tools/list uses that schema.
+The current already-open Codex session may retain its previous tool declaration;
+its final model-visible rendering must be checked after restart.
+
+The 0.2.1 optimized local build was installed through `install --harness codex
+--confirm-install`. Memory-store selection, machine identity/name, model manifest
+and unrelated Codex configuration/bootstrap content were checked unchanged.
+Installed CLI recall and project discovery returned the new recovery instructions
+without binding a project. Local `doctor` passed source/local integrity checks.
+An additional manually launched stdio probe was blocked by the execution policy;
+it is not counted as a passing live MCP check.
+
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --workspace --no-fail-fast

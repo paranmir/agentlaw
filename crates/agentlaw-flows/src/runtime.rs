@@ -551,6 +551,9 @@ impl Runtime {
             .as_ref()
             .map(|p| p.project_id.clone());
         let mut result = to_value(connected)?;
+        if project.is_none() {
+            result["next_action"] = json!("No project was connected and project memory has not been retrieved. Explain candidates in the user's language and ask the user which project to connect, even for one candidate. Call agentlaw with action=\"connect_project_memory\", the same verified project_path, intent=\"connect\", and the selected project_id. Only after first-time adoption is confirmed, use intent=\"create\" and project_name instead. No candidates alone is not permission to create. After connection, retry the original recall; alternatively include restore_context=true and recall_for in the connection call to restore context there.");
+        }
         if restore {
             if let Some(project) = project {
                 let prepared = self.prepare_for_connection(self.request_control.clone())?;

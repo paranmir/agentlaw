@@ -132,6 +132,95 @@ tokenizer and platform ONNX Runtime artifacts described in
 Codex and Oh My Pi configuration adapters are implemented. Actual Oh My Pi
 end-to-end validation is deferred; configuration tests are not live-model validation.
 
+#### Codex setup: binaries, memory store, then project connection
+
+These are separate steps. Registering MCP does not select a memory store or
+associate your working folder with a project. It installs MCP configuration and
+a short managed `AGENTS.md` bootstrap, not a separate skill.
+
+1. Prepare the model assets using [model setup](crates/agentlaw-worker/ARTIFACTS.md).
+   Preview registration with `agentlaw install --harness codex`, then confirm:
+
+   ```text
+   agentlaw install --harness codex --model-manifest <absolute-manifest.json> --confirm-install
+   ```
+
+   Omit `--model-manifest` only if you intentionally skip semantic retrieval or
+   already have installed assets. Binaries alone do not download the model.
+
+2. Connect the **local Markdown memory store**, not its GitHub URL:
+
+   ```text
+   agentlaw store propose-location
+   agentlaw store create --path <user-confirmed-absolute-path> --confirm-create
+   agentlaw machine name --value <user-chosen-machine-name>
+   ```
+
+   For an existing store, use `agentlaw store connect --path <local-store-path>`
+   instead of `store create`. Download a shared Git repository first, outside
+   this command. Keep the same `AGENTLAW_HOME` for CLI setup and the MCP process.
+
+3. Restart Codex so it loads the installed executable and refreshed tool schema.
+   `agentlaw schema` shows the executable contract with all local references
+   expanded; `agentlaw doctor` checks local setup without resetting memory.
+
+4. Have the agent verify the **project's actual root folder** with its workspace
+   tools, then call the single MCP tool `agentlaw` to discover project identities:
+
+   ```json
+   {
+     "action": "connect_project_memory",
+     "project_path": "C:/work/my-project",
+     "intent": "discover"
+   }
+   ```
+
+   Replace that example path with the verified folder (for example,
+   `/home/me/work/my-project` on Linux). Optional `clues` may contain observed
+   `repository_url`, `name`, and `description`; omit unknown values. Never use
+   Agentlaw's own directory or memory-store remote as project clues.
+
+5. Discovery does **not** connect automatically, even for one candidate. After
+   the user selects the existing project, copy its returned ID:
+
+   ```json
+   {
+     "action": "connect_project_memory",
+     "project_path": "C:/work/my-project",
+     "intent": "connect",
+     "project_id": "<selected candidate project_id>",
+     "restore_context": true,
+     "recall_for": "Current project context, decisions and unfinished work"
+   }
+   ```
+
+   For confirmed first-time adoption, replace `intent` with `"create"`, omit
+   `project_id`, and supply `project_name`. An empty candidate list alone does
+   not establish that this is a new project.
+
+6. Subsequent project recall uses the verified folder without reconnecting:
+
+   ```json
+   {
+     "action": "recall",
+     "project_path": "C:/work/my-project",
+     "recall_for": "Context needed for the current request",
+     "include_active_tasks": true,
+     "restore_context": true
+   }
+   ```
+
+   Use `restore_context` when project context is missing or incomplete; omit it
+   for focused follow-up. Without project work, omit `project_path` and use
+   user/machine recall. CLI fallback accepts these same JSON requests on stdin
+   through `agentlaw call --json -`.
+
+If the tool returns `project_connection_required`, follow its `next_action` to
+discover and explicitly connect a project, then retry the original recall.
+`memory_store_connection_required` means step 2 is needed first. Neither means
+"there are no memories". Instructions to the agent are in English; explanations
+and confirmation questions should use the user's language.
+
 ## One tool, deliberate operations
 
 | Action | Purpose |
@@ -144,7 +233,7 @@ end-to-end validation is deferred; configuration tests are not live-model valida
 `agentlaw mcp serve --stdio` exposes the MCP server.
 `agentlaw call --json -` reads a request from stdin and writes its result to stdout.
 The [usage guide](docs/usage.md) covers setup, installation, history and Git sharing.
-The [input schema](docs/design/contracts/agentlaw-input.draft.schema.json) and
+The [input schema](docs/design/contracts/agentlaw-input.schema.json) and
 [examples](docs/design/contracts/agentlaw-input.examples.json) are included in this repository.
 
 ## Architecture

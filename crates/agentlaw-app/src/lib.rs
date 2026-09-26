@@ -1,5 +1,5 @@
 //! Transport adapters. Business meaning stays in the shared runtime.
-use agentlaw_contracts::{parse_request, DomainError, Request, Result, INPUT_SCHEMA};
+use agentlaw_contracts::{parse_request, DomainError, Request, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -37,7 +37,7 @@ fn description_from_guidance(guidance: &str) -> Option<&str> {
 
 pub fn schema() -> Value {
     json!({"name":"agentlaw", "description":tool_description(),
-        "inputSchema":serde_json::from_str::<Value>(INPUT_SCHEMA).expect("checked schema")})
+        "inputSchema":agentlaw_contracts::tool_input_schema()})
 }
 
 pub trait Backend {
@@ -157,8 +157,15 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 }
 
 pub fn error_payload(error: &DomainError) -> Value {
+    let next_action = match error.code.as_str() {
+        "project_connection_required" | "project_location_required" =>
+            "Project memory has not been retrieved. Verify the actual project root using the harness workspace or shell, not the MCP process directory. Call the same agentlaw tool with {\"action\":\"connect_project_memory\",\"project_path\":\"<verified absolute project root>\",\"intent\":\"discover\"}; replace the placeholder with that verified path. Optionally supply clues: {\"repository_url\":\"<observed project remote>\",\"name\":\"<known project name>\"}, omitting unknown values. Discovery does not bind a project. Explain returned candidates in the user's language and ask the user which project to connect, even if there is only one. Use intent=\"connect\" with the selected project_id. Use intent=\"create\" with project_name only after first-time adoption is confirmed; no candidates alone is not permission to create. Then retry the original recall. If the memory store is unavailable, connect it first.",
+        "memory_store_connection_required" =>
+            "Memory is unavailable until a local memory store is connected. Explain this in the user's language. Use the installed CLI: agentlaw store propose-location. Ask the user to confirm a new location or provide an existing local memory store. After confirmation, run agentlaw store create --path <confirmed-absolute-path> --confirm-create, or agentlaw store connect --path <existing-local-memory-store>. These are local paths, not GitHub URLs. Then retry the original request. Do not create a project identity before connecting the memory store.",
+        _ => "Explain the issue in the user's language. Do not treat it as an empty or successful result.",
+    };
     json!({"code":error.code,"message":error.message,"retryable":error.retryable,
-        "next_action":"Explain the issue in the user's language. Do not treat it as an empty or successful result."})
+        "next_action":next_action})
 }
 
 pub fn exit_code(error: &DomainError) -> i32 {
@@ -262,6 +269,42 @@ mod tests {
         assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 1);
         assert_eq!(r["result"]["tools"][0]["name"], "agentlaw");
         assert!(tool_description().starts_with("Use recall"));
+        assert_eq!(
+            r["result"]["tools"][0]["inputSchema"],
+            schema()["inputSchema"]
+        );
+        assert_eq!(
+            r["result"]["tools"][0]["inputSchema"]["oneOf"][0]["properties"]["recall_for"]["type"],
+            "string"
+        );
+    }
+    #[test]
+    fn connection_errors_explain_the_next_call_without_claiming_empty_memory() {
+        let error = error_payload(&DomainError::new(
+            "project_connection_required",
+            "Not connected.",
+        ));
+        let guidance = error["next_action"].as_str().unwrap();
+        assert!(guidance.contains("Project memory has not been retrieved"));
+        let start = guidance.find('{').unwrap();
+        let end = guidance[start..].find('}').unwrap() + start + 1;
+        let example =
+            guidance[start..end].replace("<verified absolute project root>", "C:/work/project");
+        assert!(matches!(
+            parse_request(&example).unwrap(),
+            Request::ConnectProjectMemory(_)
+        ));
+        assert!(guidance.contains("even if there is only one"));
+        let missing_store = error_payload(&DomainError::new(
+            "memory_store_connection_required",
+            "Not connected.",
+        ));
+        assert!(missing_store["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("store propose-location"));
+        let unknown = error_payload(&DomainError::new("other_failure", "Failure."));
+        assert!(!unknown["next_action"].as_str().unwrap().contains("intent="));
     }
     #[test]
     fn description_accepts_git_line_endings_and_requires_complete_fences() {

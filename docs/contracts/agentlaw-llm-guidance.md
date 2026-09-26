@@ -234,6 +234,23 @@ Longer authoring, consolidation and completion examples belong to the built-in
 procedure. Normal saves do not require loading it each time. Hooks may reinforce
 supported boundaries but are not required and do not provide semantic judgment.
 
+## Executable schema and connection recovery
+
+MCP tools/list and CLI schema publish the same executable input contract with
+local schema references expanded inline. Keep action discriminators, field
+descriptions, required fields and validation constraints; do not publish draft
+metadata or replace the contract with an untyped input bag.
+
+When project context is unavailable because a folder is not connected, explain
+that project memory has not been retrieved and give a concrete
+connect_project_memory request with intent=discover and a verified project_path.
+Unknown paths remain explicitly marked placeholders, never the MCP process cwd.
+Discovery results also explain the next connect/create call. Ask the user to
+select even a single candidate; empty candidates do not establish first-time
+adoption. Connect the local memory store first if none is selected, then retry
+the original recall. Instructions use English; user-facing explanations use
+the user's language. Do not create a separate recovery tool.
+
 ## Boundaries and rationale
 
 - New observations can justify recall without previously known links.

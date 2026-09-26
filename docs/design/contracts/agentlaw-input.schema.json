@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Agentlaw proposed v1 action input — design draft 0.1",
-  "description": "Draft implementation contract, not a currently installed tool schema. Existing accepted semantics plus explicitly proposed transport fields. Read the accompanying interface specification and HOLDs.",
-  "$comment": "This artifact validates shape only. It cannot establish identity existence, every current head, scope interpretation, user confirmation, valid review references, Task Markdown headings, or publication safety. Numeric minimums and new branch fields are draft engineering choices.",
+  "title": "Agentlaw action input",
+  "description": "Executable contract shared by MCP and CLI. Choose the action and supply its required fields. Use recall for context, remember_this for memory and procedure updates, history for past changes, and connect_project_memory for a verified project folder.",
+  "$comment": "The runtime additionally validates identity existence, current heads, scope, confirmation, review references, Task Markdown headings and publication safety. MCP and CLI schema output inline local references for clients that cannot resolve definitions.",
   "type": "object",
   "oneOf": [
     {

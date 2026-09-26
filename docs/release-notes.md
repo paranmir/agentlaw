@@ -1,17 +1,17 @@
-Agentlaw's Rust memory runtime replaces the previous Python/governance seed.
+# Agentlaw 0.2.1
 
-- One MCP tool and a matching CLI for recall, explicit memory updates, history and project connections.
-- Complete Markdown current memory, retained history and rebuildable lexical/vector indexes.
-- Recoverable writes, conflict review, explicit Git sharing and a supervised embedding worker.
-- Native executables for Windows x64, Linux x64 and macOS (Apple Silicon and Intel).
-- Shell and PowerShell installers verify archive checksums. No administrator access is required.
+- MCP and `agentlaw schema` expose inline action and nested field definitions,
+  rather than requiring clients to resolve `$ref`/`$defs`. Input validation is
+  unchanged; the executable contract no longer describes itself as a design draft.
+- Missing project/store connections explain the next action and concrete input
+  shape. Project discovery asks for explicit selection even for one candidate.
+- README documents model setup, MCP registration, memory-store selection and
+  project discovery/connection as distinct steps, with JSON examples.
 
-Install with the attached `install.sh` or `install.ps1`, or download the archive
-for your platform. See the README for curl, wget, PowerShell and source-build commands.
+Install with the attached shell/PowerShell installer or platform archive. To
+update a registered Codex server, run the new executable's
+`agentlaw install --harness codex --confirm-install`, then restart Codex to reload
+the tool schema. Existing model assets, memory and unrelated settings are preserved.
 
-This is the first Rust development release, not a migration of existing Python
-data. Model/tokenizer/ONNX Runtime setup and explicit harness configuration remain
-separate. Existing memories and active harness settings are not automatically changed.
-The release workflow gates publication on the ordinary test suite for each target;
-real-model, live-harness and large-corpus validation have separate limitations in
-`docs/verification.md`.
+The release workflow tests each target before publishing. Model assets remain a
+separate setup step; this update does not migrate legacy Python data.

@@ -295,6 +295,46 @@ mod tests {
         }
     }
     #[test]
+    fn published_schema_is_self_contained_and_preserves_validation() {
+        let published = crate::tool_input_schema();
+        ensure_supported(&published).unwrap();
+        fn assert_inline(value: &Value) {
+            match value {
+                Value::Object(object) => {
+                    assert!(!object.contains_key("$ref"));
+                    assert!(!object.contains_key("$defs"));
+                    for child in object.values() {
+                        assert_inline(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        assert_inline(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_inline(&published);
+        assert_eq!(published["title"], "Agentlaw action input");
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../docs/design/contracts/agentlaw-input.examples.json"
+        ))
+        .unwrap();
+        for example in fixtures["examples"].as_array().unwrap() {
+            assert_eq!(
+                accepts(&published, &example["input"], &published),
+                validate_input(&example["input"]).is_ok(),
+                "{}",
+                example["id"]
+            );
+        }
+        let recall = &published["oneOf"][0];
+        assert_eq!(recall["properties"]["action"]["const"], "recall");
+        assert_eq!(recall["properties"]["recall_for"]["type"], "string");
+        assert!(recall["properties"]["recall_for"]["description"].is_string());
+    }
+    #[test]
     fn duplicate_keys_rejected() {
         assert!(
             crate::parse_request(r#"{"action":"recall","recall_for":"a","recall_for":"b"}"#)

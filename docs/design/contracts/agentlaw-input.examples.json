@@ -1,6 +1,6 @@
 {
-  "$comment": "Design fixtures only; valid means JSON shape, not successful storage or resolved user intent.",
-  "schema": "agentlaw-input.draft.schema.json",
+  "$comment": "Executable contract fixtures; valid means JSON shape, not successful storage or resolved user intent.",
+  "schema": "agentlaw-input.schema.json",
   "examples": [
     {
       "id": "recall-query",
@@ -683,7 +683,7 @@
         "recall_for": "Python",
         "memory_candidate_limit": 0
       },
-      "reason": "This draft proposes positive display limits."
+      "reason": "Display limits must be positive."
     },
     {
       "id": "reject-unknown-key",

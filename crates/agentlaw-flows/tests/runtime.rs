@@ -363,6 +363,11 @@ fn project_discovery_does_not_create_identity() {
         json!({"action":"connect_project_memory","project_path":"C:/work/example"}),
     );
     assert_eq!(discover["code"], "project_connection_required");
+    assert!(discover["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("even for one candidate"));
+    assert!(discover.get("project_connection").is_none());
     let created = call(
         &mut runtime,
         json!({"action":"connect_project_memory","project_path":"C:/work/example","intent":"create","project_name":"Example"}),

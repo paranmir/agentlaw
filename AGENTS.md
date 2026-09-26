@@ -5,7 +5,7 @@ Do not reinstall old governance files, run legacy Python initialization, or trea
 older tags as the current runtime contract.
 
 - Start with `README.md`, `docs/usage.md` and the crate READMEs.
-- `docs/design/contracts/agentlaw-input.draft.schema.json` and its examples are
+- `docs/design/contracts/agentlaw-input.schema.json` and its examples are
   executable input contracts. `docs/contracts/agentlaw-llm-guidance.md` contains
   the accepted tool/bootstrap guidance compiled into the product.
 - Preserve complete Markdown memory, history and pending proposals. Runtime
