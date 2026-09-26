@@ -1,7 +1,7 @@
 # Source snapshot
 
 Authoring repository: https://github.com/paranmir/agentlaw-workspace
-Authoring commit: 1cf540ba35090c8d0aaafc15811a84ed091d8e5f
+Authoring commit: 0dc9e4e6510ffce65f8d90680490de4dc37507df
 
 The committed rewrite/ tree is exported at this repository root. The schema,
 examples and accepted guidance accompany it, with relative includes relocated.

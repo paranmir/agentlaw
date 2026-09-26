@@ -172,7 +172,7 @@ fn memory_available() -> Result<u64> {
     }
     Ok(status.available_physical)
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn memory_available() -> Result<u64> {
     let text = fs::read_to_string("/proc/meminfo")
         .map_err(|_| Error::ResourceUnknown("physical memory".into()))?;
@@ -184,4 +184,51 @@ fn memory_available() -> Result<u64> {
         })
         .and_then(|n| n.checked_mul(1024))
         .ok_or_else(|| Error::ResourceUnknown("physical memory".into()))
+}
+
+#[cfg(target_os = "macos")]
+fn memory_available() -> Result<u64> {
+    unsafe extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let unknown = || Error::ResourceUnknown("physical memory".into());
+    // Use the SDK layout from libc, including room for newer kernel fields.
+    // An older kernel may return fewer fields; only the first three are read.
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: the output buffer has the supplied size and ABI layout. Release
+    // the host send right even when the query fails; never retain one per write.
+    let (status, page_size) = unsafe {
+        let host = libc::mach_host_self();
+        if host == 0 {
+            return Err(unknown());
+        }
+        let status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stats as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (status, libc::sysconf(libc::_SC_PAGESIZE))
+    };
+    if status != libc::KERN_SUCCESS || count < 3 || page_size <= 0 {
+        return Err(unknown());
+    }
+    // Conservative available-memory estimate: free and inactive pages, not
+    // active/wired memory or swap. Speculative pages already belong to free.
+    u64::from(stats.free_count)
+        .checked_add(u64::from(stats.inactive_count))
+        .and_then(|pages| pages.checked_mul(page_size as u64))
+        .ok_or_else(unknown)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn memory_available() -> Result<u64> {
+    Err(Error::ResourceUnknown(
+        "physical memory on this platform".into(),
+    ))
 }

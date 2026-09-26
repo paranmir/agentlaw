@@ -88,17 +88,20 @@ fn daemon(state: &Path) -> Daemon {
         .arg(&worker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let guard = Daemon::new(child);
-    for _ in 0..200 {
+    // Shared CI runners can need longer than five seconds for process startup.
+    // Return as soon as the endpoint exists; this is a deadline, not a delay.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if worker.join("endpoint.json").is_file() {
             return guard;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("Owned test daemon failed to start");
+    panic!("Owned test daemon failed to start within 30 seconds: {worker:?}");
 }
 fn initialize(state: &Path, source: &Path) {
     let (out, value) = run(
