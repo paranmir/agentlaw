@@ -274,7 +274,7 @@ mod tests {
             .unwrap();
         assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 1);
         assert_eq!(r["result"]["tools"][0]["name"], "agentlaw");
-        assert!(tool_description().starts_with("Use recall"));
+        assert!(tool_description().starts_with("Persistent memory"));
         assert_eq!(
             r["result"]["tools"][0]["inputSchema"],
             schema()["inputSchema"]

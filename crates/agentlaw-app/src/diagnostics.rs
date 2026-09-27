@@ -63,8 +63,12 @@ pub fn doctor(state: &Path) -> Result<Value> {
     let local = selected.runtime_root(state);
     // Does not bootstrap/recover/migrate the store. Owned temporary disk spools
     // are necessary to check a large DAG without holding all bodies in RAM.
-    let store = Store::open_read_only(&selected.memory_store_path, local.join("canonical"))
-        .map_err(storage_error)?;
+    let store = Store::open_read_only_with_coordination(
+        &selected.memory_store_path,
+        local.join("canonical"),
+        config::coordination_root(state),
+    )
+    .map_err(storage_error)?;
     let audit = store.audit_source().map_err(storage_error)?;
     let control = database_health(&local.join("control.sqlite"))?;
     let journal = database_health(&local.join("canonical/journal.sqlite"))?;
@@ -100,7 +104,11 @@ pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<V
     control.phase("recovering_recorded_publication");
     // Open may finish the exact durable decision. It never invents a new memory.
     let mut journal_repair = None;
-    let store = match Store::open(&selected.memory_store_path, local.join("canonical")) {
+    let store = match Store::open_with_coordination(
+        &selected.memory_store_path,
+        local.join("canonical"),
+        config::coordination_root(state),
+    ) {
         Ok(store) => store,
         Err(agentlaw_storage::Error::Sql(rusqlite::Error::SqliteFailure(ref detail, _)))
             if matches!(
@@ -111,11 +119,19 @@ pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<V
             control.check()?;
             control.phase("rebuilding_corrupt_journal_from_retained_decisions");
             journal_repair = Some(
-                Store::repair_local_journal(&selected.memory_store_path, local.join("canonical"))
-                    .map_err(storage_error)?,
+                Store::repair_local_journal_with_coordination(
+                    &selected.memory_store_path,
+                    local.join("canonical"),
+                    config::coordination_root(state),
+                )
+                .map_err(storage_error)?,
             );
-            Store::open(&selected.memory_store_path, local.join("canonical"))
-                .map_err(storage_error)?
+            Store::open_with_coordination(
+                &selected.memory_store_path,
+                local.join("canonical"),
+                config::coordination_root(state),
+            )
+            .map_err(storage_error)?
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -134,11 +150,12 @@ pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<V
         return Err(DomainError::new("control_backup_required",format!("Canonical recovery was preserved, but {} is absent or cannot be validated. This selected binding's database contains authoritative unpublished proposals and authoring decisions, not just a rebuildable index. Preserve any remaining database and WAL/SHM sidecars. Stop clients and restore a consistent backup for this same binding, or investigate permissions/corruption. Repair will not replace it with an empty database or claim those proposals were recovered.",local.join("control.sqlite").display())));
     }
     let identity = machine::load_or_create(state)?;
-    let mut runtime = agentlaw_flows::Runtime::open_with_machine(
+    let mut runtime = agentlaw_flows::Runtime::open_with_machine_and_coordination(
         &selected.memory_store_path,
         &local,
         &selected.user_id,
         &identity.machine_id,
+        config::coordination_root(state),
     )?;
     let worker_config = installed::worker_config(state)?;
     if worker_config.model.is_some() {

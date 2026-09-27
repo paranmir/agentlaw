@@ -17,11 +17,17 @@ units are latest units at the returned source position, deduplicated within a
 page, not a historical snapshot for each sequence. Journal loss does not prevent
 current reads; it does prevent an empty-success change stream.
 
-The machine-local `Agentlaw/source-coordination` registry pins an exact
+The installation's `state/source-coordination` registry pins an exact
 canonicalized source path to one local control directory. A second local control
 directory fails closed. Registry bindings deliberately do not auto-expire:
 relocation/rebinding/reuse of an old path needs an explicit recovery workflow.
-Temporary test directories can therefore leave inert registry records behind.
+The app explicitly supplies this registry to normal, read-only, repair, and Git
+staging paths. Storage does not inspect profile environment variables to choose
+another registry. Convenience library constructors use a sibling of their local
+control directory, keeping isolated tests inside test storage. The registry is
+not part of Git-shared Markdown memory. Older AppData
+registries require an explicit offline migration before the new location is used
+for an existing source; changing this code does not move existing bindings.
 
 ## Verification boundary
 

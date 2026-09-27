@@ -47,6 +47,7 @@ impl Clone for OwnedPublishedReader {
             store: Store {
                 root: self.store.root.clone(),
                 local: self.store.local.clone(),
+                coordination: self.store.coordination.clone(),
             },
         }
     }

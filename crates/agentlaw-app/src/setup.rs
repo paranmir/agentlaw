@@ -60,7 +60,7 @@ pub(crate) fn connect_selection_with_control(
             if !path.is_dir() || !path.join("format.md").is_file() {
                 return Err(DomainError::new("connected_store_unavailable", "The selected store is missing or invalid. Its selection was preserved, not reported as a successful reconnect."));
             }
-            agentlaw_storage::Store::open(path,selected.runtime_root(state).join("canonical"))
+            agentlaw_storage::Store::open_with_coordination(path,selected.runtime_root(state).join("canonical"), config::coordination_root(state))
                 .map_err(|_|DomainError::new("connected_store_unavailable", "The selected store failed validation or requires recovery. Its selection was preserved."))?;
         }
     }
@@ -103,22 +103,30 @@ pub(crate) fn connect_selection_with_control(
         config::binding_root(state, &source)?
     };
     if !create {
-        agentlaw_storage::Store::attach_existing(&source, local.join("canonical")).map_err(
-            |_| {
-                DomainError::new(
-                    "store_validation_failed",
-                    "The proposed store failed validation. The previous selection remains usable.",
-                )
-            },
-        )?;
+        agentlaw_storage::Store::attach_existing_with_coordination(
+            &source,
+            local.join("canonical"),
+            config::coordination_root(state),
+        )
+        .map_err(|_| {
+            DomainError::new(
+                "store_validation_failed",
+                "The proposed store failed validation. The previous selection remains usable.",
+            )
+        })?;
     }
     let machine = machine::load_or_create(state)?;
     let user_id = previous
         .as_ref()
         .map(|c| c.user_id.clone())
         .unwrap_or_else(|| "personal".into());
-    let mut prepared =
-        agentlaw_flows::Runtime::open_with_machine(&source, &local, &user_id, &machine.machine_id)?;
+    let mut prepared = agentlaw_flows::Runtime::open_with_machine_and_coordination(
+        &source,
+        &local,
+        &user_id,
+        &machine.machine_id,
+        config::coordination_root(state),
+    )?;
     let worker_configuration = crate::installed::worker_config(state)?;
     let semantic_required = worker_configuration.model.is_some();
     if semantic_required {

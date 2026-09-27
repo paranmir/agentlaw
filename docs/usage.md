@@ -54,15 +54,43 @@ see [model artifacts](../crates/agentlaw-worker/ARTIFACTS.md).
 
 Set `AGENTLAW_HOME` to an absolute installation-local state directory for a
 development trial. Keep it separate from legacy data and canonical memory.
-Defaults are `%LOCALAPPDATA%\Agentlaw` on Windows and
-`$XDG_STATE_HOME/Agentlaw` (or `~/.local/state/Agentlaw`) on Unix-like systems.
-`AGENTLAW_HOME` continues to override the installation state directory. Changing
-the default does not move existing data or rewrite registered harness commands.
-Before upgrading an installation using a former default, stop its Agentlaw
-processes and preserve its state and machine-local source-coordination registry.
-Transfer the registry to the new location without overwriting existing bindings;
-update configured paths explicitly if moving installation state. Do not run old
-and new binaries against the same store with separate coordination registries.
+Without this override, an installed executable uses its managed layout marker;
+an unmanaged executable does not silently adopt older AppData state. The default
+Windows installer root is the current user's `Agentlaw` directory, derived from
+the user profile rather than a hard-coded account name.
+The release installers use a managed root outside AppData instead:
+`<selected-root>/bin`, `<selected-root>/state`, `<selected-root>/memory` and
+`<selected-root>/models`. Its executable discovers `state` using the layout
+marker when `AGENTLAW_HOME` is unset; the harness adapter explicitly configures
+that same state path. `store propose-location` returns the sibling memory path,
+but does not create it. LLVM-MinGW/Rust build tools are for source development,
+not required by the release and not installed automatically.
+The Windows installer refuses a new root when known older AppData state or
+another managed root is found. Resolve or migrate that state explicitly first;
+one OS user shares one installation across harnesses. Reuse the
+same `-RootDir` to upgrade a nondefault Windows root. The Unix installer uses
+`$HOME/Agentlaw` by default, accepts `AGENTLAW_ROOT` for another complete root,
+and refuses known legacy state instead of adopting it silently.
+`AGENTLAW_HOME` continues to override the installation state directory. The
+`source-coordination` registry lives under that installation's `state` directory.
+All clients use this registry so the same Markdown source cannot bind to
+independent local recovery directories. The app explicitly passes the registry
+to storage, diagnostics, repair, and Git staging. Isolated tests use isolated
+registries, not a profile-global registry.
+The registry is local state, not Git-shared memory. Changing the default does not
+move existing data or rewrite registered harness commands. Before upgrading an
+installation using a former default, stop its Agentlaw processes and preserve
+its state and old source-coordination registry. Migrate source and registry
+together, checking existing bindings before replacement; update configured paths
+explicitly if moving installation state. Do not run old and new binaries against
+the same store with separate coordination registries. The new runtime does not
+search old registry locations; offline migration must account for them first.
+Index generation acknowledgements include their absolute backend directory.
+After an explicit offline relocation has updated source/control/recovery bindings
+and harness paths, run `agentlaw repair` from the new installation to rebuild
+derived generations. Copying index files alone is not sufficient. Verify a real
+semantic recall and subsequent write/index advancement before retiring backups.
+`repair` is not a relocation command and does not rewrite those source bindings.
 Legacy Python data must not be adopted as Rust state. These path conventions are
 not evidence of cross-platform testing.
 

@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const MANAGED_LAYOUT_MARKER: &str = ".agentlaw-layout";
+const MANAGED_LAYOUT_VERSION: &str = "agentlaw-managed-layout-v1";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -67,18 +70,180 @@ pub fn state_root() -> Result<PathBuf> {
             "AGENTLAW_HOME must be absolute.",
         ));
     }
-    #[cfg(windows)]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")));
-    base.map(|p| p.join("Agentlaw")).ok_or_else(|| {
+    let executable = std::env::current_exe().map_err(|_| {
         DomainError::new(
-            "configuration_required",
-            "Set AGENTLAW_HOME to an absolute local state directory.",
+            "invalid_installation",
+            "Cannot locate the Agentlaw executable to determine its installation. Set AGENTLAW_HOME explicitly or repair the installation.",
         )
-    })
+    })?;
+    {
+        if let Some(directory) = executable.parent() {
+            if directory.file_name().is_some_and(|name| name == "bin") {
+                if let Some(root) = directory.parent() {
+                    let state = root.join("state");
+                    if managed_install_root(&state)?.is_some() {
+                        return Ok(state);
+                    }
+                    if managed_candidate_state_exists(&state)? {
+                        return Err(DomainError::new(
+                            "invalid_installation",
+                            "Agentlaw state exists beside this executable but its layout marker is missing. Repair the installation before using memory.",
+                        ));
+                    }
+                }
+            }
+            if let Some(versions) = directory.parent() {
+                if versions.file_name().is_some_and(|name| name == "versions") {
+                    if let Some(state) = versions.parent() {
+                        if managed_install_root(state)?.is_some() {
+                            return Ok(state.to_path_buf());
+                        }
+                        if managed_candidate_state_exists(state)? {
+                            return Err(DomainError::new(
+                                "invalid_installation",
+                                "Agentlaw version state exists but its layout marker is missing. Repair the installation before using memory.",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let profile = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(profile) = profile.filter(|path| path.is_absolute()) {
+        let state = profile.join("Agentlaw/state");
+        if managed_install_root(&state)?.is_some() {
+            return Ok(state);
+        }
+    }
+    Err(DomainError::new(
+        "configuration_required",
+        "Install Agentlaw under the user profile or set AGENTLAW_HOME to an absolute local state directory. Existing AppData state is not selected automatically.",
+    ))
+}
+
+fn managed_candidate_state_exists(state: &Path) -> Result<bool> {
+    match fs::symlink_metadata(state) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(DomainError::new(
+            "invalid_installation",
+            "Cannot inspect Agentlaw state beside this executable. Repair the installation before using memory.",
+        )),
+    }
+}
+
+/// A release installer writes this marker outside AppData. Older and development
+/// installations require an explicit AGENTLAW_HOME instead of an AppData fallback.
+pub fn managed_install_root(state: &Path) -> Result<Option<PathBuf>> {
+    if state.file_name().is_none_or(|name| name != "state") {
+        return Ok(None);
+    }
+    let Some(root) = state.parent() else {
+        return Ok(None);
+    };
+    let marker_path = root.join(MANAGED_LAYOUT_MARKER);
+    let marker_metadata = match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(DomainError::new(
+                "invalid_installation",
+                "Cannot inspect the Agentlaw layout marker. Repair the installation before using memory.",
+            ));
+        }
+    };
+    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+        return Err(DomainError::new(
+            "invalid_installation",
+            "The Agentlaw layout marker must be an ordinary file.",
+        ));
+    }
+    let marker = match fs::read_to_string(&marker_path) {
+        Ok(marker) => marker,
+        Err(_) => {
+            return Err(DomainError::new(
+                "invalid_installation",
+                "Cannot read the Agentlaw layout marker. Repair the installation before using memory.",
+            ));
+        }
+    };
+    if marker.trim() != MANAGED_LAYOUT_VERSION {
+        return Err(DomainError::new(
+            "invalid_installation",
+            "The Agentlaw layout marker is invalid or unsupported. Repair the installation before using memory.",
+        ));
+    }
+    match fs::symlink_metadata(state) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(DomainError::new(
+                "invalid_installation",
+                "Agentlaw state must be an ordinary directory in this installation.",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(DomainError::new(
+                "invalid_installation",
+                "Cannot inspect Agentlaw state. Repair the installation before using memory.",
+            ));
+        }
+    }
+    Ok(Some(root.to_path_buf()))
+}
+
+pub fn proposed_memory_store_path() -> Result<PathBuf> {
+    let state = state_root()?;
+    Ok(managed_install_root(&state)?
+        .map(|root| root.join("memory"))
+        .unwrap_or_else(|| state.join("memory")))
+}
+
+pub fn model_artifact_root(state: &Path) -> Result<PathBuf> {
+    Ok(managed_install_root(state)?
+        .map(|root| root.join("models"))
+        .unwrap_or_else(|| state.join("artifacts")))
+}
+
+pub fn coordination_root(state: &Path) -> PathBuf {
+    state.join("source-coordination")
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn managed_layout_requires_its_exact_marker_and_state_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        assert_eq!(managed_install_root(&state).unwrap(), None);
+        assert_eq!(
+            model_artifact_root(&state).unwrap(),
+            state.join("artifacts")
+        );
+        fs::write(root.join(MANAGED_LAYOUT_MARKER), "unknown-layout\n").unwrap();
+        assert!(managed_install_root(&state).is_err());
+        fs::write(
+            root.join(MANAGED_LAYOUT_MARKER),
+            format!("{MANAGED_LAYOUT_VERSION}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            managed_install_root(&state).unwrap(),
+            Some(root.to_path_buf())
+        );
+        fs::write(&state, "not a directory").unwrap();
+        assert!(managed_install_root(&state).is_err());
+        fs::remove_file(&state).unwrap();
+        assert_eq!(model_artifact_root(&state).unwrap(), root.join("models"));
+        assert_eq!(managed_install_root(&root.join("other")).unwrap(), None);
+    }
 }
 
 pub fn load(root: &Path) -> Result<Option<Config>> {

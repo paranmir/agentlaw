@@ -849,11 +849,250 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
 }
 
 #[test]
+fn installed_layout_proposes_memory_beside_private_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Agentlaw");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    let state = root.join("state");
+    let (out, proposal) = run(&state, &["store", "propose-location"], None);
+    assert!(out.status.success());
+    assert_eq!(
+        proposal["proposed_path"],
+        root.join("memory").to_string_lossy().as_ref()
+    );
+    assert!(!state.exists());
+    assert!(!root.join("memory").exists());
+}
+
+#[test]
+fn managed_install_cli_create_and_doctor_use_installation_local_coordination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("custom-installation");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        root.join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    let installed = bin.join(if cfg!(windows) {
+        "agentlaw.exe"
+    } else {
+        "agentlaw"
+    });
+    std::fs::copy(executable(), &installed).unwrap();
+
+    let profile = tmp.path().join("isolated-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let local_app_data = tmp.path().join("unrelated-local-app-data");
+    let xdg_state = tmp.path().join("unrelated-xdg-state");
+    let invoke = |args: &[&str]| {
+        let mut cmd = Command::new(&installed);
+        cmd.args(args)
+            .env_remove("AGENTLAW_HOME")
+            .env("LOCALAPPDATA", &local_app_data)
+            .env("XDG_STATE_HOME", &xdg_state);
+        #[cfg(windows)]
+        cmd.env("USERPROFILE", &profile);
+        #[cfg(not(windows))]
+        cmd.env("HOME", &profile);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.output().unwrap()
+    };
+
+    let source = root.join("memory");
+    let create = invoke(&[
+        "store",
+        "create",
+        "--path",
+        source.to_str().unwrap(),
+        "--confirm-create",
+    ]);
+    let created: Value = serde_json::from_slice(&create.stdout).unwrap();
+    assert!(create.status.success(), "{created}");
+    assert_eq!(created["created"], true);
+
+    let doctor_output = invoke(&["doctor"]);
+    let doctor: Value = serde_json::from_slice(&doctor_output.stdout).unwrap();
+    assert!(doctor_output.status.success(), "{doctor}");
+    assert_eq!(doctor["source"]["validated"], true);
+
+    let selected_registry = root.join("state").join("source-coordination");
+    assert!(
+        selected_registry.is_dir(),
+        "create and doctor must use the selected managed installation's state registry"
+    );
+    assert!(
+        std::fs::read_dir(&selected_registry)
+            .unwrap()
+            .next()
+            .is_some(),
+        "the source binding should be recorded in the managed registry"
+    );
+    assert!(
+        !profile
+            .join("Agentlaw")
+            .join("source-coordination")
+            .exists(),
+        "coordination must not be pinned to a profile-wide Agentlaw installation"
+    );
+    assert!(
+        !local_app_data
+            .join("Agentlaw")
+            .join("source-coordination")
+            .exists(),
+        "coordination must not fall back to LOCALAPPDATA"
+    );
+    assert!(
+        !xdg_state
+            .join("Agentlaw")
+            .join("source-coordination")
+            .exists(),
+        "coordination must not fall back to XDG_STATE_HOME"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn installed_binary_discovers_its_root_without_a_user_name_or_environment_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("custom-root");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        root.join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    let installed = bin.join("agentlaw.exe");
+    std::fs::copy(executable(), &installed).unwrap();
+    let output = Command::new(&installed)
+        .args(["store", "propose-location"])
+        .env_remove("AGENTLAW_HOME")
+        .env("LOCALAPPDATA", tmp.path().join("unrelated-appdata"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let proposal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        proposal["proposed_path"],
+        root.join("memory").to_string_lossy().as_ref()
+    );
+    assert!(!root.join("state").exists());
+    assert!(!root.join("memory").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn unmanaged_binary_uses_profile_managed_root_but_never_appdata_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = tmp.path().join("profile");
+    std::fs::create_dir(&profile).unwrap();
+    let appdata = tmp.path().join("unrelated-appdata");
+    let request = || {
+        Command::new(executable())
+            .args(["store", "propose-location"])
+            .env_remove("AGENTLAW_HOME")
+            .env("USERPROFILE", &profile)
+            .env("LOCALAPPDATA", &appdata)
+            .output()
+            .unwrap()
+    };
+    let missing = request();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("configuration_required"));
+    assert!(!appdata.exists());
+
+    let root = profile.join("Agentlaw");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    let installed = request();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let proposal: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(
+        proposal["proposed_path"],
+        root.join("memory").to_string_lossy().as_ref()
+    );
+    assert!(!appdata.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn damaged_managed_layout_does_not_fall_back_to_appdata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("damaged-root");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(root.join(".agentlaw-layout"), b"future-unknown-layout\n").unwrap();
+    let installed = bin.join("agentlaw.exe");
+    std::fs::copy(executable(), &installed).unwrap();
+    let output = Command::new(&installed)
+        .args(["store", "propose-location"])
+        .env_remove("AGENTLAW_HOME")
+        .env("LOCALAPPDATA", tmp.path().join("unrelated-appdata"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stdout);
+    assert!(error.contains("invalid_installation"), "{error}");
+    assert!(!tmp.path().join("unrelated-appdata").exists());
+
+    std::fs::remove_file(root.join(".agentlaw-layout")).unwrap();
+    let missing = Command::new(&installed)
+        .args(["store", "propose-location"])
+        .env_remove("AGENTLAW_HOME")
+        .env("LOCALAPPDATA", tmp.path().join("unrelated-appdata"))
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("invalid_installation"));
+
+    let version_dir = root.join("state").join("versions").join("test-build");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    let versioned = version_dir.join("agentlaw.exe");
+    std::fs::copy(executable(), &versioned).unwrap();
+    let version_output = Command::new(&versioned)
+        .args(["store", "propose-location"])
+        .env_remove("AGENTLAW_HOME")
+        .env("LOCALAPPDATA", tmp.path().join("unrelated-appdata"))
+        .output()
+        .unwrap();
+    assert!(!version_output.status.success());
+    assert!(String::from_utf8_lossy(&version_output.stdout).contains("invalid_installation"));
+}
+
+#[test]
 fn setup_is_explicit_and_does_not_select_foreign_data() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let (_, proposed) = run(&state, &["store", "propose-location"], None);
     assert_eq!(proposed["created"], false);
+    assert_eq!(
+        proposed["proposed_path"],
+        state.join("memory").to_string_lossy().as_ref()
+    );
     assert!(!state.exists());
     let foreign = tmp.path().join("foreign");
     std::fs::create_dir(&foreign).unwrap();

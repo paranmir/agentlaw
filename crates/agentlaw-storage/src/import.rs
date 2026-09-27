@@ -123,6 +123,7 @@ impl Store {
         let staged = Store {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
+            coordination: self.coordination.clone(),
         };
         staged.register_local_binding()?;
         staged.ensure_epoch()?;

@@ -42,16 +42,19 @@ wget -qO- https://github.com/paranmir/agentlaw/releases/latest/download/install.
 ```
 
 The installer checks the archive's SHA-256 and installs to
-`~/.local/share/agentlaw/bin`, without sudo or shell-profile edits. Add it to PATH:
+`~/Agentlaw/bin`, without sudo or shell-profile edits. Add it to PATH:
 
 ```sh
-export PATH="$HOME/.local/share/agentlaw/bin:$PATH"
+export PATH="$HOME/Agentlaw/bin:$PATH"
 agentlaw --version
 ```
 
 Put the export line in your shell profile to keep it for new terminals.
-Set `AGENTLAW_INSTALL_DIR` to choose another directory, or `AGENTLAW_VERSION=v0.2.0`
-to pin a release. Download the script first if you want to inspect it before execution.
+Set `AGENTLAW_ROOT` to choose another complete installation root, or
+`AGENTLAW_VERSION=v0.2.0` to pin a release. The installer keeps binaries in
+`bin`, private state in `state`, memory in a sibling `memory` directory once
+connected, and model assets in `models`. It does not migrate an older state
+automatically. Download the script first if you want to inspect it before execution.
 
 ### Windows — PowerShell
 
@@ -60,25 +63,47 @@ irm https://github.com/paranmir/agentlaw/releases/latest/download/install.ps1 | 
 agentlaw --version
 ```
 
-Installs to `%LOCALAPPDATA%\Programs\Agentlaw\bin` and adds that directory to your
-user PATH. No administrator privileges or execution-policy changes are required.
-New terminals pick up the persisted PATH. To inspect the script and choose options:
+For a fresh installation, the default root is the current Windows user's profile
+folder plus `Agentlaw` (for example, `%USERPROFILE%\Agentlaw`, not a hard-coded
+user name). The installer puts executables in `bin`, creates private `state`,
+and records a layout marker. It proposes sibling `memory` without creating it;
+model assets installed during harness setup go under `models`. It rejects roots
+inside AppData to avoid packaged-app AppData redirection. The installer adds
+`bin` to the user PATH. No administrator privileges or execution-policy changes
+are required. New terminals pick up the persisted PATH. To inspect the script
+and choose a different root:
 
 ```powershell
 Invoke-WebRequest https://github.com/paranmir/agentlaw/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content ./install.ps1
 # After inspecting the file:
-& ([scriptblock]::Create((Get-Content ./install.ps1 -Raw))) -Version v0.2.0
+& ([scriptblock]::Create((Get-Content ./install.ps1 -Raw))) -RootDir (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Tools/Agentlaw')
 ```
 
-`-InstallDir` selects a different installation directory. Re-running either
-installer updates the executables; it does not reset memory or configure a harness.
+`-RootDir` selects the whole installation, not just the executable directory.
+The old `-InstallDir` parameter is rejected to avoid silently splitting data.
+The installer stops when it finds known earlier state in AppData or another
+managed root. It never migrates that state implicitly. One OS user shares one
+installation across harnesses; update or migrate that installation instead.
+For a nondefault root, pass the same `-RootDir` on upgrades.
+Re-running the installer at the same managed root updates executables; it does
+not reset memory or configure a harness. An existing installation using the old
+AppData state location is **not migrated automatically**; preserve its memory and
+machine-local state and explicitly plan a migration before switching roots.
+
+The root contains `bin/`, `models/`, `memory/`, and `state/`. Configuration,
+machine identity, executable versions, worker files, recovery data, indexes,
+and source-coordination locks all live under `state/`. A custom root does not
+create another registry under the default root. Build tools are development
+dependencies, not release-installation contents.
 
 ### Direct download
 
 Download an archive and `SHA256SUMS` from [GitHub Releases](https://github.com/paranmir/agentlaw/releases).
 Extract the binaries into a directory on PATH and verify the archive with
 `sha256sum`, `shasum -a 256`, or `Get-FileHash -Algorithm SHA256`.
+For a standalone extracted binary, set `AGENTLAW_HOME` to an explicit absolute
+state directory; only managed installations discover their state automatically.
 
 | Platform | Release archive |
 | --- | --- |

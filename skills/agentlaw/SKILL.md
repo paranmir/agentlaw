@@ -1,6 +1,6 @@
 ---
 name: agentlaw
-description: Use Agentlaw for persistent memory and learned procedures across tasks and sessions. Apply when checking or setting up Agentlaw connections, resuming work from memory, preserving decisions or corrections, or handling missing context in an Agentlaw-enabled workspace.
+description: Use for detailed Agentlaw Task authoring, memory reconciliation, connection checks, and recovery when the tool contract alone is insufficient.
 ---
 
 # Agentlaw
@@ -48,25 +48,27 @@ or an empty store. Never save a dummy memory as a connectivity test.
 Report verified access, project folder, recall outcome and degraded/unverified
 capabilities. Without a project, explicitly say project connection was not checked.
 
-## During work
+## Task and memory details
 
-| Situation | Action |
-| --- | --- |
-| New code/document area, changed assumption, dependency, contradiction or failure | `recall` with the new observation and what needs checking, even without known links. |
-| Need a known memory/procedure | `recall` by returned IDs; obtain required missing references using returned guidance. |
-| Decision, correction, new evidence, command/tool friction or progress worth carrying forward | `remember_this`; a single small mistake counts when its correction is reusable. Preserve its scope and corrected behavior; batch related updates. |
-| Need past decisions or changes | `history` for the known memory/procedure, using its schema and returned range/search guidance. |
-| Repeated friction suggests a reusable procedure | Review the evidence and use `remember_this`'s procedure-authoring flow; follow returned instructions rather than inventing a tool. |
+Match an existing Task by objective and scope, not title, recency, or candidate
+count. Its Objective states the requested outcome and constraints; Current
+position records the approach, reasons, evidence, progress, and blockers;
+Resume point gives the next concrete action or unresolved question; References
+points to useful IDs and files without hiding essential context outside the Task.
+Evolve the full current body rather than appending a log or copying a Plan.
+Keep unresolved issues until resolved. Completed or abandoned work leaves the
+working set; blocked work stays active with its resume condition.
 
-Choose `create`, `evolve` or `consolidate` explicitly. Copy returned IDs/versions.
-Evolve complete current content, preserving exceptions; do not append a log.
-Separate understanding from evidence and select user/project/machine scope deliberately.
-Maintain unfinished Tasks and record closure using the schema's headings, without
-copying the Plan. Save clear corrections before dependent work; at progress
-boundaries and before the final response, save only useful changes not already
-reflected in current memory. Skip incidental chatter, not new relevant evidence.
-Label assistant proposals and unverified inferences; do not present them as user
-decisions or verified facts. A write attempt is not a successful save.
+Choose `create`, `evolve`, or `consolidate` explicitly and copy returned IDs and
+versions. Select user/project/machine scope deliberately. A one-off request is
+not a lasting preference; a small reusable correction can deserve a memory
+without a Task. Label proposals and unverified claims. For multiple candidates,
+use the current request to select relevant ones; ask only when ambiguity changes
+the work. Retrieve missing context only when needed for the next decision. Do
+not use `history` or another recall merely to reconfirm a successful save.
+Repeated friction may warrant a learned procedure through the existing
+`remember_this` authoring flow. Follow returned instructions, not an invented
+tool or action.
 
 ## Resolve, do not conceal
 

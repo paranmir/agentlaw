@@ -275,7 +275,8 @@ impl Runtime {
         local_root: impl AsRef<Path>,
         user_id: impl Into<String>,
     ) -> Result<Self> {
-        Self::open_inner(store_root, local_root, user_id, None)
+        let coordination = local_root.as_ref().join("source-coordination");
+        Self::open_inner(store_root, local_root, user_id, None, coordination)
     }
     pub fn open_with_machine(
         store_root: impl AsRef<Path>,
@@ -283,15 +284,38 @@ impl Runtime {
         user_id: impl Into<String>,
         machine_id: impl Into<String>,
     ) -> Result<Self> {
+        let coordination = local_root.as_ref().join("source-coordination");
+        Self::open_with_machine_and_coordination(
+            store_root,
+            local_root,
+            user_id,
+            machine_id,
+            coordination,
+        )
+    }
+    pub fn open_with_machine_and_coordination(
+        store_root: impl AsRef<Path>,
+        local_root: impl AsRef<Path>,
+        user_id: impl Into<String>,
+        machine_id: impl Into<String>,
+        coordination: impl AsRef<Path>,
+    ) -> Result<Self> {
         let machine_id = machine_id.into();
         validate_id(&machine_id)?;
-        Self::open_inner(store_root, local_root, user_id, Some(machine_id))
+        Self::open_inner(
+            store_root,
+            local_root,
+            user_id,
+            Some(machine_id),
+            coordination,
+        )
     }
     fn open_inner(
         store_root: impl AsRef<Path>,
         local_root: impl AsRef<Path>,
         user_id: impl Into<String>,
         requested_machine: Option<String>,
+        coordination: impl AsRef<Path>,
     ) -> Result<Self> {
         // Check the local binding before opening any canonical writer/fence.
         // A failed A -> B selection must not initialize B with A's local state.
@@ -329,9 +353,10 @@ impl Runtime {
                 }
             }
         }
-        let store = source(Store::open(
+        let store = source(Store::open_with_coordination(
             store_root.as_ref(),
             local_root.as_ref().join("canonical"),
+            coordination,
         ))?;
         let root = std::fs::canonicalize(store_root).map_err(|_| {
             DomainError::new("store_unavailable", "Cannot resolve memory store root.")
@@ -676,18 +701,6 @@ impl Runtime {
                 output.push(candidate)
             }
             result["candidates"] = json!(output);
-        }
-        if result["memories"].as_array().is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry["current_heads"]
-                    .as_array()
-                    .is_some_and(|heads| heads.iter().any(|h| h["in_working_set"] == true))
-            })
-        }) || result["candidates"]
-            .as_array()
-            .is_some_and(|c| c.iter().any(|v| v.get("objective").is_some()))
-        {
-            result["task_instruction"]=json!("Use the delivered Task handoff to resume work. When updating an active Task, explicitly retain or close in_working_set and preserve a complete handoff.");
         }
         let exact: BTreeSet<_> = r
             .procedure_ids

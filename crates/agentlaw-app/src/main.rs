@@ -353,11 +353,12 @@ fn run(args: &[String]) -> Result<Value> {
             )
         })?;
         let identity = agentlaw_app::machine::load_or_create(&state)?;
-        let mut runtime = agentlaw_flows::Runtime::open_with_machine(
+        let mut runtime = agentlaw_flows::Runtime::open_with_machine_and_coordination(
             &stage.store_path,
             &stage.runtime_path,
             &selected.user_id,
             &identity.machine_id,
+            config::coordination_root(&state),
         )?;
         let configuration = agentlaw_app::installed::worker_config(&state)?;
         if configuration.model.is_some() {
@@ -420,7 +421,7 @@ fn run(args: &[String]) -> Result<Value> {
     }
     if args == ["store", "propose-location"] {
         return Ok(
-            json!({"proposed_path":config::state_root()?.join("memory"),"created":false,
+            json!({"proposed_path":config::proposed_memory_store_path()?,"created":false,
             "next_action":"Ask the user to confirm this memory store location or choose another. Create only after confirmation."}),
         );
     }
@@ -514,11 +515,12 @@ fn procedure_search(args: &[String]) -> Result<Option<Value>> {
         )
     })?;
     let identity = agentlaw_app::machine::load_or_create(&state)?;
-    let mut runtime = agentlaw_flows::Runtime::open_with_machine(
+    let mut runtime = agentlaw_flows::Runtime::open_with_machine_and_coordination(
         &selected.memory_store_path,
         selected.runtime_root(&state),
         &selected.user_id,
         &identity.machine_id,
+        config::coordination_root(&state),
     )?;
     let worker = agentlaw_app::installed::worker_config(&state)?;
     if worker.model.is_some() {
@@ -628,13 +630,17 @@ fn selected_store() -> Result<(agentlaw_storage::Store, PathBuf)> {
     })?;
     let local = selected.runtime_root(&state);
     config::require_existing_binding(&state, &selected)?;
-    let store = agentlaw_storage::Store::open(&selected.memory_store_path, local.join("canonical"))
-        .map_err(|_| {
-            DomainError::new(
-                "source_unavailable",
-                "The selected source needs diagnosis or recovery; no Git operation was performed.",
-            )
-        })?;
+    let store = agentlaw_storage::Store::open_with_coordination(
+        &selected.memory_store_path,
+        local.join("canonical"),
+        config::coordination_root(&state),
+    )
+    .map_err(|_| {
+        DomainError::new(
+            "source_unavailable",
+            "The selected source needs diagnosis or recovery; no Git operation was performed.",
+        )
+    })?;
     Ok((store, local))
 }
 

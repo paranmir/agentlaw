@@ -479,8 +479,12 @@ pub fn resolve_import_with_choices(
     {
         let _lane = lane(local)?;
         let dir = local.join("imports").join(import_ref);
-        let staged = Store::open(&context.store_path, context.runtime_path.join("canonical"))
-            .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
+        let staged = Store::open_with_coordination(
+            &context.store_path,
+            context.runtime_path.join("canonical"),
+            store.coordination_root(),
+        )
+        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
         // Only an unfinished execution retains its identity. Equal later payloads
         // are new intents (local -> incoming -> local must apply all three).
         #[derive(Serialize, Deserialize)]
@@ -571,8 +575,12 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
             "Active source changed; prepare a fresh review workspace.",
         ));
     }
-    let staged = Store::open_read_only(&stored.review.staged_path, dir.join("runtime/canonical"))
-        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
+    let staged = Store::open_read_only_with_coordination(
+        &stored.review.staged_path,
+        dir.join("runtime/canonical"),
+        store.coordination_root(),
+    )
+    .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
     let audit = staged
         .audit_source()
         .map_err(|e| DomainError::new("invalid_import_resolution", e.to_string()))?;
@@ -685,8 +693,12 @@ pub fn publish_import(
         )
         .map_err(|_| io_error("import receipt decode"));
     }
-    let staged = Store::open_read_only(&stored.review.staged_path, dir.join("runtime/canonical"))
-        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
+    let staged = Store::open_read_only_with_coordination(
+        &stored.review.staged_path,
+        dir.join("runtime/canonical"),
+        store.coordination_root(),
+    )
+    .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
     let plan_path = dir.join("handoff.json");
     let plan: ImportHandoff = if plan_path.exists() {
         serde_json::from_reader(File::open(&plan_path).map_err(|_| io_error("handoff read"))?)
@@ -1449,8 +1461,12 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
         ],
     )?;
     run(&staged, &["checkout", "--detach", commit])?;
-    let validated = Store::attach_existing(&staged, dir.join("incoming-control"))
-        .map_err(|e| DomainError::new("incoming_source_invalid", e.to_string()))?;
+    let validated = Store::attach_existing_with_coordination(
+        &staged,
+        dir.join("incoming-control"),
+        store.coordination_root(),
+    )
+    .map_err(|e| DomainError::new("incoming_source_invalid", e.to_string()))?;
     let tree = text(&staged, &["rev-parse", &format!("{commit}^{{tree}}")])?;
     let merged = dir.join("source");
     let union = store
@@ -1509,12 +1525,13 @@ pub fn inspect_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
         ));
     }
     let mut review = stored.review;
-    let stage = Store::open_read_only(
+    let stage = Store::open_read_only_with_coordination(
         &review.staged_path,
         local
             .join("imports")
             .join(import_ref)
             .join("runtime/canonical"),
+        store.coordination_root(),
     )
     .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
     review.structural_conflicts = stage
@@ -1717,8 +1734,12 @@ mod tests {
         run(&root, &["commit", "-m", "test user tracked note"]).unwrap();
         let review = prepare_import(&source, &local, &saved.commit_oid).unwrap();
         let context = get_import_stage(&source, &local, &review.import_ref).unwrap();
-        let staged =
-            Store::open(&context.store_path, context.runtime_path.join("canonical")).unwrap();
+        let staged = Store::open_with_coordination(
+            &context.store_path,
+            context.runtime_path.join("canonical"),
+            source.coordination_root(),
+        )
+        .unwrap();
         publish(&staged, "explicitly approved staged addition");
         let resolution = resolve_import(&source, &local, &review.import_ref).unwrap();
         assert!(resolution.ready_for_user_confirmation);

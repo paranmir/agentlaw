@@ -8,15 +8,13 @@ Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
 `connect_project_memory` (ADR-0140).
 
 ```text
-Use recall to retrieve saved memory and procedures when starting or resuming a task, when needed context is missing, or before changing a code or document area not yet checked through recall for this task. Recall again with new observations that change what needs checking—constraints, dependencies, counterevidence, changed assumptions, or failure evidence—even without known memory links.
+Persistent memory for ordinary work. Use recall when starting or resuming multi-step work, recovering missing context, or checking past decisions, failures, or procedures that may change the next action. Search with new evidence; skip repeat recall when the needed context is already present.
 
-Set action and supply exactly its same-named input object. For example: {"action":"recall","recall":{"recall_for":"Current work"}}. Put every action field inside that object; omit other action objects. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search.
+Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. Batch other changed progress at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
 
-For project work, pass the actual project path verified from workspace information or work tools; reuse it while valid. Set restore_context=true when project context is missing or incomplete. Use ordinary recall for focused follow-up.
+For work needing intermediate state, reuse the matching Task or create one after initial recall and before substantial work. Evolve its complete current body (Objective / Current position / Resume point / References). Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
-Start with recall, not a routine connection preflight. If it returns project candidates, use an already explicit user choice or ask the user to select one, approve a new project, or skip; never auto-select merely because one candidate exists. After an approved connection, use its recall_result if requested or repeat the original recall. Omit optional candidate limits unless needed; their values must be positive integers.
-
-Use remember_this to preserve corrections, decisions, unresolved questions, progress, and command/tool friction that can affect later work, including one small reusable correction or a repeated failure. Preserve findings with their verification status; distinguish user decisions from assistant proposals and unverified inferences. Save clear corrections before dependent work and other useful changes at progress checkpoints. Before the final response, save remaining unsaved updates to understanding, evidence, or task state. Keep active tasks current. Batch updates; skip incidental chatter and redundant re-saves, not new relevant occurrences or evidence. A write attempt is not proof of saving. Use history to inspect past changes and their evidence.
+Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect or create a project only with an explicit user choice. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls.
 ```
 
 Here “task” means the work being undertaken, not a prerequisite to create a
@@ -27,7 +25,7 @@ not every individual file; scope and observations determine whether a new
 question needs recall. Reuse depends on content still available to the LLM,
 not Runtime remembering that it once sent a response.
 
-“Progress checkpoints” are work boundaries, not a new checkpoint artifact or
+Phase boundaries are work transitions, not a new checkpoint artifact or
 workflow-registration API. No-change turns need no write. An unchanged
 conclusion with a new occurrence, condition or supporting evidence is not an
 unchanged experience. Neither future re-derivability nor small impact is a
@@ -165,13 +163,11 @@ project reconstruction is requested independently through `restore_context`
 (ADR-0141). The exact CLI line is generated from installed paths.
 
 ```text
-When starting or resuming work, or when context is missing, call agentlaw with action="recall" and a recall object whose recall_for describes the current request. Put all action inputs inside the same-named object; omit other action objects.
-For project work, confirm the actual working folder using the harness, not the MCP location or home cwd alone. In recall, supply project_path and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Without a confirmed project, recall only user/machine memory without inventing a project binding.
-Recall again when new work areas, changed assumptions, constraints, dependencies, contradictions, or failures may affect the next action.
-Use action="remember_this" for changes worth carrying forward: user decisions/corrections, reusable preferences, verified findings, friction, and active-task progress/open issues, including small reusable corrections. Save clear corrections before dependent work; batch other unsaved changes at progress boundaries, before long dependent work, and before the final response. Skip incidental chat and changes already reflected in current memory. Distinguish explicit user decisions from proposals and unverified inferences.
-If agentlaw is not exposed, try host tool discovery if available; if still unavailable (not denied), use the installed CLI. Follow the tool description/schema and any returned instructions. Do not add routine memory-management reports.
+Use Agentlaw without waiting for a memory request. Recall at the start or resumption of multi-step work. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Recall missing past context that could change the next action. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
+For project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.
+If agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.
 
-CLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` before authoring a request when its contract is unavailable. The CLI and MCP use the same installation.
+CLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` when the contract is unavailable. The CLI and MCP use the same installation.
 ```
 
 The installer replaces `{state_assignment}` and `{invocation}` with the actual
@@ -227,12 +223,12 @@ call (ADR-0141):
 Recover the missing required context using the provided steps. If recovery remains blocked, tell the user what could not be checked. Do not make changes that depend on that context; independent investigation may continue.
 ```
 
-Use existing response-specific fields, not a parallel result envelope. The
-existing `task_instruction` appears when an active Task is returned:
-
-```text
-If this Task state changes, save its complete updated form before the final response.
-```
+Use existing response-specific fields, not a parallel result envelope. Normal
+recall, including zero, one, or several active Task candidates, does not
+repeat the Task policy in `task_instruction`. The model decides which Task
+matches its objective. An empty candidate list is not an instruction to
+create a Task. Only verified omissions, failures, or unresolved context need
+response-specific guidance.
 
 The generic `turn_instruction` is now conditional on a response-specific need;
 do not repeat a universal save reminder after every recall or successful write.

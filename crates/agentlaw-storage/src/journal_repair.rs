@@ -20,9 +20,18 @@ impl Store {
         root: impl AsRef<Path>,
         local: impl AsRef<Path>,
     ) -> Result<JournalRepairReport> {
+        let coordination = local_coordination(local.as_ref());
+        Self::repair_local_journal_with_coordination(root, local, coordination)
+    }
+    pub fn repair_local_journal_with_coordination(
+        root: impl AsRef<Path>,
+        local: impl AsRef<Path>,
+        coordination: impl AsRef<Path>,
+    ) -> Result<JournalRepairReport> {
         let store = Store {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
+            coordination: coordination.as_ref().to_path_buf(),
         };
         store.check_local_binding(false)?;
         let admission = store.admission_lock()?;

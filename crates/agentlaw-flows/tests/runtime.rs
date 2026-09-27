@@ -145,7 +145,7 @@ fn active_task_candidates_copy_only_complete_handoff_sections() {
     assert!(c.get("excerpt").is_none());
     assert!(c.get("applicability").is_none());
     assert_eq!(result["active_task_count"], 1);
-    assert!(result.get("task_instruction").is_some());
+    assert!(result.get("task_instruction").is_none());
 }
 #[test]
 fn repair_rebuilds_a_private_generation_and_preserves_pending() {

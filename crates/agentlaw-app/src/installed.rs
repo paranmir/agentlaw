@@ -114,11 +114,12 @@ impl Backend for InstalledBackend {
         if self.selected.as_ref() != Some(&selected) || self.runtime.is_none() {
             let machine = crate::machine::load_or_create(&self.state)?;
             control.phase("opening_memory_store");
-            let runtime = agentlaw_flows::Runtime::open_with_machine(
+            let runtime = agentlaw_flows::Runtime::open_with_machine_and_coordination(
                 &selected.memory_store_path,
                 selected.runtime_root(&self.state),
                 &selected.user_id,
                 machine.machine_id,
+                config::coordination_root(&self.state),
             )?
             .with_history_response_limit(selected.history_response_limit_bytes);
             if self.worker.is_none() {

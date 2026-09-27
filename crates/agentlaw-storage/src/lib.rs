@@ -421,14 +421,27 @@ struct Fence {
 pub struct Store {
     root: PathBuf,
     local: PathBuf,
+    coordination: PathBuf,
+}
+fn local_coordination(local: &Path) -> PathBuf {
+    local.parent().unwrap_or(local).join("source-coordination")
 }
 impl Store {
     /// Existing source/control state only: never bootstrap, migrate, recover, or publish.
     /// Diagnostic audits may create disposable local streaming spools.
     pub fn open_read_only(root: impl AsRef<Path>, local: impl AsRef<Path>) -> Result<Self> {
+        let coordination = local_coordination(local.as_ref());
+        Self::open_read_only_with_coordination(root, local, coordination)
+    }
+    pub fn open_read_only_with_coordination(
+        root: impl AsRef<Path>,
+        local: impl AsRef<Path>,
+        coordination: impl AsRef<Path>,
+    ) -> Result<Self> {
         let s = Self {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
+            coordination: coordination.as_ref().to_path_buf(),
         };
         s.check_local_binding(false)?;
         let _gate = s.lock()?;
@@ -441,12 +454,24 @@ impl Store {
     pub fn local_root(&self) -> &Path {
         &self.local
     }
+    pub fn coordination_root(&self) -> &Path {
+        &self.coordination
+    }
     pub fn open(root: impl AsRef<Path>, local: impl AsRef<Path>) -> Result<Self> {
+        let coordination = local_coordination(local.as_ref());
+        Self::open_with_coordination(root, local, coordination)
+    }
+    pub fn open_with_coordination(
+        root: impl AsRef<Path>,
+        local: impl AsRef<Path>,
+        coordination: impl AsRef<Path>,
+    ) -> Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         fs::create_dir_all(local.as_ref())?;
         let s = Self {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
+            coordination: coordination.as_ref().to_path_buf(),
         };
         s.register_local_binding()?;
         let _lock = s.lock()?;
@@ -500,10 +525,19 @@ impl Store {
     /// Explicitly attach portable source after scanning its framing and current state.
     /// This is not a clone-identity decision and does not transfer pending local state.
     pub fn attach_existing(root: impl AsRef<Path>, local: impl AsRef<Path>) -> Result<Self> {
+        let coordination = local_coordination(local.as_ref());
+        Self::attach_existing_with_coordination(root, local, coordination)
+    }
+    pub fn attach_existing_with_coordination(
+        root: impl AsRef<Path>,
+        local: impl AsRef<Path>,
+        coordination: impl AsRef<Path>,
+    ) -> Result<Self> {
         fs::create_dir_all(local.as_ref())?;
         let s = Self {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
+            coordination: coordination.as_ref().to_path_buf(),
         };
         s.register_local_binding()?;
         let gate = s.lock()?;
@@ -554,6 +588,7 @@ impl Store {
             store: Store {
                 root: self.root.clone(),
                 local: self.local.clone(),
+                coordination: self.coordination.clone(),
             },
         }
     }
@@ -574,21 +609,16 @@ impl Store {
         self.check_local_binding(true)
     }
     fn check_local_binding(&self, create: bool) -> Result<()> {
-        #[cfg(windows)]
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-        #[cfg(not(windows))]
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-        let base = base
-            .ok_or_else(|| {
-                Error::RecoveryRequired("machine-local state directory unavailable".into())
-            })?
-            .join("Agentlaw/source-coordination");
+        if !self.coordination.is_absolute() {
+            return Err(Error::RecoveryRequired(
+                "source coordination directory must be absolute".into(),
+            ));
+        }
         let identity = self.root.to_string_lossy().to_string();
         #[cfg(windows)]
         let identity = identity.to_lowercase();
-        let dir = base.join(codec::digest(identity.as_bytes()));
+        let source_key = codec::digest(identity.as_bytes());
+        let dir = self.coordination.join(&source_key);
         if create {
             fs::create_dir_all(&dir)?;
         }
