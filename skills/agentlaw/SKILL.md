@@ -22,8 +22,9 @@ or memory store. A home-directory cwd alone does not establish a project. Ask wh
 unclear; without a project, recall user/machine context only.
 
 For project work, `recall` with verified `project_path`, request-specific `recall_for`
-and `include_active_tasks=true`. Set `restore_context=true` for missing/incomplete
-context, including after compaction. Reuse applicable context rather than restoring every turn.
+and `include_active_tasks=true`. Set `restore_context=true` only when project
+context is missing or incomplete, not merely because compaction occurred.
+Reuse applicable context rather than restoring every turn.
 
 ## When asked whether Agentlaw is connected
 
@@ -55,7 +56,11 @@ count. Its Objective states the requested outcome and constraints; Current
 position records the approach, reasons, evidence, progress, and blockers;
 Resume point gives the next concrete action or unresolved question; References
 points to useful IDs and files without hiding essential context outside the Task.
-Evolve the full current body rather than appending a log or copying a Plan.
+In Current position, distinguish verified results from hypotheses and retain
+costly failed paths with their conditions and evidence; keep one exact next
+action or question in Resume point and file/experiment locators in References.
+Evolve the complete current body, preserving still-relevant state rather than
+copying a Plan; skip writes that merely restate unchanged progress or log commands.
 Keep unresolved issues until resolved. Completed or abandoned work leaves the
 working set; blocked work stays active with its resume condition.
 
