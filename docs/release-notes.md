@@ -1,16 +1,13 @@
-# Agentlaw 0.3.0
+# Agentlaw 0.3.1
 
-- Checks the latest published full GitHub release in the background without
-  delaying memory work. A newer release appears as a conditional notice in
-  ordinary MCP tool results, and incomplete updates and old sessions receive
-  distinct notices.
-- Adds an explicit managed update flow: pinned release preview, checksum and
-  archive verification, independently staged helper, offline process check,
-  whole-bundle replacement, owned harness registration refresh and same-plan
-  recovery. The previous bundle and versioned executables remain available.
-- Adds optional `agentlaw support star` with authenticated account verification
-  and a separate interactive `y/N` choice. Agentlaw never stars the repository
-  as a side effect of an update.
+- Clarifies when to checkpoint an active Task before extended work if unsaved
+  findings or failed attempts would be costly to reconstruct.
+- Directs project work to recall active Tasks after compaction or a session
+  interruption, even when a summary is available, then reconcile both with
+  current evidence.
+- Makes Task handoffs distinguish verified findings from hypotheses and retain
+  the next exact action. This release changes agent guidance, not the memory
+  data format or public tool input schema.
 
 Existing MCP sessions must restart to load a newly installed binary and tool
 guidance. Read [the managed update procedure](usage.md#managed-updates-and-optional-github-support)
