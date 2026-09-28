@@ -253,8 +253,8 @@ namespace. No top-level action-specific fields are advertised. Describe each fie
 action, required companions and usage in English. Do not expose top-level union
 branches, schema references, or conditional validation machinery to the model.
 
-Both MCP and CLI normalize grouped requests to the internal flat domain contract;
-legacy flat requests remain accepted, but mixed/group-mismatched requests fail.
+Both MCP and CLI require grouped requests and normalize them to the internal
+domain contract. Flat, mixed and group-mismatched requests fail.
 agentlaw-input.schema.json remains the internal validator for both MCP and CLI.
 It enforces action-specific required/forbidden fields, scope combinations and
 review requirements before execution. The public schema describes a usable
@@ -300,6 +300,21 @@ Delivery of a result does not prove the user saw it. The advisor may repeat
 the same notice on later results while action remains needed. The model should
 avoid repeating the message within one conversation, while preserving the
 ordinary memory result and the user's requested work.
+
+## Managed update operator guidance
+
+When the user requests a managed update, run the stable public `agentlaw update`
+command from the installation's `command` directory. This one invocation pins
+and verifies the release, cooperatively stops the affected Agentlaw processes,
+replaces the managed bundle and registrations, probes the candidate MCP and
+read-only recall, and removes the exact approved update debris. Report success
+only for the command's `installed` result after its matching completed status.
+Then ask the user only for a normal harness restart; Agentlaw is immediately
+usable afterward. A handoff, prepared phase, deferred rename or incomplete
+cleanup is not success. For an incomplete update, inspect the reported plan and
+retry the same stable command after resolving its blocker. Do not ask the user
+to run an internal apply command, manage Agentlaw processes or cleanup files.
+Updating never authorizes an optional repository Star.
 
 ## Boundaries and rationale
 

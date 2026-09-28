@@ -1,12 +1,10 @@
 #Requires -Version 5.1
 param(
     [string]$Version = 'latest',
-    [string]$RootDir,
-    [string]$InstallDir
+    [string]$RootDir
 )
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'Use install.sh on Linux or macOS.' }
-if ($PSBoundParameters.ContainsKey('InstallDir')) { throw 'Use -RootDir to select the complete Agentlaw installation. -InstallDir only selected binaries and is no longer supported.' }
 $userProfile = [Environment]::GetFolderPath('UserProfile')
 if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'Cannot find the Windows user profile. Specify a writable RootDir explicitly after repairing the profile.' }
 if (-not $PSBoundParameters.ContainsKey('RootDir')) { $RootDir = Join-Path $userProfile 'Agentlaw' }
@@ -44,7 +42,7 @@ $stateDir = Join-Path $RootDir 'state'
 $layoutMarker = Join-Path $RootDir '.agentlaw-layout'
 $layoutVersion = 'agentlaw-managed-layout-v1'
 $pendingMarker = Join-Path $RootDir '.agentlaw-layout.pending'
-foreach ($knownPath in @($stateDir, $layoutMarker, $pendingMarker, (Join-Path $RootDir 'bin'),
+foreach ($knownPath in @($stateDir, $layoutMarker, $pendingMarker, (Join-Path $RootDir 'bin'), (Join-Path $RootDir 'command'),
     (Join-Path $RootDir '.bin-staged'), (Join-Path $RootDir '.bin-previous'), (Join-Path $RootDir '.install.lock'))) {
     if (Test-Path -LiteralPath $knownPath) {
         $item = Get-Item -LiteralPath $knownPath -Force -ErrorAction Stop
@@ -103,30 +101,6 @@ foreach ($scope in @('User', 'Machine')) {
     }
     if ($otherRoots.Count -gt 0) {
         throw "Agentlaw is already installed at $(@($otherRoots | Select-Object -Unique) -join ', '). Update that root, or migrate the existing installation before changing its location."
-    }
-}
-if (-not $managedUpgrade) {
-    $knownState = @()
-    $localBases = @([Environment]::GetFolderPath('LocalApplicationData'), $env:LOCALAPPDATA) | Where-Object { $_ } | Select-Object -Unique
-    foreach ($basePath in $localBases) {
-        foreach ($legacyName in @('Agentlaw', 'AgentlawNext')) {
-            $candidate = Join-Path $basePath $legacyName
-            if (Test-Path -LiteralPath (Join-Path $candidate 'config.json') -PathType Leaf) { $knownState += $candidate }
-            elseif (Test-Path -LiteralPath (Join-Path $candidate 'machine.json') -PathType Leaf) { $knownState += $candidate }
-        }
-        $packages = Join-Path $basePath 'Packages'
-        if (Test-Path -LiteralPath $packages -PathType Container) {
-            foreach ($package in @(Get-ChildItem -LiteralPath $packages -Directory -Filter 'OpenAI.Codex_*' -ErrorAction Stop)) {
-                foreach ($legacyName in @('Agentlaw', 'AgentlawNext')) {
-                    $candidate = Join-Path $package.FullName "LocalCache/Local/$legacyName"
-                    if (Test-Path -LiteralPath (Join-Path $candidate 'config.json') -PathType Leaf) { $knownState += $candidate }
-                    elseif (Test-Path -LiteralPath (Join-Path $candidate 'machine.json') -PathType Leaf) { $knownState += $candidate }
-                }
-            }
-        }
-    }
-    if ($knownState.Count -gt 0) {
-        throw "Existing Agentlaw state found at $(@($knownState | Select-Object -Unique) -join ', '). Migrate that installation before changing its location."
     }
 }
 function Assert-AgentlawBundle {
@@ -220,6 +194,7 @@ function Resolve-InterruptedBinSwap {
     }
 }
 $binaryDir = Join-Path $RootDir 'bin'
+$commandDir = Join-Path $RootDir 'command'
 $stagedBin = Join-Path $RootDir '.bin-staged'
 $previousBin = Join-Path $RootDir '.bin-previous'
 if ((Test-Path -LiteralPath $previousBin) -or
@@ -259,6 +234,8 @@ try {
     $actual = (Get-FileHash -LiteralPath (Join-Path $temporary $archive) -Algorithm SHA256).Hash
     if (-not $match.Success -or $actual -ne $match.Groups[1].Value) { throw 'Checksum verification failed; nothing installed.' }
     Expand-Archive -LiteralPath (Join-Path $temporary $archive) -DestinationPath (Join-Path $temporary 'unpacked')
+    $launcherSource = Join-Path $temporary 'unpacked/agentlaw-launcher.exe'
+    if (-not (Test-Path -LiteralPath $launcherSource -PathType Leaf)) { throw 'Release archive lacks the Agentlaw command launcher.' }
     # A released binary must understand this layout before it is published.
     $probeRoot = Join-Path $temporary 'probe'
     $probeBin = Join-Path $probeRoot 'bin'
@@ -323,17 +300,21 @@ try {
             throw $publishError
         }
         if ($hadPrevious) {
-            try { Remove-ReservedBundle $previousBin }
-            catch { Write-Warning "New Agentlaw bundle is active, but previous bundle cleanup was deferred: $_" }
+            Remove-ReservedBundle $previousBin
         }
     } finally {
         $installLock.Dispose()
     }
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (@($userPath -split ';') -notcontains $binaryDir) {
-        [Environment]::SetEnvironmentVariable('Path', ($binaryDir + ';' + $userPath), 'User')
+    $null = New-Item -ItemType Directory -Path $commandDir -Force
+    $publicCommand = Join-Path $commandDir 'agentlaw.exe'
+    if (-not (Test-Path -LiteralPath $publicCommand)) {
+        Copy-Item -LiteralPath $launcherSource -Destination $publicCommand
     }
-    if (@($env:PATH -split ';') -notcontains $binaryDir) { $env:PATH = $binaryDir + ';' + $env:PATH }
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userEntries = @($userPath -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $commandDir.TrimEnd('\') -and $_.TrimEnd('\') -ne $binaryDir.TrimEnd('\') })
+    [Environment]::SetEnvironmentVariable('Path', ($commandDir + ';' + ($userEntries -join ';')), 'User')
+    $processEntries = @($env:PATH -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $commandDir.TrimEnd('\') -and $_.TrimEnd('\') -ne $binaryDir.TrimEnd('\') })
+    $env:PATH = $commandDir + ';' + ($processEntries -join ';')
     Write-Host "Installed Agentlaw to $RootDir"
     Write-Host "State: $stateDir"
     Write-Host "Proposed memory store: $(Join-Path $RootDir 'memory') (not created; confirm it with agentlaw store create)"

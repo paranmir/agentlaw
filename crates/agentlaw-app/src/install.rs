@@ -352,6 +352,18 @@ pub(crate) fn same_owned_entry(harness: Harness, before: &str, now: &str) -> boo
     }
 }
 
+/// Resolve the instruction file the harness would use, without changing it.
+pub(crate) fn effective_instructions_path(harness: Harness, directory: &Path) -> Result<PathBuf> {
+    if harness == Harness::Codex
+        && read_optional(&directory.join("AGENTS.override.md"))?
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        Ok(directory.join("AGENTS.override.md"))
+    } else {
+        Ok(directory.join("AGENTS.md"))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Replacement {
     path: PathBuf,
@@ -393,39 +405,106 @@ fn recover_journal(state: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resume only a journal whose complete target set is pinned by an update plan.
-pub(crate) fn recover_matching_update_journal(
-    state: &Path,
-    expected: &[(PathBuf, String, String)],
-) -> Result<bool> {
-    let path = state.join("install-pending.json");
-    let Some(raw) = read_optional(&path)? else {
-        return Ok(false);
-    };
-    let journal: InstallJournal = serde_json::from_value(
-        agentlaw_contracts::validation::decode_unique(&raw)?,
-    )
-    .map_err(|_| err("Installation recovery journal is invalid; preserve it for diagnosis."))?;
-    if journal.targets.len() != expected.len()
-        || !journal.targets.iter().all(|target| {
-            expected.iter().any(|(path, before, after)| {
-                target.path == *path
-                    && target.before.as_deref() == Some(before.as_str())
-                    && target.after == *after
-            })
-        })
-    {
-        return Ok(false);
-    }
+/// The updater holds this lock from its last reachable-artifact scan through publication.
+pub(crate) fn lock_install_state(state: &Path) -> Result<fs::File> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(state.join("install.lock"))
         .map_err(|_| err("Cannot lock installation state."))?;
-    fs2::FileExt::lock_exclusive(&lock).map_err(|_| err("Cannot coordinate installation."))?;
-    recover_journal(state)?;
-    Ok(true)
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+        DomainError::new(
+            "update_busy",
+            "Another installation is changing this root; retry the same approved update plan.",
+        )
+    })?;
+    Ok(lock)
+}
+
+/// Apply only the complete before/after target set approved by one update plan.
+/// The caller already owns update.lock and install.lock, in that order.
+pub(crate) fn apply_pinned_registration_locked(
+    state: &Path,
+    expected: &[(PathBuf, String, String)],
+    candidate: &Path,
+    executable: &Path,
+    candidate_hash: &str,
+) -> Result<()> {
+    if expected.len() != 3
+        || expected.iter().any(|(path, _, _)| !path.is_absolute())
+        || expected.iter().enumerate().any(|(index, (path, _, _))| {
+            expected
+                .iter()
+                .skip(index + 1)
+                .any(|(next, _, _)| path == next)
+        })
+    {
+        return Err(err("The pinned registration target set is invalid."));
+    }
+    let journal_path = state.join("install-pending.json");
+    let journal = read_optional(&journal_path)?
+        .map(|raw| {
+            serde_json::from_value::<InstallJournal>(agentlaw_contracts::validation::decode_unique(
+                &raw,
+            )?)
+            .map_err(|_| {
+                err("Installation recovery journal is invalid; preserve it for diagnosis.")
+            })
+        })
+        .transpose()?;
+    if journal.as_ref().is_some_and(|journal| {
+        journal.targets.len() != expected.len()
+            || !journal.targets.iter().all(|target| {
+                expected.iter().any(|(path, before, after)| {
+                    target.path == *path
+                        && target.before.as_deref() == Some(before.as_str())
+                        && target.after == *after
+                })
+            })
+    }) {
+        return Err(err(
+            "A foreign installation journal exists; this update did not replay it.",
+        ));
+    }
+    let mut all_after = true;
+    for (path, before, after) in expected {
+        let current = read_optional(path)?;
+        if current.as_deref() != Some(before.as_str()) && current.as_deref() != Some(after.as_str())
+        {
+            return Err(err(
+                "A pinned registration changed outside the update plan.",
+            ));
+        }
+        all_after &= current.as_deref() == Some(after.as_str());
+    }
+    copy_verified(candidate, executable, candidate_hash)?;
+    if journal.is_none() && !all_after {
+        let targets = expected
+            .iter()
+            .map(|(path, before, after)| Replacement {
+                path: path.clone(),
+                before: Some(before.clone()),
+                after: after.clone(),
+            })
+            .collect();
+        atomic_text(
+            &journal_path,
+            &serde_json::to_string_pretty(&InstallJournal { targets })
+                .map_err(|_| err("Cannot encode installation recovery journal."))?,
+        )?;
+    }
+    if journal_path.exists() {
+        recover_journal(state)?;
+    }
+    for (path, _, after) in expected {
+        if read_optional(path)?.as_deref() != Some(after.as_str()) {
+            return Err(err(
+                "A pinned registration differs from its approved after-state.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn install(
@@ -453,20 +532,30 @@ pub fn install(
     } else {
         "mcp.json"
     });
-    let instructions = if harness == Harness::Codex
-        && read_optional(&directory.join("AGENTS.override.md"))?
-            .is_some_and(|s| !s.trim().is_empty())
-    {
-        directory.join("AGENTS.override.md")
-    } else {
-        directory.join("AGENTS.md")
-    };
+    let instructions = effective_instructions_path(harness, directory)?;
     if !confirmed {
         return Ok(
             json!({"status":"confirmation_required","harness":harness.name(),"executable":executable,"config_path":config,"instructions_path":instructions,"model_manifest":manifest,"next_action":"Confirm these user-level targets with the user, then repeat with --confirm-install. Existing model/machine/memory state will be preserved. No files have been changed."}),
         );
     }
     fs::create_dir_all(state).map_err(|_| err("Cannot create installation state."))?;
+    // A managed update inspects references under update.lock before publishing
+    // or retiring a bundle. Installation must not create a new reference during
+    // that interval, and every writer takes the locks in the same order.
+    let _update_lock = if let Some(root) = crate::config::managed_install_root(state)? {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".update.lock"))
+            .map_err(|_| err("Cannot lock managed update state."))?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .map_err(|_| err("Cannot coordinate with a managed update."))?;
+        Some(lock)
+    } else {
+        None
+    };
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)

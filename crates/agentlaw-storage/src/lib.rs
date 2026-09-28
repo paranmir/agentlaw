@@ -512,8 +512,8 @@ impl Store {
         s.validate_format()?;
         s.ensure_epoch()?;
         s.resume_journal_repair_locked()?;
-        // Current reads do not depend on a surviving control DB. The read-only ledger
-        // port reports CoverageLost if this optional old-format migration cannot run.
+        // Current reads do not depend on a surviving ledger database. The
+        // read-only port reports CoverageLost if the ledger cannot be opened.
         if s.local.join("journal.sqlite").exists() {
             let _ = journal::open(&s.local.join("journal.sqlite"));
         }

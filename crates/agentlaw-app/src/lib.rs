@@ -85,10 +85,14 @@ pub fn tool_result(mut body: Value, failed: bool, notice: Option<Value>) -> Valu
 pub struct McpSession {
     initialized: bool,
     ready: bool,
+    tools_listed: bool,
     advisor: Option<update::Advisor>,
 }
 
 impl McpSession {
+    pub fn tools_listed(&self) -> bool {
+        self.tools_listed
+    }
     pub fn with_advisor(advisor: update::Advisor) -> Self {
         Self {
             advisor: Some(advisor),
@@ -163,6 +167,7 @@ impl McpSession {
                         "This tool list has no continuation cursor.",
                     ));
                 }
+                self.tools_listed = true;
                 json!({"tools":[schema()]})
             }
             "tools/call" => {

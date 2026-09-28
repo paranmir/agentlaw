@@ -1,16 +1,13 @@
-# Agentlaw 0.3.1
+# Agentlaw 0.3.2
 
-- Clarifies when to checkpoint an active Task before extended work if unsaved
-  findings or failed attempts would be costly to reconstruct.
-- Directs project work to recall active Tasks after compaction or a session
-  interruption, even when a summary is available, then reconcile both with
-  current evidence.
-- Makes Task handoffs distinguish verified findings from hypotheses and retain
-  the next exact action. This release changes agent guidance, not the memory
-  data format or public tool input schema.
+- Adds a stable public command that completes a managed update in one call:
+  verify the release, drain Agentlaw processes, replace the bundle and owned
+  registrations, probe the new MCP, and remove approved update debris.
+- Reports `installed` only after the matching candidate probe, recovery closure
+  and cleanup. The harness restart then loads a ready installation.
+- Preserves memory, model assets, machine identity and pending work and stops
+  before publication if registration ownership or effective paths drift.
 
-Existing MCP sessions must restart to load a newly installed binary and tool
-guidance. Read [the managed update procedure](usage.md#managed-updates-and-optional-github-support)
-before applying a release to a registered harness. Process inspection can detect
-an active old process but cannot prevent one from starting afterward; keep the
-installation offline through application.
+Read the
+[managed update guide](usage.md#managed-updates-and-optional-github-support)
+for status and recovery behavior.

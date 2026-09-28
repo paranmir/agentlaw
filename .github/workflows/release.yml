@@ -70,7 +70,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist, bundle | Out-Null
           $suffix = if ($IsWindows) { '.exe' } else { '' }
-          foreach ($name in @('agentlaw', 'agentlaw-worker')) {
+          foreach ($name in @('agentlaw', 'agentlaw-worker', 'agentlaw-launcher')) {
             Copy-Item "target/${{ matrix.target }}/release/$name$suffix" bundle/
           }
           Copy-Item LICENSE bundle/
@@ -80,7 +80,7 @@ jobs:
           if ($IsWindows) {
             Compress-Archive -Path bundle/* -DestinationPath "dist/$name.zip"
           } else {
-            tar -czf "dist/$name.tar.gz" -C bundle agentlaw agentlaw-worker LICENSE
+            tar -czf "dist/$name.tar.gz" -C bundle agentlaw agentlaw-worker agentlaw-launcher LICENSE
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
       - uses: actions/upload-artifact@v7

@@ -625,7 +625,7 @@ mod tests {
         let mut runtime =
             Runtime::open(tmp.path().join("source"), tmp.path().join("local"), "user").unwrap();
         let body=format!("# Objective\r\n{}\r\n# Current position\n```\n# Resume point\n```\n현재 위치\n# Resume point\nnext step\n# References\nref", "x".repeat(100000));
-        let written=runtime.call(parse_request(&json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":body,"evidence":"fixture","applies_to":["user"]}]}).to_string()).unwrap()).unwrap();
+        let written=runtime.call(parse_request(&json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"fixture","applies_to":["user"]}]}}).to_string()).unwrap()).unwrap();
         let acquired = runtime
             .store
             .acquire_current(
@@ -712,7 +712,10 @@ mod tests {
         file.flush().unwrap();
         drop(file);
         let result = runtime
-            .call(parse_request(&json!({"action":"recall","memory_ids":[id]}).to_string()).unwrap())
+            .call(
+                parse_request(&json!({"action":"recall","recall":{"memory_ids":[id]}}).to_string())
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(result["code"], "complete_content_in_file");
         assert_eq!(result["content_read"], false);
@@ -721,7 +724,7 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(length, result["artifact"]["bytes"].as_u64().unwrap());
-        let restored=runtime.call(parse_request(&json!({"action":"recall","recall_for":"restore standing rules","restore_context":true}).to_string()).unwrap()).unwrap();
+        let restored=runtime.call(parse_request(&json!({"action":"recall","recall":{"recall_for":"restore standing rules","restore_context":true}}).to_string()).unwrap()).unwrap();
         assert_eq!(restored["code"], "complete_content_in_file");
         assert!(restored["artifact"]["bytes"].as_u64().unwrap() > bytes);
         let mut file = std::fs::File::open(restored["artifact"]["path"].as_str().unwrap()).unwrap();
@@ -738,10 +741,11 @@ mod tests {
         let mut runtime =
             Runtime::open(tmp.path().join("source"), tmp.path().join("local"), "user").unwrap();
         let body = "한글\r\n\"quote\"\\backslash\twithout final newline";
-        let written=runtime.call(parse_request(&json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":body,"evidence":"fixture","applies_to":["user"]}]}).to_string()).unwrap()).unwrap();
+        let written=runtime.call(parse_request(&json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"fixture","applies_to":["user"]}]}}).to_string()).unwrap()).unwrap();
         let reference = written["results"][0]["memory_ref"].clone();
         let Request::Recall(request) = parse_request(
-            &json!({"action":"recall","memory_ids":[reference["memory_id"]]}).to_string(),
+            &json!({"action":"recall","recall":{"memory_ids":[reference["memory_id"]]}})
+                .to_string(),
         )
         .unwrap() else {
             panic!()

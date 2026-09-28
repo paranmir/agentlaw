@@ -77,7 +77,7 @@ impl ReviewGate for Reviewed {
     }
 }
 fn proposal() -> MemoryProposal {
-    match parse_request(r#"{"action":"remember_this","memories":[{"operation":"create","what_to_remember":"body","evidence":"observed","applies_to":["user"]}]}"#).unwrap(){Request::RememberThis(r)=>r.memories.unwrap().remove(0),_=>unreachable!()}
+    match parse_request(r#"{"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"body","evidence":"observed","applies_to":["user"]}]}}"#).unwrap(){Request::RememberThis(r)=>r.memories.unwrap().remove(0),_=>unreachable!()}
 }
 #[test]
 fn exact_required_cycles_and_sparse_counts() {

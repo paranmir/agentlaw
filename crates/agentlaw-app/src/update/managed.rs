@@ -1,4 +1,4 @@
-//! Explicit, pinned managed-install update. Preparation never replaces a live bundle.
+//! Pinned managed update with a synchronous launcher-owned replacement.
 use crate::{config, install};
 use agentlaw_contracts::{DomainError, Result};
 use fs2::FileExt;
@@ -8,13 +8,65 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 use sysinfo::{get_current_pid, ProcessStatus, ProcessesToUpdate, System};
 
+mod cleanup;
+
 const REPO_RELEASE: &str = "https://github.com/paranmir/agentlaw/releases/download";
+const MAINTENANCE_FILE: &str = "update-maintenance.json";
+
+fn maintenance_path(state: &Path) -> PathBuf {
+    state.join(MAINTENANCE_FILE)
+}
+
+/// Normal frontends cannot start while a replacement is in progress. The
+/// candidate's private MCP probe is admitted only for the pinned plan.
+pub fn check_frontend_start(state: &Path) -> Result<()> {
+    let path = maintenance_path(state);
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read(&path).map_err(|_| {
+        error(
+            "update_maintenance",
+            "Cannot read the update maintenance gate.",
+        )
+    })?;
+    let marker: Value = serde_json::from_slice(&raw).map_err(|_| {
+        error(
+            "update_maintenance",
+            "The update maintenance gate is invalid.",
+        )
+    })?;
+    let Some(id) = marker["plan_id"].as_str() else {
+        return Err(error(
+            "update_maintenance",
+            "The update maintenance gate has no plan.",
+        ));
+    };
+    let probe = std::env::var("AGENTLAW_UPDATE_PROBE_PLAN").ok();
+    if probe.as_deref() == Some(id) {
+        let root = state
+            .parent()
+            .ok_or_else(|| error("update_maintenance", "Invalid managed state path."))?;
+        let plan = load(root, id)?;
+        let expected = candidate_executable(&plan)?;
+        let current = std::env::current_exe()
+            .map_err(|_| error("update_maintenance", "Cannot identify the MCP executable."))?;
+        if fs::canonicalize(current).ok() == fs::canonicalize(expected).ok() {
+            return Ok(());
+        }
+    }
+    Err(error(
+        "update_maintenance",
+        "Agentlaw is being replaced; restart the harness after the update command completes.",
+    ))
+}
 
 fn error(code: &str, message: &str) -> DomainError {
     DomainError::new(code, message)
@@ -50,9 +102,19 @@ struct Plan {
     registrations: Vec<Registration>,
     phase: String,
     #[serde(default)]
-    helper_digest: Option<String>,
-    #[serde(default)]
     bundle_hashes: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    launcher_digest: Option<String>,
+    #[serde(default)]
+    previous_bundle: Option<PathBuf>,
+    #[serde(default)]
+    activation_verified: bool,
+    #[serde(default)]
+    recovery_obligations_closed: bool,
+    #[serde(default)]
+    cleanup_plan_id: Option<String>,
+    #[serde(default)]
+    cleanup_completed: bool,
 }
 
 fn digest(path: &Path) -> Result<String> {
@@ -119,6 +181,100 @@ fn binary_name() -> &'static str {
     } else {
         "agentlaw"
     }
+}
+
+fn candidate_executable(plan: &Plan) -> Result<PathBuf> {
+    let hash = plan
+        .bundle_hashes
+        .as_ref()
+        .and_then(|hashes| hashes.get(binary_name()))
+        .ok_or_else(|| {
+            error(
+                "update_plan_invalid",
+                "The candidate runtime hash is missing.",
+            )
+        })?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(error(
+            "update_plan_invalid",
+            "Invalid candidate runtime hash.",
+        ));
+    }
+    Ok(plan
+        .root
+        .join("state/versions")
+        .join(format!(
+            "{}-{}",
+            plan.tag.trim_start_matches('v'),
+            &hash[..16]
+        ))
+        .join(binary_name()))
+}
+
+fn publish_candidate(plan: &Plan, source: &Path) -> Result<PathBuf> {
+    let destination = candidate_executable(plan)?;
+    let expected = plan
+        .bundle_hashes
+        .as_ref()
+        .and_then(|hashes| hashes.get(binary_name()))
+        .ok_or_else(|| error("update_plan_invalid", "Missing candidate hash."))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| error("update_path", "Invalid version path."))?;
+    if parent.exists() {
+        let entries = fs::read_dir(parent)
+            .map_err(|_| error("update_io", "Cannot inspect the version directory."))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|_| error("update_io", "Cannot inspect a version entry."))?;
+        if entries.len() != 1
+            || entries[0].path() != destination
+            || digest(&destination)? != *expected
+        {
+            return Err(error(
+                "update_drift",
+                "An existing version directory differs from the candidate.",
+            ));
+        }
+        return Ok(destination);
+    }
+    fs::create_dir(parent).map_err(|_| {
+        error(
+            "update_io",
+            "Cannot create the candidate version directory.",
+        )
+    })?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|_| error("update_io", "Cannot stage the candidate runtime."))?;
+    let mut input =
+        fs::File::open(source).map_err(|_| error("update_io", "Cannot read candidate runtime."))?;
+    std::io::copy(&mut input, &mut staged)
+        .map_err(|_| error("update_io", "Cannot copy candidate runtime."))?;
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|_| error("update_io", "Cannot persist candidate runtime."))?;
+    #[cfg(unix)]
+    staged
+        .as_file()
+        .set_permissions(
+            fs::metadata(source)
+                .map_err(|_| error("update_io", "Cannot inspect candidate permissions."))?
+                .permissions(),
+        )
+        .map_err(|_| error("update_io", "Cannot set candidate permissions."))?;
+    if digest(staged.path())? != *expected {
+        return Err(error(
+            "update_checksum",
+            "The copied candidate differs from the verified release.",
+        ));
+    }
+    staged.persist_noclobber(&destination).map_err(|_| {
+        error(
+            "update_io",
+            "Cannot publish the candidate runtime without replacement.",
+        )
+    })?;
+    Ok(destination)
 }
 
 fn bundle_hashes(directory: &Path) -> Result<BTreeMap<String, String>> {
@@ -398,8 +554,13 @@ pub fn preview() -> Result<Value> {
         bin_before_hashes,
         registrations: registration_list(&root)?,
         phase: "previewed".into(),
-        helper_digest: None,
         bundle_hashes: None,
+        launcher_digest: None,
+        previous_bundle: None,
+        activation_verified: false,
+        recovery_obligations_closed: false,
+        cleanup_plan_id: None,
+        cleanup_completed: false,
     };
     save(&plan)?;
     let registrations: Vec<Value> = plan.registrations.iter().map(|r| json!({
@@ -409,7 +570,8 @@ pub fn preview() -> Result<Value> {
     Ok(json!({"status":"confirmation_required","plan_id":plan.id,
         "running_version":env!("CARGO_PKG_VERSION"),"latest_version":tag,
         "root":root,"asset":archive,"sha256":digest,"registrations":registrations,
-        "next_action":"Review this pinned target and existing managed registrations, then run agentlaw update --confirm-update <plan_id>. Preparation will not replace running executables."}))
+        "cleanup_scope":"exact current managed bin and registered version, plus this update's stage and previous bundle",
+        "next_action":"The managed launcher will verify this pinned target, complete installation and cleanup, then request an ordinary harness restart."}))
 }
 
 fn digest_file_or_missing(path: &Path) -> Result<String> {
@@ -474,6 +636,8 @@ pub fn prepare(id: &str) -> Result<Value> {
     let stage = stage(&root, id);
     if plan.phase == "prepared" {
         verify_staged(&plan)?;
+        let mut gate = MaintenanceGate::open(&plan)?;
+        gate.retain_for_recovery();
         return Ok(prepared_result(&plan));
     }
     fs::create_dir_all(&stage).map_err(|_| error("update_io", "Cannot create update staging."))?;
@@ -513,6 +677,11 @@ pub fn prepare(id: &str) -> Result<Value> {
             "agentlaw-worker.exe"
         } else {
             "agentlaw-worker"
+        },
+        if cfg!(windows) {
+            "agentlaw-launcher.exe"
+        } else {
+            "agentlaw-launcher"
         },
         "LICENSE",
     ]
@@ -556,6 +725,13 @@ pub fn prepare(id: &str) -> Result<Value> {
             })
             .is_file()
         || !unpacked.join("LICENSE").is_file()
+        || !unpacked
+            .join(if cfg!(windows) {
+                "agentlaw-launcher.exe"
+            } else {
+                "agentlaw-launcher"
+            })
+            .is_file()
     {
         return Err(error(
             "update_extract",
@@ -602,33 +778,14 @@ pub fn prepare(id: &str) -> Result<Value> {
         fs::rename(&license, &installed_license)
             .map_err(|_| error("update_io", "Cannot stage the bundle license."))?;
     }
-    let helper_dir = stage.join("helper");
-    fs::create_dir_all(&helper_dir).map_err(|_| {
-        error(
-            "update_io",
-            "Cannot create the independent update helper directory.",
-        )
-    })?;
-    let helper = helper_dir.join(binary_name());
-    fs::copy(&candidate, &helper)
-        .map_err(|_| error("update_io", "Cannot stage an independent update helper."))?;
-    if digest(&helper)? != digest(&candidate)? {
-        return Err(error(
-            "update_checksum",
-            "The independent helper differs from the verified candidate.",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        fs::set_permissions(
-            &helper,
-            fs::metadata(&candidate)
-                .map_err(|_| error("update_io", "Cannot read candidate permissions."))?
-                .permissions(),
-        )
-        .map_err(|_| error("update_io", "Cannot make the update helper executable."))?;
-    }
-    plan.helper_digest = Some(digest(&helper)?);
+    let launcher = unpacked.join(if cfg!(windows) {
+        "agentlaw-launcher.exe"
+    } else {
+        "agentlaw-launcher"
+    });
+    fs::rename(&launcher, stage.join("launcher.asset"))
+        .map_err(|_| error("update_io", "Cannot retain the release launcher asset."))?;
+    plan.launcher_digest = Some(digest(&stage.join("launcher.asset"))?);
     let mut hashes = BTreeMap::new();
     for name in [
         binary_name(),
@@ -642,124 +799,196 @@ pub fn prepare(id: &str) -> Result<Value> {
         hashes.insert(name.to_owned(), digest(&unpacked.join(name))?);
     }
     plan.bundle_hashes = Some(hashes);
+    publish_candidate(&plan, &candidate)?;
     plan.phase = "prepared".into();
     save(&plan)?;
+    let mut gate = MaintenanceGate::open(&plan)?;
+    gate.retain_for_recovery();
     Ok(prepared_result(&plan))
 }
 
 fn prepared_result(plan: &Plan) -> Value {
-    let helper = stage(&plan.root, &plan.id)
-        .join("helper")
-        .join(binary_name());
-    json!({"status":"prepared","plan_id":plan.id,"helper":helper,
-        "helper_arguments":["update","apply",plan.id,"--root",plan.root],
-        "root":plan.root,"next_action":"Close all harnesses and Agentlaw MCP, broker, worker and CLI processes using this root. Do not restart them until application completes or safely defers. Then run the returned helper with the returned argument array. It will report remaining processes and can resume the same plan."})
+    let candidate = candidate_executable(plan).ok();
+    let candidate_sha256 = plan
+        .bundle_hashes
+        .as_ref()
+        .and_then(|hashes| hashes.get(binary_name()));
+    json!({"status":"handoff_ready","plan_id":plan.id,"candidate":candidate,
+        "candidate_sha256":candidate_sha256,"root":plan.root,
+        "next_action":"The managed launcher continues this update synchronously; this handoff is not installation success."})
 }
 
 fn verify_staged(plan: &Plan) -> Result<()> {
-    let helper = stage(&plan.root, &plan.id)
-        .join("helper")
-        .join(binary_name());
-    if plan.helper_digest.as_deref() != Some(digest(&helper)?.as_str()) {
+    let candidate = candidate_executable(plan)?;
+    let archive = stage(&plan.root, &plan.id).join(&plan.archive);
+    if digest(&archive)? != plan.archive_digest {
         return Err(error(
             "update_checksum",
-            "The staged helper no longer matches its verified digest.",
+            "The approved release archive has changed.",
         ));
     }
-    let bundle = if plan.root.join("bin").join(binary_name()).is_file()
-        && plan.phase != "prepared"
-        && plan.phase != "moving_old_bundle"
-    {
-        plan.root.join("bin")
-    } else {
-        stage(&plan.root, &plan.id).join("unpacked")
-    };
-    for (name, expected) in plan.bundle_hashes.as_ref().ok_or_else(|| {
+    let expected = plan.bundle_hashes.as_ref().ok_or_else(|| {
         error(
             "update_plan_invalid",
             "The plan has no verified bundle hashes.",
         )
-    })? {
-        if digest(&bundle.join(name))? != *expected {
+    })?;
+    if expected.get(binary_name()) != Some(&digest(&candidate)?) {
+        return Err(error(
+            "update_checksum",
+            "The versioned candidate differs from the approved release.",
+        ));
+    }
+    let staged = stage(&plan.root, &plan.id).join("unpacked");
+    let installed = plan.root.join("bin");
+    if staged.exists() {
+        if bundle_hashes(&staged)? != *expected {
             return Err(error(
                 "update_checksum",
-                "A staged or installed bundle file differs from the approved release.",
+                "The staged bundle differs from the approved release.",
             ));
         }
+    } else if installed.exists() && bundle_hashes(&installed)? == *expected {
+        // The staged directory has already been published as bin.
+    } else {
+        return Err(error(
+            "update_recovery",
+            "Neither staged nor installed candidate bundle is verified.",
+        ));
     }
     Ok(())
 }
 
-fn inspect_processes(root: &Path) -> Value {
-    // A process can exit between enumeration and executable-path lookup.
-    // Recheck an uncertain snapshot before asking the user to resolve it;
-    // persistent uncertainty still fails closed.
-    let mut inspection = inspect_processes_once(root);
-    for _ in 0..20 {
-        if inspection["status"] != "inspection_unknown" {
-            break;
+fn probe_candidate_mcp(plan: &Plan) -> Result<()> {
+    let candidate = candidate_executable(plan)?;
+    let mut child = Command::new(candidate)
+        .args(["mcp", "serve", "--stdio"])
+        .env("AGENTLAW_HOME", plan.root.join("state"))
+        .env("AGENTLAW_UPDATE_PROBE_PLAN", &plan.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| error("update_probe", "Cannot start the candidate MCP."))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| error("update_probe", "Candidate MCP stdout is unavailable."))?;
+    let (lines, responses_in) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        for _ in 0..3 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line.len() > 1_048_576 || line.is_empty() {
+                break;
+            }
+            if lines.send(line).is_err() {
+                break;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        inspection = inspect_processes_once(root);
+    });
+    let messages = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agentlaw-update-probe","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"agentlaw","arguments":{"action":"recall","recall":{
+                "recall_for":"Read-only Agentlaw managed update readiness probe"}}}}),
+    ];
+    if let Some(mut input) = child.stdin.take() {
+        for message in messages {
+            serde_json::to_writer(&mut input, &message)
+                .map_err(|_| error("update_probe", "Cannot encode an MCP probe request."))?;
+            input
+                .write_all(b"\n")
+                .map_err(|_| error("update_probe", "Cannot send the MCP probe."))?;
+        }
     }
-    inspection
-}
-
-fn inspect_processes_once(root: &Path) -> Value {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    let own = get_current_pid().ok();
-    if own.is_none() || !system.processes().contains_key(&own.unwrap()) {
-        return json!({"status":"inspection_unknown","reason":"The OS process list did not include this helper."});
-    }
-    let mut remaining = Vec::new();
-    let mut unknown = Vec::new();
-    for (pid, process) in system.processes() {
-        if Some(*pid) == own {
-            continue;
-        }
-        #[cfg(target_os = "linux")]
-        if own.is_some_and(|self_pid| same_linux_thread_group(*pid, self_pid)) {
-            continue;
-        }
-        // A zombie has exited and cannot execute the old bundle. Unix may
-        // retain its executable path until the parent reaps it.
-        if matches!(
-            process.status(),
-            ProcessStatus::Zombie | ProcessStatus::Dead
-        ) {
-            continue;
-        }
-        let name = process.name().to_string_lossy().to_ascii_lowercase();
-        if !name.starts_with("agentlaw") {
-            continue;
-        }
-        let Some(exe) = process.exe().filter(|path| !path.as_os_str().is_empty()) else {
-            unknown.push(
-                json!({"pid":pid.to_string(),"name":name,"reason":"Executable path unavailable."}),
-            );
-            continue;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut responses = BTreeMap::new();
+    for _ in 0..3 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = match responses_in.recv_timeout(remaining) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error(
+                    "update_probe",
+                    "The candidate MCP did not return all probe responses.",
+                ));
+            }
         };
-        let path = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-        if path.starts_with(root) {
-            let role = process
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ");
-            remaining.push(json!({"pid":pid.to_string(),"path":path,"role":role,
-                "process_status":process.status().to_string(),
-                "started_at":process.start_time()}));
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error(
+                    "update_probe",
+                    "The candidate MCP returned invalid JSON-RPC.",
+                ));
+            }
+        };
+        if value.get("error").is_some() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error(
+                "update_probe",
+                "The candidate MCP returned a JSON-RPC error.",
+            ));
+        }
+        if let Some(id) = value["id"].as_u64() {
+            responses.insert(id, value);
         }
     }
-    if !unknown.is_empty() {
-        json!({"status":"inspection_unknown","candidates":unknown})
-    } else if !remaining.is_empty() {
-        json!({"status":"pending_exit","processes":remaining})
-    } else {
-        json!({"status":"clear"})
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error(
+                    "update_probe",
+                    "The candidate MCP probe did not finish safely.",
+                ));
+            }
+        }
+    };
+    let _ = reader.join();
+    if !status.success() {
+        return Err(error("update_probe", "The candidate MCP probe failed."));
     }
+    let init = responses
+        .get(&1)
+        .ok_or_else(|| error("update_probe", "MCP initialize has no response."))?;
+    if init["result"]["serverInfo"]["version"] != plan.tag.trim_start_matches('v') {
+        return Err(error(
+            "update_probe",
+            "The candidate MCP reported the wrong version.",
+        ));
+    }
+    let listed = responses
+        .get(&2)
+        .ok_or_else(|| error("update_probe", "MCP tools/list has no response."))?;
+    if !listed["result"]["tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "agentlaw"))
+    {
+        return Err(error(
+            "update_probe",
+            "The candidate MCP did not list Agentlaw.",
+        ));
+    }
+    let recall = responses
+        .get(&3)
+        .ok_or_else(|| error("update_probe", "MCP recall has no response."))?;
+    if recall["result"]["isError"] != false {
+        return Err(error("update_probe", "The candidate MCP recall failed."));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -778,37 +1007,354 @@ fn same_linux_thread_group(pid: sysinfo::Pid, self_pid: sysinfo::Pid) -> bool {
         .is_some_and(|tgid| tgid == self_pid.as_u32())
 }
 
-fn offline_guard(plan: &Plan) -> Option<Value> {
-    let inspection = inspect_processes(&plan.root);
-    if inspection["status"] == "clear" {
-        return None;
-    }
-    Some(
-        json!({"status":"incomplete","plan_id":plan.id,"phase":plan.phase,
-        "inspection":inspection,"previous_bundle":plan.root.join(".bin-previous"),
-        "staged_bundle":stage(&plan.root,&plan.id).join("unpacked"),
-        "next_action":"Keep Agentlaw offline. Resolve the reported process or inspection uncertainty, then rerun the same staged helper with update apply and this plan ID. No forced termination or blind rollback was performed."}),
-    )
+fn previous_bundle(plan: &Plan) -> PathBuf {
+    plan.root.join(format!(".bin-previous-{}", plan.id))
 }
 
-fn verify_helper(plan: &Plan) -> Result<()> {
-    let expected = stage(&plan.root, &plan.id)
-        .join("helper")
-        .join(binary_name());
-    if fs::canonicalize(&expected).ok()
-        != std::env::current_exe()
-            .ok()
-            .and_then(|p| fs::canonicalize(p).ok())
+struct MaintenanceGate {
+    path: PathBuf,
+    id: String,
+    retain_on_drop: bool,
+}
+
+impl MaintenanceGate {
+    fn open(plan: &Plan) -> Result<Self> {
+        let path = maintenance_path(&plan.root.join("state"));
+        let candidate = candidate_executable(plan)?;
+        let expected = plan
+            .bundle_hashes
+            .as_ref()
+            .and_then(|hashes| hashes.get(binary_name()))
+            .ok_or_else(|| error("update_plan_invalid", "The candidate hash is missing."))?;
+        let marker = json!({"plan_id":plan.id,"candidate":candidate,"candidate_sha256":expected,"drain":false});
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                serde_json::to_writer(&mut file, &marker).map_err(|_| {
+                    error("update_maintenance", "Cannot write the maintenance gate.")
+                })?;
+                file.sync_all().map_err(|_| {
+                    error("update_maintenance", "Cannot persist the maintenance gate.")
+                })?;
+            }
+            Err(reason) if reason.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing: Value = serde_json::from_slice(&fs::read(&path).map_err(|_| {
+                    error("update_maintenance", "Cannot inspect the maintenance gate.")
+                })?)
+                .map_err(|_| error("update_maintenance", "The maintenance gate is invalid."))?;
+                if existing["plan_id"] != marker["plan_id"]
+                    || existing["candidate"] != marker["candidate"]
+                    || existing["candidate_sha256"] != marker["candidate_sha256"]
+                {
+                    return Err(error(
+                        "update_busy",
+                        "A different update owns this managed root.",
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(error(
+                    "update_maintenance",
+                    "Cannot create the maintenance gate.",
+                ))
+            }
+        }
+        Ok(Self {
+            path,
+            id: plan.id.clone(),
+            retain_on_drop: false,
+        })
+    }
+
+    fn retain_for_recovery(&mut self) {
+        self.retain_on_drop = true;
+    }
+
+    fn set_drain(&self, drain: bool) -> Result<()> {
+        let mut marker: Value =
+            serde_json::from_slice(&fs::read(&self.path).map_err(|_| {
+                error("update_maintenance", "Cannot inspect the maintenance gate.")
+            })?)
+            .map_err(|_| error("update_maintenance", "The maintenance gate changed."))?;
+        if marker["plan_id"] != self.id {
+            return Err(error(
+                "update_maintenance",
+                "Another plan owns the maintenance gate.",
+            ));
+        }
+        marker["drain"] = json!(drain);
+        atomic_json(&self.path, &marker)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let raw = fs::read(&self.path)
+            .map_err(|_| error("update_maintenance", "The maintenance gate disappeared."))?;
+        let marker: Value = serde_json::from_slice(&raw)
+            .map_err(|_| error("update_maintenance", "The maintenance gate changed."))?;
+        if marker["plan_id"] != self.id {
+            return Err(error(
+                "update_maintenance",
+                "Another plan owns the maintenance gate.",
+            ));
+        }
+        fs::remove_file(&self.path).map_err(|_| {
+            error(
+                "update_maintenance",
+                "Cannot reopen normal Agentlaw startup.",
+            )
+        })?;
+        self.retain_on_drop = true;
+        Ok(())
+    }
+}
+
+impl Drop for MaintenanceGate {
+    fn drop(&mut self) {
+        if !self.retain_on_drop {
+            if let Ok(raw) = fs::read(&self.path) {
+                if serde_json::from_slice::<Value>(&raw)
+                    .ok()
+                    .is_some_and(|marker| marker["plan_id"] == self.id)
+                {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+}
+
+fn verified_broker_pid(plan: &Plan) -> Result<Option<sysinfo::Pid>> {
+    let worker = plan.root.join("state/worker");
+    let lock = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(worker.join("daemon.lock"))
     {
-        return Err(error(
-            "update_helper_required",
-            "Run the independently staged helper shown by the prepared plan.",
-        ));
+        Ok(lock) => lock,
+        Err(reason) if reason.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(error(
+                "inspection_unknown",
+                "Cannot inspect the broker lifetime lock.",
+            ))
+        }
+    };
+    match lock.try_lock_exclusive() {
+        Ok(()) => return Ok(None),
+        Err(reason)
+            if reason.kind() == std::io::ErrorKind::WouldBlock
+                || (cfg!(windows) && reason.raw_os_error() == Some(33)) => {}
+        Err(_) => {
+            return Err(error(
+                "inspection_unknown",
+                "Cannot prove the broker lifetime lock is held.",
+            ))
+        }
+    }
+    let endpoint: Value = serde_json::from_slice(
+        &fs::read(worker.join("endpoint.json"))
+            .map_err(|_| error("inspection_unknown", "The active broker has no endpoint."))?,
+    )
+    .map_err(|_| {
+        error(
+            "inspection_unknown",
+            "The active broker endpoint is invalid.",
+        )
+    })?;
+    let pid = endpoint["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| {
+            error(
+                "inspection_unknown",
+                "The active broker has no process identity.",
+            )
+        })?;
+    Ok(Some(sysinfo::Pid::from_u32(pid)))
+}
+
+fn wait_for_managed_processes(plan: &Plan, allow_workers: bool) -> Result<()> {
+    let own = get_current_pid()
+        .ok()
+        .ok_or_else(|| error("inspection_unknown", "Cannot identify the updater process."))?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let broker_pid = if allow_workers {
+            verified_broker_pid(plan)?
+        } else {
+            None
+        };
+        if !system.processes().contains_key(&own) {
+            return Err(error(
+                "inspection_unknown",
+                "The updater is absent from the process list.",
+            ));
+        }
+        let mut blockers = Vec::new();
+        for (pid, process) in system.processes() {
+            if *pid == own
+                || matches!(
+                    process.status(),
+                    ProcessStatus::Zombie | ProcessStatus::Dead
+                )
+            {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if same_linux_thread_group(*pid, own) {
+                continue;
+            }
+            let Some(exe) = process.exe().filter(|path| !path.as_os_str().is_empty()) else {
+                if process
+                    .name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("agentlaw")
+                {
+                    blockers.push(format!("PID {} has an unknown executable", pid.as_u32()));
+                }
+                continue;
+            };
+            let path = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+            if path.starts_with(plan.root.join("command")) {
+                continue;
+            }
+            if path.starts_with(&plan.root) {
+                if allow_workers
+                    && broker_pid
+                        .is_some_and(|broker| *pid == broker || process.parent() == Some(broker))
+                {
+                    continue;
+                }
+                blockers.push(format!("PID {}: {}", pid.as_u32(), path.display()));
+            }
+        }
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(error(
+                "update_process_active",
+                &format!(
+                    "Agentlaw could not establish process exit before replacement: {}",
+                    blockers.join(", ")
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn verify_effective_targets(plan: &Plan) -> Result<()> {
+    for registration in &plan.registrations {
+        let harness = install::Harness::parse(&registration.harness)?;
+        let effective = install::effective_instructions_path(harness, &registration.directory)?;
+        if effective != registration.instructions_path {
+            return Err(error(
+                "update_drift",
+                "instruction_target_changed: the harness now selects a different instruction file.",
+            ));
+        }
     }
     Ok(())
 }
 
-pub fn apply(id: &str, requested_root: &Path) -> Result<Value> {
+fn bundle_state(
+    path: &Path,
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Result<&'static str> {
+    if !path.exists() {
+        return Ok("missing");
+    }
+    let found = bundle_hashes(path)?;
+    if found == *old {
+        Ok("old")
+    } else if found == *new {
+        Ok("new")
+    } else {
+        Err(error(
+            "update_drift",
+            "A managed bundle has bytes outside the pinned before/after states.",
+        ))
+    }
+}
+
+fn incomplete_io(plan: &Plan, operation: &str) -> Value {
+    json!({"status":"incomplete","plan_id":plan.id,"phase":plan.phase,
+        "reason":"bundle_rename_deferred","operation":operation,
+        "next_action":"The pinned replacement did not finish. Resume this plan using the stable Agentlaw command after resolving the exact file blocker."})
+}
+
+fn registration_after(
+    plan: &mut Plan,
+    index: usize,
+) -> Result<(PathBuf, Vec<(PathBuf, String, String)>)> {
+    let state = plan.root.join("state");
+    let executable = candidate_executable(plan)?;
+    let registration = &mut plan.registrations[index];
+    let harness = install::Harness::parse(&registration.harness)?;
+    let config_after = install::configuration(
+        harness,
+        &registration.config_before,
+        &executable,
+        &state,
+        true,
+    )?;
+    let instructions_after = install::upsert_bootstrap(
+        &registration.instructions_before,
+        &install::bootstrap(&executable, &state),
+    )?;
+    let receipt_after = json!({"configuration":config_after,"executable":executable,
+        "instructions":registration.instructions_path})
+    .to_string();
+    for (saved, expected) in [
+        (&registration.config_after, &config_after),
+        (&registration.instructions_after, &instructions_after),
+        (&registration.receipt_after, &receipt_after),
+    ] {
+        if saved.as_ref().is_some_and(|value| value != expected) {
+            return Err(error(
+                "update_plan_invalid",
+                "A pinned registration after-state changed.",
+            ));
+        }
+    }
+    if registration.config_after.is_none() {
+        registration.config_after = Some(config_after.clone());
+        registration.instructions_after = Some(instructions_after.clone());
+        registration.receipt_after = Some(receipt_after.clone());
+        save(plan)?;
+    }
+    let registration = &plan.registrations[index];
+    Ok((
+        executable,
+        vec![
+            (
+                registration.config_path.clone(),
+                registration.config_before.clone(),
+                config_after,
+            ),
+            (
+                registration.instructions_path.clone(),
+                registration.instructions_before.clone(),
+                instructions_after,
+            ),
+            (
+                registration.receipt_path.clone(),
+                registration.receipt_before.clone(),
+                receipt_after,
+            ),
+        ],
+    ))
+}
+
+fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     if !requested_root.is_absolute() {
         return Err(error(
             "invalid_arguments",
@@ -825,199 +1371,463 @@ pub fn apply(id: &str, requested_root: &Path) -> Result<Value> {
     let root = fs::canonicalize(root)
         .map_err(|_| error("update_unmanaged", "Cannot resolve the managed root."))?;
     let mut plan = load(&root, id)?;
+    if plan.phase == "completed" && plan.cleanup_completed && !maintenance_path(&state).exists() {
+        return status_snapshot(&plan);
+    }
     if plan.phase == "previewed" {
         return Err(error(
             "update_plan_state",
-            "Prepare and verify the approved bundle before applying it.",
+            "Prepare the approved bundle before applying it.",
         ));
     }
-    verify_helper(&plan)?;
-    verify_staged(&plan)?;
-    if plan.phase == "completed" {
-        return Ok(json!({"status":"completed","plan_id":id,"root":root,
-            "running_version":env!("CARGO_PKG_VERSION")}));
+    let candidate = candidate_executable(&plan)?;
+    if fs::canonicalize(&candidate).ok()
+        != std::env::current_exe()
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok())
+    {
+        return Err(error(
+            "update_candidate_required",
+            "Only the verified candidate may finish this update.",
+        ));
     }
-    let lock_file = fs::OpenOptions::new()
+    if plan.phase != "completed" {
+        verify_staged(&plan)?;
+    } else if plan.bundle_hashes.as_ref() != Some(&bundle_hashes(&plan.root.join("bin"))?) {
+        return Err(error(
+            "update_drift",
+            "The completed candidate bundle changed.",
+        ));
+    }
+    let update_lock = fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(root.join(".update.lock"))
         .map_err(|_| error("update_lock", "Cannot open the managed update lock."))?;
-    lock_file.try_lock_exclusive().map_err(|_| {
+    update_lock.try_lock_exclusive().map_err(|_| {
         error(
             "update_busy",
             "Another updater is already applying to this root.",
         )
     })?;
-    if let Some(blocked) = offline_guard(&plan) {
-        return Ok(blocked);
+    let mut gate = MaintenanceGate::open(&plan)?;
+    if plan.phase != "prepared" {
+        gate.retain_for_recovery();
     }
-    let staged_bundle = stage(&root, id).join("unpacked");
+    wait_for_managed_processes(&plan, true)?;
+    gate.set_drain(true)?;
+    wait_for_managed_processes(&plan, false)?;
+    if plan.cleanup_completed {
+        gate.close()?;
+        return status_snapshot(&plan);
+    }
+    gate.set_drain(false)?;
+    let mut install_lock = Some(install::lock_install_state(&state)?);
+    verify_effective_targets(&plan)?;
+    let old = &plan.bin_before_hashes;
+    let new = plan.bundle_hashes.as_ref().ok_or_else(|| {
+        error(
+            "update_plan_invalid",
+            "The candidate bundle hashes are absent.",
+        )
+    })?;
     let bin = root.join("bin");
-    let previous = root.join(".bin-previous");
+    let staged = stage(&root, id).join("unpacked");
+    let previous = previous_bundle(&plan);
+    if plan
+        .previous_bundle
+        .as_ref()
+        .is_some_and(|saved| saved != &previous)
+    {
+        return Err(error(
+            "update_plan_invalid",
+            "The previous bundle path changed.",
+        ));
+    }
+    if plan.previous_bundle.is_none() {
+        plan.previous_bundle = Some(previous.clone());
+        save(&plan)?;
+    }
+    let mut bin_state = bundle_state(&bin, old, new)?;
+    let mut staged_state = bundle_state(&staged, old, new)?;
+    let mut previous_state = bundle_state(&previous, old, new)?;
+    if previous_state == "new" || staged_state == "old" {
+        return Err(error(
+            "update_drift",
+            "Update bundle positions contradict this plan.",
+        ));
+    }
+    if matches!(
+        plan.phase.as_str(),
+        "prepared" | "moving_old_bundle" | "publishing_new_bundle"
+    ) && state.join("install-pending.json").exists()
+    {
+        return Err(error(
+            "update_recovery",
+            "An installation journal exists before this plan's registration phase.",
+        ));
+    }
     if plan.phase == "prepared" {
         check_before(&plan)?;
-        if previous.exists() {
-            return Err(error("update_recovery", "A prior bundle is retained; inspect its interrupted installation before applying another plan."));
+        if (bin_state, staged_state, previous_state) != ("old", "new", "missing") {
+            return Err(error(
+                "update_drift",
+                "Prepared bundle positions changed after approval.",
+            ));
         }
         plan.phase = "moving_old_bundle".into();
         save(&plan)?;
+        gate.retain_for_recovery();
     }
     if plan.phase == "moving_old_bundle" {
-        if let Some(blocked) = offline_guard(&plan) {
-            return Ok(blocked);
+        if (bin_state, staged_state, previous_state) == ("old", "new", "missing") {
+            verify_effective_targets(&plan)?;
+            if fs::rename(&bin, &previous).is_err() {
+                return Ok(incomplete_io(&plan, "retain_previous_bundle"));
+            }
+            bin_state = "missing";
+            previous_state = "old";
         }
-        if bin.exists() && !previous.exists() {
-            fs::rename(&bin, &previous).map_err(|_| {
-                error(
-                    "update_io",
-                    "Could not retain the previous bundle; no new bundle was published.",
-                )
-            })?;
+        if (bin_state, staged_state, previous_state) != ("missing", "new", "old")
+            && (bin_state, staged_state, previous_state) != ("new", "missing", "old")
+        {
+            return Err(error(
+                "update_drift",
+                "The old bundle move cannot be reconciled with this plan.",
+            ));
         }
         plan.phase = "publishing_new_bundle".into();
         save(&plan)?;
     }
     if plan.phase == "publishing_new_bundle" {
-        if let Some(blocked) = offline_guard(&plan) {
-            return Ok(blocked);
+        if (bin_state, staged_state, previous_state) == ("missing", "new", "old") {
+            verify_effective_targets(&plan)?;
+            if fs::rename(&staged, &bin).is_err() {
+                return Ok(incomplete_io(&plan, "publish_candidate_bundle"));
+            }
+            bin_state = "new";
+            staged_state = "missing";
         }
-        if !bin.exists() {
-            fs::rename(&staged_bundle, &bin).map_err(|_| error("update_io", "The new bundle could not be published; the previous bundle was retained for external recovery."))?;
+        if (bin_state, staged_state, previous_state) != ("new", "missing", "old") {
+            return Err(error(
+                "update_drift",
+                "The new bundle publication cannot be reconciled with this plan.",
+            ));
         }
         plan.phase = "refreshing_registrations".into();
         save(&plan)?;
     }
-    if plan.phase == "refreshing_registrations" {
-        if let Some(blocked) = offline_guard(&plan) {
-            return Ok(blocked);
+    if matches!(
+        plan.phase.as_str(),
+        "refreshing_registrations" | "verifying_candidate" | "completed"
+    ) {
+        if (bin_state, staged_state, previous_state) != ("new", "missing", "old") {
+            return Err(error(
+                "update_drift",
+                "Published bundle positions differ from the approved plan.",
+            ));
         }
-        let installed = Command::new(bin.join(binary_name()))
-            .arg("--version")
-            .output()
-            .map_err(|_| error("update_probe", "The published bundle could not be probed."))?;
-        if !installed.status.success()
-            || String::from_utf8_lossy(&installed.stdout).trim()
-                != format!("agentlaw {}", plan.tag.trim_start_matches('v'))
-        {
-            return Err(error("update_probe", "The published bundle is not the approved version. Keep the previous bundle for recovery."));
-        }
-        for index in 0..plan.registrations.len() {
-            if let Some(blocked) = offline_guard(&plan) {
-                return Ok(blocked);
-            }
-            if plan.registrations[index].config_after.is_none() {
-                let r = &plan.registrations[index];
-                let harness = install::Harness::parse(&r.harness)?;
-                let hash = digest(&std::env::current_exe().map_err(|_| {
-                    error(
-                        "update_helper_required",
-                        "Cannot identify the staged helper.",
-                    )
-                })?)?;
-                let executable = state
-                    .join("versions")
-                    .join(format!("{}-{}", env!("CARGO_PKG_VERSION"), &hash[..16]))
-                    .join(binary_name());
-                let config_after =
-                    install::configuration(harness, &r.config_before, &executable, &state, true)?;
-                let instructions_after = install::upsert_bootstrap(
-                    &r.instructions_before,
-                    &install::bootstrap(&executable, &state),
+        if plan.phase == "refreshing_registrations" {
+            let candidate = candidate_executable(&plan)?;
+            let hash = digest(&candidate)?;
+            for index in 0..plan.registrations.len() {
+                verify_effective_targets(&plan)?;
+                let (executable, expected) = registration_after(&mut plan, index)?;
+                install::apply_pinned_registration_locked(
+                    &state,
+                    &expected,
+                    &candidate,
+                    &executable,
+                    &hash,
                 )?;
-                let receipt_after = json!({"configuration":config_after,"executable":executable,
-                    "instructions":r.instructions_path})
-                .to_string();
-                let r = &mut plan.registrations[index];
-                r.config_after = Some(config_after);
-                r.instructions_after = Some(instructions_after);
-                r.receipt_after = Some(receipt_after);
-                save(&plan)?;
             }
-            let r = &plan.registrations[index];
-            let expected = vec![
-                (
-                    r.config_path.clone(),
-                    r.config_before.clone(),
-                    r.config_after.clone().unwrap_or_default(),
-                ),
-                (
-                    r.instructions_path.clone(),
-                    r.instructions_before.clone(),
-                    r.instructions_after.clone().unwrap_or_default(),
-                ),
-                (
-                    r.receipt_path.clone(),
-                    r.receipt_before.clone(),
-                    r.receipt_after.clone().unwrap_or_default(),
-                ),
-            ];
-            install::recover_matching_update_journal(&state, &expected)?;
-            let current_config = text(&r.config_path)?;
-            let current_instructions = text(&r.instructions_path)?;
-            let current_receipt = text(&r.receipt_path)?;
-            let already = r
-                .config_after
-                .as_ref()
-                .is_some_and(|after| after == &current_config)
-                && r.instructions_after
-                    .as_ref()
-                    .is_some_and(|after| after == &current_instructions)
-                && r.receipt_after
-                    .as_ref()
-                    .is_some_and(|after| after == &current_receipt);
-            if already {
-                continue;
-            }
-            if (current_config != r.config_before
-                && r.config_after.as_ref() != Some(&current_config))
-                || (current_instructions != r.instructions_before
-                    && r.instructions_after.as_ref() != Some(&current_instructions))
-                || (current_receipt != r.receipt_before
-                    && r.receipt_after.as_ref() != Some(&current_receipt))
-            {
-                return Err(error("update_drift", "A harness registration changed outside this plan. The new bundle is installed, but registration refresh is incomplete."));
-            }
-            let harness = install::Harness::parse(&r.harness)?;
-            let result = install::install(&state, harness, &r.directory, None, true)?;
-            if result["status"] != "installed" {
+            if state.join("install-pending.json").exists() {
                 return Err(error(
-                    "update_install",
-                    "A managed harness could not be refreshed.",
+                    "update_recovery",
+                    "An installation journal remains after registration refresh.",
                 ));
             }
-            let r = &plan.registrations[index];
-            if text(&r.config_path)? != r.config_after.as_deref().unwrap_or_default()
-                || text(&r.instructions_path)?
-                    != r.instructions_after.as_deref().unwrap_or_default()
-                || text(&r.receipt_path)? != r.receipt_after.as_deref().unwrap_or_default()
-            {
-                return Err(error(
-                    "update_install",
-                    "A managed registration differs from the pinned after-state.",
-                ));
-            }
+            verify_effective_targets(&plan)?;
+            plan.phase = "verifying_candidate".into();
             save(&plan)?;
         }
-        if state.join("install-pending.json").exists() {
-            return Err(error("update_recovery", "An installation journal outside this pinned plan remains; inspect it before completing the update."));
+        if plan.phase == "verifying_candidate" {
+            drop(install_lock.take());
+            probe_candidate_mcp(&plan)?;
+            wait_for_managed_processes(&plan, true)?;
+            gate.set_drain(true)?;
+            wait_for_managed_processes(&plan, false)?;
+            install_lock = Some(install::lock_install_state(&state)?);
+            let observed = status_snapshot(&plan)?;
+            if observed["bundle"] != "installed_and_verified"
+                || observed["registrations"] != "verified"
+            {
+                return Err(error(
+                    "update_probe",
+                    "The candidate registration changed during the probe.",
+                ));
+            }
+            plan.activation_verified = true;
+            plan.recovery_obligations_closed = true;
+            plan.phase = "completed".into();
+            save(&plan)?;
         }
-        plan.phase = "completed".into();
+        cleanup::cleanup_update_plan(&mut plan)?;
+        plan.cleanup_completed = true;
         save(&plan)?;
+        drop(install_lock.take());
+        gate.close()?;
+        return status_snapshot(&plan);
     }
-    Ok(json!({"status":plan.phase,"plan_id":id,"root":root,
-        "running_version":env!("CARGO_PKG_VERSION"),
-        "next_action":"Start a new approved harness session and verify initialize.serverInfo.version, tool description, and an ordinary recall. Existing sessions keep their previous running version. The retained previous bundle is recovery material."}))
+    Err(error(
+        "update_plan_invalid",
+        "The update plan has an unknown phase.",
+    ))
+}
+
+pub fn apply(id: &str, requested_root: &Path) -> Result<Value> {
+    apply_live(id, requested_root)
+}
+
+fn closed_successor(plan: &Plan) -> Result<Option<Plan>> {
+    let Some(mut expected) = plan.bundle_hashes.clone() else {
+        return Ok(None);
+    };
+    let current = bundle_hashes(&plan.root.join("bin")).ok();
+    let directory = plan.root.join("state/update-plans");
+    let mut seen = BTreeSet::from([plan.id.clone()]);
+    for _ in 0..64 {
+        if current.as_ref() == Some(&expected) {
+            return Ok(None);
+        }
+        let mut successor = None;
+        for entry in fs::read_dir(&directory)
+            .map_err(|_| error("update_plan_invalid", "Cannot inspect update lineage."))?
+        {
+            let entry = entry
+                .map_err(|_| error("update_plan_invalid", "Cannot enumerate update lineage."))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if seen.contains(id) {
+                continue;
+            }
+            let candidate = load(&plan.root, id)?;
+            if candidate.bin_before_hashes == expected
+                && candidate.phase == "completed"
+                && candidate.recovery_obligations_closed
+            {
+                if successor.is_some() {
+                    return Err(error(
+                        "update_plan_invalid",
+                        "Update lineage has two successors.",
+                    ));
+                }
+                successor = Some(candidate);
+            }
+        }
+        let Some(next) = successor else {
+            return Ok(None);
+        };
+        seen.insert(next.id.clone());
+        expected = next.bundle_hashes.clone().ok_or_else(|| {
+            error(
+                "update_plan_invalid",
+                "A closed update has no bundle hashes.",
+            )
+        })?;
+        if current.as_ref() == Some(&expected) {
+            return Ok(Some(next));
+        }
+    }
+    Err(error("update_plan_invalid", "Update lineage is too deep."))
+}
+
+fn status_snapshot(plan: &Plan) -> Result<Value> {
+    if plan.phase == "completed" && plan.cleanup_completed && plan.recovery_obligations_closed {
+        if let Some(successor) = closed_successor(plan)? {
+            let latest = status_snapshot(&successor)?;
+            return Ok(
+                json!({"status":"superseded","plan_id":plan.id,"tag":plan.tag,
+                "root":plan.root,"phase":plan.phase,"activation":"verified",
+                "bundle":"superseded","registrations":"superseded",
+                "superseded_by_plan_id":successor.id,"current_installation":latest,
+                "previous_bundle":previous_bundle(plan),
+                "previous_bundle_retained":previous_bundle(plan).exists(),
+                "cleanup":"completed",
+                "next_action":"This closed historical plan has a verified completed successor; never republish its older bundle."}),
+            );
+        }
+    }
+    let expected_new = plan.bundle_hashes.as_ref();
+    let bundle = if let Some(new) = expected_new {
+        match bundle_hashes(&plan.root.join("bin")) {
+            Ok(found) if found == *new => "installed_and_verified",
+            Ok(found) if found == plan.bin_before_hashes => "previous",
+            Ok(_) => "drifted",
+            Err(_) if !plan.root.join("bin").exists() => "missing",
+            Err(_) => "drifted",
+        }
+    } else {
+        "not_prepared"
+    };
+    let mut registration_items = Vec::new();
+    let mut overall = "verified";
+    for registration in &plan.registrations {
+        let effective = install::effective_instructions_path(
+            install::Harness::parse(&registration.harness)?,
+            &registration.directory,
+        )
+        .ok();
+        let target_changed = effective.as_ref() != Some(&registration.instructions_path);
+        let current = [
+            text(&registration.config_path).ok(),
+            text(&registration.instructions_path).ok(),
+            text(&registration.receipt_path).ok(),
+        ];
+        let after = [
+            &registration.config_after,
+            &registration.instructions_after,
+            &registration.receipt_after,
+        ];
+        let before = [
+            &registration.config_before,
+            &registration.instructions_before,
+            &registration.receipt_before,
+        ];
+        let all_after = after.iter().all(|item| item.is_some())
+            && (0..3).all(|index| current[index].as_ref() == after[index].as_ref());
+        let all_known = (0..3).all(|index| {
+            current[index].as_ref() == Some(before[index])
+                || current[index].as_ref() == after[index].as_ref()
+        });
+        let mut artifact_verified = false;
+        if all_after {
+            if let Some(receipt) = current[2]
+                .as_ref()
+                .and_then(|raw| agentlaw_contracts::validation::decode_unique(raw).ok())
+            {
+                if let Some(path) = receipt["executable"].as_str() {
+                    artifact_verified = expected_new
+                        .and_then(|hashes| hashes.get(binary_name()))
+                        .is_some_and(|hash| digest(Path::new(path)).ok().as_ref() == Some(hash));
+                }
+            }
+        }
+        let state = if target_changed || !all_known || (all_after && !artifact_verified) {
+            "drifted"
+        } else if all_after {
+            "verified"
+        } else {
+            "partial"
+        };
+        if state == "drifted" {
+            overall = "drifted";
+        } else if state == "partial" && overall == "verified" {
+            overall = "partial";
+        }
+        registration_items.push(
+            json!({"harness":registration.harness,"config_path":registration.config_path,
+            "instructions_path":registration.instructions_path,"state":state,
+            "reason":if target_changed {Some("instruction_target_changed")} else {None}}),
+        );
+    }
+    let activation = if bundle == "installed_and_verified" && overall == "verified" {
+        if plan.activation_verified {
+            "verified"
+        } else {
+            "restart_required"
+        }
+    } else {
+        "verification_pending"
+    };
+    let broker_runtime = observed_broker_runtime(plan);
+    let maintenance_open = maintenance_path(&plan.root.join("state")).exists();
+    let completed = plan.phase == "completed"
+        && plan.cleanup_completed
+        && plan.recovery_obligations_closed
+        && !maintenance_open
+        && bundle == "installed_and_verified"
+        && overall == "verified";
+    Ok(
+        json!({"status":if completed {"completed"} else {"incomplete"},
+        "plan_id":plan.id,"phase":plan.phase,"tag":plan.tag,"root":plan.root,
+        "bundle":bundle,"registrations":overall,"registration_details":registration_items,
+        "current_session":"unknown","activation":activation,"broker_runtime":broker_runtime,
+        "previous_bundle":previous_bundle(plan),
+        "cleanup":if plan.cleanup_completed {"completed"} else {"incomplete"},
+        "recovery_obligations_closed":plan.recovery_obligations_closed,
+        "maintenance_gate_open":maintenance_open,
+        "next_action":if completed {
+            "Restart the harness normally. The candidate MCP and recall have already passed the internal readiness probe."
+        } else {
+            "The update is incomplete. Resume this pinned plan after inspecting the reported blocker; do not report restart as successful installation."
+        }}),
+    )
+}
+
+fn observed_broker_runtime(plan: &Plan) -> &'static str {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let old = plan.bin_before_hashes.get(binary_name());
+    let new = plan
+        .bundle_hashes
+        .as_ref()
+        .and_then(|hashes| hashes.get(binary_name()));
+    let mut found = None;
+    for process in system.processes().values() {
+        if !process.cmd().iter().any(|arg| arg == "worker-daemon") {
+            continue;
+        }
+        let Some(path) = process.exe() else {
+            return "unknown";
+        };
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !path.starts_with(&plan.root) {
+            continue;
+        }
+        let Ok(hash) = digest(&path) else {
+            return "unknown";
+        };
+        let kind = if old == Some(&hash) {
+            "old"
+        } else if new == Some(&hash) {
+            "new"
+        } else {
+            "unknown"
+        };
+        if found.is_some_and(|prior| prior != kind) {
+            return "unknown";
+        }
+        found = Some(kind);
+    }
+    found.unwrap_or("unknown")
+}
+
+pub fn status_with_root(id: &str, requested_root: &Path) -> Result<Value> {
+    if !requested_root.is_absolute() {
+        return Err(error(
+            "invalid_arguments",
+            "The managed update root must be absolute.",
+        ));
+    }
+    let state = requested_root.join("state");
+    let root = config::managed_install_root(&state)?.ok_or_else(|| {
+        error(
+            "update_unmanaged",
+            "The plan's managed root is unavailable.",
+        )
+    })?;
+    let root = fs::canonicalize(root)
+        .map_err(|_| error("update_unmanaged", "Cannot resolve the managed root."))?;
+    status_snapshot(&load(&root, id)?)
 }
 
 pub fn status(id: &str) -> Result<Value> {
     let root = managed_root()?;
-    let plan = load(&root, id)?;
-    Ok(
-        json!({"plan_id":id,"phase":plan.phase,"tag":plan.tag,"root":root,
-        "registrations":plan.registrations.iter().map(|r|json!({"harness":r.harness,"config_path":r.config_path,
-            "refreshed":r.config_after.is_some()})).collect::<Vec<_>>() }),
-    )
+    status_with_root(id, &root)
 }
 
 #[cfg(test)]

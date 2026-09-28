@@ -24,23 +24,10 @@ pub fn load_or_create(state: &Path) -> Result<Machine> {
         return Ok(machine);
     }
     fs::create_dir_all(state).map_err(|_| err())?;
-    // Preserve an installation created by the first integration build.
-    let legacy = state.join("runtime/control.sqlite");
-    let id = if legacy.is_file() {
-        let db = rusqlite::Connection::open_with_flags(
-            legacy,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|_| err())?;
-        db.query_row(
-            "SELECT value FROM settings WHERE key='machine_id'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(|_| err())?
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
+    if state.join("config.json").exists() {
+        return Err(err());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
     agentlaw_storage::validate_id(&id).map_err(|_| err())?;
     let machine = Machine {
         machine_id: id,
@@ -92,5 +79,13 @@ mod tests {
         );
         fs::write(root.path().join("machine.json"), "{}").unwrap();
         assert!(load_or_create(root.path()).is_err());
+    }
+
+    #[test]
+    fn selected_store_never_regenerates_missing_machine_identity() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("config.json"), b"selected").unwrap();
+        assert!(load_or_create(root.path()).is_err());
+        assert!(!root.path().join("machine.json").exists());
     }
 }

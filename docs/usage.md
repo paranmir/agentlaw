@@ -53,7 +53,7 @@ see [model artifacts](../crates/agentlaw-worker/ARTIFACTS.md).
 ## Isolated setup and installation
 
 Set `AGENTLAW_HOME` to an absolute installation-local state directory for a
-development trial. Keep it separate from legacy data and canonical memory.
+development trial. Keep it separate from the active canonical memory store.
 Without this override, an installed executable uses its managed layout marker;
 an unmanaged executable does not silently adopt older AppData state. The default
 Windows installer root is the current user's `Agentlaw` directory, derived from
@@ -65,12 +65,11 @@ marker when `AGENTLAW_HOME` is unset; the harness adapter explicitly configures
 that same state path. `store propose-location` returns the sibling memory path,
 but does not create it. LLVM-MinGW/Rust build tools are for source development,
 not required by the release and not installed automatically.
-The Windows installer refuses a new root when known older AppData state or
-another managed root is found. Resolve or migrate that state explicitly first;
+The Windows installer refuses a new root when another managed root is found;
 one OS user shares one installation across harnesses. Reuse the
 same `-RootDir` to upgrade a nondefault Windows root. The Unix installer uses
 `$HOME/Agentlaw` by default, accepts `AGENTLAW_ROOT` for another complete root,
-and refuses known legacy state instead of adopting it silently.
+and refuses unrecognized content at the selected root.
 `AGENTLAW_HOME` continues to override the installation state directory. The
 `source-coordination` registry lives under that installation's `state` directory.
 All clients use this registry so the same Markdown source cannot bind to
@@ -152,28 +151,23 @@ For an installed, managed root:
 ```text
 agentlaw update check
 agentlaw update
-agentlaw update --confirm-update <plan-id>
 agentlaw update status <plan-id>
 ```
 
-`update check` queries the public release endpoint explicitly. `update` previews
-the latest full release, the managed root, asset checksum and existing owned
-harness registrations. Review the returned plan ID before `--confirm-update`.
-Preparation verifies the pinned release archive and returns a separate helper
-path and argument array. Keep the managed installation offline from that point:
-close every harness, MCP server, persistent broker, model child and CLI process
-using the root, and do not restart them while the helper applies the plan. Run
-the exact returned helper and arguments. If it reports `pending_exit` or
-`inspection_unknown`, resolve the reported condition and rerun the same helper
-and plan. It does not kill processes or assume a transmitted notice was read.
-
-The helper keeps the previous binary bundle and versioned executables for
-recovery, preserves memory, models, machine identity and pending work, and
-refreshes only the approved owned harness registrations. A drifted registration
-is reported for inspection. Once application completes, start a new harness
-session and verify `initialize.serverInfo.version`, the refreshed tool guidance
-and an ordinary recall. A source build using `AGENTLAW_HOME` for an installed
-state cannot approve a managed update.
+`update check` queries the public release endpoint explicitly. The public
+`agentlaw` command in `command/` owns a complete synchronous update. It pins the
+latest full release and the owned harness registrations, verifies the archive
+and candidate, gates new Agentlaw work, and waits for affected MCP and worker
+processes to finish and exit. It replaces the bundle and registrations, probes
+the new MCP with initialize, tool discovery and read-only recall, then removes
+only the old bundle, previous registered version and staging objects approved
+by that plan. Memory, models, machine identity and pending work are preserved.
+An `installed` response means replacement, probe and cleanup all finished;
+restart the harness normally and use Agentlaw immediately. An incomplete result
+names its blocker and never asks for a restart as if installation succeeded.
+Retry the same `agentlaw update` command to resume an interrupted plan. A source
+build using `AGENTLAW_HOME` for an installed state cannot approve a managed
+update.
 
 `agentlaw support star` is a separate optional action. With an authenticated
 GitHub CLI account, it checks whether that account already starred

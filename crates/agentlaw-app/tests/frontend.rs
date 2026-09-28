@@ -36,7 +36,20 @@ fn run(state: &Path, args: &[&str], input: Option<Value>) -> (Output, Value) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
-    if let Some(input) = input {
+    if let Some(mut input) = input {
+        if args == ["call", "--json", "-"] {
+            if let Some(action) = input["action"].as_str().map(str::to_owned) {
+                if input.get(&action).is_none() {
+                    let mut fields = input.as_object().unwrap().clone();
+                    fields.remove("action");
+                    input = json!({"action":action});
+                    input
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(action, Value::Object(fields));
+                }
+            }
+        }
         write!(child.stdin.take().unwrap(), "{input}").unwrap();
     } else {
         drop(child.stdin.take());
@@ -211,7 +224,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":body,"evidence":"Confirmed in the actual installed-model integration test.","applies_to":["user"]}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Confirmed in the actual installed-model integration test.","applies_to":["user"]}]}}),
         ),
     );
     assert!(out.status.success(), "{saved}");
@@ -220,7 +233,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
     let (out, recalled) = run(
         &state,
         &["call", "--json", "-"],
-        Some(json!({"action":"recall","memory_ids":[id]})),
+        Some(json!({"action":"recall","recall":{"memory_ids":[id]}})),
     );
     assert!(out.status.success(), "{recalled}");
     assert_eq!(
@@ -230,7 +243,9 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
     let (out, search) = run(
         &state,
         &["call", "--json", "-"],
-        Some(json!({"action":"recall","recall_for":"atomic publication of memory updates"})),
+        Some(
+            json!({"action":"recall","recall":{"recall_for":"atomic publication of memory updates"}}),
+        ),
     );
     assert!(out.status.success(), "{search}");
     assert!(
@@ -272,7 +287,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
         json!({"jsonrpc":"2.0","method":"notifications/initialized"})
     )
     .unwrap();
-    writeln!(stdin,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","memory_ids":[id]}}})).unwrap();
+    writeln!(stdin,"{}",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"memory_ids":[id]}}}})).unwrap();
     drop(stdin);
     let output = mcp.wait_with_output().unwrap();
     assert!(output.status.success());
@@ -374,7 +389,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
     let (_, replica_exact) = run(
         &replica,
         &["call", "--json", "-"],
-        Some(json!({"action":"recall","memory_ids":[id]})),
+        Some(json!({"action":"recall","recall":{"memory_ids":[id]}})),
     );
     assert_eq!(
         replica_exact["memories"][0]["current_heads"][0]["what_to_remember"],
@@ -383,7 +398,9 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
     let (out, replica_search) = run(
         &replica,
         &["call", "--json", "-"],
-        Some(json!({"action":"recall","recall_for":"atomic publication of memory updates"})),
+        Some(
+            json!({"action":"recall","recall":{"recall_for":"atomic publication of memory updates"}}),
+        ),
     );
     assert!(out.status.success(), "{replica_search}");
     let has_id = replica_search["memories"]
@@ -585,7 +602,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":first_body,"evidence":"A quoted path failed in the original command.","applies_to":["user"]}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":first_body,"evidence":"A quoted path failed in the original command.","applies_to":["user"]}]}}),
         ),
     );
     assert!(out.status.success(), "{first}");
@@ -596,7 +613,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"evolve","parent_refs":[original_ref],"what_to_remember":current_body,"evidence":"The user clarified that string interpolation is also unsafe."}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"evolve","parent_refs":[original_ref],"what_to_remember":current_body,"evidence":"The user clarified that string interpolation is also unsafe."}]}}),
         ),
     );
     assert!(out.status.success(), "{evolved}");
@@ -607,7 +624,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":current_body,"evidence":"Unresolved duplicate proposal: retain this evidence until the user decides.","applies_to":["user"]}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":current_body,"evidence":"Unresolved duplicate proposal: retain this evidence until the user decides.","applies_to":["user"]}]}}),
         ),
     );
     assert!(out.status.success(), "{pending}");
@@ -694,7 +711,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
         let (out, recalled) = run(
             &state,
             &["call", "--json", "-"],
-            Some(json!({"action":"recall","memory_ids":[id]})),
+            Some(json!({"action":"recall","recall":{"memory_ids":[id]}})),
         );
         assert!(out.status.success(), "{recalled}");
         let recalled = delivered(recalled);
@@ -710,7 +727,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
             &state,
             &["call", "--json", "-"],
             Some(
-                json!({"action":"remember_this","pending_action":"inspect","pending_batch_ref":pending_ref}),
+                json!({"action":"remember_this","remember_this":{"pending_action":"inspect","pending_batch_ref":pending_ref}}),
             ),
         );
         assert!(out.status.success(), "{inspected}");
@@ -1153,13 +1170,13 @@ fn real_cli_publication_is_visible_to_new_mcp_process() {
         &state,
         &["call", "--json", "-"],
         Some(json!({
-            "action":"remember_this", "memories":[{"operation":"create", "what_to_remember":"Use PowerShell argument arrays for paths with spaces.", "evidence":"Verified in the shell.", "applies_to":["user"]}]
+            "action":"remember_this", "remember_this":{"memories":[{"operation":"create", "what_to_remember":"Use PowerShell argument arrays for paths with spaces.", "evidence":"Verified in the shell.", "applies_to":["user"]}]}
         })),
     );
     assert!(out.status.success(), "{written}");
     assert_eq!(written["status"], "remembered");
     let reference = &written["results"][0]["memory_ref"];
-    let request = json!({"action":"recall", "memory_ids":[reference["memory_id"]]});
+    let request = json!({"action":"recall", "recall":{"memory_ids":[reference["memory_id"]]}});
     let messages = [
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"integration","version":"1"}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -1237,7 +1254,7 @@ fn existing_frontend_switches_next_request_and_old_store_is_retained() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"Store A contains this marker.","evidence":"Store switch fixture.","applies_to":["user"]}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"Store A contains this marker.","evidence":"Store switch fixture.","applies_to":["user"]}]}}),
         ),
     );
     let id = saved["results"][0]["memory_ref"]["memory_id"].clone();
@@ -1270,7 +1287,7 @@ fn existing_frontend_switches_next_request_and_old_store_is_retained() {
     )
     .unwrap();
     let mut request = |n: u64| -> Value {
-        writeln!(input,"{}",json!({"jsonrpc":"2.0","id":n,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","memory_ids":[id]}}})).unwrap();
+        writeln!(input,"{}",json!({"jsonrpc":"2.0","id":n,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"memory_ids":[id]}}}})).unwrap();
         input.flush().unwrap();
         let mut line = String::new();
         output.read_line(&mut line).unwrap();
@@ -1340,7 +1357,7 @@ fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _daemon = daemon(&state);
-    let write = json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"Use argument arrays for paths with spaces.","evidence":"User corrected command quoting.","applies_to":["user"]}]});
+    let write = json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"Use argument arrays for paths with spaces.","evidence":"User corrected command quoting.","applies_to":["user"]}]}});
     let (_, first) = run(&state, &["call", "--json", "-"], Some(write.clone()));
     assert_eq!(first["status"], "remembered");
     let (_, pending) = run(&state, &["call", "--json", "-"], Some(write));
@@ -1351,8 +1368,7 @@ fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
     std::fs::rename(&control, &backup).unwrap();
     let bytes = std::fs::read(&backup).unwrap();
     let selection = std::fs::read(state.join("config.json")).unwrap();
-    let recall =
-        json!({"action":"recall","memory_ids":[first["results"][0]["memory_ref"]["memory_id"]]});
+    let recall = json!({"action":"recall","recall":{"memory_ids":[first["results"][0]["memory_ref"]["memory_id"]]}});
     let (out, error) = run(&state, &["call", "--json", "-"], Some(recall.clone()));
     assert!(!out.status.success());
     assert_eq!(error["code"], "control_backup_required");
@@ -1381,7 +1397,7 @@ fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","pending_action":"inspect","pending_batch_ref":pending["pending_batch_ref"]}),
+            json!({"action":"remember_this","remember_this":{"pending_action":"inspect","pending_batch_ref":pending["pending_batch_ref"]}}),
         ),
     );
     assert_eq!(
@@ -1412,12 +1428,12 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":body,"evidence":"Verified command invocation.","applies_to":["user"]}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Verified command invocation.","applies_to":["user"]}]}}),
         ),
     );
     assert_eq!(saved["status"], "remembered", "{saved}");
     let reference = saved["results"][0]["memory_ref"].clone();
-    let request = json!({"action":"recall","memory_ids":[reference["memory_id"]]});
+    let request = json!({"action":"recall","recall":{"memory_ids":[reference["memory_id"]]}});
     let (out, oversized) = run(&state, &["call", "--json", "-"], Some(request.clone()));
     assert!(out.status.success(), "{oversized}");
     assert_eq!(oversized["code"], "complete_content_in_file");
@@ -1440,7 +1456,7 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","memories":[{"operation":"evolve","parent_refs":[reference],"what_to_remember":"Current concise command guidance.","evidence":"User requested a coherent rewrite."}]}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"evolve","parent_refs":[reference],"what_to_remember":"Current concise command guidance.","evidence":"User requested a coherent rewrite."}]}}),
         ),
     );
     assert_eq!(changed["status"], "remembered", "{changed}");

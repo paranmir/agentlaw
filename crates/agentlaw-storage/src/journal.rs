@@ -1,40 +1,22 @@
-//! Local ledger migration and connection policy. File publication remains separate.
-use crate::{Error, PublishReceipt, Result, Store};
+//! Local ledger and connection policy. File publication remains separate.
+use crate::{Error, Result, Store};
 use std::path::Path;
 pub(super) fn open(path: &Path) -> Result<rusqlite::Connection> {
-    let mut conn = rusqlite::Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS publications(operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, manifest TEXT NOT NULL, sequence BLOB CHECK(sequence IS NULL OR length(sequence)=8));")?;
-    let has_sequence = {
-        let mut q = conn.prepare("PRAGMA table_info(publications)")?;
-        let names = q.query_map([], |r| r.get::<_, String>(1))?;
-        names
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .iter()
-            .any(|n| n == "sequence")
-    };
-    if !has_sequence {
-        conn.execute_batch("ALTER TABLE publications ADD COLUMN sequence BLOB CHECK(sequence IS NULL OR length(sequence)=8);")?;
-    }
-    let tx = conn.transaction()?;
-    // Legacy rewrite rows are migrated one at a time, never an all-history RAM collection.
-    {
-        let mut query =
-            tx.prepare("SELECT operation_id,receipt FROM publications WHERE sequence IS NULL")?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            let operation: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            let receipt: PublishReceipt = serde_json::from_str(&raw)?;
-            tx.execute(
-                "UPDATE publications SET sequence=?1 WHERE operation_id=?2",
-                rusqlite::params![receipt.generation.to_be_bytes().as_slice(), operation],
-            )?;
-        }
-    }
-    tx.execute_batch(
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS publications(operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, manifest TEXT NOT NULL, sequence BLOB NOT NULL CHECK(length(sequence)=8));")?;
+    conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS publications_sequence ON publications(sequence);",
     )?;
-    tx.commit()?;
+    let missing_sequence: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM publications WHERE sequence IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_sequence != 0 {
+        return Err(Error::Corrupt(
+            "publication ledger has rows without sequence".into(),
+        ));
+    }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS canonical_change_ids(change_id TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS registry_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), complete INTEGER NOT NULL CHECK(complete IN(0,1)));")?;
     Ok(conn)
 }

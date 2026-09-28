@@ -25,9 +25,12 @@ retrieval, explicit updates, history, indexing and recovery.
   History is preserved separately; search indexes and embeddings are rebuildable.
 - **Carry context between machines.** Share a memory repository through explicit
   Git operations and rebuild local indexes from its source documents.
+- **Update a managed installation.** After you approve a pinned release, the
+  assistant can apply a certified compatible update and verify it before asking
+  you to restart the harness normally.
 
-> **Rust development release.** Version 0.2.0 starts the new Rust implementation.
-> Older tags and the Python package describe the previous
+> **Rust development release.** Version 0.3.2 is the current Rust release;
+> version 0.2.0 started this implementation. Older tags and the Python package describe the previous
 > product. Do not use `pip install agentlaw` or the old governance initialization
 > instructions to install this code. See [what has been verified](docs/verification.md).
 
@@ -51,7 +54,7 @@ agentlaw --version
 
 Put the export line in your shell profile to keep it for new terminals.
 Set `AGENTLAW_ROOT` to choose another complete installation root, or
-`AGENTLAW_VERSION=v0.3.1` to pin this release. The installer keeps binaries in
+`AGENTLAW_VERSION=v0.3.2` to pin this release. The installer keeps binaries in
 `bin`, private state in `state`, memory in a sibling `memory` directory once
 connected, and model assets in `models`. It does not migrate an older state
 automatically. Download the script first if you want to inspect it before execution.
@@ -81,22 +84,19 @@ Get-Content ./install.ps1
 ```
 
 `-RootDir` selects the whole installation, not just the executable directory.
-The old `-InstallDir` parameter is rejected to avoid silently splitting data.
-The installer stops when it finds known earlier state in AppData or another
-managed root. It never migrates that state implicitly. One OS user shares one
-installation across harnesses; update or migrate that installation instead.
+The installer stops when the selected root contains unrecognized state or
+another managed root is already selected. One OS user shares one installation
+across harnesses; update that installation instead.
 For a nondefault root, pass the same `-RootDir` on upgrades.
 Re-running the installer at the same managed root updates executables; it does
-not reset memory or configure a harness. An existing installation using the old
-AppData state location is **not migrated automatically**; preserve its memory and
-machine-local state and explicitly plan a migration before switching roots.
+not reset memory or configure a harness.
 
 Agentlaw can report a newer published release in an ordinary MCP result. For a
-managed installation, `agentlaw update` previews the pinned release and owned
-harness registrations. After reviewing the plan, `agentlaw update
---confirm-update <plan-id>` prepares an independent helper. Close every Agentlaw
-harness and broker process, then run the returned helper and arguments to apply
-the bundle and refresh approved registrations. See [the update procedure](docs/usage.md#managed-updates-and-optional-github-support).
+managed installation, run `agentlaw update` through the stable command in
+`command/`. It verifies the release, stops the affected Agentlaw processes,
+replaces the bundle and owned registrations, probes the candidate MCP, and
+removes approved old update artifacts before reporting `installed`. Then
+restart the harness normally. See [the update procedure](docs/usage.md#managed-updates-and-optional-github-support).
 
 The root contains `bin/`, `models/`, `memory/`, and `state/`. Configuration,
 machine identity, executable versions, worker files, recovery data, indexes,
@@ -292,8 +292,8 @@ and confirmation questions should use the user's language.
 Set `action` and put its inputs inside the same-named object; omit the other
 action objects. Every nested field has an explicit type in the MCP schema.
 For recall, use `memory_candidate_limit` or `procedure_candidate_limit`;
-`max_matches` is only available inside `history`. Older flat requests remain
-accepted for compatibility, but new integrations should use the grouped form.
+`max_matches` is only available inside `history`. Flat and mixed requests are
+rejected.
 
 | Action | Purpose |
 | --- | --- |

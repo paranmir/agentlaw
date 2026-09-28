@@ -2,21 +2,18 @@
 set -eu
 
 version=${AGENTLAW_VERSION:-latest}
-if [ -n "${AGENTLAW_INSTALL_DIR:-}" ]; then
-  echo 'Use AGENTLAW_ROOT to select the complete installation, not AGENTLAW_INSTALL_DIR.' >&2
-  exit 1
-fi
 root=${AGENTLAW_ROOT:-"$HOME/Agentlaw"}
 case "$root" in /*) ;; *) echo 'AGENTLAW_ROOT must be absolute.' >&2; exit 1 ;; esac
 [ "$root" != / ] || { echo 'AGENTLAW_ROOT cannot be the filesystem root.' >&2; exit 1; }
 destination=$root/bin
+command_dir=$root/command
 marker=$root/.agentlaw-layout
 if [ "$root" != "$HOME/Agentlaw" ] && [ -f "$HOME/Agentlaw/.agentlaw-layout" ]; then
   echo 'Agentlaw is already installed under ~/Agentlaw; update or migrate that installation.' >&2
   exit 1
 fi
 existing=$(command -v agentlaw 2>/dev/null || true)
-if [ -n "$existing" ] && [ "$existing" != "$destination/agentlaw" ]; then
+if [ -n "$existing" ] && [ "$existing" != "$destination/agentlaw" ] && [ "$existing" != "$command_dir/agentlaw" ]; then
   echo "Agentlaw is already available at $existing; update or migrate that installation." >&2
   exit 1
 fi
@@ -30,10 +27,6 @@ if [ -f "$marker" ]; then
   }
 elif [ -e "$destination" ] || [ -e "$root/state" ] || [ -e "$root/memory" ]; then
   echo 'Existing Agentlaw files without a layout marker require explicit migration.' >&2
-  exit 1
-fi
-if [ ! -f "$marker" ] && { [ -e "$HOME/.local/state/Agentlaw/config.json" ] || [ -e "$HOME/.local/state/Agentlaw/machine.json" ]; }; then
-  echo 'Existing legacy Agentlaw state requires explicit migration before installation.' >&2
   exit 1
 fi
 case "$version" in *[!A-Za-z0-9.+-]*) echo 'Invalid version.' >&2; exit 1 ;; esac
@@ -65,7 +58,7 @@ if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$temporary/$ar
 else actual=$(shasum -a 256 "$temporary/$archive" | awk '{print $1}')
 fi
 [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo 'Checksum verification failed; nothing installed.' >&2; exit 1; }
-tar -xzf "$temporary/$archive" -C "$temporary" agentlaw agentlaw-worker LICENSE
+tar -xzf "$temporary/$archive" -C "$temporary" agentlaw agentlaw-worker agentlaw-launcher LICENSE
 mkdir -p "$root"
 lockdir=$root/.install-lock
 if ! mkdir "$lockdir" 2>/dev/null; then
@@ -98,6 +91,23 @@ fi
 
 staged=$root/.bin-staged
 previous=$root/.bin-previous
+remove_reserved_bundle() {
+  bundle=$1
+  [ -d "$bundle" ] && [ ! -L "$bundle" ] || {
+    echo "Reserved Agentlaw bundle is not an ordinary directory: $bundle" >&2; exit 1;
+  }
+  for item in "$bundle"/* "$bundle"/.[!.]* "$bundle"/..?*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    case "${item##*/}" in agentlaw|agentlaw-worker|LICENSE.agentlaw) ;;
+      *) echo "Reserved Agentlaw bundle contains an unexpected file: $item" >&2; exit 1 ;;
+    esac
+    [ -f "$item" ] && [ ! -L "$item" ] || {
+      echo "Reserved Agentlaw bundle contains an invalid entry: $item" >&2; exit 1;
+    }
+  done
+  rm -f "$bundle/agentlaw" "$bundle/agentlaw-worker" "$bundle/LICENSE.agentlaw"
+  rmdir "$bundle" || { echo "Cannot remove reserved Agentlaw bundle: $bundle" >&2; exit 1; }
+}
 if [ -d "$previous" ]; then
   if [ ! -d "$destination" ]; then
     if [ -d "$staged" ]; then
@@ -107,8 +117,7 @@ if [ -d "$previous" ]; then
     fi
   fi
   if [ -x "$destination/agentlaw" ] && "$destination/agentlaw" --version >/dev/null 2>&1; then
-    rm -f "$previous/agentlaw" "$previous/agentlaw-worker" "$previous/LICENSE.agentlaw"
-    rmdir "$previous" || { echo 'Previous bundle has unexpected files; inspect it.' >&2; exit 1; }
+    remove_reserved_bundle "$previous"
   else
     echo 'Published bundle failed verification; previous bundle preserved.' >&2; exit 1
   fi
@@ -125,8 +134,7 @@ if [ -d "$destination" ]; then
   done
 fi
 if [ -d "$staged" ]; then
-  rm -f "$staged/agentlaw" "$staged/agentlaw-worker" "$staged/LICENSE.agentlaw"
-  rmdir "$staged" || { echo 'Staging has unexpected files; inspect it.' >&2; exit 1; }
+  remove_reserved_bundle "$staged"
 fi
 mkdir "$staged"
 install -m 755 "$temporary/agentlaw" "$temporary/agentlaw-worker" "$staged/"
@@ -140,7 +148,12 @@ if ! mv "$staged" "$destination"; then
   exit 1
 fi
 "$destination/agentlaw" --version >/dev/null || { echo 'Published bundle probe failed; previous bundle retained.' >&2; exit 1; }
+if [ -d "$previous" ]; then remove_reserved_bundle "$previous"; fi
 mkdir -p "$root/state"
+mkdir -p "$command_dir"
+if [ ! -e "$command_dir/agentlaw" ]; then
+  install -m 755 "$temporary/agentlaw-launcher" "$command_dir/agentlaw"
+fi
 printf '\nInstalled Agentlaw to %s\n' "$destination"
-printf 'Add this directory to PATH in your shell profile:\n  export PATH="%s:$PATH"\n' "$destination"
+printf 'Add this directory to PATH in your shell profile:\n  export PATH="%s:$PATH"\n' "$command_dir"
 printf 'Model setup and harness configuration: https://github.com/paranmir/agentlaw/blob/main/docs/usage.md\n'

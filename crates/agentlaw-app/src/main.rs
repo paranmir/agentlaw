@@ -119,8 +119,10 @@ fn main() {
         return;
     }
     if args == ["mcp", "serve", "--stdio"] {
-        let result = InstalledBackend::start().and_then(|backend| {
-            let advisor = agentlaw_app::update::Advisor::new(config::state_root()?);
+        let result = config::state_root().and_then(|state| {
+            agentlaw_app::update::managed::check_frontend_start(&state)?;
+            let backend = InstalledBackend::start()?;
+            let advisor = agentlaw_app::update::Advisor::new(state);
             agentlaw_app::transport::serve_with_advisor(
                 io::BufReader::new(io::stdin()),
                 io::stdout(),
@@ -147,7 +149,7 @@ fn run(args: &[String]) -> Result<Value> {
     if args.is_empty() || args == ["--help"] || args == ["help"] {
         return Ok(
             json!({"name":"agentlaw","status":"implementation_in_progress","commands":[
-            "schema", "call --json -", "mcp serve --stdio", "update", "update check", "update --confirm-update <plan-id>", "update status <plan-id>", "support star [--ask-again]", "config path", "config get history.response_limit_bytes|response_limit_bytes", "config set history.response_limit_bytes|response_limit_bytes <positive-bytes>",
+            "schema", "call --json -", "mcp serve --stdio", "update", "update check", "update --confirm-update <plan-id>", "update status <plan-id> [--root <absolute>]", "support star [--ask-again]", "config path", "config get history.response_limit_bytes|response_limit_bytes", "config set history.response_limit_bytes|response_limit_bytes <positive-bytes>",
             "install --harness codex|oh-my-pi [--harness-dir <absolute>] [--model-manifest <path>] --confirm-install", "machine inspect", "machine name --value <display-name>", "doctor", "repair", "history export --memory-id <uuid> --output <new-file>",
             "store propose-location", "store create --path <absolute> --confirm-create", "store connect --path <absolute>",
             "learned-procedure list [--scope <kind>] [--project <id-or-hint>] [--machine <id>] [--output <path>] [--format jsonl|table]",
@@ -172,6 +174,9 @@ fn run(args: &[String]) -> Result<Value> {
     }
     if args.len() == 3 && args[0..2] == ["update", "status"] {
         return agentlaw_app::update::managed::status(&args[2]);
+    }
+    if args.len() == 5 && args[0..2] == ["update", "status"] && args[3] == "--root" {
+        return agentlaw_app::update::managed::status_with_root(&args[2], &PathBuf::from(&args[4]));
     }
     if args.len() == 5 && args[0..2] == ["update", "apply"] && args[3] == "--root" {
         return agentlaw_app::update::managed::apply(&args[2], &PathBuf::from(&args[4]));
