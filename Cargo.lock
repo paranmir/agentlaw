@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentlaw-app"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agentlaw-contracts",
  "agentlaw-flows",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-contracts"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-flows"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agentlaw-contracts",
  "agentlaw-search",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-launcher"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde_json",
  "sha2",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-search"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-storage"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-worker"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agentlaw-search",
  "fs2",

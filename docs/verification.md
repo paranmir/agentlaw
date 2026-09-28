@@ -6,6 +6,20 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
+### 0.3.3 Task handoff guidance checks
+
+The v0.3.3 candidate changes LLM-facing guidance, not memory storage or the
+tool input schema. The accepted workspace/product tool and bootstrap text blocks
+match, and the generated bootstrap source contains the accepted paragraph.
+`cargo fmt --all -- --check` and `cargo build --locked -p agentlaw-app` passed.
+The candidate CLI reported v0.3.3 with the accepted `schema` description; an
+isolated MCP `initialize` reported v0.3.3 and `tools/list` exposed that same
+description. These checks establish candidate exposure, not behavior of a
+running user harness after update. Long review-edit-test interruption scenarios
+for Sol and Astra remain unverified. They must judge whether the last confirmed
+Task and accessible references let a fresh session resume; call count alone is
+not a success criterion. Do not infer universal compliance from a short run.
+
 ### 0.3.2 synchronous replacement checks
 
 The stop, replace, probe and cleanup design supersedes the earlier live
