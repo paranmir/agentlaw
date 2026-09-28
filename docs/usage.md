@@ -141,10 +141,11 @@ Missing inference is never replaced with fake vectors.
 ## Managed updates and optional GitHub support
 
 An ordinary MCP result may include `update_notice` when Agentlaw has verified a
-newer full GitHub release, when a managed update is incomplete, or when an old
-session needs a restart. The release check is bounded and runs outside memory
-work. A failed check does not claim that the installation is current. The
-notice does not install anything; a running MCP process keeps its loaded version.
+newer full GitHub release. The release check is bounded and runs outside memory
+work. A failed check does not claim that the installation is current. Ordinary
+MCP work does not inspect historical update plans; the update command reports
+its own success or exact blocker using the plan it is already executing. A
+running MCP process keeps its loaded version until the harness restarts.
 
 For an installed, managed root:
 
@@ -165,9 +166,11 @@ by that plan. Memory, models, machine identity and pending work are preserved.
 An `installed` response means replacement, probe and cleanup all finished;
 restart the harness normally and use Agentlaw immediately. An incomplete result
 names its blocker and never asks for a restart as if installation succeeded.
-Retry the same `agentlaw update` command to resume an interrupted plan. A source
-build using `AGENTLAW_HOME` for an installed state cannot approve a managed
-update.
+Retry the same `agentlaw update` command to resume an interrupted plan. The
+installed runtime checks unfinished plans on this explicit command before
+checking for a newer release; ordinary MCP memory calls do not scan them. A
+source build using `AGENTLAW_HOME` for an installed state cannot approve a
+managed update.
 
 `agentlaw support star` is a separate optional action. With an authenticated
 GitHub CLI account, it checks whether that account already starred

@@ -1,4 +1,5 @@
 //! Managed update subprocess tests use only temporary roots and owned processes.
+use fs2::FileExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -336,6 +337,186 @@ fn maintenance_drains_an_open_mcp_before_replacing_bundle() {
     assert!(
         active.child.try_wait().unwrap().is_some(),
         "old MCP stayed alive after the update"
+    );
+}
+
+#[test]
+fn completion_ignores_unrelated_host_edits_and_resumes_without_restarting_mcp() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.apply()["status"], "completed");
+    let config = fixture.host.join("config.toml");
+    let instructions = fixture.host.join("AGENTS.md");
+    let original_instructions = fs::read_to_string(&instructions).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{}\n[mcp_servers.unrelated]\ncommand = 'other'\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &instructions,
+        format!("User instructions outside Agentlaw\n{original_instructions}"),
+    )
+    .unwrap();
+    let status = || {
+        run(
+            &fixture.helper,
+            &fixture.state,
+            &[
+                "update",
+                "status",
+                &fixture.id,
+                "--root",
+                fixture.root.to_str().unwrap(),
+            ],
+        )
+    };
+    assert_eq!(status()["status"], "completed");
+
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["cleanup_completed"] = json!(false);
+    fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert_eq!(status()["status"], "incomplete");
+
+    plan["cleanup_completed"] = json!(true);
+    plan["phase"] = json!("finalizing");
+    fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let runtime = fixture.root.join("bin").join(binary_name());
+    let preview = run(&runtime, &fixture.state, &["update"]);
+    assert_eq!(preview["status"], "confirmation_required", "{preview}");
+    assert_eq!(preview["plan_id"], fixture.id);
+    let handoff = run(
+        &runtime,
+        &fixture.state,
+        &["update", "--confirm-update", &fixture.id],
+    );
+    assert_eq!(handoff["status"], "handoff_ready", "{handoff}");
+    assert_eq!(handoff["plan_id"], fixture.id);
+    assert_eq!(handoff["candidate"], fixture.helper.to_str().unwrap());
+    let conflict_id = uuid::Uuid::new_v4().to_string();
+    let mut conflict = plan.clone();
+    conflict["id"] = json!(conflict_id);
+    let conflict_path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{conflict_id}.json"));
+    fs::write(&conflict_path, serde_json::to_vec(&conflict).unwrap()).unwrap();
+    let ambiguous = Command::new(&runtime)
+        .arg("update")
+        .env("AGENTLAW_HOME", &fixture.state)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    let blocker: Value = serde_json::from_slice(&ambiguous.stdout).unwrap();
+    assert_eq!(blocker["code"], "update_recovery", "{blocker}");
+    fs::remove_file(&conflict_path).unwrap();
+    assert_eq!(
+        fs::read_dir(fixture.state.join("update-plans"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let mut active = McpClient::new(&fixture.helper, &fixture.state);
+    assert_eq!(fixture.apply()["status"], "completed");
+    assert!(active.child.try_wait().unwrap().is_none());
+    fs::write(
+        &instructions,
+        fs::read_to_string(&instructions).unwrap().replace(
+            "Use Agentlaw without waiting",
+            "Disable Agentlaw without waiting",
+        ),
+    )
+    .unwrap();
+    assert_eq!(status()["status"], "incomplete");
+}
+
+#[test]
+fn deferred_cleanup_resumes_the_same_finalizing_plan() {
+    let fixture = Fixture::new();
+    let worker = fixture.state.join("worker");
+    fs::create_dir_all(&worker).unwrap();
+    let guard = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(worker.join("model.lock"))
+        .unwrap();
+    guard.lock_exclusive().unwrap();
+    let output = Command::new(&fixture.helper)
+        .args([
+            "update",
+            "apply",
+            &fixture.id,
+            "--root",
+            fixture.root.to_str().unwrap(),
+        ])
+        .env("AGENTLAW_HOME", &fixture.state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["code"], "cleanup_incomplete", "{result}");
+    let plan_path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(plan["phase"], "finalizing");
+    assert!(plan["cleanup_plan_id"].is_string());
+    assert_eq!(plan["cleanup_completed"], false);
+    drop(guard);
+    fs::remove_file(fixture.state.join("update-maintenance.json")).unwrap();
+    let runtime = fixture.root.join("bin").join(binary_name());
+    let preview = run(&runtime, &fixture.state, &["update"]);
+    assert_eq!(preview["plan_id"], fixture.id);
+    assert_eq!(preview["status"], "confirmation_required");
+    let handoff = run(
+        &runtime,
+        &fixture.state,
+        &["update", "--confirm-update", &fixture.id],
+    );
+    assert_eq!(handoff["status"], "handoff_ready");
+    assert_eq!(fixture.apply()["status"], "completed");
+}
+
+#[test]
+#[ignore = "requires AGENTLAW_TEST_STABLE_LAUNCHER pointing to a released launcher"]
+fn released_stable_launcher_resumes_finalization_without_a_gate() {
+    let stable = PathBuf::from(std::env::var("AGENTLAW_TEST_STABLE_LAUNCHER").unwrap());
+    let fixture = Fixture::new();
+    assert_eq!(fixture.apply()["status"], "completed");
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["phase"] = json!("finalizing");
+    fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert!(!fixture.state.join("update-maintenance.json").exists());
+    assert!(!fixture
+        .root
+        .join(format!(".update-{}", fixture.id))
+        .exists());
+    let command = fixture.root.join("command");
+    fs::create_dir_all(&command).unwrap();
+    let launcher = command.join(binary_name());
+    fs::copy(stable, &launcher).unwrap();
+    let before = hash(&launcher);
+    let result = run(&launcher, &fixture.state, &["update"]);
+    assert_eq!(result["status"], "installed", "{result}");
+    assert_eq!(result["plan_id"], fixture.id);
+    assert_eq!(hash(&launcher), before);
+    assert_eq!(
+        fs::read_dir(fixture.state.join("update-plans"))
+            .unwrap()
+            .count(),
+        1
     );
 }
 

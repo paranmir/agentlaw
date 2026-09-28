@@ -248,6 +248,19 @@ pub(crate) fn upsert_bootstrap(previous: &str, body: &str) -> Result<String> {
         _=>Err(err("Managed instruction markers are inconsistent. Existing instructions were not rewritten.")),
     }
 }
+
+pub(crate) fn same_owned_bootstrap(before: &str, now: &str) -> bool {
+    fn owned(text: &str) -> Option<&str> {
+        let (start, rest) = text.split_once(BEGIN)?;
+        let (body, end) = rest.split_once(END)?;
+        (!start.contains(END)
+            && !body.contains(BEGIN)
+            && !end.contains(BEGIN)
+            && !end.contains(END))
+        .then_some(body)
+    }
+    owned(before).is_some_and(|expected| owned(now) == Some(expected))
+}
 pub(crate) fn configuration(
     harness: Harness,
     previous: &str,
@@ -704,6 +717,18 @@ mod tests {
     fn instruction_replacement_preserves_user_text_and_refuses_ambiguous_markers() {
         let first = upsert_bootstrap("User rules\n", &format!("{BEGIN}\nold\n{END}")).unwrap();
         let second = upsert_bootstrap(&first, &format!("{BEGIN}\nnew\n{END}")).unwrap();
+        assert!(same_owned_bootstrap(
+            &second,
+            &format!("Unrelated user rule\n{second}")
+        ));
+        assert!(!same_owned_bootstrap(
+            &second,
+            &second.replace("new", "changed")
+        ));
+        assert!(!same_owned_bootstrap(
+            &second,
+            &format!("{second}\n{BEGIN}")
+        ));
         assert!(second.starts_with("User rules\n"));
         assert_eq!(second.matches(BEGIN).count(), 1);
         assert!(!second.contains("old"));
