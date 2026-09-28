@@ -1,8 +1,7 @@
 # Agentlaw contributor guidance
 
-This is the Rust implementation repository, not the former target-project seed.
-Do not reinstall old governance files, run legacy Python initialization, or treat
-older tags as the current runtime contract.
+This is the Rust implementation repository. Keep contributor instructions
+and product source separate from a user project and its memory store.
 
 - Start with `README.md`, `docs/usage.md` and the crate READMEs.
 - `docs/design/contracts/agentlaw-tool.schema.json` is the public typed tool surface;

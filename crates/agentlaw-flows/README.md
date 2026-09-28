@@ -52,4 +52,4 @@ Remaining limitations, not completion claims:
   uncommitted pending/authoring payloads are authoritative there and require
   preservation/recovery. Derived indexes are independently rebuildable.
 
-No legacy edits, commits or Git transport occur in this crate.
+This crate does not edit project files, create commits, or transport data through Git.
