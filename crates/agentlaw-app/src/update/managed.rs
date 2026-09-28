@@ -691,6 +691,21 @@ fn verify_staged(plan: &Plan) -> Result<()> {
 }
 
 fn inspect_processes(root: &Path) -> Value {
+    // A process can exit between enumeration and executable-path lookup.
+    // Recheck an uncertain snapshot before asking the user to resolve it;
+    // persistent uncertainty still fails closed.
+    let mut inspection = inspect_processes_once(root);
+    for _ in 0..20 {
+        if inspection["status"] != "inspection_unknown" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        inspection = inspect_processes_once(root);
+    }
+    inspection
+}
+
+fn inspect_processes_once(root: &Path) -> Value {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let own = get_current_pid().ok();

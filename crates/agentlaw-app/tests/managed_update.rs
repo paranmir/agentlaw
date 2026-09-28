@@ -399,7 +399,19 @@ fn interrupted_bundle_move_and_publish_resume_the_same_plan() {
             .unwrap();
         }
         fixture.set_phase(phase);
-        let result = fixture.apply();
+        // Other isolated tests can briefly launch an Agentlaw-named process
+        // while its executable path is unavailable to the OS process list.
+        // The updater must defer and resume the same plan in that case.
+        let mut result = fixture.apply();
+        for _ in 0..20 {
+            if result["status"] != "incomplete"
+                || result["inspection"]["status"] != "inspection_unknown"
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            result = fixture.apply();
+        }
         assert_eq!(result["status"], "completed", "phase={phase}: {result}");
         let receipt: Value = serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
         assert!(Path::new(receipt["executable"].as_str().unwrap()).is_file());
