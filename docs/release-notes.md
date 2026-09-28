@@ -1,13 +1,13 @@
-# Agentlaw 0.3.2
+# Agentlaw 0.3.3
 
-- Adds a stable public command that completes a managed update in one call:
-  verify the release, drain Agentlaw processes, replace the bundle and owned
-  registrations, probe the new MCP, and remove approved update debris.
-- Reports `installed` only after the matching candidate probe, recovery closure
-  and cleanup. The harness restart then loads a ready installation.
-- Preserves memory, model assets, machine identity and pending work and stops
-  before publication if registration ownership or effective paths drift.
+- Clarifies when an agent must checkpoint a Task during extended work: compare
+  the last confirmed save with what a fresh session needs, and save before the
+  next dependent step or wait rather than deferring to a broad phase end.
+- Keeps unfinished work and verification limits in the Task, while avoiding
+  duplicate writes when the last confirmed handoff already suffices.
+- Treats failed, pending, and unconfirmed memory writes as unsaved and uses
+  existing recovery paths; no new memory format, setting, or background process.
 
-Read the
-[managed update guide](usage.md#managed-updates-and-optional-github-support)
-for status and recovery behavior.
+The guidance is supplied through the tool description, installed bootstrap,
+and Agentlaw skill. Updating a running harness requires a fresh session to load
+the new instructions.

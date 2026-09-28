@@ -29,7 +29,7 @@ retrieval, explicit updates, history, indexing and recovery.
   assistant can apply a certified compatible update and verify it before asking
   you to restart the harness normally.
 
-> **Rust development release.** Version 0.3.2 is the current Rust release;
+> **Rust development release.** Version 0.3.3 is the current Rust release;
 > version 0.2.0 started this implementation. Older tags and the Python package describe the previous
 > product. Do not use `pip install agentlaw` or the old governance initialization
 > instructions to install this code. See [what has been verified](docs/verification.md).
@@ -54,7 +54,7 @@ agentlaw --version
 
 Put the export line in your shell profile to keep it for new terminals.
 Set `AGENTLAW_ROOT` to choose another complete installation root, or
-`AGENTLAW_VERSION=v0.3.2` to pin this release. The installer keeps binaries in
+`AGENTLAW_VERSION=v0.3.3` to pin this release. The installer keeps binaries in
 `bin`, private state in `state`, memory in a sibling `memory` directory once
 connected, and model assets in `models`. It does not migrate an older state
 automatically. Download the script first if you want to inspect it before execution.

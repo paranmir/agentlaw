@@ -56,9 +56,14 @@ count. Its Objective states the requested outcome and constraints; Current
 position records the approach, reasons, evidence, progress, and blockers;
 Resume point gives the next concrete action or unresolved question; References
 points to useful IDs and files without hiding essential context outside the Task.
-In Current position, distinguish verified results from hypotheses and retain
-costly failed paths with their conditions and evidence; keep one exact next
-action or question in Resume point and file/experiment locators in References.
+A new Task needs an actionable restart point, not just a title. Across these
+headings, preserve still-valid constraints, the approach and rationale,
+important findings and failed or rejected attempts, verification and in-flight
+status, and the next safe step. Scope evidence to its project, revision, and
+coverage; distinguish observations, hypotheses, and pending work. Reference
+durable details, but retain rationale available only in chat. For unresolved
+operations, record the request, known status, and how to check before repeating.
+In recovery, a newer version alone is insufficient: verify published content.
 Evolve the complete current body, preserving still-relevant state rather than
 copying a Plan; skip writes that merely restate unchanged progress or log commands.
 Keep unresolved issues until resolved. Completed or abandoned work leaves the
