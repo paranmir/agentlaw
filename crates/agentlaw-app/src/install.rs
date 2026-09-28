@@ -214,7 +214,7 @@ fn read_manifest(path: &Path) -> Result<ModelManifest> {
     }
     Ok(manifest)
 }
-fn bootstrap(executable: &Path, state: &Path) -> String {
+pub(crate) fn bootstrap(executable: &Path, state: &Path) -> String {
     let invocation = if cfg!(windows) {
         format!(
             "& '{}'",
@@ -239,7 +239,7 @@ fn bootstrap(executable: &Path, state: &Path) -> String {
     };
     format!("{BEGIN}\n## Agentlaw memory\n\nUse Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.\nFor project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.\nIf agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.\n\nCLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` when the contract is unavailable. The CLI and MCP use the same installation.\n{END}")
 }
-fn upsert_bootstrap(previous: &str, body: &str) -> Result<String> {
+pub(crate) fn upsert_bootstrap(previous: &str, body: &str) -> Result<String> {
     let begins: Vec<_> = previous.match_indices(BEGIN).map(|(i, _)| i).collect();
     let ends: Vec<_> = previous.match_indices(END).map(|(i, _)| i).collect();
     match (begins.as_slice(),ends.as_slice()) {
@@ -248,7 +248,7 @@ fn upsert_bootstrap(previous: &str, body: &str) -> Result<String> {
         _=>Err(err("Managed instruction markers are inconsistent. Existing instructions were not rewritten.")),
     }
 }
-fn configuration(
+pub(crate) fn configuration(
     harness: Harness,
     previous: &str,
     executable: &Path,
@@ -320,7 +320,7 @@ fn configuration(
     }
 }
 
-fn same_owned_entry(harness: Harness, before: &str, now: &str) -> bool {
+pub(crate) fn same_owned_entry(harness: Harness, before: &str, now: &str) -> bool {
     match harness {
         Harness::Codex => {
             let (Ok(a), Ok(b)) = (
@@ -391,6 +391,41 @@ fn recover_journal(state: &Path) -> Result<()> {
         err("Installation completed but its recovery journal could not be marked complete.")
     })?;
     Ok(())
+}
+
+/// Resume only a journal whose complete target set is pinned by an update plan.
+pub(crate) fn recover_matching_update_journal(
+    state: &Path,
+    expected: &[(PathBuf, String, String)],
+) -> Result<bool> {
+    let path = state.join("install-pending.json");
+    let Some(raw) = read_optional(&path)? else {
+        return Ok(false);
+    };
+    let journal: InstallJournal = serde_json::from_value(
+        agentlaw_contracts::validation::decode_unique(&raw)?,
+    )
+    .map_err(|_| err("Installation recovery journal is invalid; preserve it for diagnosis."))?;
+    if journal.targets.len() != expected.len()
+        || !journal.targets.iter().all(|target| {
+            expected.iter().any(|(path, before, after)| {
+                target.path == *path
+                    && target.before.as_deref() == Some(before.as_str())
+                    && target.after == *after
+            })
+        })
+    {
+        return Ok(false);
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(state.join("install.lock"))
+        .map_err(|_| err("Cannot lock installation state."))?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|_| err("Cannot coordinate installation."))?;
+    recover_journal(state)?;
+    Ok(true)
 }
 
 pub fn install(

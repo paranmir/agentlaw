@@ -139,6 +139,49 @@ or silently download an alternative model. A development frontend can instead
 use `AGENTLAW_ONNX_MODEL`, `AGENTLAW_TOKENIZER` and `AGENTLAW_ORT_LIBRARY` together.
 Missing inference is never replaced with fake vectors.
 
+## Managed updates and optional GitHub support
+
+An ordinary MCP result may include `update_notice` when Agentlaw has verified a
+newer full GitHub release, when a managed update is incomplete, or when an old
+session needs a restart. The release check is bounded and runs outside memory
+work. A failed check does not claim that the installation is current. The
+notice does not install anything; a running MCP process keeps its loaded version.
+
+For an installed, managed root:
+
+```text
+agentlaw update check
+agentlaw update
+agentlaw update --confirm-update <plan-id>
+agentlaw update status <plan-id>
+```
+
+`update check` queries the public release endpoint explicitly. `update` previews
+the latest full release, the managed root, asset checksum and existing owned
+harness registrations. Review the returned plan ID before `--confirm-update`.
+Preparation verifies the pinned release archive and returns a separate helper
+path and argument array. Keep the managed installation offline from that point:
+close every harness, MCP server, persistent broker, model child and CLI process
+using the root, and do not restart them while the helper applies the plan. Run
+the exact returned helper and arguments. If it reports `pending_exit` or
+`inspection_unknown`, resolve the reported condition and rerun the same helper
+and plan. It does not kill processes or assume a transmitted notice was read.
+
+The helper keeps the previous binary bundle and versioned executables for
+recovery, preserves memory, models, machine identity and pending work, and
+refreshes only the approved owned harness registrations. A drifted registration
+is reported for inspection. Once application completes, start a new harness
+session and verify `initialize.serverInfo.version`, the refreshed tool guidance
+and an ordinary recall. A source build using `AGENTLAW_HOME` for an installed
+state cannot approve a managed update.
+
+`agentlaw support star` is a separate optional action. With an authenticated
+GitHub CLI account, it checks whether that account already starred
+`paranmir/agentlaw`; only a verified unstarred account at an interactive terminal
+gets a `y/N` prompt. `n` is remembered for that account; `--ask-again` reopens
+the choice. Star approval never approves an update, and an update never stars
+the repository.
+
 ## Ordinary memory work
 
 `mcp serve --stdio` exposes only `agentlaw`. `call --json -` reads one JSON request

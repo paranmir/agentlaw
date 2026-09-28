@@ -54,6 +54,10 @@ jobs:
         run: |
           cargo fmt --all -- --check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not $IsWindows) {
+            sh -n install.sh
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
           cargo test --locked --workspace --no-fail-fast --target ${{ matrix.target }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build release executables

@@ -120,7 +120,13 @@ fn main() {
     }
     if args == ["mcp", "serve", "--stdio"] {
         let result = InstalledBackend::start().and_then(|backend| {
-            agentlaw_app::transport::serve(io::BufReader::new(io::stdin()), io::stdout(), backend)
+            let advisor = agentlaw_app::update::Advisor::new(config::state_root()?);
+            agentlaw_app::transport::serve_with_advisor(
+                io::BufReader::new(io::stdin()),
+                io::stdout(),
+                backend,
+                Some(advisor),
+            )
         });
         if let Err(error) = result {
             eprintln!("{}", agentlaw_app::error_payload(&error));
@@ -141,7 +147,7 @@ fn run(args: &[String]) -> Result<Value> {
     if args.is_empty() || args == ["--help"] || args == ["help"] {
         return Ok(
             json!({"name":"agentlaw","status":"implementation_in_progress","commands":[
-            "schema", "call --json -", "mcp serve --stdio", "config path", "config get history.response_limit_bytes|response_limit_bytes", "config set history.response_limit_bytes|response_limit_bytes <positive-bytes>",
+            "schema", "call --json -", "mcp serve --stdio", "update", "update check", "update --confirm-update <plan-id>", "update status <plan-id>", "support star [--ask-again]", "config path", "config get history.response_limit_bytes|response_limit_bytes", "config set history.response_limit_bytes|response_limit_bytes <positive-bytes>",
             "install --harness codex|oh-my-pi [--harness-dir <absolute>] [--model-manifest <path>] --confirm-install", "machine inspect", "machine name --value <display-name>", "doctor", "repair", "history export --memory-id <uuid> --output <new-file>",
             "store propose-location", "store create --path <absolute> --confirm-create", "store connect --path <absolute>",
             "learned-procedure list [--scope <kind>] [--project <id-or-hint>] [--machine <id>] [--output <path>] [--format jsonl|table]",
@@ -154,6 +160,27 @@ fn run(args: &[String]) -> Result<Value> {
     }
     if args == ["schema"] {
         return Ok(agentlaw_app::schema());
+    }
+    if args == ["update", "check"] {
+        return Ok(agentlaw_app::update::check());
+    }
+    if args == ["update"] {
+        return agentlaw_app::update::managed::preview();
+    }
+    if args.len() == 3 && args[0..2] == ["update", "--confirm-update"] {
+        return agentlaw_app::update::managed::prepare(&args[2]);
+    }
+    if args.len() == 3 && args[0..2] == ["update", "status"] {
+        return agentlaw_app::update::managed::status(&args[2]);
+    }
+    if args.len() == 5 && args[0..2] == ["update", "apply"] && args[3] == "--root" {
+        return agentlaw_app::update::managed::apply(&args[2], &PathBuf::from(&args[4]));
+    }
+    if args == ["support", "star"] {
+        return agentlaw_app::update::support::star(false);
+    }
+    if args == ["support", "star", "--ask-again"] {
+        return agentlaw_app::update::support::star(true);
     }
     if args.first().map(String::as_str) == Some("install") {
         let mut harness = None;

@@ -1,0 +1,366 @@
+//! Best-effort release advice is outside the memory runtime.
+pub mod managed;
+pub mod support;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const RELEASE_API: &str = "https://api.github.com/repos/paranmir/agentlaw/releases/latest";
+const RELEASE_PAGE: &str = "https://github.com/paranmir/agentlaw/releases/tag/";
+const SUCCESS_TTL: u64 = 24 * 60 * 60;
+const FAILURE_RETRY: u64 = 60 * 60;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Cache {
+    last_success: Option<u64>,
+    retry_after: Option<u64>,
+    latest_tag: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct Advisor {
+    state: PathBuf,
+    current: Arc<Mutex<Cache>>,
+    running: Arc<Mutex<bool>>,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn version(tag: &str) -> Option<[u64; 3]> {
+    let mut parts = tag.strip_prefix('v').unwrap_or(tag).split('.');
+    let value = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    parts.next().is_none().then_some(value)
+}
+
+fn parse_release(bytes: &[u8]) -> Option<String> {
+    let release: Value = serde_json::from_slice(bytes).ok()?;
+    if release["draft"] != false || release["prerelease"] != false {
+        return None;
+    }
+    let tag = release["tag_name"].as_str()?;
+    version(tag)?;
+    tag.starts_with('v').then(|| tag.to_owned())
+}
+
+fn curl(url: &str) -> Option<Vec<u8>> {
+    let output = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            "5",
+            "--max-filesize",
+            "65536",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "User-Agent: agentlaw-update-advisor",
+            url,
+        ])
+        .output()
+        .ok()?;
+    (output.status.success() && output.stdout.len() <= 65536).then_some(output.stdout)
+}
+
+fn fetch() -> Option<String> {
+    parse_release(&curl(RELEASE_API)?)
+}
+
+fn read_cache(state: &Path) -> Cache {
+    let path = state.join("update-check.json");
+    let Ok(bytes) = fs::read(path) else {
+        return Cache::default();
+    };
+    if bytes.len() > 4096 {
+        return Cache::default();
+    }
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn write_cache(state: &Path, cache: &Cache) {
+    if fs::create_dir_all(state).is_err() {
+        return;
+    }
+    let Ok(mut temp) = tempfile::NamedTempFile::new_in(state) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(cache) else {
+        return;
+    };
+    if temp.write_all(&bytes).is_ok() && temp.as_file().sync_all().is_ok() {
+        let _ = temp.persist(state.join("update-check.json"));
+    }
+}
+
+fn installation_notice(state: &Path) -> Option<Value> {
+    let root = fs::canonicalize(state.parent()?).ok()?;
+    if fs::read_to_string(root.join(".agentlaw-layout"))
+        .ok()?
+        .trim()
+        != "agentlaw-managed-layout-v1"
+    {
+        return None;
+    }
+    let mut plans = fs::read_dir(state.join("update-plans"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if meta.len() > 1024 * 1024 {
+                return None;
+            }
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in plans.into_iter().take(64) {
+        let Some(plan) = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        if plan["root"].as_str() != root.to_str() {
+            continue;
+        }
+        let (Some(id), Some(tag), Some(phase)) = (
+            plan["id"].as_str(),
+            plan["tag"].as_str(),
+            plan["phase"].as_str(),
+        ) else {
+            continue;
+        };
+        if matches!(
+            phase,
+            "moving_old_bundle" | "publishing_new_bundle" | "refreshing_registrations"
+        ) {
+            return Some(
+                json!({"kind":"update_incomplete","plan_id":id,"phase":phase,
+                "target_version":tag,"next_action":format!("Keep Agentlaw offline and inspect this plan with agentlaw update status {id}; resume only the independently staged helper after resolving its reported condition."),
+                "guidance":crate::update_notice_guidance()}),
+            );
+        }
+        if phase == "completed"
+            && version(tag)
+                .zip(version(env!("CARGO_PKG_VERSION")))
+                .is_some_and(|(a, b)| a > b)
+        {
+            return Some(
+                json!({"kind":"restart_required","running_version":env!("CARGO_PKG_VERSION"),
+                "installed_version":tag,"next_action":"Restart the approved harness to start its refreshed Agentlaw registration, then verify initialize.serverInfo.version and an ordinary recall.",
+                "guidance":crate::update_notice_guidance()}),
+            );
+        }
+    }
+    None
+}
+
+impl Advisor {
+    pub fn new(state: PathBuf) -> Self {
+        let current = read_cache(&state);
+        let advisor = Self {
+            state,
+            current: Arc::new(Mutex::new(current)),
+            running: Arc::new(Mutex::new(false)),
+        };
+        advisor.schedule();
+        advisor
+    }
+
+    pub fn schedule(&self) {
+        let current = self.current.clone();
+        let running = self.running.clone();
+        let state = self.state.clone();
+        let time = now();
+        let cache = current.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.retry_after.is_some_and(|until| until > time)
+            || cache
+                .last_success
+                .is_some_and(|at| at.saturating_add(SUCCESS_TTL) > time)
+        {
+            return;
+        }
+        drop(cache);
+        let mut busy = running.lock().unwrap_or_else(|e| e.into_inner());
+        if *busy {
+            return;
+        }
+        *busy = true;
+        drop(busy);
+        std::thread::spawn(move || {
+            let _ = fs::create_dir_all(&state);
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(state.join("update-check.lock"));
+            let Ok(lock) = lock else {
+                *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                return;
+            };
+            if lock.lock_exclusive().is_err() {
+                *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                return;
+            }
+            let disk = read_cache(&state);
+            if disk
+                .last_success
+                .is_some_and(|at| at.saturating_add(SUCCESS_TTL) > now())
+                || disk.retry_after.is_some_and(|until| until > now())
+            {
+                *current.lock().unwrap_or_else(|e| e.into_inner()) = disk;
+                *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                return;
+            }
+            let latest = fetch();
+            let mut cache = current.lock().unwrap_or_else(|e| e.into_inner());
+            match latest {
+                Some(tag) => {
+                    cache.latest_tag = Some(tag);
+                    cache.last_success = Some(now());
+                    cache.retry_after = None;
+                }
+                None => cache.retry_after = Some(now().saturating_add(FAILURE_RETRY)),
+            }
+            write_cache(&state, &cache);
+            *running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        });
+    }
+
+    pub fn notice(&self) -> Option<Value> {
+        self.schedule();
+        if let Some(notice) = installation_notice(&self.state) {
+            return Some(notice);
+        }
+        let cache = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = cache.latest_tag.as_deref()?;
+        let latest = version(tag)?;
+        let running = version(env!("CARGO_PKG_VERSION"))?;
+        (latest > running).then(|| {
+            json!({"kind":"new_release","running_version":env!("CARGO_PKG_VERSION"),
+                "latest_version":tag,"release_url":format!("{RELEASE_PAGE}{tag}"),
+                "last_verified_at":cache.last_success,
+                "verification":if cache.last_success.is_some_and(|at|at.saturating_add(SUCCESS_TTL)>now()) {"fresh"} else {"stale"},
+                "next_action":"Use agentlaw update to preview the managed installation update.",
+                "guidance":crate::update_notice_guidance()})
+        })
+    }
+}
+
+pub fn check() -> Value {
+    match fetch() {
+        Some(tag) => {
+            let current = env!("CARGO_PKG_VERSION");
+            let available = version(&tag)
+                .zip(version(current))
+                .is_some_and(|(a, b)| a > b);
+            json!({"status":"checked","running_version":current,"latest_version":tag,
+                "update_available":available,"release_url":format!("{RELEASE_PAGE}{tag}")})
+        }
+        None => json!({"status":"unknown","running_version":env!("CARGO_PKG_VERSION"),
+            "reason":"The latest published release could not be verified."}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_full_published_versions_are_admitted() {
+        assert_eq!(version("v0.2.7"), Some([0, 2, 7]));
+        assert_eq!(version("v0.2.7-rc1"), None);
+        assert_eq!(version("v0.2.7.1"), None);
+        assert_eq!(
+            parse_release(br#"{"tag_name":"v0.2.7","draft":false,"prerelease":false}"#),
+            Some("v0.2.7".into())
+        );
+        assert_eq!(
+            parse_release(br#"{"tag_name":"v0.2.7-rc1","draft":false,"prerelease":false}"#),
+            None
+        );
+        assert_eq!(
+            parse_release(br#"{"tag_name":"v0.2.8","draft":true,"prerelease":false}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_cache_is_unknown_and_does_not_block_advice() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("update-check.json"), b"not json").unwrap();
+        assert!(read_cache(root.path()).latest_tag.is_none());
+        let cache = Cache {
+            last_success: Some(now()),
+            retry_after: None,
+            latest_tag: Some("v99.0.0".into()),
+        };
+        write_cache(root.path(), &cache);
+        let advisor = Advisor::new(root.path().to_path_buf());
+        assert_eq!(advisor.notice().unwrap()["latest_version"], "v99.0.0");
+    }
+
+    #[test]
+    fn conditional_guidance_matches_build_consumed_contract() {
+        let guidance =
+            include_str!("../../../docs/contracts/agentlaw-llm-guidance.md").replace("\r\n", "\n");
+        let section = guidance
+            .split_once("## Conditional release advisory in a tool result")
+            .unwrap()
+            .1;
+        let body = section
+            .split_once("```text\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        assert_eq!(body, crate::update_notice_guidance());
+    }
+
+    #[test]
+    fn interrupted_update_and_old_session_have_distinct_notices() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let state = canonical_root.join("state");
+        fs::create_dir_all(state.join("update-plans")).unwrap();
+        fs::write(
+            root.path().join(".agentlaw-layout"),
+            "agentlaw-managed-layout-v1\n",
+        )
+        .unwrap();
+        let path = state.join("update-plans/plan.json");
+        let mut plan = json!({"root":canonical_root,"id":"plan","tag":"v99.0.0",
+            "phase":"refreshing_registrations"});
+        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(
+            installation_notice(&state).unwrap()["kind"],
+            "update_incomplete"
+        );
+        plan["phase"] = json!("completed");
+        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(
+            installation_notice(&state).unwrap()["kind"],
+            "restart_required"
+        );
+    }
+}
