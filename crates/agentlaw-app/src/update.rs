@@ -150,13 +150,23 @@ fn installation_notice(state: &Path) -> Option<Value> {
         ) else {
             continue;
         };
+        let observed = managed::status_with_root(id, &root).ok();
         if matches!(
             phase,
-            "moving_old_bundle" | "publishing_new_bundle" | "refreshing_registrations"
-        ) {
+            "prepared"
+                | "moving_old_bundle"
+                | "publishing_new_bundle"
+                | "refreshing_registrations"
+                | "verifying_candidate"
+        ) || (phase == "completed"
+            && observed
+                .as_ref()
+                .is_none_or(|state| state["status"] != "completed"))
+        {
             return Some(
                 json!({"kind":"update_incomplete","plan_id":id,"phase":phase,
-                "target_version":tag,"next_action":format!("Keep Agentlaw offline and inspect this plan with agentlaw update status {id}; resume only the independently staged helper after resolving its reported condition."),
+                "observed":observed,
+                "target_version":tag,"next_action":format!("The update has not finished. Inspect plan {id} and resume it through the stable Agentlaw update command after resolving the reported blocker."),
                 "guidance":crate::update_notice_guidance()}),
             );
         }
@@ -167,7 +177,7 @@ fn installation_notice(state: &Path) -> Option<Value> {
         {
             return Some(
                 json!({"kind":"restart_required","running_version":env!("CARGO_PKG_VERSION"),
-                "installed_version":tag,"next_action":"Restart the approved harness to start its refreshed Agentlaw registration, then verify initialize.serverInfo.version and an ordinary recall.",
+                "installed_version":tag,"next_action":"Restart the harness normally. Installation, candidate MCP verification and approved cleanup already completed.",
                 "guidance":crate::update_notice_guidance()}),
             );
         }
@@ -176,6 +186,9 @@ fn installation_notice(state: &Path) -> Option<Value> {
 }
 
 impl Advisor {
+    pub fn maintenance_path(&self) -> PathBuf {
+        self.state.join("update-maintenance.json")
+    }
     pub fn new(state: PathBuf) -> Self {
         let current = read_cache(&state);
         let advisor = Self {
@@ -338,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_update_and_old_session_have_distinct_notices() {
+    fn incomplete_or_unverified_plan_never_claims_restart_required() {
         let root = tempfile::tempdir().unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
         let state = canonical_root.join("state");
@@ -360,7 +373,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
         assert_eq!(
             installation_notice(&state).unwrap()["kind"],
-            "restart_required"
+            "update_incomplete"
         );
     }
 }

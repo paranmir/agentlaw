@@ -7,10 +7,11 @@ members = [
   "crates/agentlaw-worker",
   "crates/agentlaw-flows",
   "crates/agentlaw-app",
+  "crates/agentlaw-launcher",
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 publish = false
 

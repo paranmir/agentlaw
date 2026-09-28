@@ -31,6 +31,7 @@ pub struct RuntimeConfig {
 #[derive(Clone, Serialize, Deserialize)]
 struct Endpoint {
     protocol_version: u32,
+    pid: u32,
     incarnation: String,
     address: String,
     secret: String,
@@ -725,6 +726,18 @@ impl Drop for Client {
 pub fn run_daemon(config: RuntimeConfig) -> Result<()> {
     fs::create_dir_all(&config.state_dir)?;
     private_state_directory(&config.state_dir)?;
+    let maintenance = config
+        .state_dir
+        .parent()
+        .ok_or("invalid worker state directory")?
+        .join("update-maintenance.json");
+    if maintenance.exists() {
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&maintenance)?)?;
+        let probe = std::env::var("AGENTLAW_UPDATE_PROBE_PLAN").ok();
+        if probe.as_deref() != raw["plan_id"].as_str() {
+            return Err("Agentlaw is being replaced; broker startup is gated".into());
+        }
+    }
     let singleton = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -751,6 +764,7 @@ pub fn run_daemon(config: RuntimeConfig) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let endpoint = Endpoint {
         protocol_version: PROTOCOL_VERSION,
+        pid: std::process::id(),
         incarnation: incarnation.clone(),
         address: listener.local_addr()?.to_string(),
         secret: format!(
@@ -842,7 +856,22 @@ pub fn run_daemon(config: RuntimeConfig) -> Result<()> {
             last_heartbeat = now();
             // Disposable query cache only. Never removes durable derived work or source.
             broker.connection.execute("DELETE FROM jobs WHERE durable=0 AND state!='running' AND id NOT IN(SELECT job FROM waiters) AND id NOT IN(SELECT id FROM jobs WHERE durable=0 ORDER BY id DESC LIMIT 1024)",[])?;
-            let _ = broker.idle_shutdown_due(now(), 600000)?; // Lease cleanup; supervisor owns model idle stop.
+            let drain = fs::read(&maintenance)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|marker| marker["drain"] == true);
+            if drain && active.load(Ordering::Relaxed) == 0 {
+                // The updater requests this only after all admitted frontends
+                // have exited. Durable runnable jobs still block shutdown.
+                broker
+                    .connection
+                    .execute("UPDATE leases SET expires=?1", [now()])?;
+                if broker.idle_shutdown_due(now(), 0)? {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            } else {
+                let _ = broker.idle_shutdown_due(now(), 600000)?; // Lease cleanup; supervisor owns model idle stop.
+            }
         }
         match incoming_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(mut socket)) => {

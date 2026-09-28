@@ -321,10 +321,12 @@ pub fn binding_root(root: &Path, source: &Path) -> Result<PathBuf> {
             "Cannot resolve the selected store location.",
         )
     })?;
-    let legacy = root.join("runtime/control.sqlite");
-    if legacy.is_file() {
+    // The original binding remains current data. Re-selecting its source must
+    // reuse its proposal database and recovery files under runtime/.
+    let original = root.join("runtime/control.sqlite");
+    if original.is_file() {
         let db = rusqlite::Connection::open_with_flags(
-            &legacy,
+            &original,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|_| {

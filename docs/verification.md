@@ -6,6 +6,15 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
+### 0.3.2 synchronous replacement checks
+
+The stop, replace, probe and cleanup design supersedes the earlier live
+coexistence tests. The isolated Windows integration suite now checks exact
+cleanup before success, an open MCP session draining before replacement, and
+harness drift stopping before publication. Full locked workspace and release
+matrix results must be recorded after the implementation is finalized; these
+focused tests alone do not establish cross-platform behavior.
+
 ### 0.3.0 managed update checks
 
 On Windows, `cargo fmt --all -- --check` and
@@ -96,6 +105,16 @@ invalidation, interrupted multi-memory writes and recovery, index corruption,
 failed store switching, large complete responses, explicit Git review and import,
 worker retry/ownership, and LF/CRLF tool descriptions. This is not a happy-path-only
 suite or a claim that every failure is covered.
+
+## v0.3.2 managed updater candidate (2026-09-28)
+
+The isolated Windows managed-update integration suite passed 3 tests for
+replacement, candidate MCP probe and cleanup, open-session drain, and a
+registration drift blocker. `cargo fmt --all -- --check` and
+`cargo test --locked --workspace --no-fail-fast` passed after the synchronous
+updater changes. Tests did not modify the active Agentlaw installation.
+The four-platform release matrix, public release assets, and local installation
+are pending separate verification.
 
 ## Opt-in real-model tests
 

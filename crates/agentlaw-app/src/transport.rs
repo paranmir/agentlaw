@@ -58,8 +58,29 @@ pub fn serve_with_advisor<R: BufRead, W: Write + Send + 'static, B: Backend + Se
 ) -> Result<()> {
     let output = Arc::new(Mutex::new(writer));
     let active = Arc::new(Mutex::new(BTreeMap::<String, Arc<AtomicBool>>::new()));
+    let accepting = Arc::new(Mutex::new(()));
+    let maintenance = advisor.as_ref().map(Advisor::maintenance_path);
     let (send, receive) = mpsc::sync_channel::<Work>(8);
     std::thread::scope(|scope| {
+        // The replacement gate stops new work before the updater waits for
+        // this frontend to exit. Accepted work keeps its response and durable
+        // boundary; the watchdog exits only after that work has finished.
+        if let Some(path) = maintenance.clone() {
+            if std::env::var_os("AGENTLAW_UPDATE_PROBE_PLAN").is_none() {
+                let accepted = accepting.clone();
+                let running = active.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if !path.exists() {
+                        continue;
+                    }
+                    let _gate = accepted.lock().unwrap_or_else(|e| e.into_inner());
+                    if running.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                        std::process::exit(0);
+                    }
+                });
+            }
+        }
         let writes = output.clone();
         let running = active.clone();
         let worker=scope.spawn(move||->Result<()> {
@@ -86,21 +107,40 @@ pub fn serve_with_advisor<R: BufRead, W: Write + Send + 'static, B: Backend + Se
                     }
                 });
                 let result=control.check().and_then(|_|backend.call_with_control(work.request,control));
-                let _guard=running.lock().map_err(|_|io_error())?.remove(&work.id.to_string());
                 if failed.load(Ordering::Acquire) {return Err(io_error());}
                 // A cancellation after the durable decision cannot roll it back.
                 // Complete recovery, then suppress the transport response as MCP recommends.
-                if work.cancel.load(Ordering::Acquire) {continue;}
+                if work.cancel.load(Ordering::Acquire) {
+                    running.lock().map_err(|_|io_error())?.remove(&work.id.to_string());
+                    continue;
+                }
                 let (body,is_error)=match result {Ok(v)=>(v,false),Err(e)=>(error_payload(&e),true)};
                 let notice = advisor.as_ref().and_then(Advisor::notice);
                 emit(&writes,&json!({"jsonrpc":"2.0","id":work.id,"result":tool_result(body,is_error,notice)}))?;
+                running.lock().map_err(|_|io_error())?.remove(&work.id.to_string());
             }
             Ok(())
         });
         let mut session = McpSession::default();
         let input_result = (|| -> Result<()> {
             while let Some(line) = read_message(&mut reader)? {
+                let _admission = accepting.lock().map_err(|_| io_error())?;
                 let parsed = agentlaw_contracts::validation::decode_unique(&line).ok();
+                if maintenance.as_ref().is_some_and(|path| path.exists())
+                    && std::env::var_os("AGENTLAW_UPDATE_PROBE_PLAN").is_none()
+                {
+                    if let Some(id) = parsed.as_ref().and_then(|v| v.get("id")) {
+                        emit(
+                            &output,
+                            &rpc_error(
+                                id.clone(),
+                                -32002,
+                                "Agentlaw is being replaced; retry after the harness restarts.",
+                            ),
+                        )?;
+                    }
+                    continue;
+                }
                 if let Some(v) = &parsed {
                     if v["jsonrpc"] == "2.0"
                         && v["method"] == "notifications/cancelled"
@@ -345,7 +385,7 @@ mod tests {
         );
         send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         send(
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall_for":"test"},"_meta":{"progressToken":"phase"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"recall_for":"test"}},"_meta":{"progressToken":"phase"}}}),
         );
         let progress = observed
             .recv_timeout(std::time::Duration::from_secs(3))

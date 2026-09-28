@@ -1,4 +1,4 @@
-//! One tool, explicit action namespaces; legacy flat calls remain accepted.
+//! One tool with explicit action namespaces.
 use crate::{tool_input_schema, DomainError, Result};
 use serde_json::{json, Map, Value};
 
@@ -19,20 +19,10 @@ pub(crate) fn normalize(value: Value) -> Result<Value> {
         .ok_or_else(|| {
             invalid("action must be recall, remember_this, history or connect_project_memory.")
         })?;
-    let grouped = actions
-        .iter()
-        .any(|a| root.contains_key(a.as_str().unwrap()));
-    let input = if grouped {
-        if root.len() != 2 || !root.contains_key(action) {
-            return Err(invalid(format!("For action={action}, supply only action and the {action} object. Do not mix action objects or top-level input fields.")));
-        }
-        root[action].clone()
-    } else {
-        // Compatibility is never advertised as a second model-facing format.
-        let mut input = root.clone();
-        input.remove("action");
-        Value::Object(input)
-    };
+    if root.len() != 2 || !root.contains_key(action) {
+        return Err(invalid(format!("For action={action}, supply only action and the {action} object. Do not mix action objects or top-level input fields.")));
+    }
+    let input = root[action].clone();
     check_shape(&schema["properties"][action], &input, action, &schema)?;
     let mut flat: Map<String, Value> = input.as_object().unwrap().clone();
     flat.insert("action".into(), action.into());
@@ -122,10 +112,10 @@ mod tests {
 
     #[test]
     fn action_boundaries_types_and_no_secret_echo() {
-        for input in [
-            json!({"action":"recall","recall":{"recall_for":"x","max_matches":10}}),
-            json!({"action":"recall","recall_for":"x","max_matches":10}),
-        ] {
+        assert!(
+            parse_request(r#"{"action":"recall","recall_for":"A former flat request"}"#).is_err()
+        );
+        for input in [json!({"action":"recall","recall":{"recall_for":"x","max_matches":10}})] {
             let error = parse_request(&input.to_string()).unwrap_err();
             assert!(error.message.contains("recall.memory_candidate_limit"));
         }

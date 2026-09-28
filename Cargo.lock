@@ -4,13 +4,14 @@ version = 4
 
 [[package]]
 name = "agentlaw-app"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agentlaw-contracts",
  "agentlaw-flows",
  "agentlaw-storage",
  "agentlaw-worker",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -21,12 +22,13 @@ dependencies = [
  "time",
  "toml_edit",
  "uuid",
+ "windows",
  "windows-sys",
 ]
 
 [[package]]
 name = "agentlaw-contracts"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -35,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-flows"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agentlaw-contracts",
  "agentlaw-search",
@@ -51,8 +53,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentlaw-launcher"
+version = "0.3.2"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "agentlaw-search"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -65,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-storage"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -81,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "agentlaw-worker"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agentlaw-search",
  "fs2",

@@ -68,6 +68,12 @@ impl InstalledBackend {
             },
             Err(error) => (None, Some(error)),
         };
+        if std::env::var_os("AGENTLAW_UPDATE_PROBE_PLAN").is_some() && worker.is_none() {
+            return Err(DomainError::new(
+                "update_probe",
+                "The candidate MCP could not attach its worker.",
+            ));
+        }
         Ok(Self {
             runtime: None,
             worker,

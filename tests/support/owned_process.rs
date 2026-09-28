@@ -38,6 +38,14 @@ impl OwnedProcess {
         #[cfg(not(windows))]
         Self { child }
     }
+
+    #[allow(dead_code)] // Each integration target uses only the process checks it needs.
+    pub fn is_running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("inspect owned process")
+            .is_none()
+    }
 }
 impl Drop for OwnedProcess {
     fn drop(&mut self) {

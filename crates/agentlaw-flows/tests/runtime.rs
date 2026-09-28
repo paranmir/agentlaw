@@ -1,5 +1,22 @@
-use agentlaw_flows::{parse_request, Runtime};
+use agentlaw_flows::{parse_request as parse_public_request, Runtime};
 use serde_json::{json, Value};
+fn parse_request(input: &str) -> agentlaw_flows::Result<agentlaw_flows::Request> {
+    let mut fields = serde_json::from_str::<Value>(input)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    let action = fields
+        .remove("action")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut grouped = serde_json::Map::new();
+    grouped.insert("action".into(), Value::String(action.clone()));
+    grouped.insert(action, Value::Object(fields));
+    parse_public_request(&Value::Object(grouped).to_string())
+}
 fn call(runtime: &mut Runtime, input: Value) -> Value {
     runtime
         .call(parse_request(&input.to_string()).unwrap())

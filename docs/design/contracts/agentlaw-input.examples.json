@@ -1,5 +1,5 @@
 {
-  "$comment": "Executable contract fixtures; valid means JSON shape, not successful storage or resolved user intent.",
+  "$comment": "Internal normalized input fixtures; valid means JSON shape, not successful storage or resolved user intent. MCP and CLI callers use the grouped public tool schema.",
   "schema": "agentlaw-input.schema.json",
   "examples": [
     {

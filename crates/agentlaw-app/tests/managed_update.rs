@@ -1,14 +1,12 @@
 //! Managed update subprocess tests use only temporary roots and owned processes.
-#[path = "../../../tests/support/owned_process.rs"]
-mod owned_process;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    time::Duration,
 };
 
 fn binary_name() -> &'static str {
@@ -29,15 +27,18 @@ fn hash(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
-    let mut output = None;
+    let mut child = None;
     for attempt in 0..20 {
         match Command::new(binary)
             .args(args)
             .env("AGENTLAW_HOME", state)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
         {
             Ok(value) => {
-                output = Some(value);
+                child = Some(value);
                 break;
             }
             Err(error)
@@ -50,44 +51,99 @@ fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
             Err(error) => panic!("Could not start {}: {error}", binary.display()),
         }
     }
-    let output = output.expect("bounded executable-busy retry");
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|_| panic!("Invalid CLI output: {:?}", output));
-    assert!(output.status.success(), "{value}");
+    let mut child = child.expect("bounded executable-busy retry");
+    let stdout = child.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        let _ = BufReader::new(stdout).read_until(b'\n', &mut line);
+        let _ = send.send(line);
+    });
+    let status = child.wait().unwrap();
+    let line = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let value: Value =
+        serde_json::from_slice(&line).unwrap_or_else(|_| panic!("Invalid CLI output: {line:?}"));
+    assert!(status.success(), "{value}");
     value
 }
 
-fn mcp_recall(binary: &Path, state: &Path) -> Vec<Value> {
-    let mut child = Command::new(binary)
-        .args(["mcp", "serve", "--stdio"])
-        .env("AGENTLAW_HOME", state)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    for request in [
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"managed-update-test","version":"1"}}}),
-        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw",
-            "arguments":{"action":"recall","recall":{"recall_for":"general preferences"}}}}),
-    ] {
-        writeln!(input, "{request}").unwrap();
+struct McpClient {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpClient {
+    fn new(binary: &Path, state: &Path) -> Self {
+        let mut child = Command::new(binary)
+            .args(["mcp", "serve", "--stdio"])
+            .env("AGENTLAW_HOME", state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            input,
+            output,
+            next_id: 1,
+        };
+        let initialized = client.request(
+            "initialize",
+            json!({
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"mixed-release-test","version":"1"}
+            }),
+        );
+        assert!(
+            initialized["result"]["serverInfo"]["version"].is_string(),
+            "{initialized}"
+        );
+        client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        assert!(client.request("tools/list", json!({}))["result"]["tools"].is_array());
+        client
     }
-    drop(input);
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+
+    fn send(&mut self, request: Value) {
+        writeln!(self.input, "{request}").unwrap();
+        self.input.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.output.read_line(&mut line).unwrap() > 0,
+                "MCP closed before reply"
+            );
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == id {
+                return response;
+            }
+        }
+    }
+
+    fn call(&mut self, argument: Value) -> Value {
+        self.request(
+            "tools/call",
+            json!({"name":"agentlaw","arguments":argument}),
+        )["result"]
+            .clone()
+    }
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct Fixture {
@@ -97,10 +153,13 @@ struct Fixture {
     host: PathBuf,
     helper: PathBuf,
     id: String,
-    receipt: PathBuf,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_old_binary(None)
+    }
+
+    fn with_old_binary(old_binary: Option<&Path>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("managed");
         let state = root.join("state");
@@ -119,36 +178,15 @@ impl Fixture {
         let bin = root.join("bin");
         let source = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
         let old = bin.join(binary_name());
-        fs::copy(source, &old).unwrap();
-        // Appending fixture bytes invalidates Mach-O signatures on macOS.
-        // Other bundle files still differ and exercise the same swap phases.
-        #[cfg(not(target_os = "macos"))]
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&old)
-            .unwrap()
-            .write_all(b"previous-version-overlay")
-            .unwrap();
-        #[cfg(target_os = "macos")]
-        {
-            // Re-signing with a fixture identifier changes the file hash
-            // while keeping the old executable's code signature valid.
-            assert!(Command::new("codesign")
-                .args([
-                    "--force",
-                    "--sign",
-                    "-",
-                    "--identifier",
-                    "agentlaw.fixture.old",
-                ])
-                .arg(&old)
-                .status()
-                .unwrap()
-                .success());
-            assert_ne!(hash(&old), hash(source));
+        fs::copy(old_binary.unwrap_or(source), &old).unwrap();
+        if let Some(old_binary) = old_binary {
+            let release_dir = old_binary.parent().unwrap();
+            fs::copy(release_dir.join(worker_name()), bin.join(worker_name())).unwrap();
+            fs::copy(release_dir.join("LICENSE"), bin.join("LICENSE.agentlaw")).unwrap();
+        } else {
+            fs::write(bin.join(worker_name()), b"new-worker").unwrap();
+            fs::write(bin.join("LICENSE.agentlaw"), b"old-license").unwrap();
         }
-        fs::write(bin.join(worker_name()), b"old-worker").unwrap();
-        fs::write(bin.join("LICENSE.agentlaw"), b"old-license").unwrap();
         let install = run(
             &old,
             &state,
@@ -177,14 +215,45 @@ impl Fixture {
         let id = uuid::Uuid::new_v4().to_string();
         let staged = root.join(format!(".update-{id}"));
         let unpacked = staged.join("unpacked");
-        let helper_dir = staged.join("helper");
         fs::create_dir_all(&unpacked).unwrap();
-        fs::create_dir_all(&helper_dir).unwrap();
         fs::copy(source, unpacked.join(binary_name())).unwrap();
         fs::write(unpacked.join(worker_name()), b"new-worker").unwrap();
         fs::write(unpacked.join("LICENSE.agentlaw"), b"new-license").unwrap();
-        let helper = helper_dir.join(binary_name());
-        fs::copy(source, &helper).unwrap();
+        let receipt_value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        let helper = PathBuf::from(receipt_value["executable"].as_str().unwrap());
+        let memory = temp.path().join("memory");
+        assert_eq!(
+            run(
+                &old,
+                &state,
+                &[
+                    "store",
+                    "create",
+                    "--path",
+                    memory.to_str().unwrap(),
+                    "--confirm-create"
+                ]
+            )["created"],
+            true
+        );
+        fs::write(staged.join("launcher.asset"), b"pinned launcher asset").unwrap();
+        let archive_name = if cfg!(windows) {
+            "agentlaw-x86_64-pc-windows-msvc.zip"
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "agentlaw-aarch64-apple-darwin.tar.gz"
+            } else {
+                "agentlaw-x86_64-apple-darwin.tar.gz"
+            }
+        } else {
+            "agentlaw-x86_64-unknown-linux-gnu.tar.gz"
+        };
+        let archive = staged.join(archive_name);
+        fs::write(
+            &archive,
+            b"isolated bundle fixture; archive digest is pinned",
+        )
+        .unwrap();
         let hashes = json!({
             binary_name(): hash(&unpacked.join(binary_name())),
             worker_name(): hash(&unpacked.join(worker_name())),
@@ -192,10 +261,8 @@ impl Fixture {
         });
         let plan = json!({
             "id":id,"root":root,"tag":format!("v{}",env!("CARGO_PKG_VERSION")),
-            "archive": if cfg!(windows) { "agentlaw-x86_64-pc-windows-msvc.zip" } else if cfg!(target_os="macos") {
-                if cfg!(target_arch="aarch64") { "agentlaw-aarch64-apple-darwin.tar.gz" } else { "agentlaw-x86_64-apple-darwin.tar.gz" }
-            } else { "agentlaw-x86_64-unknown-linux-gnu.tar.gz" },
-            "archive_digest":"a".repeat(64),"bin_before":hash(&old),
+            "archive":archive_name,
+            "archive_digest":hash(&archive),"bin_before":hash(&old),
             "bin_before_hashes":{
                 binary_name():hash(&old),worker_name():hash(&bin.join(worker_name())),
                 "LICENSE.agentlaw":hash(&bin.join("LICENSE.agentlaw"))
@@ -205,7 +272,7 @@ impl Fixture {
                 "config_before":fs::read_to_string(&config).unwrap(),
                 "instructions_before":fs::read_to_string(&instructions).unwrap(),
                 "receipt_before":fs::read_to_string(&receipt).unwrap()}],
-            "phase":"prepared","helper_digest":hash(&helper),"bundle_hashes":hashes
+            "phase":"prepared","launcher_digest":hash(&staged.join("launcher.asset")),"bundle_hashes":hashes
         });
         fs::create_dir_all(state.join("update-plans")).unwrap();
         fs::write(
@@ -220,7 +287,6 @@ impl Fixture {
             host,
             helper,
             id,
-            receipt,
         }
     }
     fn apply(&self) -> Value {
@@ -236,203 +302,49 @@ impl Fixture {
             ],
         )
     }
-    fn plan_path(&self) -> PathBuf {
-        self.state
-            .join("update-plans")
-            .join(format!("{}.json", self.id))
-    }
-    fn set_phase(&self, phase: &str) {
-        let path = self.plan_path();
-        let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        plan["phase"] = json!(phase);
-        fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
-    }
 }
 
 #[test]
-fn updater_waits_for_owned_broker_then_refreshes_pinned_harness_and_preserves_state() {
+fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
     let fixture = Fixture::new();
-    let before_receipt: Value =
-        serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
-    let machine_before = fs::read(fixture.state.join("machine.json")).unwrap();
-    let sentinel = fixture.state.join("pending-user-data");
-    fs::write(&sentinel, b"unchanged memory and model state").unwrap();
-    fs::create_dir_all(fixture.root.join("models")).unwrap();
-    fs::write(fixture.root.join("models/test-model"), b"model sentinel").unwrap();
-    let worker_state = fixture.state.join("owned-worker");
-    let broker = Command::new(fixture.root.join("bin").join(binary_name()))
-        .args([
-            "worker-daemon",
-            "--state-dir",
-            worker_state.to_str().unwrap(),
-        ])
-        .env("AGENTLAW_HOME", &fixture.state)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let broker = owned_process::OwnedProcess::new(broker);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !worker_state.join("endpoint.json").is_file() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(worker_state.join("endpoint.json").is_file());
-    let blocked = fixture.apply();
-    assert_eq!(blocked["status"], "incomplete");
-    assert_eq!(blocked["inspection"]["status"], "pending_exit");
-    drop(broker);
+    let memory_format = fixture.root.parent().unwrap().join("memory/format.md");
+    let original_memory = fs::read(&memory_format).unwrap();
+    let previous = fixture.root.join(format!(".bin-previous-{}", fixture.id));
+    let stage = fixture.root.join(format!(".update-{}", fixture.id));
     let complete = fixture.apply();
-    assert_eq!(complete["status"], "completed");
-    assert_eq!(
-        fs::read(&sentinel).unwrap(),
-        b"unchanged memory and model state"
-    );
-    assert_eq!(
-        fs::read(fixture.state.join("machine.json")).unwrap(),
-        machine_before
-    );
-    assert_eq!(
-        fs::read(fixture.root.join("models/test-model")).unwrap(),
-        b"model sentinel"
-    );
-    let after_receipt: Value =
-        serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
-    assert_ne!(before_receipt["executable"], after_receipt["executable"]);
-    assert_eq!(
-        fs::read(fixture.root.join("bin").join(worker_name())).unwrap(),
-        b"new-worker"
-    );
-    assert!(fixture.root.join(".bin-previous").is_dir());
-    let pinned = PathBuf::from(after_receipt["executable"].as_str().unwrap());
-    assert!(Command::new(&pinned)
-        .arg("--version")
-        .output()
-        .unwrap()
-        .status
-        .success());
-    assert!(fixture.host.join("AGENTS.md").is_file());
-    let worker_state = fixture.state.join("worker");
-    let worker = Command::new(fixture.root.join("bin").join(binary_name()))
-        .args([
-            "worker-daemon",
-            "--state-dir",
-            worker_state.to_str().unwrap(),
-        ])
-        .env("AGENTLAW_HOME", &fixture.state)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let worker = owned_process::OwnedProcess::new(worker);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !worker_state.join("endpoint.json").is_file() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(worker_state.join("endpoint.json").is_file());
-    let memory = fixture.root.join("memory");
-    assert_eq!(
-        run(
-            &fixture.root.join("bin").join(binary_name()),
-            &fixture.state,
-            &[
-                "store",
-                "create",
-                "--path",
-                memory.to_str().unwrap(),
-                "--confirm-create"
-            ],
-        )["created"],
-        true
-    );
-    let verified_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    fs::write(
-        fixture.state.join("update-check.json"),
-        serde_json::to_vec(
-            &json!({"last_success":verified_at,"retry_after":null,"latest_tag":"v99.0.0"}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    for binary in [&fixture.root.join("bin").join(binary_name()), &pinned] {
-        let replies = mcp_recall(binary, &fixture.state);
-        assert_eq!(
-            replies[0]["result"]["serverInfo"]["version"],
-            env!("CARGO_PKG_VERSION")
-        );
-        let recall = &replies[1]["result"];
-        assert_eq!(recall["isError"], false, "{recall}");
-        assert!(
-            recall["structuredContent"].get("memories").is_some(),
-            "{recall}"
-        );
-        assert_eq!(
-            recall["structuredContent"]["update_notice"]["latest_version"],
-            "v99.0.0"
-        );
-        let text: Value =
-            serde_json::from_str(recall["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text, recall["structuredContent"]);
-    }
-    drop(worker);
+    assert_eq!(complete["status"], "completed", "{complete}");
+    assert_eq!(complete["bundle"], "installed_and_verified");
+    assert_eq!(complete["registrations"], "verified");
+    assert_eq!(complete["cleanup"], "completed");
+    assert_eq!(complete["recovery_obligations_closed"], true);
+    assert!(!previous.exists());
+    assert!(!stage.exists());
+    assert!(!fixture.state.join("update-maintenance.json").exists());
+    assert_eq!(fs::read(memory_format).unwrap(), original_memory);
+    assert!(complete["activation"] == "verified");
 }
 
 #[test]
-fn interrupted_bundle_move_and_publish_resume_the_same_plan() {
-    for phase in ["moving_old_bundle", "publishing_new_bundle"] {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.root.join("memory")).unwrap();
-        fs::write(fixture.root.join("memory/source.md"), b"memory sentinel").unwrap();
-        fs::rename(fixture.root.join("bin"), fixture.root.join(".bin-previous")).unwrap();
-        if phase == "publishing_new_bundle" {
-            fs::rename(
-                fixture
-                    .root
-                    .join(format!(".update-{}", fixture.id))
-                    .join("unpacked"),
-                fixture.root.join("bin"),
-            )
-            .unwrap();
-        }
-        fixture.set_phase(phase);
-        // Other isolated tests can briefly launch an Agentlaw-named process
-        // while its executable path is unavailable to the OS process list.
-        // The updater must defer and resume the same plan in that case.
-        let mut result = fixture.apply();
-        for _ in 0..20 {
-            if result["status"] != "incomplete"
-                || result["inspection"]["status"] != "inspection_unknown"
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            result = fixture.apply();
-        }
-        assert_eq!(result["status"], "completed", "phase={phase}: {result}");
-        let receipt: Value = serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
-        assert!(Path::new(receipt["executable"].as_str().unwrap()).is_file());
-        assert!(fixture.root.join(".bin-previous").is_dir());
-        assert_eq!(
-            fs::read(fixture.root.join("memory/source.md")).unwrap(),
-            b"memory sentinel"
-        );
-    }
-}
-
-#[test]
-fn external_harness_edit_after_preview_stops_before_swap() {
+fn maintenance_drains_an_open_mcp_before_replacing_bundle() {
     let fixture = Fixture::new();
-    let config = fixture.host.join("config.toml");
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&config)
-        .unwrap()
-        .write_all(b"\n# user changed this registration\n")
-        .unwrap();
+    let mut active = McpClient::new(&fixture.helper, &fixture.state);
+    let recall = active
+        .call(json!({"action":"recall","recall":{"recall_for":"verify managed update drain"}}));
+    assert_eq!(recall["isError"], false, "{recall}");
+    let complete = fixture.apply();
+    assert_eq!(complete["status"], "completed", "{complete}");
+    assert!(
+        active.child.try_wait().unwrap().is_some(),
+        "old MCP stayed alive after the update"
+    );
+}
+
+#[test]
+fn harness_drift_stops_before_publication_and_reopens_old_startup() {
+    let fixture = Fixture::new();
+    let before = hash(&fixture.root.join("bin").join(binary_name()));
+    let instructions = fixture.host.join("AGENTS.md");
+    fs::write(&instructions, "user changed this instruction file\n").unwrap();
     let output = Command::new(&fixture.helper)
         .args([
             "update",
@@ -445,65 +357,12 @@ fn external_harness_edit_after_preview_stops_before_swap() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(error["code"], "update_drift");
-    assert!(fixture.root.join("bin").is_dir());
-    assert!(!fixture.root.join(".bin-previous").exists());
-}
-
-#[test]
-fn interrupted_registration_journal_recovers_only_pinned_targets() {
-    let fixture = Fixture::new();
-    let plan_path = fixture.plan_path();
-    let mut plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
-    let old = plan["registrations"][0].clone();
-    let config = fixture.host.join("config.toml");
-    let instructions = fixture.host.join("AGENTS.md");
-    let installed = run(
-        &fixture.helper,
-        &fixture.state,
-        &[
-            "install",
-            "--harness",
-            "codex",
-            "--harness-dir",
-            fixture.host.to_str().unwrap(),
-            "--confirm-install",
-        ],
-    );
-    assert_eq!(installed["status"], "installed");
-    let after_config = fs::read_to_string(&config).unwrap();
-    let after_instructions = fs::read_to_string(&instructions).unwrap();
-    let after_receipt = fs::read_to_string(&fixture.receipt).unwrap();
-    fs::write(&config, old["config_before"].as_str().unwrap()).unwrap();
-    fs::write(&instructions, old["instructions_before"].as_str().unwrap()).unwrap();
-    fs::write(&fixture.receipt, old["receipt_before"].as_str().unwrap()).unwrap();
-    plan["registrations"][0]["config_after"] = json!(after_config.clone());
-    plan["registrations"][0]["instructions_after"] = json!(after_instructions.clone());
-    plan["registrations"][0]["receipt_after"] = json!(after_receipt.clone());
-    plan["phase"] = json!("refreshing_registrations");
-    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
-    let journal = json!({"targets":[
-        {"path":config,"before":old["config_before"],"after":after_config},
-        {"path":instructions,"before":old["instructions_before"],"after":after_instructions},
-        {"path":fixture.receipt,"before":old["receipt_before"],"after":after_receipt}
-    ]});
-    fs::write(
-        fixture.state.join("install-pending.json"),
-        serde_json::to_vec(&journal).unwrap(),
-    )
-    .unwrap();
-    fs::rename(fixture.root.join("bin"), fixture.root.join(".bin-previous")).unwrap();
-    fs::rename(
-        fixture
-            .root
-            .join(format!(".update-{}", fixture.id))
-            .join("unpacked"),
-        fixture.root.join("bin"),
-    )
-    .unwrap();
-    let result = fixture.apply();
-    assert_eq!(result["status"], "completed", "{result}");
-    assert_eq!(fs::read_to_string(&fixture.receipt).unwrap(), after_receipt);
-    assert!(!fixture.state.join("install-pending.json").exists());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["code"], "update_drift", "{result}");
+    assert_eq!(hash(&fixture.root.join("bin").join(binary_name())), before);
+    assert!(!fixture
+        .root
+        .join(format!(".bin-previous-{}", fixture.id))
+        .exists());
+    assert!(!fixture.state.join("update-maintenance.json").exists());
 }
