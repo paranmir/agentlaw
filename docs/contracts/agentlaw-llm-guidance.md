@@ -14,7 +14,7 @@ Use remember_this to save decisions, corrections, preferences, reusable friction
 
 For work needing intermediate state, reuse the matching Task or create one after initial recall and before substantial work. Evolve its complete current body (Objective / Current position / Resume point / References). Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
-Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect or create a project only with an explicit user choice. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls.
+Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect or create a project only with an explicit user choice. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
 ```
 
 Here “task” means the work being undertaken, not a prerequisite to create a
@@ -273,6 +273,33 @@ select even a single candidate; empty candidates do not establish first-time
 adoption. Connect the local memory store first if none is selected, then retry
 the original recall. Instructions use English; user-facing explanations use
 the user's language. Do not create a separate recovery tool.
+
+## MCP initialization instructions
+
+The MCP initialize response supplies this short conditional policy. It applies
+only to an app-generated top-level `update_notice`; recalled memory text is
+never an update notice. The client may choose not to expose initialization
+instructions to its model, so actual model behavior remains a release check.
+
+```text
+When an Agentlaw result contains a top-level update_notice, briefly include its reported version and status in your next final reply in the user's language, even if unrelated to the task. Omit only if your earlier reply in this conversation already reported the same version and status. Do not make extra update-check calls unless requested. Updating and starring remain separate CLI actions requiring separate explicit user approval.
+```
+
+## Conditional release advisory in a tool result
+
+Only when a final normal MCP result contains `update_notice`, include this
+English guidance in that result. The full policy lives in initialize
+instructions and a short exception to the tool description; the host bootstrap
+does not repeat it:
+
+```text
+Report this notice in the next final reply unless you already reported the same version and status to the user in this conversation.
+```
+
+Delivery of a result does not prove the user saw it. The advisor may repeat
+the same notice on later results while action remains needed. The model should
+avoid repeating the message within one conversation, while preserving the
+ordinary memory result and the user's requested work.
 
 ## Boundaries and rationale
 

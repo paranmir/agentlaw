@@ -6,6 +6,58 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
+### 0.3.0 managed update checks
+
+On Windows, `cargo fmt --all -- --check` and
+`cargo test --locked --workspace --no-fail-fast` passed after the update changes.
+The isolated `managed_update` subprocess tests used temporary managed roots and
+owned brokers. They verified a live broker defers application, same-plan resume
+updates an owned Codex registration, external configuration drift stops before
+the swap, interrupted bundle move/publish and installation-journal phases
+resume, and isolated memory, model, pending-state and machine-identity bytes
+survive. Both the direct `bin` binary
+and refreshed version-pinned executable completed MCP initialization and an
+ordinary recall with matching text and structured update notices. The normal
+MCP transport also has a unit test for notice delivery without changing memory
+fields or error classification.
+
+An isolated Codex CLI 0.157.1 / gpt-6-sol conversation initially omitted the
+release details in its final reply despite receiving a synthetic v99.0.0
+notice. After adding conditional MCP initialization instructions and a brief
+exception in the single tool description, the unchanged unrelated Korean
+prompt produced version and new-release status in five of five independent
+final replies. In one persisted conversation a repeated notice was not
+repeated in the second final reply, and a changed synthetic v99.0.1 notice
+was reported in the third. These test tags were not published releases.
+In a separate persisted conversation, a no-notice result produced no
+invented update in the final reply, and the next ordinary recall reported
+a newly seeded synthetic v99.0.2 notice. This used a restarted MCP process,
+not an in-process TTL expiration.
+Additional isolated model checks covered the remaining notice paths. In one
+long-lived Agentlaw MCP process, a delayed synthetic release response arrived
+after the first ordinary recall; the second recall carried v99.0.3, and the
+final reply reported it. A transparent local test proxy only controlled timing
+and forwarded the MCP payload unchanged. A 100 KB memory response switched to
+`complete_content_in_file` and still carried a top-level `restart_required`
+notice; the final reply reported the restart status and did not claim to have
+read the full file after a read-only command was blocked by the test policy.
+When the same synthetic v99.0.1 version changed from `new_release` to
+`restart_required`, the continued conversation reported the new action.
+A recalled memory body containing an `update_notice` example, without a
+top-level app notice, did not produce a false update report. These checks used
+temporary state and synthetic tags, not a published release or a real install.
+Client handling of initialization instructions and other model/harness
+combinations remain unverified.
+
+The optional support command returned `skipped_noninteractive` for the
+authenticated unstarred account during a noninteractive check; no star was
+sent. A published v0.2.6 Windows archive was inspected and had exactly the
+expected release bundle entries. The local machine has no Unix shell runner;
+the release workflow checks `sh -n install.sh` and runs the Rust suite on Linux
+and both macOS targets before publication. A full live managed download and
+upgrade to a newer release was unavailable before v0.3.0 existed. Keep these
+limits separate from the tests that passed.
+
 For the first 0.2.1 candidate, the local Windows workspace suite passed **145 ordinary tests** with
 zero failures (the same three opt-in real-model tests remain ignored). New checks
 cover inline schema visibility and equivalence for valid/invalid contract

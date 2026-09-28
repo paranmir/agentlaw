@@ -51,7 +51,7 @@ agentlaw --version
 
 Put the export line in your shell profile to keep it for new terminals.
 Set `AGENTLAW_ROOT` to choose another complete installation root, or
-`AGENTLAW_VERSION=v0.2.6` to pin this release. The installer keeps binaries in
+`AGENTLAW_VERSION=v0.3.0` to pin this release. The installer keeps binaries in
 `bin`, private state in `state`, memory in a sibling `memory` directory once
 connected, and model assets in `models`. It does not migrate an older state
 automatically. Download the script first if you want to inspect it before execution.
@@ -90,6 +90,13 @@ Re-running the installer at the same managed root updates executables; it does
 not reset memory or configure a harness. An existing installation using the old
 AppData state location is **not migrated automatically**; preserve its memory and
 machine-local state and explicitly plan a migration before switching roots.
+
+Agentlaw can report a newer published release in an ordinary MCP result. For a
+managed installation, `agentlaw update` previews the pinned release and owned
+harness registrations. After reviewing the plan, `agentlaw update
+--confirm-update <plan-id>` prepares an independent helper. Close every Agentlaw
+harness and broker process, then run the returned helper and arguments to apply
+the bundle and refresh approved registrations. See [the update procedure](docs/usage.md#managed-updates-and-optional-github-support).
 
 The root contains `bin/`, `models/`, `memory/`, and `state/`. Configuration,
 machine identity, executable versions, worker files, recovery data, indexes,

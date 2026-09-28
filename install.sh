@@ -49,7 +49,9 @@ base=https://github.com/paranmir/agentlaw/releases
 if [ "$version" = latest ]; then base=$base/latest/download; else base=$base/download/$version; fi
 archive=agentlaw-$target.tar.gz
 temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+trap 'rm -rf "$temporary"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 download() {
   if command -v curl >/dev/null 2>&1; then curl -fSL --retry 2 "$1" -o "$2"
   elif command -v wget >/dev/null 2>&1; then wget -q "$1" -O "$2"
@@ -64,11 +66,81 @@ else actual=$(shasum -a 256 "$temporary/$archive" | awk '{print $1}')
 fi
 [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo 'Checksum verification failed; nothing installed.' >&2; exit 1; }
 tar -xzf "$temporary/$archive" -C "$temporary" agentlaw agentlaw-worker LICENSE
-mkdir -p "$destination"
-install -m 755 "$temporary/agentlaw" "$temporary/agentlaw-worker" "$destination/"
-install -m 644 "$temporary/LICENSE" "$destination/LICENSE.agentlaw"
+mkdir -p "$root"
+lockdir=$root/.install-lock
+if ! mkdir "$lockdir" 2>/dev/null; then
+  if [ -f "$lockdir/pid" ]; then
+    owner=$(cat "$lockdir/pid")
+    case "$owner" in *[!0-9]*|'') echo 'Invalid installer lock; inspect the managed root.' >&2; exit 1 ;; esac
+    if kill -0 "$owner" 2>/dev/null; then echo 'Another installer is still running.' >&2; exit 1; fi
+    rm -f "$lockdir/pid"
+    rmdir "$lockdir" || { echo 'Cannot recover the stale installer lock.' >&2; exit 1; }
+    mkdir "$lockdir" || { echo 'Another installer acquired the lock.' >&2; exit 1; }
+  else
+    echo 'Installer lock has no owner; inspect it before retrying.' >&2; exit 1
+  fi
+fi
+printf '%s\n' "$$" > "$lockdir/pid"
+unlock_install() { rm -f "$lockdir/pid"; rmdir "$lockdir" 2>/dev/null || true; }
+trap 'unlock_install; rm -rf "$temporary"' EXIT
+
+if [ ! -f "$marker" ]; then
+  pending=$root/.agentlaw-layout.pending
+  if [ -e "$pending" ]; then
+    [ -f "$pending" ] && [ "$(cat "$pending")" = agentlaw-managed-layout-v1 ] || {
+      echo 'Interrupted layout marker needs inspection.' >&2; exit 1;
+    }
+  else
+    printf 'agentlaw-managed-layout-v1\n' > "$pending"
+  fi
+  mv "$pending" "$marker"
+fi
+
+staged=$root/.bin-staged
+previous=$root/.bin-previous
+if [ -d "$previous" ]; then
+  if [ ! -d "$destination" ]; then
+    if [ -d "$staged" ]; then
+      mv "$staged" "$destination" || { mv "$previous" "$destination" || true; echo 'Interrupted swap needs inspection.' >&2; exit 1; }
+    else
+      mv "$previous" "$destination" || { echo 'Cannot restore the previous bundle.' >&2; exit 1; }
+    fi
+  fi
+  if [ -x "$destination/agentlaw" ] && "$destination/agentlaw" --version >/dev/null 2>&1; then
+    rm -f "$previous/agentlaw" "$previous/agentlaw-worker" "$previous/LICENSE.agentlaw"
+    rmdir "$previous" || { echo 'Previous bundle has unexpected files; inspect it.' >&2; exit 1; }
+  else
+    echo 'Published bundle failed verification; previous bundle preserved.' >&2; exit 1
+  fi
+fi
+if [ -d "$destination" ]; then
+  for item in "$destination"/* "$destination"/.[!.]* "$destination"/..?*; do
+    [ -e "$item" ] || [ -L "$item" ] || continue
+    case "${item##*/}" in agentlaw|agentlaw-worker|LICENSE.agentlaw) ;;
+      *) echo "Managed bin contains an unexpected file: $item" >&2; exit 1 ;;
+    esac
+    [ -f "$item" ] && [ ! -L "$item" ] || {
+      echo "Managed bin contains an invalid bundle entry: $item" >&2; exit 1;
+    }
+  done
+fi
+if [ -d "$staged" ]; then
+  rm -f "$staged/agentlaw" "$staged/agentlaw-worker" "$staged/LICENSE.agentlaw"
+  rmdir "$staged" || { echo 'Staging has unexpected files; inspect it.' >&2; exit 1; }
+fi
+mkdir "$staged"
+install -m 755 "$temporary/agentlaw" "$temporary/agentlaw-worker" "$staged/"
+install -m 644 "$temporary/LICENSE" "$staged/LICENSE.agentlaw"
+"$staged/agentlaw" --version >/dev/null
+"$staged/agentlaw" schema >/dev/null
+if [ -d "$destination" ]; then mv "$destination" "$previous"; fi
+if ! mv "$staged" "$destination"; then
+  if [ -d "$previous" ] && [ ! -d "$destination" ]; then mv "$previous" "$destination" || true; fi
+  echo 'Bundle publication failed; recovery material was preserved.' >&2
+  exit 1
+fi
+"$destination/agentlaw" --version >/dev/null || { echo 'Published bundle probe failed; previous bundle retained.' >&2; exit 1; }
 mkdir -p "$root/state"
-printf 'agentlaw-managed-layout-v1\n' > "$marker"
 printf '\nInstalled Agentlaw to %s\n' "$destination"
 printf 'Add this directory to PATH in your shell profile:\n  export PATH="%s:$PATH"\n' "$destination"
 printf 'Model setup and harness configuration: https://github.com/paranmir/agentlaw/blob/main/docs/usage.md\n'

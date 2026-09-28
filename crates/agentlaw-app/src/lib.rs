@@ -15,6 +15,7 @@ pub mod machine;
 pub mod setup;
 use agentlaw_flows::history_diff as stream_diff;
 pub mod transport;
+pub mod update;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -23,6 +24,20 @@ const GUIDANCE: &str = include_str!("../../../docs/contracts/agentlaw-llm-guidan
 pub fn tool_description() -> &'static str {
     description_from_guidance(GUIDANCE)
         .expect("accepted tool description must exist in the source contract")
+}
+
+pub fn initialize_instructions() -> &'static str {
+    fenced_text_in_section(GUIDANCE, "## MCP initialization instructions")
+        .expect("accepted MCP initialization instructions must exist in the source contract")
+}
+
+pub fn update_notice_guidance() -> &'static str {
+    fenced_text_in_section(GUIDANCE, "## Conditional release advisory in a tool result")
+        .expect("accepted release notice guidance must exist in the source contract")
+}
+
+fn fenced_text_in_section<'a>(guidance: &'a str, heading: &str) -> Option<&'a str> {
+    description_from_guidance(guidance.split_once(heading)?.1)
 }
 
 fn description_from_guidance(guidance: &str) -> Option<&str> {
@@ -56,13 +71,31 @@ pub fn call_json(backend: &mut impl Backend, input: &str) -> Result<Value> {
     backend.call(parse_request(input)?)
 }
 
+/// Build only the final MCP result. Transport Capture never calls this with an
+/// advisory; its intermediate result is discarded before the real work runs.
+pub fn tool_result(mut body: Value, failed: bool, notice: Option<Value>) -> Value {
+    if let (Some(object), Some(notice)) = (body.as_object_mut(), notice) {
+        object.insert("update_notice".into(), notice);
+    }
+    json!({"content":[{"type":"text","text":body.to_string()}],
+        "structuredContent":body,"isError":failed})
+}
+
 #[derive(Default)]
 pub struct McpSession {
     initialized: bool,
     ready: bool,
+    advisor: Option<update::Advisor>,
 }
 
 impl McpSession {
+    pub fn with_advisor(advisor: update::Advisor) -> Self {
+        Self {
+            advisor: Some(advisor),
+            ..Self::default()
+        }
+    }
+
     pub fn handle(&mut self, raw: &str, backend: &mut impl Backend) -> Option<Value> {
         let value = match agentlaw_contracts::validation::decode_unique(raw) {
             Ok(v) => v,
@@ -115,7 +148,8 @@ impl McpSession {
                 }
                 self.initialized = true;
                 json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{"listChanged":false}},
-                    "serverInfo":{"name":"agentlaw","version":env!("CARGO_PKG_VERSION")}})
+                    "serverInfo":{"name":"agentlaw","version":env!("CARGO_PKG_VERSION")},
+                    "instructions":initialize_instructions()})
             }
             "ping" => json!({}),
             _ if !self.ready => {
@@ -143,8 +177,11 @@ impl McpSession {
                     Ok(body) => (body, false),
                     Err(error) => (error_payload(&error), true),
                 };
-                // The text copy is required for clients that do not surface structuredContent.
-                json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":failed})
+                tool_result(
+                    body,
+                    failed,
+                    self.advisor.as_ref().and_then(update::Advisor::notice),
+                )
             }
             _ => return Some(rpc_error(id, -32601, "Unknown method.")),
         };
@@ -230,7 +267,16 @@ pub fn serve_stdio(
     writer: &mut impl Write,
     backend: &mut impl Backend,
 ) -> Result<()> {
-    let mut session = McpSession::default();
+    serve_stdio_with_advisor(reader, writer, backend, None)
+}
+
+pub fn serve_stdio_with_advisor(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    backend: &mut impl Backend,
+    advisor: Option<update::Advisor>,
+) -> Result<()> {
+    let mut session = advisor.map(McpSession::with_advisor).unwrap_or_default();
     while let Some(line) = read_message(reader)? {
         if let Some(response) = session.handle(&line, backend) {
             serde_json::to_writer(&mut *writer, &response)
@@ -257,6 +303,11 @@ mod tests {
     fn ready(s: &mut McpSession, b: &mut TestBackend) {
         let response=s.handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,b).unwrap();
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            response["result"]["instructions"],
+            initialize_instructions()
+        );
+        assert!(initialize_instructions().contains("top-level update_notice"));
         assert!(s
             .handle(
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -275,6 +326,8 @@ mod tests {
         assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 1);
         assert_eq!(r["result"]["tools"][0]["name"], "agentlaw");
         assert!(tool_description().starts_with("Persistent memory"));
+        assert!(tool_description()
+            .contains("Do not report routine memory calls; report a top-level update_notice"));
         assert_eq!(
             r["result"]["tools"][0]["inputSchema"],
             schema()["inputSchema"]

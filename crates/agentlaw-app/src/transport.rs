@@ -1,6 +1,8 @@
 //! One serialized Runtime lane, with independent input for progress/cancellation.
 //! MCP 2025-06-18 progress/cancellation, not a claim of support for Tasks.
-use crate::{error_payload, read_message, rpc_error, Backend, McpSession};
+use crate::{
+    error_payload, read_message, rpc_error, tool_result, update::Advisor, Backend, McpSession,
+};
 use agentlaw_contracts::{DomainError, Request, Result};
 use agentlaw_flows::RequestControl;
 use serde_json::{json, Value};
@@ -41,9 +43,18 @@ fn emit<W: Write>(writer: &Mutex<W>, value: &Value) -> Result<()> {
 }
 
 pub fn serve<R: BufRead, W: Write + Send + 'static, B: Backend + Send>(
+    reader: R,
+    writer: W,
+    backend: B,
+) -> Result<()> {
+    serve_with_advisor(reader, writer, backend, None)
+}
+
+pub fn serve_with_advisor<R: BufRead, W: Write + Send + 'static, B: Backend + Send>(
     mut reader: R,
     writer: W,
     mut backend: B,
+    advisor: Option<Advisor>,
 ) -> Result<()> {
     let output = Arc::new(Mutex::new(writer));
     let active = Arc::new(Mutex::new(BTreeMap::<String, Arc<AtomicBool>>::new()));
@@ -81,7 +92,8 @@ pub fn serve<R: BufRead, W: Write + Send + 'static, B: Backend + Send>(
                 // Complete recovery, then suppress the transport response as MCP recommends.
                 if work.cancel.load(Ordering::Acquire) {continue;}
                 let (body,is_error)=match result {Ok(v)=>(v,false),Err(e)=>(error_payload(&e),true)};
-                emit(&writes,&json!({"jsonrpc":"2.0","id":work.id,"result":{"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":is_error}}))?;
+                let notice = advisor.as_ref().and_then(Advisor::notice);
+                emit(&writes,&json!({"jsonrpc":"2.0","id":work.id,"result":tool_result(body,is_error,notice)}))?;
             }
             Ok(())
         });
@@ -245,6 +257,60 @@ mod tests {
             }
             c.check()?;
             Ok(json!({}))
+        }
+    }
+    struct Immediate;
+    impl Backend for Immediate {
+        fn call(&mut self, _: Request) -> Result<Value> {
+            Ok(json!({"status":"remembered","results":[]}))
+        }
+    }
+    #[test]
+    fn final_transport_result_preserves_memory_and_repeats_visible_advice() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("update-check.json"),
+            format!(
+                r#"{{"last_success":{},"retry_after":null,"latest_tag":"v99.0.0"}}"#,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            ),
+        )
+        .unwrap();
+        let advisor = Advisor::new(root.path().to_path_buf());
+        let lines = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"recall_for":"test"}}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"recall_for":"test"}}}}),
+        ];
+        let input = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let (tx, rx) = mpsc::channel();
+        serve_with_advisor(
+            std::io::Cursor::new(input),
+            Output { tx, buf: vec![] },
+            Immediate,
+            Some(advisor),
+        )
+        .unwrap();
+        let responses: Vec<Value> = rx.try_iter().collect();
+        assert_eq!(responses.len(), 3);
+        for response in &responses[1..] {
+            let result = &response["result"];
+            assert_eq!(result["isError"], false);
+            assert_eq!(result["structuredContent"]["status"], "remembered");
+            assert_eq!(
+                result["structuredContent"]["update_notice"]["latest_version"],
+                "v99.0.0"
+            );
+            let text: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text, result["structuredContent"]);
         }
     }
     #[test]
