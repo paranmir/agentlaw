@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
+use sysinfo::{get_current_pid, ProcessStatus, ProcessesToUpdate, System};
 
 const REPO_RELEASE: &str = "https://github.com/paranmir/agentlaw/releases/download";
 
@@ -701,6 +701,14 @@ fn inspect_processes(root: &Path) -> Value {
     let mut unknown = Vec::new();
     for (pid, process) in system.processes() {
         if Some(*pid) == own {
+            continue;
+        }
+        // A zombie has exited and cannot execute the old bundle. Unix may
+        // retain its executable path until the parent reaps it.
+        if matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ) {
             continue;
         }
         let name = process.name().to_string_lossy().to_ascii_lowercase();

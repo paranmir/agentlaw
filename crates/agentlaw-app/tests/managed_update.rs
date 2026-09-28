@@ -103,19 +103,15 @@ impl Fixture {
         let source = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
         let old = bin.join(binary_name());
         fs::copy(source, &old).unwrap();
+        // Appending fixture bytes invalidates Mach-O signatures on macOS.
+        // Other bundle files still differ and exercise the same swap phases.
+        #[cfg(not(target_os = "macos"))]
         fs::OpenOptions::new()
             .append(true)
             .open(&old)
             .unwrap()
             .write_all(b"previous-version-overlay")
             .unwrap();
-        #[cfg(target_os = "macos")]
-        assert!(Command::new("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&old)
-            .status()
-            .unwrap()
-            .success());
         fs::write(bin.join(worker_name()), b"old-worker").unwrap();
         fs::write(bin.join("LICENSE.agentlaw"), b"old-license").unwrap();
         let install = run(
