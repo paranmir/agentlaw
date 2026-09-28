@@ -64,7 +64,7 @@ versions. Select user/project/machine scope deliberately. A one-off request is
 not a lasting preference; a small reusable correction can deserve a memory
 without a Task. Label proposals and unverified claims. For multiple candidates,
 use the current request to select relevant ones; ask only when ambiguity changes
-the work. Retrieve missing context only when needed for the next decision. Do
+the work. Follow the tool contract for recall timing. Do
 not use `history` or another recall merely to reconfirm a successful save.
 Repeated friction may warrant a learned procedure through the existing
 `remember_this` authoring flow. Follow returned instructions, not an invented

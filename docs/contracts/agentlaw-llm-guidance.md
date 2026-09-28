@@ -8,7 +8,7 @@ Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
 `connect_project_memory` (ADR-0140).
 
 ```text
-Persistent memory for ordinary work. Use recall when starting or resuming multi-step work, recovering missing context, or checking past decisions, failures, or procedures that may change the next action. Search with new evidence; skip repeat recall when the needed context is already present.
+Persistent memory for ordinary work. At a new work request or resumption, recall relevant memories before proceeding; for project work, check active Tasks and match by objective and scope before creating one. During work, recall again when a new area, assumption, constraint, failure, or similarity to prior work raises a question not covered by recalled context. Combine related clues in one call. Skip a lookup only when recall results still in context cover the same question and conditions, including any needed Task selection.
 
 Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. When a user corrects your prior work, extract any reusable approach supported by the correction and save it with its conditions and scope. Batch other changed progress at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
 
@@ -23,7 +23,10 @@ to follow the existing user/machine/project context contract. Checking an area
 means obtaining relevant memory context, not merely reading a file. An area is
 not every individual file; scope and observations determine whether a new
 question needs recall. Reuse depends on content still available to the LLM,
-not Runtime remembering that it once sent a response.
+not Runtime remembering that it once sent a response. A new work request is a
+new objective, not each message in an unchanged exchange. Short work can still
+depend on saved context; confidence that one can answer unaided is not proof
+that no relevant memory exists.
 
 Phase boundaries are work transitions, not a new checkpoint artifact or
 workflow-registration API. No-change turns need no write. An unchanged
@@ -163,7 +166,7 @@ project reconstruction is requested independently through `restore_context`
 (ADR-0141). The exact CLI line is generated from installed paths.
 
 ```text
-Use Agentlaw without waiting for a memory request. Recall at the start or resumption of multi-step work. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Recall missing past context that could change the next action. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
+Use Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
 For project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.
 If agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.
 

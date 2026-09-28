@@ -1,14 +1,17 @@
-# Agentlaw 0.2.5
+# Agentlaw 0.2.6
 
-- Fixes `agentlaw doctor` reporting old `model_load` and `vector_index:<repository>`
-  failures as active after the worker or vector index has recovered. Recovery is
-  verified before the active diagnostic is cleared.
-- Preserves the most recently resolved cause for each key in
-  `worker_runtime.diagnostic_history`, with the time recovery was confirmed.
-  `doctor` remains read-only, and its top-level status retains its existing meaning.
-- Lets vector indexing continue for other repositories when one repository fails.
-  This release does not change the tool schema or memory storage format.
+- Guides agents to recall at a new work request or resumption, including short
+  work that may reuse a saved approach. New evidence or a similarity to prior
+  work prompts a focused follow-up recall when the question is not covered by
+  context already retrieved.
+- Tells agents to check active project Tasks and match by objective and scope
+  before creating a Task. Repeated recall is skipped only while the relevant
+  results remain in context for the same question and conditions.
+- Aligns the MCP tool description, installed bootstrap, and optional skill.
+  The schema, memory storage format, and Runtime retrieval behavior are unchanged.
+  Invocation still depends on the agent and harness following the guidance.
 
 The GitHub release contains binaries and installers for the supported platforms.
-Publishing this release does not replace a running Codex MCP process or migrate an
-existing installation. Follow `docs/usage.md` when upgrading a live installation.
+Publishing this release does not replace a running Codex MCP process or update
+an existing harness bootstrap. Follow `docs/usage.md` to upgrade the executable,
+refresh harness instructions, and start a new session with the new tool description.

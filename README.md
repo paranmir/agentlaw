@@ -51,7 +51,7 @@ agentlaw --version
 
 Put the export line in your shell profile to keep it for new terminals.
 Set `AGENTLAW_ROOT` to choose another complete installation root, or
-`AGENTLAW_VERSION=v0.2.5` to pin this release. The installer keeps binaries in
+`AGENTLAW_VERSION=v0.2.6` to pin this release. The installer keeps binaries in
 `bin`, private state in `state`, memory in a sibling `memory` directory once
 connected, and model assets in `models`. It does not migrate an older state
 automatically. Download the script first if you want to inspect it before execution.

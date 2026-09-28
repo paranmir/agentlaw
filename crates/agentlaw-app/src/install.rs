@@ -237,7 +237,7 @@ fn bootstrap(executable: &Path, state: &Path) -> String {
             state.display().to_string().replace('\'', "'\\''")
         )
     };
-    format!("{BEGIN}\n## Agentlaw memory\n\nUse Agentlaw without waiting for a memory request. Recall at the start or resumption of multi-step work. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Recall missing past context that could change the next action. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.\nFor project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.\nIf agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.\nCLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` when the contract is unavailable. The CLI and MCP use the same installation.\n{END}")
+    format!("{BEGIN}\n## Agentlaw memory\n\nUse Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. Reuse or create a matching Task before substantial work; save reusable decisions, corrections, friction, and findings before relying on them. Batch other changed progress at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.\nFor project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.\nIf agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.\n\nCLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` when the contract is unavailable. The CLI and MCP use the same installation.\n{END}")
 }
 fn upsert_bootstrap(previous: &str, body: &str) -> Result<String> {
     let begins: Vec<_> = previous.match_indices(BEGIN).map(|(i, _)| i).collect();
@@ -536,6 +536,46 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_bootstrap_matches_accepted_contract() {
+        let guidance = super::super::GUIDANCE.replace("\r\n", "\n");
+        let accepted = guidance
+            .split_once("## Bootstrap")
+            .unwrap()
+            .1
+            .split_once("```text\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let expected = accepted
+            .replace(
+                "{state_assignment}",
+                if cfg!(windows) {
+                    "$env:AGENTLAW_HOME='state'"
+                } else {
+                    "AGENTLAW_HOME='state'"
+                },
+            )
+            .replace(
+                "{invocation}",
+                if cfg!(windows) {
+                    "& 'agentlaw'"
+                } else {
+                    "'agentlaw'"
+                },
+            );
+        let generated = bootstrap(Path::new("agentlaw"), Path::new("state"));
+        let body = generated
+            .split_once("## Agentlaw memory\n\n")
+            .unwrap()
+            .1
+            .split_once(&format!("\n{END}"))
+            .unwrap()
+            .0;
+        assert_eq!(body, expected);
+    }
     #[test]
     fn instruction_replacement_preserves_user_text_and_refuses_ambiguous_markers() {
         let first = upsert_bootstrap("User rules\n", &format!("{BEGIN}\nold\n{END}")).unwrap();

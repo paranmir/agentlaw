@@ -480,6 +480,8 @@ fn isolated_install_is_explicit_repeatable_and_preserves_harness_settings() {
     let instructions = std::fs::read_to_string(host.join("AGENTS.override.md")).unwrap();
     assert!(instructions.starts_with("# Existing override"));
     assert!(!instructions.contains("{AGENTLAW_CLI_PATH}"));
+    assert!(instructions.contains("check for a matching active Task before creating one"));
+    assert!(instructions.contains("emerging evidence or similarity to prior work"));
     assert!(!host.join("AGENTS.md").exists());
     // Unrelated user edits after installation remain intact through an update.
     std::fs::write(
@@ -505,10 +507,16 @@ fn isolated_install_is_explicit_repeatable_and_preserves_harness_settings() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap()["name"],
-        "agentlaw"
-    );
+    let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(schema["name"], "agentlaw");
+    assert!(schema["description"]
+        .as_str()
+        .unwrap()
+        .contains("At a new work request or resumption"));
+    assert!(schema["description"]
+        .as_str()
+        .unwrap()
+        .contains("match by objective and scope before creating one"));
     let omp = tmp.path().join("omp profile");
     std::fs::create_dir(&omp).unwrap();
     std::fs::write(
