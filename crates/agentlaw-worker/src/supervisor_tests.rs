@@ -38,6 +38,57 @@ fn state(b: &Broker, id: i64) -> String {
 }
 
 #[test]
+fn model_failure_requires_current_ready_incarnation_before_becoming_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = Broker::open(dir.path().join("broker.sqlite"), 64).unwrap();
+    initialize(&b).unwrap();
+    diagnostic(&b, "model_load", "old model failure").unwrap();
+    diagnostic(&b, "vector_index:other", "independent vector failure").unwrap();
+    let inc = b
+        .reserve_worker_start("model-a", now())
+        .unwrap()
+        .incarnation;
+    b.transition(&inc, WorkerState::Loading, now()).unwrap();
+    assert!(!resolve_diagnostic(&mut b, "model_load", Some(&inc)).unwrap());
+    b.transition(&inc, WorkerState::Ready, now()).unwrap();
+    assert!(!resolve_diagnostic(&mut b, "model_load", Some("older-incarnation")).unwrap());
+    assert!(resolve_diagnostic(&mut b, "model_load", Some(&inc)).unwrap());
+    assert!(!resolve_diagnostic(&mut b, "model_load", Some(&inc)).unwrap());
+    let before = inspect_runtime(dir.path()).unwrap();
+    assert!(!before["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "model_load"));
+    assert!(before["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "vector_index:other"));
+    let history = before["diagnostic_history"].as_array().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["name"], "model_load");
+    assert_eq!(history[0]["detail"], "old model failure");
+    assert!(history[0]["resolved_at_ms"].as_i64().is_some());
+    assert_eq!(
+        inspect_runtime(dir.path()).unwrap(),
+        before,
+        "diagnosis must be read-only"
+    );
+    diagnostic(&b, "model_load", "new model failure").unwrap();
+    let after = inspect_runtime(dir.path()).unwrap();
+    assert!(after["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "model_load" && d["detail"] == "new model failure"));
+    assert_eq!(
+        after["diagnostic_history"][0]["detail"],
+        "old model failure"
+    );
+}
+
+#[test]
 fn lost_worker_retries_only_its_unfinished_claim_and_preserves_results_and_ack() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("broker.sqlite");

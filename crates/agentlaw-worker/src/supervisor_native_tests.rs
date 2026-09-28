@@ -124,6 +124,7 @@ fn native_worker_death_recovers_without_another_frontend_request() {
     };
     let b = Broker::open(dir.path().join("broker.sqlite"), 64).unwrap();
     initialize(&b).unwrap();
+    diagnostic(&b, "model_load", "previous model startup failure").unwrap();
     // Existing client demand survives. Until the replacement reaches READY,
     // the test sends no attach/embed/recall or wake to provoke recovery.
     b.renew_lease("test-client", false, now(), 240000).unwrap();
@@ -147,6 +148,16 @@ fn native_worker_death_recovers_without_another_frontend_request() {
     let new = await_ready(dir.path(), Some(&old));
     assert_ne!(new, old);
     let status = inspect_runtime(dir.path()).unwrap();
+    assert!(!status["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "model_load"));
+    assert!(status["diagnostic_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "model_load" && d["detail"] == "previous model startup failure"));
     assert_eq!(status["recovery"][0]["failure_streak"], 1);
     assert!(status["diagnostics"]
         .as_array()

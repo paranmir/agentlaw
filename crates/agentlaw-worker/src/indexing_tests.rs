@@ -278,3 +278,206 @@ fn superseded_failed_revision_does_not_block_current_vector() {
     drop(b);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
+    let (dir, mut b) = fixture();
+    b.connection
+        .execute_batch("CREATE TABLE diagnostics(name TEXT PRIMARY KEY,cause TEXT NOT NULL)")
+        .unwrap();
+    let c = context();
+    DerivedWorkCoordinator::new(
+        &mut b,
+        &Source {
+            revision: "v1".into(),
+            count: 1,
+        },
+    )
+    .unwrap()
+    .advance(&c, 1)
+    .unwrap();
+    let mut vector = vec![0f32; 256];
+    vector[0] = 1.0;
+    let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+    b.connection
+        .execute("UPDATE jobs SET state='ready_to_index',result=?1", [&bytes])
+        .unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    assert_eq!(
+        channel_position(&b, &c, Channel::Vector).unwrap().sequence,
+        1
+    );
+
+    // Upgrade of an already repaired installation: there is no new batch to
+    // flush, so the immutable backend and exact acknowledgement must be checked.
+    b.connection
+        .execute(
+            "INSERT INTO diagnostics VALUES('vector_index:r','old vector failure')",
+            [],
+        )
+        .unwrap();
+    b.connection
+        .execute(
+            "INSERT INTO diagnostics VALUES('index_background_status','active')",
+            [],
+        )
+        .unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    let snapshot = crate::inspect_runtime(&dir).unwrap();
+    assert!(!snapshot["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "vector_index:r"));
+    assert_eq!(
+        snapshot["diagnostic_history"][0]["detail"],
+        "old vector failure"
+    );
+    assert_eq!(
+        snapshot["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "index_background_status")
+            .unwrap()["detail"],
+        "resolved; last failure retained in index_background"
+    );
+
+    // A missing backend with the same ACK must not be called recovered.
+    b.connection
+        .execute(
+            "INSERT INTO diagnostics VALUES('vector_index:r','new vector failure')",
+            [],
+        )
+        .unwrap();
+    std::fs::remove_file(directory(&dir, &c).unwrap().join("vector.sqlite")).unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    let snapshot = crate::inspect_runtime(&dir).unwrap();
+    assert!(snapshot["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "vector_index:r"));
+    assert_eq!(
+        snapshot["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "index_background_status")
+            .unwrap()["detail"],
+        "active"
+    );
+
+    repair_index(&mut b, &c, &dir).unwrap();
+    let mut other = c.clone();
+    other.config_digest = "other-config".into();
+    DerivedWorkCoordinator::new(
+        &mut b,
+        &Source {
+            revision: "v2".into(),
+            count: 1,
+        },
+    )
+    .unwrap()
+    .advance(&other, 1)
+    .unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    assert!(
+        crate::inspect_runtime(&dir).unwrap()["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "vector_index:r"),
+        "one repaired context cannot clear another pending context"
+    );
+
+    b.connection.execute("UPDATE jobs SET state='ready_to_index',result=?1 WHERE config='other-config:repository:r'", [&bytes]).unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    let snapshot = crate::inspect_runtime(&dir).unwrap();
+    assert!(!snapshot["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "vector_index:r"));
+    assert_eq!(snapshot["diagnostic_history"][0]["name"], "vector_index:r");
+    drop(b);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn one_repository_vector_failure_does_not_block_another() {
+    let (dir, mut b) = fixture();
+    b.connection
+        .execute_batch("CREATE TABLE diagnostics(name TEXT PRIMARY KEY,cause TEXT NOT NULL)")
+        .unwrap();
+    let mut a = context();
+    a.repository_id = "a".into();
+    let mut other = context();
+    other.repository_id = "b".into();
+    DerivedWorkCoordinator::new(
+        &mut b,
+        &Source {
+            revision: "first".into(),
+            count: 1,
+        },
+    )
+    .unwrap()
+    .advance(&a, 1)
+    .unwrap();
+    let mut vector = vec![0f32; 256];
+    vector[0] = 1.0;
+    let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+    b.connection
+        .execute(
+            "UPDATE jobs SET state='ready_to_index',result=?1 WHERE config='c:repository:a'",
+            [&bytes],
+        )
+        .unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    DerivedWorkCoordinator::new(
+        &mut b,
+        &Source {
+            revision: "second".into(),
+            count: 1,
+        },
+    )
+    .unwrap()
+    .advance(&a, 1)
+    .unwrap();
+    DerivedWorkCoordinator::new(
+        &mut b,
+        &Source {
+            revision: "other".into(),
+            count: 1,
+        },
+    )
+    .unwrap()
+    .advance(&other, 1)
+    .unwrap();
+    b.connection.execute("UPDATE jobs SET state='ready_to_index',result=?1 WHERE config IN('c:repository:a','c:repository:b')", [&bytes]).unwrap();
+    std::fs::remove_file(directory(&dir, &a).unwrap().join("vector.sqlite")).unwrap();
+    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    assert_eq!(
+        channel_position(&b, &other, Channel::Vector)
+            .unwrap()
+            .sequence,
+        1
+    );
+    let snapshot = crate::inspect_runtime(&dir).unwrap();
+    assert!(snapshot["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["name"] == "vector_index:a"));
+    assert_eq!(
+        snapshot["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "index_background_status")
+            .unwrap()["detail"],
+        "active"
+    );
+    drop(b);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -797,12 +797,7 @@ pub fn run_daemon(config: RuntimeConfig) -> Result<()> {
         let mut b = Broker::open(index_state.join("broker.sqlite"), 64)?;
         while !index_stop.load(Ordering::Relaxed) {
             let observed = index_signal.version();
-            if let Err(error) = flush_vectors(&mut b, &index_state) {
-                b.connection.execute("INSERT INTO diagnostics VALUES('index_background',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[error.to_string()])?;
-                b.connection.execute("INSERT INTO diagnostics VALUES('index_background_status','active') ON CONFLICT(name) DO UPDATE SET cause='active'",[])?;
-            } else {
-                b.connection.execute("UPDATE diagnostics SET cause='resolved; last failure retained in index_background' WHERE name='index_background_status'",[])?;
-            }
+            index_background_pass(&mut b, &index_state)?;
             index_signal.wait(observed, Duration::from_secs(30));
         }
         Ok(())
@@ -830,15 +825,15 @@ pub fn run_daemon(config: RuntimeConfig) -> Result<()> {
                     Ok(Ok(())) => None,
                 };
                 if let Some(cause) = cause {
-                    broker.connection.execute("INSERT INTO diagnostics VALUES('supervisor_fatal',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[&cause])?;
-                    broker.connection.execute("INSERT INTO diagnostics VALUES('model_load',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[&cause])?;
-                    broker
-                        .connection
-                        .execute("UPDATE worker SET state='failed'", [])?;
-                    broker.connection.execute(
+                    let tx = broker.connection.transaction()?;
+                    tx.execute("INSERT INTO diagnostics VALUES('supervisor_fatal',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[&cause])?;
+                    tx.execute("INSERT INTO diagnostics VALUES('model_load',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[&cause])?;
+                    tx.execute("UPDATE worker SET state='failed'", [])?;
+                    tx.execute(
                         "UPDATE jobs SET state='failed',error=?1 WHERE state='running'",
                         [cause],
                     )?;
+                    tx.commit()?;
                 }
             }
             broker
@@ -1263,24 +1258,94 @@ fn handle_request(
     }
 }
 struct MaterializedSource(Option<PublishedPage>);
+pub(crate) fn index_background_pass(b: &mut Broker, state: &std::path::Path) -> Result<()> {
+    if let Err(error) = flush_vectors(b, state) {
+        b.connection.execute("INSERT INTO diagnostics VALUES('index_background',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[error.to_string()])?;
+        b.connection.execute("INSERT INTO diagnostics VALUES('index_background_status','active') ON CONFLICT(name) DO UPDATE SET cause='active'",[])?;
+    } else {
+        b.connection.execute("UPDATE diagnostics SET cause='resolved; last failure retained in index_background' WHERE name='index_background_status'",[])?;
+    }
+    Ok(())
+}
 pub(crate) fn flush_vectors(b: &mut Broker, state: &std::path::Path) -> Result<()> {
-    let contexts = {
+    let stored_contexts = {
         let mut st = b.connection.prepare("SELECT json FROM derived_contexts")?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for json in contexts {
-        let c: DerivedContext = serde_json::from_str(&json)?;
+    let contexts: Vec<DerivedContext> = stored_contexts
+        .iter()
+        .map(|json| serde_json::from_str(json))
+        .collect::<std::result::Result<_, _>>()?;
+    let mut failed_repositories = std::collections::HashSet::new();
+    let mut first_error: Option<String> = None;
+    for c in &contexts {
         loop {
-            match crate::indexing::flush_channel(b, &c, state, crate::indexing::Channel::Vector) {
+            match crate::indexing::flush_channel(b, c, state, crate::indexing::Channel::Vector) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
-                    b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",rusqlite::params![format!("vector_index:{}",c.repository_id),error.to_string()])?;
+                    let detail = format!(
+                        "model={} config={}: {error}",
+                        c.model_digest, c.config_digest
+                    );
+                    b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",rusqlite::params![format!("vector_index:{}",c.repository_id),detail])?;
+                    failed_repositories.insert(c.repository_id.clone());
+                    first_error.get_or_insert_with(|| error.to_string());
                     break;
                 }
             }
         }
+    }
+    let repositories: std::collections::HashSet<&str> =
+        contexts.iter().map(|c| c.repository_id.as_str()).collect();
+    for repository in repositories {
+        if failed_repositories.contains(repository) {
+            continue;
+        }
+        let name = format!("vector_index:{repository}");
+        let active: bool = b.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM diagnostics WHERE name=?1)",
+            [&name],
+            |r| r.get(0),
+        )?;
+        if !active {
+            continue;
+        }
+        let mut verified = true;
+        for c in contexts.iter().filter(|c| c.repository_id == repository) {
+            match crate::indexing::verify_vector_recovery(b, c, state) {
+                Ok(true) => {}
+                Ok(false) => verified = false,
+                Err(error) => {
+                    let detail = format!(
+                        "model={} config={}: {error}",
+                        c.model_digest, c.config_digest
+                    );
+                    b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",rusqlite::params![name,detail])?;
+                    first_error.get_or_insert_with(|| error.to_string());
+                    verified = false;
+                    break;
+                }
+            }
+        }
+        if verified {
+            crate::supervisor::resolve_diagnostic(b, &name, None)?;
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error.into());
+    }
+    let unresolved: Option<String> = b
+        .connection
+        .query_row(
+            "SELECT name FROM diagnostics WHERE name LIKE 'vector_index:%' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(name) = unresolved {
+        return Err(format!("{name}: recovery not yet verified").into());
     }
     Ok(())
 }

@@ -207,6 +207,39 @@ fn diagnostic(b: &Broker, name: &str, cause: &str) -> Result<()> {
     b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",params![name,cause])?;
     Ok(())
 }
+pub(crate) fn resolve_diagnostic(
+    b: &mut Broker,
+    name: &str,
+    ready_inc: Option<&str>,
+) -> Result<bool> {
+    let tx = b
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(inc) = ready_inc {
+        let (current, state): (String, String) =
+            tx.query_row("SELECT incarnation,state FROM worker", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        if current != inc || state != "ready" {
+            return Ok(false);
+        }
+    }
+    let cause: Option<String> = tx
+        .query_row("SELECT cause FROM diagnostics WHERE name=?1", [name], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(cause) = cause else {
+        return Ok(false);
+    };
+    tx.execute(
+        "INSERT INTO diagnostics(name,cause) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",
+        params![format!("history:{name}"), serde_json::json!({"detail":cause,"resolved_at_ms":now()}).to_string()],
+    )?;
+    tx.execute("DELETE FROM diagnostics WHERE name=?1", [name])?;
+    tx.commit()?;
+    Ok(true)
+}
 fn heartbeat(port: &impl WorkerProcessPort, b: &Broker, active: &mut Active) -> Result<()> {
     let address = active.control.as_ref().ok_or("model control unavailable")?;
     let model = port.control(address, &active.inc, &active.secret, false)?;
@@ -414,6 +447,16 @@ pub fn inspect_runtime(state: &std::path::Path) -> Result<serde_json::Value> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into();
+        let mut history=db.prepare("SELECT name,cause FROM diagnostics WHERE name LIKE 'history:%' ORDER BY name LIMIT 128")?;
+        result["diagnostic_history"] = history
+            .query_map([], |r| {
+                let name: String = r.get(0)?;
+                let saved: String = r.get(1)?;
+                let value: serde_json::Value = serde_json::from_str(&saved).unwrap_or_else(|_| serde_json::json!({"detail":saved}));
+                Ok(serde_json::json!({"name":name.trim_start_matches("history:"),"detail":value["detail"],"resolved_at_ms":value["resolved_at_ms"]}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into();
     }
     if has("generation_ack")? {
         let mut s=db.prepare("SELECT repository,channel,epoch,sequence,index_commit_id FROM generation_ack ORDER BY repository,channel LIMIT 128")?;
@@ -512,14 +555,31 @@ fn run_with_port(
                     )?;
                     b.transition(&active.inc, WorkerState::Ready, now())?;
                     active.ready_since = Some(Instant::now());
-                    if let Err(error) = heartbeat(&port, &b, active) {
-                        let _ = tx.send(Event::ControlLost(active.inc.clone(), error.to_string()));
+                    match heartbeat(&port, &b, active) {
+                        Ok(()) => {
+                            let moved = !active.unavailable
+                                && !active.exited
+                                && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?;
+                            diagnostic(
+                                &b,
+                                "worker_recovery_state",
+                                if moved {
+                                    "READY; previous model failure moved to diagnostic_history"
+                                } else {
+                                    "READY"
+                                },
+                            )?;
+                        }
+                        Err(error) => {
+                            let _ =
+                                tx.send(Event::ControlLost(active.inc.clone(), error.to_string()));
+                            diagnostic(
+                                &b,
+                                "worker_recovery_state",
+                                "READY; control verification pending",
+                            )?;
+                        }
                     }
-                    diagnostic(
-                        &b,
-                        "worker_recovery_state",
-                        "READY; previous failure diagnostic retained",
-                    )?;
                     signal.notify();
                 }
                 Event::Output(_, Output::Unavailable { cause }) => {
@@ -584,6 +644,16 @@ fn run_with_port(
                 }
                 Event::ControlLost(_, cause) => {
                     if heartbeat(&port, &b, active).is_ok() {
+                        if !active.unavailable
+                            && !active.exited
+                            && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?
+                        {
+                            diagnostic(
+                                &b,
+                                "worker_recovery_state",
+                                "READY; previous model failure moved to diagnostic_history",
+                            )?;
+                        }
                         continue;
                     }
                     let _ = tx.send(Event::Pipe(active.inc.clone(), cause));
@@ -658,6 +728,15 @@ fn run_with_port(
                                 format!("control reconnect failed: {error}"),
                             ));
                             signal.notify();
+                        } else if !active.unavailable
+                            && !active.exited
+                            && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?
+                        {
+                            diagnostic(
+                                &b,
+                                "worker_recovery_state",
+                                "READY; previous model failure moved to diagnostic_history",
+                            )?;
                         }
                     }
                 }

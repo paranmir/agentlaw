@@ -171,6 +171,12 @@ agentlaw repair
 History defaults to 8192 response bytes; general delivery defaults to 65536.
 These control delivery, not silent truncation. `doctor` diagnoses without source
 repair. `repair` completes recorded publication and rebuilds derived generations.
+In `doctor` output, `model_load` and `vector_index:<repository>` entries under
+`worker_runtime.diagnostics` are unresolved failures. The separate
+`worker_runtime.diagnostic_history` keeps the latest verified resolution of each
+such failure with its resolution time; it does not reconstruct when the
+original failure occurred. The worker snapshot is not a live model probe, and
+the top-level `doctor` status still reports source and local integrity.
 A damaged journal can be rebuilt from retained authoritative decisions while
 preserving originals. A missing/corrupt proposal DB needs backup recovery, never
 a successful-looking empty replacement.

@@ -1,10 +1,13 @@
-# Agentlaw 0.2.4
+# Agentlaw 0.2.5
 
-- Clarifies the model-facing `remember_this` guidance: after a user corrects prior
-  work, extract a reusable approach supported by the correction and save it with
-  its conditions and scope.
-- Keeps the product's embedded guidance aligned with the accepted development
-  contract. This release does not change the tool schema or memory storage format.
+- Fixes `agentlaw doctor` reporting old `model_load` and `vector_index:<repository>`
+  failures as active after the worker or vector index has recovered. Recovery is
+  verified before the active diagnostic is cleared.
+- Preserves the most recently resolved cause for each key in
+  `worker_runtime.diagnostic_history`, with the time recovery was confirmed.
+  `doctor` remains read-only, and its top-level status retains its existing meaning.
+- Lets vector indexing continue for other repositories when one repository fails.
+  This release does not change the tool schema or memory storage format.
 
 The GitHub release contains binaries and installers for the supported platforms.
 Publishing this release does not replace a running Codex MCP process or migrate an

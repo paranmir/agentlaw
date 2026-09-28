@@ -248,6 +248,62 @@ pub fn verify_receipt(state: &Path, c: &DerivedContext, receipt: &IndexReceipt) 
     }
     Ok(())
 }
+/// A no-work flush is not proof of recovery: it can also mean incomplete
+/// bootstrap or pending embeddings. Verify the durable source fence and the
+/// actual immutable backend before retiring a vector failure diagnostic.
+pub(crate) fn verify_vector_recovery(b: &Broker, c: &DerivedContext, state: &Path) -> Result<bool> {
+    if !bootstrap_channel_complete(b, c, Channel::Vector)? {
+        return Ok(false);
+    }
+    let accepted: Option<(String, i64)> = b.connection.query_row(
+        "SELECT epoch,accepted_through FROM derived_cursor WHERE repository=?1 AND model=?2 AND config=?3",
+        key(c),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((epoch, accepted)) = accepted else {
+        return Ok(false);
+    };
+    if epoch != c.initial_basis.epoch {
+        return Err("vector source epoch changed; rebuild required".into());
+    }
+    let ack: Option<(String, i64, String, i64)> = b.connection.query_row(
+        "SELECT epoch,sequence,generation_id,index_commit_id FROM generation_ack WHERE repository=?1 AND model=?2 AND config=?3 AND channel='vector'",
+        key(c),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).optional()?;
+    let Some((ack_epoch, sequence, generation_id, index_commit_id)) = ack else {
+        return Ok(false);
+    };
+    if accepted < 0 || sequence < 0 || ack_epoch != epoch || sequence < accepted {
+        return Ok(false);
+    }
+    // Foreground index writers share this lock. The verifier never creates a
+    // missing backend and cannot mistake a partially published generation for
+    // an acknowledged one.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root_directory(state, c)?.join("writer.lock"))?;
+    use fs2::FileExt;
+    lock.lock_exclusive()?;
+    verify_receipt(
+        state,
+        c,
+        &IndexReceipt {
+            token: String::new(),
+            channel: Channel::Vector,
+            generation_id,
+            index_commit_id,
+            source_position: SourcePosition {
+                epoch,
+                sequence: sequence as u64,
+            },
+        },
+    )?;
+    Ok(true)
+}
 fn root_directory(state: &Path, c: &DerivedContext) -> Result<PathBuf> {
     let digest = format!(
         "{:x}",
