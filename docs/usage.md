@@ -5,15 +5,8 @@ recall, deliberate memory updates, history and learned procedures. The CLI uses
 the same input contract. Runtime does not replace the agent's semantic judgment
 or the user's decisions.
 
-This workspace implements the redesign authorized on 2026-09-26 independently
-of the legacy Python product. The Rust executable is named `agentlaw`; the
-Python package is not an installation route for this implementation.
-Publishing the source does not imply a packaged binary release or complete verification.
-The user has resumed risk-focused testing after the implementation pass. Oh My Pi
-end-to-end verification remains deferred. Passing tests verify only their stated scope.
-See the [implementation record](verification.md).
-The [practical testing report](verification.md) records
-the testing principles, regression scenarios, real-model runs and remaining gaps.
+For installation and harness setup, see the [installation guide](installation.md).
+For tested behavior and current gaps, see [verification](verification.md).
 
 ## Modules and source of truth
 
@@ -26,7 +19,7 @@ the testing principles, regression scenarios, real-model runs and remaining gaps
 | agentlaw-worker | Shared broker, model lifecycle, durable jobs and index acknowledgment |
 | agentlaw-app | MCP/CLI, explicit installation, configuration and Git operations |
 
-The [design guide](../README.md#architecture) identifies normative contracts.
+The [README](../README.md#how-the-pieces-fit) introduces the user-facing pieces.
 Current memory is directly readable Markdown: reading it does not replay every
 past change. History retains causal changes separately. Indexes and embeddings
 are rebuildable; unpublished proposals and recovery decisions are not disposable
@@ -76,22 +69,14 @@ All clients use this registry so the same Markdown source cannot bind to
 independent local recovery directories. The app explicitly passes the registry
 to storage, diagnostics, repair, and Git staging. Isolated tests use isolated
 registries, not a profile-global registry.
-The registry is local state, not Git-shared memory. Changing the default does not
-move existing data or rewrite registered harness commands. Before upgrading an
-installation using a former default, stop its Agentlaw processes and preserve
-its state and old source-coordination registry. Migrate source and registry
-together, checking existing bindings before replacement; update configured paths
-explicitly if moving installation state. Do not run old and new binaries against
-the same store with separate coordination registries. The new runtime does not
-search old registry locations; offline migration must account for them first.
+The registry is local state, separate from Git-shared memory.
 Index generation acknowledgements include their absolute backend directory.
 After an explicit offline relocation has updated source/control/recovery bindings
 and harness paths, run `agentlaw repair` from the new installation to rebuild
 derived generations. Copying index files alone is not sufficient. Verify a real
 semantic recall and subsequent write/index advancement before retiring backups.
 `repair` is not a relocation command and does not rewrite those source bindings.
-Legacy Python data must not be adopted as Rust state. These path conventions are
-not evidence of cross-platform testing.
+These path conventions are not evidence of cross-platform testing.
 
 ```text
 agentlaw store propose-location
@@ -260,5 +245,5 @@ CPU inference, installation, worker recovery and nonempty Git-clone reconstructi
 Actual GPU execution, macOS/Linux/Arm, physical power loss and
 million-record user-corpus latency/quality remain unverified.
 
-Building the product does not migrate legacy memory or reconfigure an active
-harness. Installation and Git sharing remain explicit operations.
+Building the product does not reconfigure an active harness.
+Installation and Git sharing remain explicit operations.

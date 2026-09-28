@@ -1,8 +1,8 @@
 # Verification and development status
 
-This repository contains the Rust implementation. Historical Python releases are
-a different product. Binary publication is gated by the release workflow; passing
-that workflow is not a claim of complete model, harness or search-quality validation.
+This repository contains the Rust implementation. Binary publication is gated
+by the release workflow. Passing that workflow establishes only the checks
+recorded below.
 
 ## Regression suite
 
@@ -192,24 +192,3 @@ still pending. No release was published for this candidate.
   and process-abort cases.
 - Every idle/reattach/orphan and control-channel-loss interleaving.
 - Whether a particular LLM will always recall and save at the intended moments.
-
-Default state and source-coordination paths now use `Agentlaw`. After this change,
-`cargo fmt --all -- --check` and the full workspace suite passed: 145 tests,
-with three opt-in real-model tests skipped. The release build also passed.
-
-The user's local Windows installation was explicitly migrated offline with a
-complete backup, preserving machine identity, project association and memory
-source bytes. Local path metadata, recovery manifest checksums/decisions, ledger
-paths and the source-coordination binding were updated together. Codex config,
-its managed AGENTS.md block and global binaries now use the installed candidate
-`0.2.1-18a1cb61ca113ab9`. Unrelated Codex settings/instructions were preserved.
-CLI recall of Personal Workspace succeeded after model warm-up without diagnostics;
-doctor reported valid source/local DB integrity and a ready embedding worker.
-After Codex restart, the model-visible MCP schema exposed typed input fields and
-an actual project recall succeeded without diagnostics. The worker was ready and
-local database integrity passed. The migration backup was then moved to Recycle
-Bin at the user's request. These checks preceded the 0.2.1 release submission.
-
-This was a one-off authorized migration, not an automatic upgrade feature.
-Other installations require the explicit path/coordination handoff in usage.md;
-source publication does not migrate data or adopt legacy Python memory.
