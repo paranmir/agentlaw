@@ -703,6 +703,10 @@ fn inspect_processes(root: &Path) -> Value {
         if Some(*pid) == own {
             continue;
         }
+        #[cfg(target_os = "linux")]
+        if own.is_some_and(|self_pid| same_linux_thread_group(*pid, self_pid)) {
+            continue;
+        }
         // A zombie has exited and cannot execute the old bundle. Unix may
         // retain its executable path until the parent reaps it.
         if matches!(
@@ -730,6 +734,7 @@ fn inspect_processes(root: &Path) -> Value {
                 .collect::<Vec<_>>()
                 .join(" ");
             remaining.push(json!({"pid":pid.to_string(),"path":path,"role":role,
+                "process_status":process.status().to_string(),
                 "started_at":process.start_time()}));
         }
     }
@@ -740,6 +745,22 @@ fn inspect_processes(root: &Path) -> Value {
     } else {
         json!({"status":"clear"})
     }
+}
+
+#[cfg(target_os = "linux")]
+fn same_linux_thread_group(pid: sysinfo::Pid, self_pid: sysinfo::Pid) -> bool {
+    // Linux lists a process's threads under /proc as separate task IDs on
+    // some hosts. Only the OS-confirmed threads of this helper are exempt.
+    let path = format!("/proc/{}/status", pid.as_u32());
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Tgid:"))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .is_some_and(|tgid| tgid == self_pid.as_u32())
 }
 
 fn offline_guard(plan: &Plan) -> Option<Value> {

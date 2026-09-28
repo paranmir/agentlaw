@@ -112,6 +112,24 @@ impl Fixture {
             .unwrap()
             .write_all(b"previous-version-overlay")
             .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // Re-signing with a fixture identifier changes the file hash
+            // while keeping the old executable's code signature valid.
+            assert!(Command::new("codesign")
+                .args([
+                    "--force",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    "agentlaw.fixture.old",
+                ])
+                .arg(&old)
+                .status()
+                .unwrap()
+                .success());
+            assert_ne!(hash(&old), hash(source));
+        }
         fs::write(bin.join(worker_name()), b"old-worker").unwrap();
         fs::write(bin.join("LICENSE.agentlaw"), b"old-license").unwrap();
         let install = run(
