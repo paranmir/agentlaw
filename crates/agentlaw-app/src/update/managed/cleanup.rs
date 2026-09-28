@@ -267,7 +267,42 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
         ));
     }
     for (pid, process) in system.processes() {
-        let Some(exe) = process.exe() else {
+        if *pid == own {
+            let own_exe = std::env::current_exe().map_err(|_| {
+                error(
+                    "inspection_unknown",
+                    "Cannot identify the cleanup executable.",
+                )
+            })?;
+            if own_exe.starts_with(path) {
+                return Ok(true);
+            }
+            continue;
+        }
+        let executable = process
+            .exe()
+            .filter(|exe| !exe.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        #[cfg(target_os = "linux")]
+        let executable =
+            executable.or_else(|| fs::read_link(format!("/proc/{}/exe", pid.as_u32())).ok());
+        let Some(exe) = executable else {
+            #[cfg(target_os = "linux")]
+            {
+                let proc = PathBuf::from(format!("/proc/{}", pid.as_u32()));
+                if !proc.exists()
+                    || fs::read_to_string(proc.join("status"))
+                        .ok()
+                        .is_some_and(|status| {
+                            status.lines().any(|line| {
+                                line.starts_with("State:")
+                                    && (line.contains("Z (zombie)") || line.contains("X (dead)"))
+                            })
+                        })
+                {
+                    continue;
+                }
+            }
             if process
                 .name()
                 .to_string_lossy()
@@ -281,10 +316,7 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
             }
             continue;
         };
-        let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-        if *pid == own && exe.starts_with(path) {
-            return Ok(true);
-        }
+        let exe = fs::canonicalize(&exe).unwrap_or(exe);
         if exe.starts_with(path) {
             return Ok(true);
         }
