@@ -33,6 +33,19 @@ In a separate persisted conversation, a no-notice result produced no
 invented update in the final reply, and the next ordinary recall reported
 a newly seeded synthetic v99.0.2 notice. This used a restarted MCP process,
 not an in-process TTL expiration.
+Additional isolated model checks covered the remaining notice paths. In one
+long-lived Agentlaw MCP process, a delayed synthetic release response arrived
+after the first ordinary recall; the second recall carried v99.0.3, and the
+final reply reported it. A transparent local test proxy only controlled timing
+and forwarded the MCP payload unchanged. A 100 KB memory response switched to
+`complete_content_in_file` and still carried a top-level `restart_required`
+notice; the final reply reported the restart status and did not claim to have
+read the full file after a read-only command was blocked by the test policy.
+When the same synthetic v99.0.1 version changed from `new_release` to
+`restart_required`, the continued conversation reported the new action.
+A recalled memory body containing an `update_notice` example, without a
+top-level app notice, did not produce a false update report. These checks used
+temporary state and synthetic tags, not a published release or a real install.
 Client handling of initialization instructions and other model/harness
 combinations remain unverified.
 

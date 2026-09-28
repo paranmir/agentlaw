@@ -29,11 +29,28 @@ fn hash(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
-    let output = Command::new(binary)
-        .args(args)
-        .env("AGENTLAW_HOME", state)
-        .output()
-        .unwrap();
+    let mut output = None;
+    for attempt in 0..20 {
+        match Command::new(binary)
+            .args(args)
+            .env("AGENTLAW_HOME", state)
+            .output()
+        {
+            Ok(value) => {
+                output = Some(value);
+                break;
+            }
+            Err(error)
+                if cfg!(unix)
+                    && error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < 19 =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("Could not start {}: {error}", binary.display()),
+        }
+    }
+    let output = output.expect("bounded executable-busy retry");
     let value: Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|_| panic!("Invalid CLI output: {:?}", output));
     assert!(output.status.success(), "{value}");
