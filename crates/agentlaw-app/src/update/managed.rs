@@ -58,7 +58,11 @@ pub fn check_frontend_start(state: &Path) -> Result<()> {
         let expected = candidate_executable(&plan)?;
         let current = std::env::current_exe()
             .map_err(|_| error("update_maintenance", "Cannot identify the MCP executable."))?;
-        if fs::canonicalize(current).ok() == fs::canonicalize(expected).ok() {
+        if fs::canonicalize(current)
+            .ok()
+            .zip(fs::canonicalize(expected).ok())
+            .is_some_and(|(running, candidate)| running == candidate)
+        {
             return Ok(());
         }
     }
@@ -528,8 +532,88 @@ fn save(plan: &Plan) -> Result<()> {
     atomic_json(&plan_path(&plan.root, &plan.id)?, plan)
 }
 
+fn root_update_lock(root: &Path) -> Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(root.join(".update.lock"))
+        .map_err(|_| error("update_lock", "Cannot open the managed update lock."))?;
+    lock.try_lock_exclusive().map_err(|_| {
+        error(
+            "update_busy",
+            "Another updater is already applying to this root.",
+        )
+    })?;
+    Ok(lock)
+}
+
+fn unfinished_plan(root: &Path) -> Result<Option<Plan>> {
+    let directory = root.join("state/update-plans");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(reason) if reason.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(error("update_recovery", "Cannot inspect update plans.")),
+    };
+    let mut selected = None;
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| error("update_recovery", "Cannot enumerate update plans."))?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| error("update_plan_invalid", "An update plan name is invalid."))?;
+        let plan = load(root, id)?;
+        if plan.phase == "previewed" {
+            continue;
+        }
+        if plan.phase == "completed" {
+            if plan.activation_verified
+                && plan.recovery_obligations_closed
+                && plan.cleanup_completed
+                && cleanup::cleanup_complete(&plan)?
+            {
+                continue;
+            }
+            return Err(error(
+                "update_recovery",
+                &format!("Plan {id} claims completion with unfinished cleanup."),
+            ));
+        }
+        if !matches!(plan.phase.as_str(), "prepared" | "finalizing") {
+            return Err(error(
+                "update_recovery",
+                &format!("Plan {id} is mid-update; inspect its maintenance gate."),
+            ));
+        }
+        if selected.replace(plan).is_some() {
+            return Err(error(
+                "update_recovery",
+                "More than one update plan needs recovery; inspect their exact IDs.",
+            ));
+        }
+    }
+    Ok(selected)
+}
+
 pub fn preview() -> Result<Value> {
     let root = managed_root()?;
+    let _lock = root_update_lock(&root)?;
+    if maintenance_path(&root.join("state")).exists() {
+        return Err(error(
+            "update_busy",
+            "A managed update already owns the maintenance gate; use the stable launcher.",
+        ));
+    }
+    if let Some(plan) = unfinished_plan(&root)? {
+        return Ok(json!({"status":"confirmation_required","plan_id":plan.id,
+            "running_version":env!("CARGO_PKG_VERSION"),"latest_version":plan.tag,
+            "next_action":"The stable launcher resumes this previously approved update before checking for a newer release."}));
+    }
     let tag = release_tag()?;
     if super::version(&tag) <= super::version(env!("CARGO_PKG_VERSION")) {
         return Ok(
@@ -607,7 +691,33 @@ fn check_before(plan: &Plan) -> Result<()> {
 
 pub fn prepare(id: &str) -> Result<Value> {
     let root = managed_root()?;
+    let _lock = root_update_lock(&root)?;
     let mut plan = load(&root, id)?;
+    if matches!(plan.phase.as_str(), "finalizing" | "completed") {
+        if !plan.activation_verified || !plan.recovery_obligations_closed {
+            return Err(error(
+                "update_recovery",
+                "The candidate has no completed verification record.",
+            ));
+        }
+        if maintenance_path(&root.join("state")).exists() {
+            return Err(error(
+                "update_busy",
+                "The maintenance gate changed; retry through the stable launcher.",
+            ));
+        }
+        let observed = status_snapshot(&plan)?;
+        if observed["bundle"] != "installed_and_verified"
+            || observed["registrations"] != "verified"
+            || (plan.phase == "completed" && observed["status"] != "completed")
+        {
+            return Err(error(
+                "update_drift",
+                "The approved candidate is not ready for finalization.",
+            ));
+        }
+        return verified_handoff(&plan);
+    }
     if plan.phase != "previewed" && plan.phase != "prepared" {
         return Err(error(
             "update_plan_state",
@@ -638,7 +748,7 @@ pub fn prepare(id: &str) -> Result<Value> {
         verify_staged(&plan)?;
         let mut gate = MaintenanceGate::open(&plan)?;
         gate.retain_for_recovery();
-        return Ok(prepared_result(&plan));
+        return verified_handoff(&plan);
     }
     fs::create_dir_all(&stage).map_err(|_| error("update_io", "Cannot create update staging."))?;
     let archive_path = stage.join(&plan.archive);
@@ -804,18 +914,27 @@ pub fn prepare(id: &str) -> Result<Value> {
     save(&plan)?;
     let mut gate = MaintenanceGate::open(&plan)?;
     gate.retain_for_recovery();
-    Ok(prepared_result(&plan))
+    verified_handoff(&plan)
 }
 
-fn prepared_result(plan: &Plan) -> Value {
-    let candidate = candidate_executable(plan).ok();
+fn verified_handoff(plan: &Plan) -> Result<Value> {
+    let candidate = candidate_executable(plan)?;
     let candidate_sha256 = plan
         .bundle_hashes
         .as_ref()
-        .and_then(|hashes| hashes.get(binary_name()));
-    json!({"status":"handoff_ready","plan_id":plan.id,"candidate":candidate,
+        .and_then(|hashes| hashes.get(binary_name()))
+        .ok_or_else(|| error("update_plan_invalid", "The candidate hash is missing."))?;
+    if digest(&candidate)? != *candidate_sha256 {
+        return Err(error(
+            "update_checksum",
+            "The candidate differs from the approved update plan.",
+        ));
+    }
+    Ok(
+        json!({"status":"handoff_ready","plan_id":plan.id,"candidate":candidate,
         "candidate_sha256":candidate_sha256,"root":plan.root,
-        "next_action":"The managed launcher continues this update synchronously; this handoff is not installation success."})
+        "next_action":"The managed launcher continues this update synchronously; this handoff is not installation success."}),
+    )
 }
 
 fn verify_staged(plan: &Plan) -> Result<()> {
@@ -1354,6 +1473,32 @@ fn registration_after(
     ))
 }
 
+fn finish_finalizing(plan: &mut Plan) -> Result<Value> {
+    if plan.phase != "finalizing"
+        || !plan.activation_verified
+        || !plan.recovery_obligations_closed
+        || !plan.cleanup_completed
+        || !cleanup::cleanup_complete(plan)?
+        || plan.root.join("state/install-pending.json").exists()
+        || maintenance_path(&plan.root.join("state")).exists()
+    {
+        return Err(error(
+            "update_recovery",
+            "The update still has unfinished finalization work.",
+        ));
+    }
+    let observed = status_snapshot(plan)?;
+    if observed["bundle"] != "installed_and_verified" || observed["registrations"] != "verified" {
+        return Err(error(
+            "update_drift",
+            "The installed candidate changed before final completion.",
+        ));
+    }
+    plan.phase = "completed".into();
+    save(plan)?;
+    status_snapshot(plan)
+}
+
 fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     if !requested_root.is_absolute() {
         return Err(error(
@@ -1370,8 +1515,10 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     })?;
     let root = fs::canonicalize(root)
         .map_err(|_| error("update_unmanaged", "Cannot resolve the managed root."))?;
+    let _update_lock = root_update_lock(&root)?;
+    let state = root.join("state");
     let mut plan = load(&root, id)?;
-    if plan.phase == "completed" && plan.cleanup_completed && !maintenance_path(&state).exists() {
+    if plan.phase == "completed" {
         return status_snapshot(&plan);
     }
     if plan.phase == "previewed" {
@@ -1380,37 +1527,35 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
             "Prepare the approved bundle before applying it.",
         ));
     }
-    let candidate = candidate_executable(&plan)?;
-    if fs::canonicalize(&candidate).ok()
-        != std::env::current_exe()
-            .ok()
-            .and_then(|p| fs::canonicalize(p).ok())
-    {
+    let candidate = fs::canonicalize(candidate_executable(&plan)?)
+        .map_err(|_| error("update_candidate_required", "The candidate is unavailable."))?;
+    let running = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|_| {
+            error(
+                "update_candidate_required",
+                "Cannot identify this executable.",
+            )
+        })?;
+    if candidate != running {
         return Err(error(
             "update_candidate_required",
             "Only the verified candidate may finish this update.",
         ));
     }
-    if plan.phase != "completed" {
+    if plan.phase == "finalizing" {
+        if plan.bundle_hashes.as_ref() != Some(&bundle_hashes(&plan.root.join("bin"))?) {
+            return Err(error(
+                "update_drift",
+                "The installed candidate bundle changed.",
+            ));
+        }
+        if plan.cleanup_completed && !maintenance_path(&state).exists() {
+            return finish_finalizing(&mut plan);
+        }
+    } else {
         verify_staged(&plan)?;
-    } else if plan.bundle_hashes.as_ref() != Some(&bundle_hashes(&plan.root.join("bin"))?) {
-        return Err(error(
-            "update_drift",
-            "The completed candidate bundle changed.",
-        ));
     }
-    let update_lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(root.join(".update.lock"))
-        .map_err(|_| error("update_lock", "Cannot open the managed update lock."))?;
-    update_lock.try_lock_exclusive().map_err(|_| {
-        error(
-            "update_busy",
-            "Another updater is already applying to this root.",
-        )
-    })?;
     let mut gate = MaintenanceGate::open(&plan)?;
     if plan.phase != "prepared" {
         gate.retain_for_recovery();
@@ -1419,12 +1564,34 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     gate.set_drain(true)?;
     wait_for_managed_processes(&plan, false)?;
     if plan.cleanup_completed {
+        if plan.phase != "finalizing" || !cleanup::cleanup_complete(&plan)? {
+            return Err(error(
+                "update_recovery",
+                "Cleanup completion is inconsistent.",
+            ));
+        }
         gate.close()?;
-        return status_snapshot(&plan);
+        return finish_finalizing(&mut plan);
     }
     gate.set_drain(false)?;
     let mut install_lock = Some(install::lock_install_state(&state)?);
     verify_effective_targets(&plan)?;
+    if plan.phase == "finalizing" {
+        let observed = status_snapshot(&plan)?;
+        if observed["bundle"] != "installed_and_verified" || observed["registrations"] != "verified"
+        {
+            return Err(error(
+                "update_drift",
+                "The installed candidate changed during finalization.",
+            ));
+        }
+        cleanup::cleanup_update_plan(&mut plan)?;
+        plan.cleanup_completed = true;
+        save(&plan)?;
+        drop(install_lock.take());
+        gate.close()?;
+        return finish_finalizing(&mut plan);
+    }
     let old = &plan.bin_before_hashes;
     let new = plan.bundle_hashes.as_ref().ok_or_else(|| {
         error(
@@ -1520,7 +1687,7 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     }
     if matches!(
         plan.phase.as_str(),
-        "refreshing_registrations" | "verifying_candidate" | "completed"
+        "refreshing_registrations" | "verifying_candidate"
     ) {
         if (bin_state, staged_state, previous_state) != ("new", "missing", "old") {
             return Err(error(
@@ -1570,7 +1737,7 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
             }
             plan.activation_verified = true;
             plan.recovery_obligations_closed = true;
-            plan.phase = "completed".into();
+            plan.phase = "finalizing".into();
             save(&plan)?;
         }
         cleanup::cleanup_update_plan(&mut plan)?;
@@ -1578,7 +1745,7 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
         save(&plan)?;
         drop(install_lock.take());
         gate.close()?;
-        return status_snapshot(&plan);
+        return finish_finalizing(&mut plan);
     }
     Err(error(
         "update_plan_invalid",
@@ -1617,7 +1784,10 @@ fn closed_successor(plan: &Plan) -> Result<Option<Plan>> {
             let candidate = load(&plan.root, id)?;
             if candidate.bin_before_hashes == expected
                 && candidate.phase == "completed"
+                && candidate.activation_verified
                 && candidate.recovery_obligations_closed
+                && candidate.cleanup_completed
+                && cleanup::cleanup_complete(&candidate)?
             {
                 if successor.is_some() {
                     return Err(error(
@@ -1646,7 +1816,8 @@ fn closed_successor(plan: &Plan) -> Result<Option<Plan>> {
 }
 
 fn status_snapshot(plan: &Plan) -> Result<Value> {
-    if plan.phase == "completed" && plan.cleanup_completed && plan.recovery_obligations_closed {
+    let cleanup_verified = plan.cleanup_completed && cleanup::cleanup_complete(plan)?;
+    if plan.phase == "completed" && cleanup_verified && plan.recovery_obligations_closed {
         if let Some(successor) = closed_successor(plan)? {
             let latest = status_snapshot(&successor)?;
             return Ok(
@@ -1676,11 +1847,8 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
     let mut registration_items = Vec::new();
     let mut overall = "verified";
     for registration in &plan.registrations {
-        let effective = install::effective_instructions_path(
-            install::Harness::parse(&registration.harness)?,
-            &registration.directory,
-        )
-        .ok();
+        let harness = install::Harness::parse(&registration.harness)?;
+        let effective = install::effective_instructions_path(harness, &registration.directory).ok();
         let target_changed = effective.as_ref() != Some(&registration.instructions_path);
         let current = [
             text(&registration.config_path).ok(),
@@ -1697,12 +1865,25 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
             &registration.instructions_before,
             &registration.receipt_before,
         ];
-        let all_after = after.iter().all(|item| item.is_some())
-            && (0..3).all(|index| current[index].as_ref() == after[index].as_ref());
-        let all_known = (0..3).all(|index| {
-            current[index].as_ref() == Some(before[index])
-                || current[index].as_ref() == after[index].as_ref()
-        });
+        let owned_config = |expected: &str| {
+            current[0]
+                .as_deref()
+                .is_some_and(|now| install::same_owned_entry(harness, expected, now))
+        };
+        let owned_instructions = |expected: &str| {
+            current[1]
+                .as_deref()
+                .is_some_and(|now| install::same_owned_bootstrap(expected, now))
+        };
+        let config_after = after[0].as_deref().is_some_and(|value| owned_config(value));
+        let instructions_after = after[1]
+            .as_deref()
+            .is_some_and(|value| owned_instructions(value));
+        let receipt_after = after[2].is_some() && after[2].as_ref() == current[2].as_ref();
+        let all_after = config_after && instructions_after && receipt_after;
+        let all_known = (owned_config(before[0]) || config_after)
+            && (owned_instructions(before[1]) || instructions_after)
+            && (current[2].as_deref() == Some(before[2]) || receipt_after);
         let mut artifact_verified = false;
         if all_after {
             if let Some(receipt) = current[2]
@@ -1746,7 +1927,8 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
     let broker_runtime = observed_broker_runtime(plan);
     let maintenance_open = maintenance_path(&plan.root.join("state")).exists();
     let completed = plan.phase == "completed"
-        && plan.cleanup_completed
+        && plan.activation_verified
+        && cleanup_verified
         && plan.recovery_obligations_closed
         && !maintenance_open
         && bundle == "installed_and_verified"
@@ -1757,7 +1939,7 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
         "bundle":bundle,"registrations":overall,"registration_details":registration_items,
         "current_session":"unknown","activation":activation,"broker_runtime":broker_runtime,
         "previous_bundle":previous_bundle(plan),
-        "cleanup":if plan.cleanup_completed {"completed"} else {"incomplete"},
+        "cleanup":if cleanup_verified {"completed"} else {"incomplete"},
         "recovery_obligations_closed":plan.recovery_obligations_closed,
         "maintenance_gate_open":maintenance_open,
         "next_action":if completed {

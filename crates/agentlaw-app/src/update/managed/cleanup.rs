@@ -351,7 +351,7 @@ fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn unfinished_work(root: &Path, path: &Path) -> Result<bool> {
+fn unfinished_work(root: &Path, path: &Path, finishing_plan: Option<&str>) -> Result<bool> {
     if root.join("state/install-pending.json").exists() {
         return Ok(true);
     }
@@ -368,6 +368,13 @@ fn unfinished_work(root: &Path, path: &Path) -> Result<bool> {
             };
             let plan = load(root, id)?;
             if plan.phase != "completed" {
+                if finishing_plan == Some(id)
+                    && plan.phase == "finalizing"
+                    && plan.activation_verified
+                    && plan.recovery_obligations_closed
+                {
+                    continue;
+                }
                 if path == stage(root, id) || path == previous_bundle(&plan) {
                     return Ok(true);
                 }
@@ -400,8 +407,8 @@ fn unfinished_work(root: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn eligible(root: &Path, kind: &str, path: &Path) -> Result<bool> {
-    if unfinished_work(root, path)?
+fn eligible(root: &Path, kind: &str, path: &Path, finishing_plan: Option<&str>) -> Result<bool> {
+    if unfinished_work(root, path, finishing_plan)?
         || referenced_by_registrations(root, path)?
         || referenced_by_processes(root, path)?
     {
@@ -422,10 +429,14 @@ fn eligible(root: &Path, kind: &str, path: &Path) -> Result<bool> {
         })
         .ok_or_else(|| error("cleanup_scope", "The cleanup item has no update plan ID."))?;
     let plan = load(root, id)?;
-    Ok(plan.phase == "completed" && plan.activation_verified && plan.recovery_obligations_closed)
+    Ok(
+        (plan.phase == "completed" || (finishing_plan == Some(id) && plan.phase == "finalizing"))
+            && plan.activation_verified
+            && plan.recovery_obligations_closed,
+    )
 }
 
-fn validate_item(plan: &CleanupPlan, index: usize) -> Result<bool> {
+fn validate_item(plan: &CleanupPlan, index: usize, finishing_plan: Option<&str>) -> Result<bool> {
     let item = &plan.items[index];
     let expected_holding = plan
         .root
@@ -489,7 +500,7 @@ fn validate_item(plan: &CleanupPlan, index: usize) -> Result<bool> {
             "An item is not an owned managed artifact.",
         ));
     }
-    eligible(&plan.root, &item.kind, &item.source)
+    eligible(&plan.root, &item.kind, &item.source, finishing_plan)
 }
 
 #[cfg(windows)]
@@ -653,7 +664,7 @@ fn remove_held_item(plan: &mut CleanupPlan, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn execute_plan_locked(root: &Path, id: &str) -> Result<Value> {
+fn execute_plan_locked(root: &Path, id: &str, finishing_plan: Option<&str>) -> Result<Value> {
     let mut plan = cleanup_load(&root, id)?;
     if !plan.permanent_internal_removal_approved {
         plan.permanent_internal_removal_approved = true;
@@ -691,7 +702,7 @@ fn execute_plan_locked(root: &Path, id: &str) -> Result<Value> {
             cleanup_save(&plan)?;
             continue;
         }
-        if !validate_item(&plan, index)? {
+        if !validate_item(&plan, index, finishing_plan)? {
             plan.items[index].phase = "blocked_reference".into();
             cleanup_save(&plan)?;
             continue;
@@ -748,7 +759,8 @@ fn execute_plan_locked(root: &Path, id: &str) -> Result<Value> {
 /// already owns the root update and install locks and has completed the MCP
 /// probe, so no broad inventory or second user confirmation is involved.
 pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
-    if !plan.activation_verified || !plan.recovery_obligations_closed || plan.phase != "completed" {
+    if !plan.activation_verified || !plan.recovery_obligations_closed || plan.phase != "finalizing"
+    {
         return Err(error(
             "cleanup_plan_state",
             "The candidate is not verified for cleanup.",
@@ -844,7 +856,7 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
         save(plan)?;
         id
     };
-    execute_plan_locked(&plan.root, &id)?;
+    execute_plan_locked(&plan.root, &id, Some(&plan.id))?;
     let observed = cleanup_load(&plan.root, &id)?;
     if observed.items.iter().any(|item| item.phase != "removed") {
         return Err(error(
@@ -853,6 +865,22 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) fn cleanup_complete(plan: &Plan) -> Result<bool> {
+    let Some(id) = &plan.cleanup_plan_id else {
+        return Ok(false);
+    };
+    let cleanup = cleanup_load(&plan.root, id)?;
+    Ok(cleanup.items.iter().all(|item| item.phase == "removed")
+        && cleanup
+            .items
+            .iter()
+            .any(|item| item.kind == "previous" && item.source == previous_bundle(plan))
+        && cleanup
+            .items
+            .iter()
+            .any(|item| item.kind == "stage" && item.source == stage(&plan.root, &plan.id)))
 }
 #[cfg(test)]
 mod tests {

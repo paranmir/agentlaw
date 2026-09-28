@@ -6,6 +6,24 @@ that workflow is not a claim of complete model, harness or search-quality valida
 
 ## Regression suite
 
+### 0.3.4 managed update completion checks
+
+The ordinary MCP notice test covers more than 64 historical update plans and
+confirms they are not inspected for an automatic incomplete/restart notice.
+The isolated managed-update tests check finalization after cleanup and gate
+closure, unrelated host edits, owned registration drift, retry through the
+same plan ID, and deferred cleanup. An opt-in Windows test copied the released
+v0.3.3 stable launcher into an isolated installation, interrupted a completed
+fixture at `finalizing` with its gate closed and stage removed, then ran the
+public `update` command. It returned `installed` for that same ID without
+changing the launcher or creating a new plan. This verifies the old-launcher
+handoff for that specific interruption window, not all crash points or other
+platforms. On Windows, `cargo fmt --all -- --check` and
+`cargo test --locked --workspace --no-fail-fast` passed after the runtime
+changes; all five ordinary managed-update integration tests passed. Three
+real-model asset tests remained ignored. The release workflow and installed
+v0.3.4 remain to be verified.
+
 ### 0.3.3 Task handoff guidance checks
 
 The v0.3.3 candidate changes LLM-facing guidance, not memory storage or the

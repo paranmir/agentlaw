@@ -111,80 +111,6 @@ fn write_cache(state: &Path, cache: &Cache) {
     }
 }
 
-fn installation_notice(state: &Path) -> Option<Value> {
-    let root = fs::canonicalize(state.parent()?).ok()?;
-    if fs::read_to_string(root.join(".agentlaw-layout"))
-        .ok()?
-        .trim()
-        != "agentlaw-managed-layout-v1"
-    {
-        return None;
-    }
-    let mut plans = fs::read_dir(state.join("update-plans"))
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
-        .filter_map(|entry| {
-            let meta = entry.metadata().ok()?;
-            if meta.len() > 1024 * 1024 {
-                return None;
-            }
-            Some((meta.modified().ok()?, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    plans.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in plans.into_iter().take(64) {
-        let Some(plan) = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
-            continue;
-        };
-        if plan["root"].as_str() != root.to_str() {
-            continue;
-        }
-        let (Some(id), Some(tag), Some(phase)) = (
-            plan["id"].as_str(),
-            plan["tag"].as_str(),
-            plan["phase"].as_str(),
-        ) else {
-            continue;
-        };
-        let observed = managed::status_with_root(id, &root).ok();
-        if matches!(
-            phase,
-            "prepared"
-                | "moving_old_bundle"
-                | "publishing_new_bundle"
-                | "refreshing_registrations"
-                | "verifying_candidate"
-        ) || (phase == "completed"
-            && observed
-                .as_ref()
-                .is_none_or(|state| state["status"] != "completed"))
-        {
-            return Some(
-                json!({"kind":"update_incomplete","plan_id":id,"phase":phase,
-                "observed":observed,
-                "target_version":tag,"next_action":format!("The update has not finished. Inspect plan {id} and resume it through the stable Agentlaw update command after resolving the reported blocker."),
-                "guidance":crate::update_notice_guidance()}),
-            );
-        }
-        if phase == "completed"
-            && version(tag)
-                .zip(version(env!("CARGO_PKG_VERSION")))
-                .is_some_and(|(a, b)| a > b)
-        {
-            return Some(
-                json!({"kind":"restart_required","running_version":env!("CARGO_PKG_VERSION"),
-                "installed_version":tag,"next_action":"Restart the harness normally. Installation, candidate MCP verification and approved cleanup already completed.",
-                "guidance":crate::update_notice_guidance()}),
-            );
-        }
-    }
-    None
-}
-
 impl Advisor {
     pub fn maintenance_path(&self) -> PathBuf {
         self.state.join("update-maintenance.json")
@@ -262,9 +188,6 @@ impl Advisor {
 
     pub fn notice(&self) -> Option<Value> {
         self.schedule();
-        if let Some(notice) = installation_notice(&self.state) {
-            return Some(notice);
-        }
         let cache = self.current.lock().unwrap_or_else(|e| e.into_inner());
         let tag = cache.latest_tag.as_deref()?;
         let latest = version(tag)?;
@@ -351,29 +274,25 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_or_unverified_plan_never_claims_restart_required() {
+    fn ordinary_notice_ignores_update_plan_history() {
         let root = tempfile::tempdir().unwrap();
-        let canonical_root = fs::canonicalize(root.path()).unwrap();
-        let state = canonical_root.join("state");
+        let state = root.path().join("state");
         fs::create_dir_all(state.join("update-plans")).unwrap();
-        fs::write(
-            root.path().join(".agentlaw-layout"),
-            "agentlaw-managed-layout-v1\n",
-        )
-        .unwrap();
-        let path = state.join("update-plans/plan.json");
-        let mut plan = json!({"root":canonical_root,"id":"plan","tag":"v99.0.0",
-            "phase":"refreshing_registrations"});
-        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
-        assert_eq!(
-            installation_notice(&state).unwrap()["kind"],
-            "update_incomplete"
+        for index in 0..70 {
+            fs::write(
+                state.join("update-plans").join(format!("{index}.json")),
+                b"corrupt historical plan",
+            )
+            .unwrap();
+        }
+        write_cache(
+            &state,
+            &Cache {
+                last_success: Some(now()),
+                retry_after: None,
+                latest_tag: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
+            },
         );
-        plan["phase"] = json!("completed");
-        fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
-        assert_eq!(
-            installation_notice(&state).unwrap()["kind"],
-            "update_incomplete"
-        );
+        assert!(Advisor::new(state).notice().is_none());
     }
 }
