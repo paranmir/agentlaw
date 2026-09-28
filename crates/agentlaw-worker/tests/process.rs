@@ -270,7 +270,17 @@ fn real_process_reuses_daemon_and_missing_assets_are_explicit() {
     );
     drop(second);
     drop(_replacement);
-    std::fs::remove_dir_all(dir).unwrap();
+    // A background writer can finish a pending file operation just after the
+    // daemon has been reaped on Unix.
+    for attempt in 0..20 {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 19 => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("cannot remove owned test state: {error}"),
+        }
+    }
 }
 
 #[test]
