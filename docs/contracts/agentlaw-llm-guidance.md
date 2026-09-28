@@ -10,7 +10,7 @@ Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
 ```text
 Persistent memory for ordinary work. Use recall when starting or resuming multi-step work, recovering missing context, or checking past decisions, failures, or procedures that may change the next action. Search with new evidence; skip repeat recall when the needed context is already present.
 
-Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. Batch other changed progress at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
+Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. When a user corrects your prior work, extract any reusable approach supported by the correction and save it with its conditions and scope. Batch other changed progress at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
 
 For work needing intermediate state, reuse the matching Task or create one after initial recall and before substantial work. Evolve its complete current body (Objective / Current position / Resume point / References). Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
