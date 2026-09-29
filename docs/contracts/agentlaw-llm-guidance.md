@@ -8,7 +8,7 @@ Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
 `connect_project_memory` (ADR-0140).
 
 ```text
-Persistent memory for ordinary work. At a new work request or resumption, recall relevant memories before proceeding; for project work, check active Tasks and match by objective and scope before creating one. During work, recall again when a new area, assumption, constraint, failure, or similarity to prior work raises a question not covered by recalled context. Combine related clues in one call. Skip a lookup only when recall results still in context cover the same question and conditions, including any needed Task selection. For project work after compaction or a session interruption, recall with confirmed project_path and include_active_tasks=true before dependent work unless that recall already succeeded since resumption. A summary does not replace this check; reconcile it with the recalled Task and current evidence.
+Persistent memory for ordinary work. At a new work request or resumption, recall relevant memories before proceeding; for project work, check active Tasks and match by objective and scope before creating one. A recall with recall_for delivers applicable standing rules independently of search rank; read them before dependent work. During work, recall again when a new area, assumption, constraint, failure, or similarity to prior work raises a question not covered by recalled context. Combine related clues in one call. Skip a lookup only when recall results still in context cover the same question and conditions, including any needed Task selection. For project work after compaction or a session interruption, recall with confirmed project_path and include_active_tasks=true before dependent work unless that recall already succeeded since resumption. A summary does not replace this check; reconcile it with the recalled Task and current evidence.
 
 Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. When a user corrects your prior work, extract any reusable approach supported by the correction and save it with its conditions and scope. Batch only other progress that leaves the Task's restart state intact at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
 
@@ -98,7 +98,7 @@ ADR-0141 adds this request-local recall option to the existing Pro-reviewed
 invocation guidance; it is not a new tool or persisted session status.
 
 ```text
-Set true to retrieve applicable standing rules and discover project context from multiple perspectives. Omit for ordinary recall. This does not mark a session as restored or replace explicit Task selection.
+Set true to discover project context from multiple perspectives when it is missing or incomplete. Every recall with recall_for already includes applicable standing rules; omit this option for ordinary recall. This does not mark a session as restored or replace explicit Task selection.
 ```
 
 ### `what_to_remember`
@@ -165,11 +165,11 @@ preservation remains applicable when no active Task is needed.
 
 The installer uses the following bootstrap for project work and for user/machine
 recall when no project is confirmed. It does not alter `include_active_tasks`;
-project reconstruction is requested independently through `restore_context`
+multiview project reconstruction is requested independently through `restore_context`
 (ADR-0141). The exact CLI line is generated from installed paths.
 
 ```text
-Use Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. After compaction or a session interruption, recall before dependent work even with a summary, unless this recall already succeeded since resumption. Before substantial project work, recall and reuse or create a matching Task. Before another substantial step or a wait, use remember_this if its last confirmed version and accessible durable references would not let a fresh session resume. Save reusable decisions, corrections, friction, and findings before relying on them. Batch only other progress that leaves this restart state intact at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
+Use Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context and read applicable standing rules returned with recall_for before dependent work; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. After compaction or a session interruption, recall before dependent work even with a summary, unless this recall already succeeded since resumption. Before substantial project work, recall and reuse or create a matching Task. Before another substantial step or a wait, use remember_this if its last confirmed version and accessible durable references would not let a fresh session resume. Save reusable decisions, corrections, friction, and findings before relying on them. Batch only other progress that leaves this restart state intact at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
 For project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.
 If agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.
 

@@ -380,7 +380,7 @@
         },
         "restore_context": {
           "type": "boolean",
-          "description": "Set true to retrieve applicable standing rules and discover project context from multiple perspectives. Omit for ordinary recall. This does not mark a session as restored or replace explicit Task selection."
+          "description": "Set true to discover project context from multiple perspectives when it is missing or incomplete. Every recall with recall_for already includes applicable standing rules; omit this option for ordinary recall. This does not mark a session as restored or replace explicit Task selection."
         },
         "include_active_tasks": {
           "type": "boolean"

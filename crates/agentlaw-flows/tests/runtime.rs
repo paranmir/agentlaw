@@ -417,12 +417,213 @@ fn first_recall_discovers_without_binding_even_one_candidate() {
     assert!(first["turn_instruction"]
         .as_str()
         .unwrap()
-        .contains("not been retrieved"));
+        .contains("Project rules, active Tasks and work targets have not been checked"));
+    assert!(first.get("partial_recall").is_some());
     let second = call(
         &mut runtime,
         json!({"action":"recall","recall_for":"Continue work","project_path":"C:/work/copy"}),
     );
     assert_eq!(second["status"], "needs_user_input");
+}
+
+#[test]
+fn ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/rules","project_name":"Rules"}),
+    );
+    let user = call(
+        &mut runtime,
+        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"Always inspect durable constraints.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
+    );
+    let machine_id = runtime.machine_id().to_owned();
+    let machine = call(
+        &mut runtime,
+        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"Use local paths carefully.","evidence":"Test rule","applies_to":["machine"],"is_rule":true}]}),
+    );
+    let project = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":"C:/work/rules","memories":[{"operation":"create","what_to_remember":"Keep the project contract aligned.","evidence":"Test rule","applies_to":["project"],"is_rule":true}]}),
+    );
+    for written in [&user, &machine, &project] {
+        assert_eq!(written["status"], "remembered", "{written}");
+    }
+    let ids: Vec<_> = [&user, &machine, &project]
+        .iter()
+        .map(|v| v["results"][0]["memory_ref"]["memory_id"].clone())
+        .collect();
+    let result = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/rules","recall_for":"completely unrelated subject","memory_candidate_limit":1}),
+    );
+    for id in &ids {
+        assert!(
+            result["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["memory_id"] == *id),
+            "missing rule {id}: {result}"
+        );
+    }
+    assert_eq!(result["memories"].as_array().unwrap().len(), 3);
+    let id_only = call(
+        &mut runtime,
+        json!({"action":"recall","memory_ids":[ids[0].clone()]}),
+    );
+    assert_eq!(id_only["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(id_only["memories"][0]["memory_id"], ids[0]);
+    let mixed = call(
+        &mut runtime,
+        json!({"action":"recall","recall_for":"unrelated","memory_ids":[ids[0].clone()],"machine_id":machine_id,"project_path":"C:/work/rules"}),
+    );
+    for id in &ids {
+        assert!(mixed["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == *id));
+    }
+}
+
+#[test]
+fn unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let user = call(
+        &mut runtime,
+        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"User-wide prerequisite.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
+    );
+    let machine = call(
+        &mut runtime,
+        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"Machine prerequisite.","evidence":"Test rule","applies_to":["machine"],"is_rule":true}]}),
+    );
+    let no_project = call(
+        &mut runtime,
+        json!({"action":"recall","recall_for":"unrelated request"}),
+    );
+    assert!(no_project.get("status").is_none(), "{no_project}");
+    assert_eq!(no_project["memories"].as_array().unwrap().len(), 2);
+    let result = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/unbound","recall_for":"unrelated request","include_active_tasks":true,"memory_candidate_limit":1}),
+    );
+    assert_eq!(result["status"], "needs_user_input", "{result}");
+    assert_eq!(result["code"], "project_connection_required");
+    let partial = &result["partial_recall"];
+    assert!(partial.is_object(), "{result}");
+    assert!(partial.get("active_task_count").is_none());
+    for written in [&user, &machine] {
+        let id = &written["results"][0]["memory_ref"]["memory_id"];
+        assert!(
+            partial["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["memory_id"] == *id),
+            "missing partial rule {id}: {result}"
+        );
+    }
+    assert!(result["turn_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("Project rules, active Tasks and work targets have not been checked"));
+}
+
+#[test]
+fn contextual_rule_recall_synchronizes_index_stale_before_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("source");
+    let local = dir.path().join("local");
+    let mut writer = Runtime::open(&root, &local, "user").unwrap();
+    let mut reader = Runtime::open(&root, &local, "user").unwrap();
+    let before = call(
+        &mut reader,
+        json!({"action":"recall","recall_for":"unrelated work"}),
+    );
+    assert!(before["memories"].as_array().unwrap().is_empty());
+    let saved = call(
+        &mut writer,
+        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"New user rule after reader index creation.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
+    );
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let after = call(
+        &mut reader,
+        json!({"action":"recall","recall_for":"unrelated work"}),
+    );
+    let expected = &saved["results"][0]["memory_ref"];
+    assert!(
+        after["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == expected["memory_id"]
+                && m["current_heads"][0]["memory_ref"] == *expected),
+        "{after}"
+    );
+    let changed = call(
+        &mut writer,
+        json!({"action":"remember_this","memories":[{"operation":"evolve","parent_refs":[expected],"what_to_remember":"Now an ordinary observation.","evidence":"Rule withdrawn by test","is_rule":false}]}),
+    );
+    assert_eq!(changed["status"], "remembered", "{changed}");
+    let withdrawn = call(
+        &mut reader,
+        json!({"action":"recall","recall_for":"unrelated work"}),
+    );
+    assert!(
+        !withdrawn["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == expected["memory_id"]),
+        "{withdrawn}"
+    );
+}
+
+#[test]
+fn joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/joint","project_name":"Joint"}),
+    );
+    let saved = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":"C:/work/joint","memories":[{"operation":"create","what_to_remember":"Joint scope rule irrelevant to the query.","evidence":"Test rule","applies_to":["project","machine"],"is_rule":true}]}),
+    );
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let id = &saved["results"][0]["memory_ref"]["memory_id"];
+    let same = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/joint","recall_for":"unrelated"}),
+    );
+    assert!(
+        same["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == *id),
+        "{same}"
+    );
+    let other_machine = uuid::Uuid::new_v4().to_string();
+    let different = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/joint","machine_id":other_machine,"recall_for":"unrelated"}),
+    );
+    assert!(
+        !different["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["memory_id"] == *id),
+        "{different}"
+    );
 }
 #[test]
 fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {

@@ -724,7 +724,15 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(length, result["artifact"]["bytes"].as_u64().unwrap());
-        let restored=runtime.call(parse_request(&json!({"action":"recall","recall":{"recall_for":"restore standing rules","restore_context":true}}).to_string()).unwrap()).unwrap();
+        let restored = runtime
+            .call(
+                parse_request(
+                    &json!({"action":"recall","recall":{"recall_for":"unrelated ordinary work"}})
+                        .to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         assert_eq!(restored["code"], "complete_content_in_file");
         assert!(restored["artifact"]["bytes"].as_u64().unwrap() > bytes);
         let mut file = std::fs::File::open(restored["artifact"]["path"].as_str().unwrap()).unwrap();
