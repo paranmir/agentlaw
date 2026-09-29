@@ -1428,7 +1428,7 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Verified command invocation.","applies_to":["user"]}]}}),
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Verified command invocation.","applies_to":["user"],"is_rule":true}]}}),
         ),
     );
     assert_eq!(saved["status"], "remembered", "{saved}");
@@ -1452,6 +1452,30 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         reference
     );
     assert_eq!(oversized["artifact"]["bytes"], frozen.len());
+    let (_, contextual) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"recall","recall":{"recall_for":"unrelated ordinary work","memory_candidate_limit":1}}),
+        ),
+    );
+    assert_eq!(
+        contextual["code"], "complete_content_in_file",
+        "{contextual}"
+    );
+    assert_eq!(contextual["content_read"], false);
+    let contextual_packet: Value = serde_json::from_slice(
+        &std::fs::read(contextual["artifact"]["path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        contextual_packet["memories"][0]["current_heads"][0]["what_to_remember"],
+        body
+    );
+    assert_eq!(
+        contextual_packet["memories"][0]["current_heads"][0]["memory_ref"],
+        saved["results"][0]["memory_ref"]
+    );
     let (_, changed) = run(
         &state,
         &["call", "--json", "-"],
@@ -1465,9 +1489,113 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         frozen,
         "later writes changed an already acquired artifact"
     );
+    assert_eq!(
+        contextual_packet,
+        serde_json::from_slice::<Value>(
+            &std::fs::read(contextual["artifact"]["path"].as_str().unwrap()).unwrap()
+        )
+        .unwrap()
+    );
     let (_, current) = run(&state, &["call", "--json", "-"], Some(request));
     assert_eq!(
         current["memories"][0]["current_heads"][0]["what_to_remember"],
         "Current concise command guidance."
     );
+}
+
+#[test]
+fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let source = tmp.path().join("source");
+    initialize(&state, &source);
+    let _daemon = daemon(&state);
+    let (out, _) = run(
+        &state,
+        &["config", "set", "response_limit_bytes", "4096"],
+        None,
+    );
+    assert!(out.status.success());
+    let reference_body = format!("Reference: {}", "R".repeat(1000));
+    let (_, reference) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":reference_body,"evidence":"Fixture","applies_to":["user"]}]}}),
+        ),
+    );
+    assert_eq!(reference["status"], "remembered", "{reference}");
+    let reference_id = reference["results"][0]["memory_ref"]["memory_id"].clone();
+    let first_body = format!("First rule: {}", "A".repeat(1800));
+    let (_, first) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":first_body,"evidence":"Fixture","applies_to":["user"],"is_rule":true,"required_memory_ids":[reference_id]}]}}),
+        ),
+    );
+    assert_eq!(first["status"], "remembered", "{first}");
+    let second_body = format!("Second rule: {}", "B".repeat(1800));
+    let (_, second) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":second_body,"evidence":"Fixture","applies_to":["user"],"is_rule":true}]}}),
+        ),
+    );
+    assert_eq!(second["status"], "remembered", "{second}");
+    let (_, response) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"recall","recall":{"recall_for":"unrelated task","memory_candidate_limit":1}}),
+        ),
+    );
+    assert_eq!(response["code"], "complete_content_in_file", "{response}");
+    assert_eq!(response["content_read"], false);
+    let bytes = std::fs::read(response["artifact"]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(response["artifact"]["bytes"], bytes.len());
+    let packet: Value = serde_json::from_slice(&bytes).unwrap();
+    let memories = packet["memories"].as_array().unwrap();
+    for (saved, body) in [
+        (&reference, &reference_body),
+        (&first, &first_body),
+        (&second, &second_body),
+    ] {
+        let expected = &saved["results"][0]["memory_ref"];
+        assert!(memories
+            .iter()
+            .any(|m| m["memory_id"] == expected["memory_id"]
+                && m["current_heads"][0]["memory_ref"] == *expected
+                && m["current_heads"][0]["what_to_remember"] == *body));
+    }
+    assert_eq!(memories.len(), 3);
+    assert!(packet
+        .get("undelivered_required")
+        .is_none_or(|v| v.as_array().unwrap().is_empty()));
+    let (_, unbound) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"recall","recall":{"project_path":"C:/work/unbound-aggregate","recall_for":"unrelated task","include_active_tasks":true}}),
+        ),
+    );
+    assert_eq!(unbound["code"], "complete_content_in_file", "{unbound}");
+    let unbound_packet: Value = serde_json::from_slice(
+        &std::fs::read(unbound["artifact"]["path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unbound_packet["status"], "needs_user_input");
+    assert_eq!(unbound_packet["code"], "project_connection_required");
+    assert_eq!(
+        unbound_packet["partial_recall"]["memories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(unbound_packet["turn_instruction"]
+        .as_str()
+        .unwrap()
+        .contains("Project rules, active Tasks and work targets have not been checked"));
 }

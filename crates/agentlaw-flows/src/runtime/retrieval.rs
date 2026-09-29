@@ -625,11 +625,7 @@ impl Runtime {
                 ids.extend(admitted(&channels));
                 queries.insert(q, channels);
             }
-            ids.extend(index.ids_matching(
-                c,
-                r.restore_context == Some(true),
-                r.include_active_tasks == Some(true),
-            )?);
+            ids.extend(index.ids_matching(c, true, r.include_active_tasks == Some(true))?);
             if let Some(targets) = &r.work_targets {
                 let project = c.project_id.as_deref().ok_or_else(|| {
                     DomainError::new(

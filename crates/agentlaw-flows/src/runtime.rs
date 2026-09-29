@@ -569,14 +569,33 @@ impl Runtime {
             Err(error) if error.code == "project_connection_required" => {
                 // Discovery is read-only. A candidate, even a sole candidate, is not a binding.
                 let candidates = self.discover(None)?;
-                return Ok(json!({
+                let mut result = json!({
                     "status":"needs_user_input",
                     "code":"project_connection_required",
                     "message":"Choose a project memory for this folder.",
                     "candidates":candidates,
                     "project_path":r.project_path,
-                    "turn_instruction":"Project memory has not been retrieved. Use an already explicit user choice, or ask the user to select a candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, use its recall_result if requested; otherwise repeat the original recall."
-                }));
+                    "turn_instruction": if r.recall_for.is_some() { "Project rules, active Tasks and work targets have not been checked. Read partial_recall for available user/machine context, including its artifact when content_read=false, or partial_recall_error if that check failed; do not infer that missing rules do not exist. Use an already explicit user choice, or ask the user to select a project candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, repeat the original recall with its goal and options." } else { "Project memory has not been retrieved. Use an already explicit user choice, or ask the user to select a candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, repeat the original recall." }
+                });
+                if r.recall_for.is_some() {
+                    let mut partial_request = r.clone();
+                    partial_request.project_path = None;
+                    partial_request.project_hint = None;
+                    partial_request.selected_project_id = None;
+                    partial_request.memory_ids = None;
+                    partial_request.procedure_ids = None;
+                    partial_request.restore_context = None;
+                    partial_request.include_active_tasks = None;
+                    partial_request.work_targets = None;
+                    match self
+                        .request_context(None)
+                        .and_then(|context| self.recall_with_context(partial_request, context))
+                    {
+                        Ok(partial) => result["partial_recall"] = partial,
+                        Err(error) => result["partial_recall_error"] = to_value(error)?,
+                    }
+                }
+                return Ok(result);
             }
             Err(error) => return Err(error),
         };

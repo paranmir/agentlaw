@@ -61,7 +61,7 @@
         },
         "restore_context": {
           "type": "boolean",
-          "description": "recall or connect_project_memory only. Set true when project context is missing or incomplete. Requires recall_for; omit for ID-only or focused follow-up."
+          "description": "recall or connect_project_memory only. Set true for multiview discovery when project context is missing or incomplete. Requires recall_for; every recall_for already includes applicable standing rules. Omit for ID-only or focused follow-up."
         },
         "include_active_tasks": {
           "type": "boolean",
@@ -496,7 +496,7 @@
         },
         "restore_context": {
           "type": "boolean",
-          "description": "recall or connect_project_memory only. Set true when project context is missing or incomplete. Requires recall_for; omit for ID-only or focused follow-up."
+          "description": "recall or connect_project_memory only. Set true for multiview discovery when project context is missing or incomplete. Requires recall_for; every recall_for already includes applicable standing rules. Omit for ID-only or focused follow-up."
         },
         "recall_for": {
           "type": "string",

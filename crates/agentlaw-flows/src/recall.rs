@@ -113,9 +113,8 @@ pub fn recall(
                 }
             }
         }
-        if r.restore_context == Some(true)
-            || r.include_active_tasks == Some(true)
-            || r.work_targets.is_some()
+        // Rules are mandatory for every contextual recall; other inventory
+        // selections remain controlled by their request options.
         {
             if (r.include_active_tasks == Some(true) || r.work_targets.is_some())
                 && effective.project_id.is_none()
@@ -132,7 +131,7 @@ pub fn recall(
                     if !scope_matches(&head.applicability, &effective) {
                         continue;
                     }
-                    if r.restore_context == Some(true) && head.is_rule {
+                    if head.is_rule {
                         selected.insert(state.resolved_id.clone());
                     }
                     if r.include_active_tasks == Some(true) && head.in_working_set == Some(true) {
