@@ -193,6 +193,145 @@ fn contextual_recall_selects_same_head_applicable_rules_outside_search_limits() 
     let mixed_result = recall(&source, &EmptySearch, &context(), &mixed, "now".into()).unwrap();
     assert!(mixed_result.memories.iter().any(|m| m.memory_id == OTHER));
 }
+
+#[test]
+fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
+    const C: &str = "33333333-3333-4333-8333-333333333333";
+    const EXACT: &str = "44444444-4444-4444-8444-444444444444";
+    const REQUIRED: &str = "55555555-5555-4555-8555-555555555555";
+    struct PathsSearch;
+    fn candidate(id: &str, preview: &str, paths: &[(&str, &str)]) -> MemoryCandidate {
+        MemoryCandidate {
+            memory_id: id.into(),
+            excerpt: preview.into(),
+            applicability: memory(id).applicability,
+            retrieval_paths: paths
+                .iter()
+                .map(|(via, clue)| RetrievalPath {
+                    via: vec![(*via).into()],
+                    clue: (*clue).into(),
+                    source_memory_id: None,
+                })
+                .collect(),
+        }
+    }
+    impl RecallSearch for PathsSearch {
+        fn search(&self, _: &RequestContext, query: &str, _: &[String]) -> Result<Discovery> {
+            let candidates = if query == "topic" {
+                vec![
+                    candidate(A, "First preview", &[("lexical", "shared clue")]),
+                    candidate(A, "Other head preview", &[("lexical", "other head clue")]),
+                    candidate(B, "Source B preview", &[("lexical", "source B clue")]),
+                    candidate(C, "Source C preview", &[("lexical", "source C clue")]),
+                ]
+            } else {
+                vec![candidate(
+                    A,
+                    "Later view preview",
+                    &[("vector", "shared clue"), ("lexical", "other view clue")],
+                )]
+            };
+            Ok(Discovery {
+                candidates,
+                full_ids: vec![],
+                diagnostics: vec![],
+            })
+        }
+    }
+    let mut source = Snapshot::default();
+    let mut task = memory(A);
+    task.in_working_set = Some(true);
+    task.work_targets.push(StoredTarget {
+        project_id: B.into(),
+        path: "src/task.rs".into(),
+        kind: TargetKind::File,
+        reading: Reading::Related,
+    });
+    source.insert(task.clone());
+    task.memory_ref.observed_version = "v2".into();
+    task.what_to_remember = "Other current head, preserved by exact recall".into();
+    task.in_working_set = None;
+    source.0.get_mut(A).unwrap().heads.push(task);
+    for id in [B, C] {
+        let mut linked = memory(id);
+        linked.related_memory_ids = vec![A.into(), A.into()];
+        source.insert(linked);
+    }
+    let mut exact = memory(EXACT);
+    exact.required_memory_ids = vec![REQUIRED.into()];
+    source.insert(exact.clone());
+    exact.memory_ref.observed_version = "v2".into();
+    exact.what_to_remember = "Complete second exact head".into();
+    source.0.get_mut(EXACT).unwrap().heads.push(exact);
+    source.insert(memory(REQUIRED));
+    let result = recall(
+        &source,
+        &PathsSearch,
+        &context(),
+        &RecallRequest {
+            recall_for: Some("topic".into()),
+            restore_context: Some(true),
+            include_active_tasks: Some(true),
+            memory_candidate_limit: Some(1),
+            memory_ids: Some(vec![EXACT.into()]),
+            work_targets: Some(vec![WorkTarget {
+                path: "src/task.rs".into(),
+                kind: TargetKind::File,
+            }]),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    let c = &result.candidates[0];
+    assert_eq!(c.memory_id, A);
+    assert_eq!(c.excerpt, "First preview");
+    assert_eq!(c.retrieval_paths.len(), 7);
+    assert_eq!(c.retrieval_paths[0].via, ["lexical", "vector"]);
+    assert_eq!(c.retrieval_paths[1].clue, "other head clue");
+    assert_eq!(c.retrieval_paths[2].clue, "other view clue");
+    let sources: Vec<_> = c
+        .retrieval_paths
+        .iter()
+        .filter_map(|p| p.source_memory_id.as_deref())
+        .collect();
+    assert_eq!(sources, [B, C]);
+    assert!(c.retrieval_paths.iter().any(|p| p.via == ["active_task"]));
+    assert!(c
+        .retrieval_paths
+        .iter()
+        .any(|p| p.via == ["work_target"] && p.clue == "src/task.rs"));
+    let counts = &result.candidate_counts.as_ref().unwrap().memories;
+    assert_eq!((counts.matched, counts.shown), (3, 1));
+    assert_eq!(result.active_task_count, Some(1));
+    assert_eq!(result.memories.len(), 2);
+    assert_eq!(
+        result
+            .memories
+            .iter()
+            .find(|m| m.memory_id == EXACT)
+            .unwrap()
+            .current_heads
+            .len(),
+        2
+    );
+    let full = recall(
+        &source,
+        &Search,
+        &context(),
+        &RecallRequest {
+            memory_ids: Some(vec![A.into()]),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    assert_eq!(full.memories[0].current_heads.len(), 2);
+    assert_eq!(
+        full.memories[0].current_heads[1].what_to_remember,
+        "Other current head, preserved by exact recall"
+    );
+}
 struct Reviewed;
 impl ReviewGate for Reviewed {
     fn review(&self, _: &RequestContext, _: &[MemoryProposal], _: &ReadSet) -> Result<()> {

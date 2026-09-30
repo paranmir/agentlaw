@@ -405,10 +405,33 @@ impl From<Memory> for RecallHead {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalPath {
-    pub via: String,
+    pub via: Vec<String>,
     pub clue: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_memory_id: Option<String>,
+}
+/// Group only identical clue/source pairs; preserve every actual channel in
+/// first encounter order. This is response compaction, not semantic merging.
+pub fn group_retrieval_paths(paths: impl IntoIterator<Item = RetrievalPath>) -> Vec<RetrievalPath> {
+    let mut groups = Vec::<RetrievalPath>::new();
+    let mut positions = std::collections::BTreeMap::new();
+    for path in paths {
+        let key = (path.clue.clone(), path.source_memory_id.clone());
+        let index = *positions.entry(key).or_insert_with(|| {
+            groups.push(RetrievalPath {
+                via: Vec::new(),
+                clue: path.clue,
+                source_memory_id: path.source_memory_id,
+            });
+            groups.len() - 1
+        });
+        for channel in path.via {
+            if !groups[index].via.contains(&channel) {
+                groups[index].via.push(channel);
+            }
+        }
+    }
+    groups
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryCandidate {

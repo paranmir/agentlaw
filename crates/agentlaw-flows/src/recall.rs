@@ -1,5 +1,20 @@
 use crate::*;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+fn add_candidate(
+    candidates: &mut Vec<MemoryCandidate>,
+    positions: &mut BTreeMap<String, usize>,
+    candidate: MemoryCandidate,
+) {
+    if let Some(&index) = positions.get(&candidate.memory_id) {
+        candidates[index]
+            .retrieval_paths
+            .extend(candidate.retrieval_paths);
+    } else {
+        positions.insert(candidate.memory_id.clone(), candidates.len());
+        candidates.push(candidate);
+    }
+}
 
 pub struct Discovery {
     pub candidates: Vec<MemoryCandidate>,
@@ -73,7 +88,7 @@ pub fn recall(
                     .map(|p| format!("{query}\nPerspective: {p}")),
             )
         }
-        let mut candidate_ids = BTreeSet::new();
+        let mut candidate_positions = BTreeMap::new();
         let mut discovered_ids = BTreeSet::new();
         for query in queries {
             let result =
@@ -83,9 +98,11 @@ pub fn recall(
             response.diagnostics.extend(result.diagnostics);
             for candidate in result.candidates {
                 discovered_ids.insert(candidate.memory_id.clone());
-                if candidate_ids.insert(candidate.memory_id.clone()) {
-                    response.candidates.push(candidate)
-                }
+                add_candidate(
+                    &mut response.candidates,
+                    &mut candidate_positions,
+                    candidate,
+                );
             }
         }
         // Exactly one related hop from discovery, distinct from required closure.
@@ -94,19 +111,21 @@ pub fn recall(
                 for head in state.heads {
                     for related in head.related_memory_ids {
                         if let Some(target) = source.current(&related)? {
-                            if candidate_ids.insert(target.resolved_id.clone()) {
-                                if let Some(head) = target.heads.first() {
-                                    response.candidates.push(MemoryCandidate {
+                            if let Some(head) = target.heads.first() {
+                                add_candidate(
+                                    &mut response.candidates,
+                                    &mut candidate_positions,
+                                    MemoryCandidate {
                                         memory_id: target.resolved_id.clone(),
                                         excerpt: head.what_to_remember.chars().take(400).collect(),
                                         applicability: head.applicability.clone(),
                                         retrieval_paths: vec![RetrievalPath {
-                                            via: "related_memory".into(),
+                                            via: vec!["related_memory".into()],
                                             clue: related,
                                             source_memory_id: Some(id.clone()),
                                         }],
-                                    })
-                                }
+                                    },
+                                );
                             }
                         }
                     }
@@ -136,18 +155,20 @@ pub fn recall(
                     }
                     if r.include_active_tasks == Some(true) && head.in_working_set == Some(true) {
                         tasks.insert(state.resolved_id.clone());
-                        if candidate_ids.insert(state.resolved_id.clone()) {
-                            response.candidates.push(MemoryCandidate {
+                        add_candidate(
+                            &mut response.candidates,
+                            &mut candidate_positions,
+                            MemoryCandidate {
                                 memory_id: state.resolved_id.clone(),
                                 excerpt: head.what_to_remember.clone(),
                                 applicability: head.applicability.clone(),
                                 retrieval_paths: vec![RetrievalPath {
-                                    via: "active_task".into(),
+                                    via: vec!["active_task".into()],
                                     clue: "Active Task".into(),
                                     source_memory_id: None,
                                 }],
-                            })
-                        }
+                            },
+                        );
                     }
                     if let Some(targets) = &r.work_targets {
                         for requested in targets {
@@ -160,17 +181,21 @@ pub fn recall(
                                 )? {
                                     if stored.reading == Reading::Required {
                                         selected.insert(state.resolved_id.clone());
-                                    } else if candidate_ids.insert(state.resolved_id.clone()) {
-                                        response.candidates.push(MemoryCandidate {
-                                            memory_id: state.resolved_id.clone(),
-                                            excerpt: head.what_to_remember.clone(),
-                                            applicability: head.applicability.clone(),
-                                            retrieval_paths: vec![RetrievalPath {
-                                                via: "work_target".into(),
-                                                clue: stored.path.clone(),
-                                                source_memory_id: None,
-                                            }],
-                                        })
+                                    } else {
+                                        add_candidate(
+                                            &mut response.candidates,
+                                            &mut candidate_positions,
+                                            MemoryCandidate {
+                                                memory_id: state.resolved_id.clone(),
+                                                excerpt: head.what_to_remember.clone(),
+                                                applicability: head.applicability.clone(),
+                                                retrieval_paths: vec![RetrievalPath {
+                                                    via: vec!["work_target".into()],
+                                                    clue: stored.path.clone(),
+                                                    source_memory_id: None,
+                                                }],
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -228,6 +253,10 @@ pub fn recall(
         response
             .candidates
             .truncate(r.memory_candidate_limit.unwrap_or(10) as usize);
+        for candidate in &mut response.candidates {
+            candidate.retrieval_paths =
+                group_retrieval_paths(std::mem::take(&mut candidate.retrieval_paths));
+        }
         response.candidate_counts = Some(CandidateCounts {
             memories: Counts {
                 matched,

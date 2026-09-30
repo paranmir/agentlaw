@@ -1544,6 +1544,16 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
         ),
     );
     assert_eq!(second["status"], "remembered", "{second}");
+    for candidate_body in ["unrelated task alpha", "unrelated task bravo"] {
+        let (_, saved) = run(
+            &state,
+            &["call", "--json", "-"],
+            Some(
+                json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":candidate_body,"evidence":"Candidate fixture","applies_to":["user"]}]}}),
+            ),
+        );
+        assert_eq!(saved["status"], "remembered", "{saved}");
+    }
     let (_, response) = run(
         &state,
         &["call", "--json", "-"],
@@ -1570,6 +1580,21 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
                 && m["current_heads"][0]["what_to_remember"] == *body));
     }
     assert_eq!(memories.len(), 3);
+    assert_eq!(
+        packet["candidate_counts"]["memories"],
+        json!({"matched":2,"shown":1})
+    );
+    assert_eq!(
+        packet["candidates"][0]["retrieval_paths"][0]["via"],
+        json!(["lexical"])
+    );
+    assert_eq!(
+        packet["candidates"][0]["retrieval_paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(packet
         .get("undelivered_required")
         .is_none_or(|v| v.as_array().unwrap().is_empty()));
@@ -1587,6 +1612,19 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     .unwrap();
     assert_eq!(unbound_packet["status"], "needs_user_input");
     assert_eq!(unbound_packet["code"], "project_connection_required");
+    for candidate in unbound_packet["partial_recall"]["candidates"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(candidate["retrieval_paths"][0]["via"], json!(["lexical"]));
+    }
+    assert_eq!(
+        unbound_packet["partial_recall"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         unbound_packet["partial_recall"]["memories"]
             .as_array()
