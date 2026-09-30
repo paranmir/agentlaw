@@ -1,19 +1,21 @@
-# Agentlaw 0.3.5
+# Agentlaw 0.3.6
 
-- Delivers complete current memories marked as rules for the applicable user,
-  project and machine scopes on every recall with `recall_for`. Rule delivery
-  is independent of search similarity, ranking, candidate limits and
-  `restore_context`; the agent judges conditions stated in each rule's body.
-- Preserves user and machine recall when a project path is not connected yet.
-  The response keeps the project-connection decision, distinguishes partial
-  recall from its failure, and identifies project rules, Tasks and targets as
-  unchecked. After connecting, repeat the original recall goal and options.
-- Aligns tool and installed bootstrap guidance with these recall boundaries.
-  Oversized results retain the existing complete-content artifact path, which
-  the agent must read before using the result.
-- Refreshes the README with everyday memory and Task examples.
+- Groups identical recall clues from lexical and vector discovery into one
+  retrieval path within a memory candidate, retaining each actual channel.
+- Preserves later discoveries of the same memory across search views, current
+  heads, related sources, active Tasks and work targets. Different clues and
+  source memory IDs remain distinct; first previews and ordering are preserved.
+- Uses the same grouped paths in active Task projections and complete response
+  artifacts. Candidate counts/limits, full memory delivery and required
+  references keep their existing boundaries.
 
-ID-only recall continues to return requested memories and their required
-references without automatically adding all rules. No new settings,
-dependencies or persisted file types are introduced. This release verifies
-rule delivery; an agent still has to recall and apply the returned instructions.
+**Response compatibility:** `retrieval_paths[].via` changes from a string to an
+array of strings, including paths with only one channel. Consumers of that
+field must accept the new format. Tool requests and persisted memories are
+unchanged; no new settings or dependencies are introduced.
+
+A representative candidate JSON decreased from 749 to 651 UTF-8 bytes (13.1%).
+This is a fixture byte comparison, not a measured tokenizer count or a promise
+for every response. Preserving previously discarded paths can increase other
+responses. Real-model retrieval quality, LLM adherence and performance are
+outside this change's verified scope.
