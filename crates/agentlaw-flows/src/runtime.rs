@@ -689,6 +689,28 @@ impl Runtime {
         result
             .diagnostics
             .retain(|d| !d.message.starts_with("Learned procedure discovery"));
+        if r.include_active_tasks == Some(true) {
+            for candidate in &mut result.candidates {
+                if snapshot
+                    .states
+                    .get(&candidate.memory_id)
+                    .is_some_and(|state| {
+                        state.heads.iter().any(|head| {
+                            head.in_working_set == Some(true)
+                                && scope_matches(&head.applicability, &context)
+                        })
+                    })
+                {
+                    candidate.retrieval_paths.push(RetrievalPath {
+                        via: vec!["active_working_set".into()],
+                        clue: "Active Task".into(),
+                        source_memory_id: None,
+                    });
+                    candidate.retrieval_paths =
+                        group_retrieval_paths(std::mem::take(&mut candidate.retrieval_paths));
+                }
+            }
+        }
         let mut result = to_value(result)?;
         if r.include_active_tasks == Some(true) {
             let mut output = Vec::new();
@@ -707,11 +729,10 @@ impl Runtime {
                         for head in active {
                             let [objective, current_position, resume_point] =
                                 snapshot.streaming.task_sections(&head.what_to_remember)?;
-                            let mut paths = candidate["retrieval_paths"]
+                            let paths = candidate["retrieval_paths"]
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
-                            paths.push(json!({"via":"active_working_set","clue":"Active Task"}));
                             output.push(json!({"memory_id":id,"objective":objective,"current_position":current_position,"resume_point":resume_point,"retrieval_paths":paths}));
                         }
                         continue;

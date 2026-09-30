@@ -6,6 +6,35 @@ recorded below.
 
 ## Regression suite
 
+### Unreleased grouped recall paths
+
+The feature groups identical clue/source pairs into a single path with a
+distinct `via` channel array, preserving later discoveries of the same memory.
+On 2026-09-30, Windows local `cargo check --locked --workspace`,
+`cargo fmt --all -- --check` and
+`cargo test --locked --workspace --no-fail-fast` passed: 186 tests passed,
+zero failed and four opt-in tests were ignored. The contracts tests check exact
+clue/source grouping, distinct clues, source IDs and absent sources,
+whitespace/Unicode differences, channel order and idempotence. Pure-flow tests
+cover later discoveries across views/heads, links, Tasks and work targets,
+with candidate counts/limits, first previews and exact full bodies preserved.
+Runtime tests check Task projection and multiple link sources; the CLI test
+parses grouped candidates in complete response artifacts and partial recall.
+
+A representative whole candidate JSON shrank from 749 to 651 UTF-8 bytes
+(13.1%). This is a fixture byte comparison, not a measured tokenizer count or
+a reduction promised for all responses. Existing candidate excerpts remain;
+retaining previously discarded paths can increase other responses. `via` changes
+from a string to an array even for one channel. Requests and persisted memories
+are unchanged.
+
+All test cases finished before one remaining managed-update fixture daemon was
+identified by its isolated path, endpoint PID and binary hash and closed;
+the suite command then returned exit code zero. This local run does not prove
+daemon cleanup at every exit. Real-model retrieval quality, LLM adherence,
+performance, other-platform CI and installation into an active harness have
+not been established for this unreleased feature.
+
 ### 0.3.5 contextual standing-rule recall checks
 
 Product PR [#9](https://github.com/paranmir/agentlaw/pull/9) passed the full

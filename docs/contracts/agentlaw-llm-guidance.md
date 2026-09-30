@@ -212,6 +212,10 @@ Rule changes use existing remember_this/evolve, with current content, applicable
 metadata and evidence. Removing rule status preserves the memory and its history.
 A user's one-time exception must not silently become a permanent rule change.
 
+Recall candidates group identical clues and source provenance in retrieval_paths;
+each entry's via array preserves its actual discovery channels. Distinct clues
+or link sources remain separate. This is provenance, not factual confidence.
+
 Results describe only known response state: unselected Tasks, missing requested
 IDs, unresolved current heads, overlap/version issues, candidate display
 limits, or a required referenced document not delivered by that call. Never

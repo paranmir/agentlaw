@@ -771,7 +771,7 @@ impl Runtime {
                             .into_iter()
                             .filter(|(_, found)| *found)
                             .map(|(via, _)| RetrievalPath {
-                                via: via.into(),
+                                via: vec![via.into()],
                                 clue: excerpt.chars().take(80).collect(),
                                 source_memory_id: None,
                             })

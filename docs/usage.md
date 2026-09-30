@@ -206,6 +206,18 @@ A damaged journal can be rebuilt from retained authoritative decisions while
 preserving originals. A missing/corrupt proposal DB needs backup recovery, never
 a successful-looking empty replacement.
 
+Recall candidates group identical clues from the same source into one
+`retrieval_paths` entry. Its `via` array lists every actual discovery channel:
+
+```json
+{"via":["lexical","vector"],"clue":"Use argument arrays for paths with spaces."}
+```
+
+Different clues or link-source IDs remain separate. Active Task candidates and
+complete-content files use the same representation. Builds with this change
+emit an array for `via`; releases through v0.3.5 emitted a string. Consumers
+reading that response field must account for the new shape.
+
 ## Git and management
 
 ```text

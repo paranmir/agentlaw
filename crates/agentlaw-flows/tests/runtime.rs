@@ -163,6 +163,94 @@ fn active_task_candidates_copy_only_complete_handoff_sections() {
     assert!(c.get("applicability").is_none());
     assert_eq!(result["active_task_count"], 1);
     assert!(result.get("task_instruction").is_none());
+    assert!(c["retrieval_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["via"].is_array()));
+    let task_paths: Vec<_> = c["retrieval_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["clue"] == "Active Task")
+        .collect();
+    assert_eq!(task_paths.len(), 1);
+    assert_eq!(
+        task_paths[0]["via"],
+        json!(["active_task", "active_working_set"])
+    );
+}
+
+#[test]
+fn task_projection_retains_search_two_link_sources_and_target_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let folder = "C:/work/grouped-paths";
+    let project = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Grouped"}),
+    );
+    let project_id = &project["project_connection"]["project_id"];
+    let body = "## Objective\nReview shared material.\n## Current position\nInputs checked.\n## Resume point\nInspect the result.\n## References\nFixture reference.\n";
+    let task = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"in_working_set":true,"work_targets":[{"project_id":project_id,"path":"src/task.rs","kind":"file","reading":"related"}]}]}),
+    );
+    assert_eq!(task["status"], "remembered", "{task}");
+    let task_id = &task["results"][0]["memory_ref"]["memory_id"];
+    let mut sources = Vec::new();
+    for body in ["shared material alpha", "shared material bravo"] {
+        let saved = call(
+            &mut runtime,
+            json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"related_memory_ids":[task_id]}]}),
+        );
+        assert_eq!(saved["status"], "remembered", "{saved}");
+        sources.push(saved["results"][0]["memory_ref"]["memory_id"].clone());
+    }
+    let result = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"shared material","restore_context":true,"include_active_tasks":true,"work_targets":[{"path":"src/task.rs","kind":"file"}]}),
+    );
+    let c = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["memory_id"] == *task_id)
+        .expect("Task remains a compact candidate");
+    assert_eq!(c["objective"], "Review shared material.\n");
+    assert_eq!(c["current_position"], "Inputs checked.\n");
+    assert_eq!(c["resume_point"], "Inspect the result.\n");
+    let paths = c["retrieval_paths"].as_array().unwrap();
+    assert!(paths
+        .iter()
+        .all(|p| p["via"].as_array().is_some_and(|v| !v.is_empty())));
+    for source in sources {
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| p["source_memory_id"] == source)
+                .count(),
+            1,
+            "{c}"
+        );
+    }
+    assert!(paths
+        .iter()
+        .any(|p| p["via"].as_array().unwrap().contains(&json!("lexical"))));
+    assert!(paths
+        .iter()
+        .any(|p| p["via"] == json!(["work_target"]) && p["clue"] == "src/task.rs"));
+    let task_paths: Vec<_> = paths
+        .iter()
+        .filter(|p| p["clue"] == "Active Task")
+        .collect();
+    assert_eq!(task_paths.len(), 1);
+    assert_eq!(
+        task_paths[0]["via"],
+        json!(["active_task", "active_working_set"])
+    );
+    assert_eq!(result["active_task_count"], 1);
 }
 #[test]
 fn repair_rebuilds_a_private_generation_and_preserves_pending() {
