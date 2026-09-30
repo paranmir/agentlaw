@@ -6,6 +6,24 @@ recorded below.
 
 ## Regression suite
 
+### 0.3.5 contextual standing-rule recall checks
+
+Product PR [#9](https://github.com/paranmir/agentlaw/pull/9) passed the full
+locked workspace test suite on Linux x64, Windows x64, macOS arm64 and macOS
+x64 in [CI run 36544489655](https://github.com/paranmir/agentlaw/actions/runs/36544489655).
+Pure-flow and Runtime tests cover general contextual recall with low candidate
+limits, explicit-ID/context combinations, ID-only boundaries, required
+references, same-head rule/scope matching, compound scope matching, stale-index
+synchronization before recall, and unconnected-project partial recall.
+Streaming and CLI tests parse complete oversized rule artifacts, including
+aggregate rule/reference content and unconnected-project partial results.
+
+These tests do not inject mid-call source changes, partial-recall internal
+failure, artifact-creation failure or partial required-reference read failure.
+They also do not establish that an LLM always calls recall or follows every
+delivered rule. Release packaging is checked by the publication workflow;
+installation into a running user harness is a separate check.
+
 ### 0.3.4 managed update completion checks
 
 The ordinary MCP notice test covers more than 64 historical update plans and
