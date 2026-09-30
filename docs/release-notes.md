@@ -1,15 +1,19 @@
-# Agentlaw 0.3.4
+# Agentlaw 0.3.5
 
-- Records managed update completion only after candidate verification, approved
-  cleanup and maintenance gate closure. Interrupted finalization resumes from
-  the matching plan without disrupting an already running candidate MCP.
-- Checks only Agentlaw-owned harness registration and bootstrap content when
-  judging an installed update; unrelated host settings and user instructions
-  no longer make a completed update appear incomplete.
-- Removes historical plan discovery from ordinary MCP results. Automatic
-  `update_notice` remains available for verified newer releases; the public
-  update command resumes one unfinished plan before checking for another
-  release, then reports its own installation result or exact blocker.
+- Delivers complete current memories marked as rules for the applicable user,
+  project and machine scopes on every recall with `recall_for`. Rule delivery
+  is independent of search similarity, ranking, candidate limits and
+  `restore_context`; the agent judges conditions stated in each rule's body.
+- Preserves user and machine recall when a project path is not connected yet.
+  The response keeps the project-connection decision, distinguishes partial
+  recall from its failure, and identifies project rules, Tasks and targets as
+  unchecked. After connecting, repeat the original recall goal and options.
+- Aligns tool and installed bootstrap guidance with these recall boundaries.
+  Oversized results retain the existing complete-content artifact path, which
+  the agent must read before using the result.
+- Refreshes the README with everyday memory and Task examples.
 
-No new settings, dependencies or persisted file types are introduced. Restart
-the harness normally after the public update command reports `installed`.
+ID-only recall continues to return requested memories and their required
+references without automatically adding all rules. No new settings,
+dependencies or persisted file types are introduced. This release verifies
+rule delivery; an agent still has to recall and apply the returned instructions.
