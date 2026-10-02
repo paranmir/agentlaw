@@ -257,6 +257,34 @@ Pro review's illustrative `Saved: T@r` text as a replacement schema. Put
 operational guidance outside quoted/retrieved memory so historical instructions
 are not mistaken for current tool rules.
 
+### Incomplete semantic recall
+
+A recall with `recall_for` and an actual `semantic_channel_incomplete`
+diagnostic appends the following instruction once to `turn_instruction`,
+including when `restore_context=true`. Preserve existing required-context
+instructions, diagnostics and full recalled data. ID-only recall does not infer
+a semantic warning from worker state. Incomplete retrieval may still return
+vector candidates; it does not by itself establish lexical-only retrieval or
+execution failure. Describe causes only as supported by the diagnostics.
+
+```text
+Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.
+```
+
+Every qualifying response includes this instruction, even for repeated or
+multiple diagnostic causes. The LLM may omit a repeated semantic notice only
+when the prior notice remains visible in its current context and the task,
+recall scope and impact are unchanged. Required missing-context warnings must
+still be disclosed. There is no server-side once-only state or acknowledgement
+protocol; do not automatically retry or repair in response to this notice.
+
+Existing oversized-response envelopes preserve top-level `turn_instruction`,
+the complete artifact and `next_action`; an absent instruction adds no field.
+Healthy responses and fixed tool/bootstrap guidance gain no notice. Existing
+connection/preparation status and guidance remain authoritative. Returning this
+guidance does not prove LLM compliance; that requires scoped observation of
+downstream LLM behavior.
+
 Longer authoring, consolidation and completion examples belong to the built-in
 procedure. Normal saves do not require loading it each time. Hooks may reinforce
 supported boundaries but are not required and do not provide semantic judgment.

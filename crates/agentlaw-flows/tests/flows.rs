@@ -1,8 +1,11 @@
 use agentlaw_flows::*;
 use agentlaw_flows::{context::*, recall::*, write::*};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 const A: &str = "11111111-1111-4111-8111-111111111111";
 const B: &str = "22222222-2222-4222-8222-222222222222";
+const C: &str = "33333333-3333-4333-8333-333333333333";
+const EXPECTED_SEMANTIC_NOTICE: &str = "Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.";
 fn context() -> RequestContext {
     RequestContext {
         store_binding_id: "store".into(),
@@ -79,6 +82,394 @@ impl RecallSearch for EmptySearch {
             diagnostics: vec![],
         })
     }
+}
+
+#[derive(Default)]
+struct ObservedSearch {
+    candidates: Vec<MemoryCandidate>,
+    full_ids: Vec<String>,
+    diagnostics: Vec<DomainError>,
+    queries: RefCell<Vec<String>>,
+}
+impl RecallSearch for ObservedSearch {
+    fn search(&self, _: &RequestContext, query: &str, _: &[String]) -> Result<Discovery> {
+        self.queries.borrow_mut().push(query.into());
+        Ok(Discovery {
+            candidates: self.candidates.clone(),
+            full_ids: self.full_ids.clone(),
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+}
+fn discovery_candidate(id: &str, channels: &[&str]) -> MemoryCandidate {
+    MemoryCandidate {
+        memory_id: id.into(),
+        excerpt: format!("Candidate {id}"),
+        applicability: memory(id).applicability,
+        retrieval_paths: vec![RetrievalPath {
+            via: channels.iter().map(|channel| (*channel).into()).collect(),
+            clue: "Matching saved evidence".into(),
+            source_memory_id: None,
+        }],
+    }
+}
+
+#[test]
+fn contextual_recall_without_semantic_degradation_has_no_turn_instruction() {
+    let request = RecallRequest {
+        recall_for: Some("topic".into()),
+        ..Default::default()
+    };
+    let source = Snapshot::default();
+    let empty = recall(&source, &EmptySearch, &context(), &request, "now".into()).unwrap();
+    assert!(empty.memories.is_empty());
+    assert!(empty.candidates.is_empty());
+    let counts = &empty.candidate_counts.as_ref().unwrap().memories;
+    assert_eq!((counts.matched, counts.shown), (0, 0));
+    assert!(serde_json::to_value(&empty)
+        .unwrap()
+        .get("turn_instruction")
+        .is_none());
+
+    // A similar code must not be mistaken for the exact semantic diagnostic.
+    let unrelated = DomainError::new(
+        "semantic_channel_incomplete_unrelated",
+        "Unrelated provider detail.",
+    );
+    for diagnostics in [vec![], vec![unrelated]] {
+        let search = ObservedSearch {
+            candidates: vec![discovery_candidate(C, &["lexical", "vector"])],
+            diagnostics: diagnostics.clone(),
+            ..Default::default()
+        };
+        let result = recall(&source, &search, &context(), &request, "now".into()).unwrap();
+        assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].memory_id, C);
+        assert_eq!(
+            result.candidates[0].retrieval_paths[0].via,
+            ["lexical", "vector"]
+        );
+        assert_eq!(
+            &result.diagnostics[..diagnostics.len()],
+            diagnostics.as_slice()
+        );
+        let counts = &result.candidate_counts.as_ref().unwrap().memories;
+        assert_eq!((counts.matched, counts.shown), (1, 1));
+        assert!(serde_json::to_value(&result)
+            .unwrap()
+            .get("turn_instruction")
+            .is_none());
+    }
+}
+
+#[test]
+fn semantic_degradation_notice_preserves_each_retrieval_outcome() {
+    let cases = [
+        (
+            "No semantic worker is attached; exact and indexed lexical retrieval remain available.",
+            &["lexical"][..],
+        ),
+        (
+            "The semantic worker is not ready; exact and indexed lexical retrieval remain available.",
+            &["lexical"][..],
+        ),
+        (
+            "The worker did not establish a complete semantic view.",
+            &["lexical", "vector"][..],
+        ),
+        (
+            "Semantic retrieval failed; exact and indexed lexical retrieval remain available.",
+            &["lexical"][..],
+        ),
+    ];
+    let mut source = Snapshot::default();
+    let mut selected = memory(A);
+    selected.what_to_remember = "Full discovered memory.\nPreserve the second paragraph.".into();
+    selected.required_memory_ids.push(B.into());
+    source.insert(selected.clone());
+    source.insert(memory(B));
+    source.insert(memory(C));
+    for (message, channels) in cases {
+        let diagnostic = DomainError::new("semantic_channel_incomplete", message);
+        let candidate = discovery_candidate(C, channels);
+        let search = ObservedSearch {
+            candidates: vec![candidate.clone()],
+            full_ids: vec![A.into()],
+            diagnostics: vec![diagnostic.clone()],
+            ..Default::default()
+        };
+        let result = recall(
+            &source,
+            &search,
+            &context(),
+            &RecallRequest {
+                recall_for: Some("topic".into()),
+                ..Default::default()
+            },
+            "now".into(),
+        )
+        .unwrap();
+        assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
+        assert_eq!(
+            result.turn_instruction.as_deref(),
+            Some(EXPECTED_SEMANTIC_NOTICE)
+        );
+        assert_eq!(result.diagnostics[0], diagnostic);
+        assert!(!result.diagnostics[0].retryable);
+        assert_eq!(result.diagnostics.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&result.candidates).unwrap(),
+            serde_json::to_value([candidate]).unwrap()
+        );
+        let counts = &result.candidate_counts.as_ref().unwrap().memories;
+        assert_eq!((counts.matched, counts.shown), (1, 1));
+        assert_eq!(result.memories.len(), 2);
+        let full = result.memories.iter().find(|m| m.memory_id == A).unwrap();
+        assert_eq!(
+            full.current_heads[0].what_to_remember,
+            selected.what_to_remember
+        );
+        assert_eq!(full.current_heads[0].required_memory_ids, [B]);
+        assert!(result.memories.iter().any(|m| m.memory_id == B));
+        assert!(result.undelivered_required.is_empty());
+        assert!(result.code.is_none());
+    }
+}
+
+#[test]
+fn id_only_recall_does_not_search_or_add_semantic_notice() {
+    let mut source = Snapshot::default();
+    source.insert(memory(A));
+    let search = ObservedSearch {
+        candidates: vec![discovery_candidate(C, &["vector"])],
+        diagnostics: vec![DomainError::new(
+            "semantic_channel_incomplete",
+            "No semantic worker is attached; exact and indexed lexical retrieval remain available.",
+        )],
+        ..Default::default()
+    };
+    let result = recall(
+        &source,
+        &search,
+        &context(),
+        &RecallRequest {
+            memory_ids: Some(vec![A.into()]),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    assert!(search.queries.borrow().is_empty());
+    assert_eq!(result.memories.len(), 1);
+    assert_eq!(result.memories[0].memory_id, A);
+    assert_eq!(
+        result.memories[0].current_heads[0].what_to_remember,
+        "Exact content"
+    );
+    assert!(result.candidates.is_empty());
+    assert!(result.candidate_counts.is_none());
+    assert!(result.diagnostics.is_empty());
+    assert!(serde_json::to_value(result)
+        .unwrap()
+        .get("turn_instruction")
+        .is_none());
+}
+
+#[test]
+fn mixed_exact_and_contextual_recall_retains_notice_and_complete_heads() {
+    let mut source = Snapshot::default();
+    let mut exact = memory(A);
+    exact.what_to_remember = "First exact head".into();
+    exact.required_memory_ids.push(B.into());
+    source.insert(exact.clone());
+    exact.memory_ref.observed_version = "v2".into();
+    exact.what_to_remember = "Second exact head".into();
+    source.0.get_mut(A).unwrap().heads.push(exact);
+    source.insert(memory(B));
+    source.insert(memory(C));
+    let diagnostic = DomainError::new(
+        "semantic_channel_incomplete",
+        "Semantic retrieval failed; exact and indexed lexical retrieval remain available.",
+    );
+    let search = ObservedSearch {
+        candidates: vec![discovery_candidate(C, &["lexical"])],
+        diagnostics: vec![diagnostic.clone()],
+        ..Default::default()
+    };
+    let result = recall(
+        &source,
+        &search,
+        &context(),
+        &RecallRequest {
+            memory_ids: Some(vec![A.into()]),
+            recall_for: Some("topic".into()),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
+    assert_eq!(
+        result.turn_instruction.as_deref(),
+        Some(EXPECTED_SEMANTIC_NOTICE)
+    );
+    assert_eq!(result.diagnostics[0], diagnostic);
+    assert_eq!(result.memories.len(), 2);
+    let full = result.memories.iter().find(|m| m.memory_id == A).unwrap();
+    assert_eq!(full.current_heads.len(), 2);
+    assert_eq!(full.current_heads[0].what_to_remember, "First exact head");
+    assert_eq!(full.current_heads[1].what_to_remember, "Second exact head");
+    assert_eq!(full.head_reconciliation_required, Some(true));
+    assert!(result.memories.iter().any(|m| m.memory_id == B));
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].memory_id, C);
+    let counts = &result.candidate_counts.as_ref().unwrap().memories;
+    assert_eq!((counts.matched, counts.shown), (1, 1));
+}
+
+#[test]
+fn restored_recall_expands_search_and_emits_one_semantic_notice() {
+    let diagnostic = DomainError::new(
+        "semantic_channel_incomplete",
+        "The worker did not establish a complete semantic view.",
+    );
+    let search = ObservedSearch {
+        candidates: vec![discovery_candidate(C, &["lexical", "vector"])],
+        diagnostics: vec![diagnostic.clone()],
+        ..Default::default()
+    };
+    let result = recall(
+        &Snapshot::default(),
+        &search,
+        &context(),
+        &RecallRequest {
+            recall_for: Some("topic".into()),
+            restore_context: Some(true),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    let queries = search.queries.borrow();
+    assert_eq!(
+        queries.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "topic",
+            "topic\nPerspective: intent and goals",
+            "topic\nPerspective: choices and alternatives",
+            "topic\nPerspective: responsibilities and flow",
+            "topic\nPerspective: conditions and exceptions",
+            "topic\nPerspective: failures and verification",
+            "topic\nPerspective: progress and unresolved questions",
+        ]
+    );
+    assert_eq!(
+        result.turn_instruction.as_deref(),
+        Some(EXPECTED_SEMANTIC_NOTICE)
+    );
+    assert_eq!(&result.diagnostics[..7], vec![diagnostic; 7].as_slice());
+    assert_eq!(result.diagnostics.len(), 8);
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].memory_id, C);
+    assert_eq!(result.candidates[0].retrieval_paths.len(), 1);
+    assert_eq!(
+        result.candidates[0].retrieval_paths[0].via,
+        ["lexical", "vector"]
+    );
+    let counts = &result.candidate_counts.as_ref().unwrap().memories;
+    assert_eq!((counts.matched, counts.shown), (1, 1));
+}
+
+#[test]
+fn duplicate_and_distinct_semantic_diagnostics_preserve_one_notice() {
+    let repeated = DomainError::new(
+        "semantic_channel_incomplete",
+        "The semantic worker is not ready; exact and indexed lexical retrieval remain available.",
+    );
+    let mut distinct = DomainError::new(
+        "semantic_channel_incomplete",
+        "The worker did not establish a complete semantic view.",
+    )
+    .with_details(serde_json::json!({"provider_detail": "preserve this detail"}));
+    distinct.retryable = true;
+    let diagnostics = vec![
+        repeated.clone(),
+        DomainError::new("unrelated_diagnostic", "Preserve this diagnostic too."),
+        repeated,
+        distinct,
+    ];
+    let search = ObservedSearch {
+        diagnostics: diagnostics.clone(),
+        ..Default::default()
+    };
+    let result = recall(
+        &Snapshot::default(),
+        &search,
+        &context(),
+        &RecallRequest {
+            recall_for: Some("topic".into()),
+            ..Default::default()
+        },
+        "now".into(),
+    )
+    .unwrap();
+    assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
+    assert_eq!(
+        result.turn_instruction.as_deref(),
+        Some(EXPECTED_SEMANTIC_NOTICE)
+    );
+    assert_eq!(
+        &result.diagnostics[..diagnostics.len()],
+        diagnostics.as_slice()
+    );
+    assert_eq!(result.diagnostics.len(), diagnostics.len() + 1);
+    assert!(result.diagnostics[3].retryable);
+    assert_eq!(
+        result.diagnostics[3].details,
+        Some(serde_json::json!({"provider_detail": "preserve this detail"}))
+    );
+}
+
+#[test]
+fn degraded_recall_appends_notice_to_required_context_warning() {
+    const REQUIRED_WARNING: &str = "Required context is unavailable. Explain this limitation in the user's language; do not treat absent required context as reviewed.";
+    let mut source = Snapshot::default();
+    let mut rule = memory(A);
+    rule.is_rule = true;
+    rule.required_memory_ids.push(B.into());
+    source.insert(rule);
+    let request = RecallRequest {
+        recall_for: Some("topic".into()),
+        ..Default::default()
+    };
+    let baseline = recall(&source, &EmptySearch, &context(), &request, "now".into()).unwrap();
+    assert_eq!(baseline.turn_instruction.as_deref(), Some(REQUIRED_WARNING));
+    assert_eq!(baseline.memories.len(), 1);
+    assert_eq!(baseline.undelivered_required.len(), 1);
+    assert_eq!(baseline.undelivered_required[0].memory_id, B);
+    assert_eq!(
+        baseline.undelivered_required[0].reason,
+        "The referenced current identity is absent; required context was not delivered."
+    );
+    let diagnostic = DomainError::new(
+        "semantic_channel_incomplete",
+        "Semantic retrieval failed; exact and indexed lexical retrieval remain available.",
+    );
+    let search = ObservedSearch {
+        diagnostics: vec![diagnostic.clone()],
+        ..Default::default()
+    };
+    let result = recall(&source, &search, &context(), &request, "now".into()).unwrap();
+    assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
+    let mut expected = serde_json::to_value(baseline).unwrap();
+    expected["turn_instruction"] =
+        serde_json::json!(format!("{REQUIRED_WARNING} {EXPECTED_SEMANTIC_NOTICE}"));
+    expected["diagnostics"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, serde_json::to_value(diagnostic).unwrap());
+    assert_eq!(serde_json::to_value(result).unwrap(), expected);
 }
 
 #[test]

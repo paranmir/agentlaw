@@ -78,6 +78,9 @@ impl StreamedSelection {
         if let Some(status) = value.get("status") {
             envelope["operation_status"] = status.clone();
         }
+        if let Some(instruction) = value.get("turn_instruction") {
+            envelope["turn_instruction"] = instruction.clone();
+        }
         Ok(envelope)
     }
     fn emit(&self, out: &mut impl Write, value: &Value, control: &RequestControl) -> Result<()> {
@@ -619,6 +622,127 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_with_spooled_body(directory: &Path, body: &str) -> (StreamedSelection, String) {
+        let path = directory.join("selected-body.payload");
+        std::fs::write(&path, body).unwrap();
+        let spool = serde_json::from_value::<agentlaw_storage::acquire::SpoolBody>(json!({
+            "path": path,
+            "bytes": body.len(),
+            "sha256": format!("{:x}", Sha256::digest(body.as_bytes())),
+        }))
+        .unwrap();
+        let mut selection = StreamedSelection::default();
+        let token = selection.insert(spool, 0, body.len() as u64);
+        (selection, token)
+    }
+
+    fn read_streamed_artifact(envelope: &Value) -> Value {
+        assert_eq!(envelope["code"], "complete_content_in_file");
+        assert_eq!(envelope["content_read"], false);
+        assert_eq!(envelope["artifact"]["complete"], true);
+        assert_eq!(envelope["artifact"]["format"], "json");
+        assert_eq!(envelope["artifact"]["access"], "runtime_host_filesystem");
+        let next_action = envelope["next_action"].as_str().unwrap();
+        for guidance in [
+            "has NOT been read",
+            "Read the complete file with your harness file tool before relying on it.",
+            "If that filesystem is inaccessible, explain the limitation and request file transfer.",
+            "Do not infer an empty result or summarize unread content.",
+            "After the indicated expiry, repeat the request",
+        ] {
+            assert!(next_action.contains(guidance), "{next_action}");
+        }
+        let bytes = std::fs::read(envelope["artifact"]["path"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["artifact"]["bytes"], bytes.len());
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn streamed_selection_preserves_composed_turn_instruction_and_full_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "한글\r\n\"quote\"\\backslash\tfull body without a final newline";
+        let (selection, token) = selection_with_spooled_body(tmp.path(), body);
+        let instruction = concat!(
+            "Required context is unavailable. Explain this limitation in the user's language; ",
+            "do not treat absent required context as reviewed. ",
+            "Briefly disclose this recall's incomplete semantic search in the user's language; ",
+            "combine any required-context warning into the same sentence. ",
+            "Omit only an unchanged semantic notice already visible for this task. ",
+            "Do not auto-retry or repair."
+        );
+        let original = json!({
+            "status": "needs_user_input",
+            "turn_instruction": instruction,
+            "memories": [{
+                "memory_id": "selected-memory",
+                "current_heads": [{"what_to_remember": token}],
+            }],
+            "undelivered_required": [{"memory_id": "missing-required-memory"}],
+            "diagnostics": [{
+                "code": "semantic_channel_incomplete",
+                "message": "Semantic retrieval failed; exact and indexed lexical retrieval remain available.",
+                "retryable": false,
+            }],
+        });
+        let envelope = selection
+            .finish(original.clone(), tmp.path(), &RequestControl::default())
+            .unwrap();
+        assert_eq!(envelope["turn_instruction"], instruction);
+        assert_eq!(envelope["operation_status"], original["status"]);
+        let complete = read_streamed_artifact(&envelope);
+        let mut expected = original;
+        expected["memories"][0]["current_heads"][0]["what_to_remember"] = json!(body);
+        assert_eq!(complete, expected);
+    }
+
+    #[test]
+    fn streamed_selection_without_turn_instruction_keeps_field_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "Complete selected body with no turn instruction.";
+        let (selection, token) = selection_with_spooled_body(tmp.path(), body);
+        let original = json!({
+            "memories": [{
+                "memory_id": "selected-memory",
+                "current_heads": [{"what_to_remember": token}],
+            }],
+            "candidates": [],
+        });
+        let envelope = selection
+            .finish(original.clone(), tmp.path(), &RequestControl::default())
+            .unwrap();
+        assert!(envelope.get("turn_instruction").is_none());
+        assert!(envelope.get("operation_status").is_none());
+        let complete = read_streamed_artifact(&envelope);
+        assert!(complete.get("turn_instruction").is_none());
+        let mut expected = original;
+        expected["memories"][0]["current_heads"][0]["what_to_remember"] = json!(body);
+        assert_eq!(complete, expected);
+    }
+
+    #[test]
+    fn empty_streamed_selection_preserves_empty_and_inline_responses_without_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        let selection = StreamedSelection::default();
+        for original in [
+            json!({}),
+            json!({
+                "status": "ready",
+                "turn_instruction": "Continue using this complete inline response.",
+                "memories": [{"what_to_remember": "Complete inline body."}],
+                "next_action": "Use the complete inline result.",
+            }),
+        ] {
+            let result = selection
+                .finish(original.clone(), &local, &RequestControl::default())
+                .unwrap();
+            assert_eq!(result, original);
+            assert!(result.get("artifact").is_none());
+            assert!(!local.exists());
+        }
+    }
+
     #[test]
     fn streamed_task_sections_preserve_complete_text_and_ignore_fenced_headings() {
         let tmp = tempfile::tempdir().unwrap();
