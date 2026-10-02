@@ -117,6 +117,25 @@ impl Backend for InstalledBackend {
             ))?,
         };
         config::require_existing_binding(&self.state, &selected)?;
+        if let Request::Sync(input) = request {
+            let identity = crate::machine::load_or_create(&self.state)?;
+            let local = selected.runtime_root(&self.state);
+            let store = agentlaw_storage::Store::open_with_coordination(
+                &selected.memory_store_path,
+                local.join("canonical"),
+                config::coordination_root(&self.state),
+            )
+            .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?;
+            return crate::sync::call(
+                &store,
+                &local,
+                &self.state,
+                &selected.user_id,
+                &identity.machine_id,
+                input,
+                control,
+            );
+        }
         if self.selected.as_ref() != Some(&selected) || self.runtime.is_none() {
             let machine = crate::machine::load_or_create(&self.state)?;
             control.phase("opening_memory_store");

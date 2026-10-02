@@ -20,6 +20,7 @@ pub use read_set::ReadSet;
 pub mod published;
 mod recovery;
 pub mod resource;
+pub mod sync;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[error("external operation: {0}")]
+    ExternalOperation(String),
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("journal: {0}")]

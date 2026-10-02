@@ -143,6 +143,7 @@ impl Store {
                 [id],
             )?;
         }
+        sync::update_registry(self, &conn, m)?;
         hit(fault, FaultPoint::Journal)?;
         if m.imported {
             conn.execute("UPDATE registry_state SET complete=0 WHERE singleton=1", [])?;

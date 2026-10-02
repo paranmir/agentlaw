@@ -328,6 +328,11 @@ impl HistorySpool {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    /// An exact retained historical input for the import-only resolution writer.
+    pub fn exact_change(&self, change_id: &str) -> Result<SpoolChange> {
+        validate_id(change_id)?;
+        self.change(change_id)
+    }
     fn component(&self, id: &str, kind: &str, desc: &Value) -> Result<Component> {
         self.component_mode(id, kind, desc, true)
     }

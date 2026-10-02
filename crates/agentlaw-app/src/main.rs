@@ -155,6 +155,7 @@ fn run(args: &[String]) -> Result<Value> {
             "learned-procedure list [--scope <kind>] [--project <id-or-hint>] [--machine <id>] [--output <path>] [--format jsonl|table]",
             "learned-procedure search --query <text> [--limit <positive-integer>] [--scope <kind>] [--project <id-or-hint>] [--machine <id>] [--output <path>] [--format jsonl|table]",
             "continuity save", "share inspect --remote <name> --target-ref <refs/heads/name>",
+            "sync start --policy <id> --request-id <unique-id>","sync status --operation <id>","sync resolve --operation <id> --revision <n> --request-id <unique-id> --solution <JSON-file-or->","sync resume|hold|cancel --operation <id> --revision <n> --request-id <unique-id>","sync policy propose --remote <name> --target-ref <ref>","sync policy configure --file <user-reviewed-local-policy.json> --confirm-delegation","sync accept-findings --operation <id> --candidate <OID> --findings-digest <digest> --confirm-sharing",
             "share push --review <returned-ref> [--allow-sensitive --user-confirmed]"
             ,"share fetch --remote <name>","share import prepare --commit <oid>","share import inspect --ref <returned-ref>","share import call --ref <returned-ref> --json -", "share import resolve --ref <returned-ref> [--choices <JSON-file-or-> --user-confirmed]", "share import publish --ref <returned-ref> --resolution <returned-token> --user-confirmed"
         ],"note":"Search defaults to all management scopes and five procedure IDs; list is complete inventory. Import call edits the isolated review workspace, resolve freezes the reviewed state, and publish requires explicit user confirmation. Model availability, harness verification and power-loss guarantees must be checked through diagnostics and test evidence."}),
@@ -308,6 +309,16 @@ fn run(args: &[String]) -> Result<Value> {
             &state.join("git"),
             "Agentlaw continuity snapshot\n",
         )?);
+    }
+    if args.first().map(String::as_str) == Some("sync") {
+        let (store, local) = selected_store()?;
+        return agentlaw_app::sync::cli(
+            &store,
+            &local,
+            &config::state_root()?,
+            &args[1..],
+            &cli_control(),
+        );
     }
     if args.len() == 6
         && args[0..2] == ["share", "inspect"]

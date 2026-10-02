@@ -494,6 +494,7 @@ impl Runtime {
         self.request_control.phase("resolving");
         let mut result = match request {
             Request::ConnectProjectMemory(r) => self.connect_request(r),
+            Request::Sync(_) => Err(DomainError::new("sync_requires_app_adapter", "Use the installed Agentlaw MCP/CLI sync adapter; isolated ordinary-memory runtimes cannot transport Git or activate delegation.")),
             Request::Recall(r) => self.recall_request(r),
             Request::RememberThis(r) => self.remember(r),
             Request::History(r) => {

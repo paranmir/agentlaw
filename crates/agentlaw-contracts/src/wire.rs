@@ -17,7 +17,9 @@ pub(crate) fn normalize(value: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .filter(|a| actions.iter().any(|known| known.as_str() == Some(a)))
         .ok_or_else(|| {
-            invalid("action must be recall, remember_this, history or connect_project_memory.")
+            invalid(
+                "action must be recall, remember_this, history, connect_project_memory or sync.",
+            )
         })?;
     if root.len() != 2 || !root.contains_key(action) {
         return Err(invalid(format!("For action={action}, supply only action and the {action} object. Do not mix action objects or top-level input fields.")));

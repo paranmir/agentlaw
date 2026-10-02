@@ -19,7 +19,7 @@ impl Store {
         }
         self.validate_import_lineage_locked(staged, expected_generation, &old_history, &incoming)
     }
-    fn validate_import_lineage_locked(
+    pub(super) fn validate_import_lineage_locked(
         &self,
         staged: &Store,
         expected_generation: u64,
@@ -104,22 +104,36 @@ impl Store {
         root: impl AsRef<Path>,
         local: impl AsRef<Path>,
     ) -> Result<Store> {
+        self.prepare_union(incoming, root.as_ref(), local.as_ref(), false)
+    }
+    /// A semantic/structural review may temporarily have an unresolved redirect
+    /// graph. Only isolated sync workspaces use this; publication still audits it.
+    pub fn prepare_sync_union(&self, incoming: &Store, root: &Path, local: &Path) -> Result<Store> {
+        self.prepare_union(incoming, root, local, true)
+    }
+    fn prepare_union(
+        &self,
+        incoming: &Store,
+        root: &Path,
+        local: &Path,
+        unresolved: bool,
+    ) -> Result<Store> {
         let active_generation = self.generation()?;
         let incoming_generation = incoming.generation()?;
-        if root.as_ref().exists() {
+        if root.exists() {
             return Err(Error::Corrupt("review workspace must be new".into()));
         }
-        fs::create_dir_all(root.as_ref())?;
-        fs::create_dir_all(local.as_ref())?;
-        let conflict_dir = local.as_ref().join("import-conflicts");
+        fs::create_dir_all(root)?;
+        fs::create_dir_all(local)?;
+        let conflict_dir = local.join("import-conflicts");
         let mut conflicts = Vec::new();
         self.with_source_read(|source, _| {
-            copy_canonical(source, root.as_ref(), false, &conflict_dir, &mut conflicts)
+            copy_canonical(source, root, false, &conflict_dir, &mut conflicts)
         })?;
         incoming.with_source_read(|source, _| {
-            copy_canonical(source, root.as_ref(), true, &conflict_dir, &mut conflicts)
+            copy_canonical(source, root, true, &conflict_dir, &mut conflicts)
         })?;
-        fs::create_dir_all(local.as_ref())?;
+        fs::create_dir_all(local)?;
         let staged = Store {
             root: fs::canonicalize(root)?,
             local: fs::canonicalize(local)?,
@@ -240,7 +254,9 @@ impl Store {
                 "source changed during import preparation".into(),
             ));
         }
-        staged.audit_source()?;
+        if !unresolved {
+            staged.audit_source()?;
+        }
         staged.record(&staged.local.join("import-conflicts.json"), &conflicts)?;
         staged.record(&staged.local.join("import-review"),&json!({"active_root":self.root,"active_generation":active_generation,"incoming_root":incoming.root,"incoming_generation":incoming_generation}))?;
         fs::remove_file(staged.local.join("validation-required"))?;

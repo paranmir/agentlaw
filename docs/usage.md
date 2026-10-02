@@ -220,6 +220,80 @@ reading that response field must account for the new shape.
 
 ## Git and management
 
+### Fixed-cutoff sync (0.4.0)
+
+This operation is introduced in 0.4.0. An older installed runtime does not gain
+the new tool action until a separately authorized update and harness restart.
+
+The agent starts one operation, submits a whole solution only if conflicts require
+judgment, then reports completion. Agentlaw owns mechanical Git operations and
+recovery. Ordinary `remember_this` still creates no Git commit or push.
+
+Activate a continuing local delegation separately and only at the user's request:
+
+```text
+agentlaw sync policy propose --remote <name> --target-ref <refs/heads/name>
+agentlaw sync policy configure --file <reviewed-policy.json> --confirm-delegation
+```
+
+`propose` returns an `enabled:false` JSON policy, without registering it. Save a
+reviewed copy, explicitly set `enabled:true`, then configure it. Review its actual
+source/control paths, fetch/push endpoints, target ref, allowed operations/scopes
+and push permission. Updating/revoking the same policy changes its version/digest;
+unstarted effects stop, while decided canonical recovery and mandatory Git handoff
+still finish. This OS-local policy is not a signed per-call approval or a security
+boundary against malicious tools executing as the same user. LLM calls cannot
+create, edit, enable or broaden policies.
+
+```text
+agentlaw sync start --policy <registered-id> --request-id <unique-id>
+agentlaw sync status --operation <returned-id>
+agentlaw sync resolve --operation <id> --revision <returned> --request-id <unique-id> --solution <whole-solution.json-or->
+agentlaw sync resume --operation <id> --revision <returned> --request-id <unique-id>
+agentlaw sync hold --operation <id> --revision <returned> --request-id <unique-id>
+agentlaw sync cancel --operation <id> --revision <returned> --request-id <unique-id>
+```
+
+The MCP/CLI `call` shape is `{"action":"sync","sync":{...}}`. Use the current
+schema for typed solution fields. Read the complete frozen packet, including
+base/local/incoming bodies, metadata, evidence and dependent dispositions.
+Large packets are complete immutable JSON files with path/digest/bytes and an
+explicit unread marker, not truncations. Copy returned handles and revisions;
+Runtime allocates change/version identities and checks both branches' lineage,
+required references and the final graph. Rejected replacements close the gate.
+For response loss, replay the same request ID and payload before introducing
+a new request. Status/recovery checks completed effects before obsolete inputs.
+
+`completed_for_cutoff` means the fixed candidate was locally applied, handed off
+to Git and confirmed at the target. Later local saves remain available, unstaged
+relative to that commit, for a future explicit sync. It does not mean a clean or
+globally latest working tree. Local-only overlay conflicts keep the candidate and
+scan receipt. Remote advancement permits one new candidate from the old candidate,
+not the latest local tail; a second advancement pauses rather than rewriting history.
+Exact existing tree/parent coverage reuses the commit instead of adding empty Git
+history. A missing required predecision view fails closed without creating empty
+memory; a completed status remains independent of old stage files. With push
+permission disabled, `local_completed_push_not_delegated` is partial local success,
+not remote completion; it does not implicitly broaden the policy.
+
+Sensitive findings still require a separate exact-candidate user decision:
+
+```text
+agentlaw sync accept-findings --operation <id> --candidate <OID> --findings-digest <returned> --confirm-sharing
+```
+
+`--confirm-sharing` never activates delegation, and `--confirm-delegation` never
+approves sensitive findings. Acceptance binds candidate, findings, scanner,
+policy and destination. Sharing unchanged or cancelling is supported; redaction,
+exclusion or history rewrite needs a separate scoped decision, not a bypass.
+Scanning materializes a self-contained raw Git transfer store. Retries validate
+its integrity and reuse pattern findings; new candidates are scanned again.
+Replace refs, grafts, shallow/partial/promisor stores, alternates and gitlinks are
+unsupported, without silently reconfiguring Git. Default capture/read-set bounds
+and unmeasured performance are documented in [verification](verification.md).
+
+### Existing separate continuity/import/share commands
+
 ```text
 agentlaw continuity save
 agentlaw share inspect --remote <name> --target-ref <refs/heads/name>

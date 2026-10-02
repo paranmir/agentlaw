@@ -8,12 +8,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
-const POLICY: &str = "agentlaw-pattern-scan-v1";
+pub(crate) const POLICY: &str = "agentlaw-pattern-scan-v1";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveReceipt {
     pub status: String,
@@ -44,6 +44,8 @@ struct StoredReview {
     repo: String,
     endpoint_digest: String,
     closure_digest: String,
+    #[serde(default)]
+    scan: Option<crate::git_scan::ScanReceipt>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushReceipt {
@@ -61,6 +63,8 @@ pub struct FetchReceipt {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportReview {
+    #[serde(default)]
+    pub completion: Option<ImportPublishReceipt>,
     #[serde(default)]
     pub conflicting_memory_ids: Vec<String>,
     #[serde(default)]
@@ -147,11 +151,13 @@ struct ImportHandoff {
     index_plan: IndexPlan,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct IndexPlan {
+pub(crate) struct IndexPlan {
     index: PathBuf,
     candidate: PathBuf,
     expected: Option<String>,
     desired: String,
+    #[serde(default)]
+    owner_token: String,
 }
 #[derive(Serialize, Deserialize)]
 struct SaveHandoff {
@@ -161,7 +167,7 @@ struct SaveHandoff {
     receipt: SaveReceipt,
     index_plan: IndexPlan,
 }
-fn file_digest(path: &Path) -> Result<Option<String>> {
+pub(crate) fn file_digest(path: &Path) -> Result<Option<String>> {
     match File::open(path) {
         Ok(mut file) => {
             let mut hash = Sha256::new();
@@ -172,9 +178,9 @@ fn file_digest(path: &Path) -> Result<Option<String>> {
         Err(_) => Err(io_error("index read")),
     }
 }
-fn pipe_git_index(repo: &Path, index: &Path, args: &[&str], input: &[u8]) -> Result<()> {
+pub(crate) fn pipe_git_index(repo: &Path, index: &Path, args: &[&str], input: &[u8]) -> Result<()> {
     let mut child = command(repo)
-        .env("GIT_INDEX_FILE", index)
+        .env("GIT_INDEX_FILE", git_path(index))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -196,7 +202,7 @@ fn pipe_git_index(repo: &Path, index: &Path, args: &[&str], input: &[u8]) -> Res
     }
     Ok(())
 }
-fn prepare_index_plan(repo: &Path, local: &Path, tree: &str) -> Result<IndexPlan> {
+pub(crate) fn prepare_index_plan(repo: &Path, local: &Path, tree: &str) -> Result<IndexPlan> {
     let canonical = [
         "current",
         "history",
@@ -269,9 +275,10 @@ fn prepare_index_plan(repo: &Path, local: &Path, tree: &str) -> Result<IndexPlan
         candidate,
         expected,
         desired,
+        owner_token: uuid::Uuid::new_v4().to_string(),
     })
 }
-fn apply_ref_index(
+pub(crate) fn apply_ref_index(
     repo: &Path,
     reference: &str,
     expected_head: Option<&str>,
@@ -279,8 +286,20 @@ fn apply_ref_index(
     plan: &IndexPlan,
 ) -> Result<()> {
     let lock_path = plan.index.with_extension("lock");
-    let marker = format!("agentlaw-index-handoff-v1\n{commit}\n{}\n", plan.desired);
-    let lock = match OpenOptions::new()
+    let owner_path = plan.index.with_extension("lock.agentlaw-owner");
+    let marker = format!(
+        "agentlaw-index-handoff-v2\n{}\n{commit}\n{}\n",
+        plan.owner_token, plan.desired
+    );
+    // A completed handoff must never claim/remove a subsequently-created foreign lock.
+    if file_digest(&plan.index)?.as_deref() == Some(&plan.desired)
+        && optional_head(repo)?.as_deref() == Some(commit)
+        && head_reference_matches(repo, reference)?
+    {
+        clear_index_owner(&owner_path, &marker)?;
+        return Ok(());
+    }
+    let (lock, marker_owned) = match OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
@@ -290,30 +309,42 @@ fn apply_ref_index(
             f.write_all(marker.as_bytes())
                 .map_err(|_| io_error("index lock marker"))?;
             f.sync_all().map_err(|_| io_error("index lock sync"))?;
-            f
+            save_local_json(&owner_path, &marker)?;
+            (f, true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let bytes = fs::read(&lock_path).map_err(|_| io_error("index lock read"))?;
-            if bytes != marker.as_bytes()
-                && file_digest(&lock_path)?.as_deref() != Some(&plan.desired)
+            let owned: Option<String> = File::open(&owner_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader(f).ok());
+            if plan.owner_token.is_empty()
+                || (bytes != marker.as_bytes()
+                    && !(owned.as_deref() == Some(&marker)
+                        && file_digest(&lock_path)?.as_deref() == Some(&plan.desired)))
             {
                 return Err(DomainError::new(
                     "git_index_locked",
                     "Git index is locked by another operation; handoff remains pending.",
                 ));
             }
-            OpenOptions::new()
+            let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&lock_path)
-                .map_err(|_| io_error("index lock resume"))?
+                .map_err(|_| io_error("index lock resume"))?;
+            (lock, bytes == marker.as_bytes())
         }
         Err(_) => return Err(io_error("index lock")),
     };
     let actual = file_digest(&plan.index)?;
     if actual != plan.expected && actual.as_deref() != Some(&plan.desired) {
         drop(lock);
-        let _ = fs::remove_file(&lock_path);
+        // A stale sidecar alone cannot authorize deletion of a full index lock.
+        // It may belong to a later Git operation after our prior handoff.
+        if marker_owned {
+            fs::remove_file(&lock_path).map_err(|_| io_error("stale index marker"))?;
+            clear_index_owner(&owner_path, &marker)?;
+        }
         return Err(DomainError::new(
             "index_handoff_pending",
             "User index changed since preparation; no staged entries or Git ref were overwritten.",
@@ -330,7 +361,10 @@ fn apply_ref_index(
     };
     if current_reference != reference {
         drop(lock);
-        let _ = fs::remove_file(&lock_path);
+        if marker_owned {
+            fs::remove_file(&lock_path).map_err(|_| io_error("stale branch marker"))?;
+            clear_index_owner(&owner_path, &marker)?;
+        }
         return Err(DomainError::new(
             "ref_handoff_pending",
             "Checked-out branch changed; no ref or staged entries were overwritten.",
@@ -342,7 +376,10 @@ fn apply_ref_index(
     }
     if current.as_deref() != Some(commit) && current.as_deref() != expected_head {
         drop(lock);
-        let _ = fs::remove_file(&lock_path);
+        if marker_owned {
+            fs::remove_file(&lock_path).map_err(|_| io_error("stale ref marker"))?;
+            clear_index_owner(&owner_path, &marker)?;
+        }
         return Err(DomainError::new(
             "ref_handoff_pending",
             "Git HEAD changed; ref/index handoff remains pending.",
@@ -387,13 +424,45 @@ fn apply_ref_index(
     }
     if actual.as_deref() == Some(&plan.desired) {
         fs::remove_file(lock_path).map_err(|_| io_error("completed index lock"))?;
+        clear_index_owner(&owner_path, &marker)?;
         return Ok(());
     }
     fs::rename(&lock_path, &plan.index).map_err(|_| io_error("index installation replace"))?;
+    clear_index_owner(&owner_path, &marker)?;
     Ok(())
 }
+fn clear_index_owner(path: &Path, marker: &str) -> Result<()> {
+    let owned: Option<String> = File::open(path)
+        .ok()
+        .and_then(|f| serde_json::from_reader(f).ok());
+    if owned.as_deref() == Some(marker) {
+        fs::remove_file(path).map_err(|_| io_error("index owner cleanup"))?;
+    }
+    Ok(())
+}
+pub(crate) fn ref_index_matches(
+    repo: &Path,
+    reference: &str,
+    commit: &str,
+    plan: &IndexPlan,
+) -> Result<bool> {
+    Ok(file_digest(&plan.index)?.as_deref() == Some(&plan.desired)
+        && optional_head(repo)?.as_deref() == Some(commit)
+        && head_reference_matches(repo, reference)?)
+}
+fn head_reference_matches(repo: &Path, reference: &str) -> Result<bool> {
+    let symbolic = command(repo)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|_| io_error("HEAD branch binding"))?;
+    Ok(if symbolic.status.success() {
+        String::from_utf8_lossy(&symbolic.stdout).trim() == reference
+    } else {
+        reference == "HEAD"
+    })
+}
 
-fn save_local_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn save_local_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut f = File::create(&tmp).map_err(|_| io_error("local handoff create"))?;
     serde_json::to_writer(&mut f, value).map_err(|_| io_error("handoff encode"))?;
@@ -416,12 +485,12 @@ fn import_record(local: &Path, id: &str) -> Result<(PathBuf, StoredImport)> {
     .map_err(|_| io_error("import record decode"))?;
     Ok((dir, stored))
 }
-fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<String> {
+pub(crate) fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<String> {
     let index = local.join(format!("resolution-{}.index", uuid::Uuid::new_v4()));
     let result = (|| {
         let parent = optional_head(repo)?;
         let out = command(repo)
-            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_INDEX_FILE", git_path(&index))
             .args(["read-tree", parent.as_deref().unwrap_or("--empty")])
             .output()
             .map_err(|_| io_error("resolution index"))?;
@@ -437,8 +506,8 @@ fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<String> {
         ] {
             if staged.join(path).exists() {
                 let out = command(repo)
-                    .env("GIT_INDEX_FILE", &index)
-                    .env("GIT_WORK_TREE", staged)
+                    .env("GIT_INDEX_FILE", git_path(&index))
+                    .env("GIT_WORK_TREE", git_path(staged))
                     .args(["add", "-A", "-f", "--", path])
                     .output()
                     .map_err(|_| io_error("resolution capture"))?;
@@ -448,7 +517,7 @@ fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<String> {
             }
         }
         let out = command(repo)
-            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_INDEX_FILE", git_path(&index))
             .args(["write-tree"])
             .output()
             .map_err(|_| io_error("resolution tree"))?;
@@ -615,7 +684,7 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
                 ));
             }
             staged_tree(&root, path, local)
-                .map_err(|e| agentlaw_storage::Error::Corrupt(e.to_string()))
+                .map_err(|e| agentlaw_storage::Error::ExternalOperation(e.to_string()))
         })
         .map_err(|e| DomainError::new("staged_capture", e.to_string()))?;
     let token = format!(
@@ -667,6 +736,7 @@ pub fn publish_import(
         ));
     }
     let _lane = lane(local)?;
+    crate::sync::require_git_slot_clear(local)?;
     let (dir, stored) = import_record(local, import_ref)?;
     let root = store
         .with_source_read(|r, _| Ok(r.to_path_buf()))
@@ -693,17 +763,17 @@ pub fn publish_import(
         )
         .map_err(|_| io_error("import receipt decode"));
     }
-    let staged = Store::open_read_only_with_coordination(
-        &stored.review.staged_path,
-        dir.join("runtime/canonical"),
-        store.coordination_root(),
-    )
-    .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
     let plan_path = dir.join("handoff.json");
     let plan: ImportHandoff = if plan_path.exists() {
         serde_json::from_reader(File::open(&plan_path).map_err(|_| io_error("handoff read"))?)
             .map_err(|_| io_error("handoff decode"))?
     } else {
+        let staged = Store::open_read_only_with_coordination(
+            &stored.review.staged_path,
+            dir.join("runtime/canonical"),
+            store.coordination_root(),
+        )
+        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
         if optional_head(&root)? != stored.review.active_head
             || store
                 .generation()
@@ -723,7 +793,7 @@ pub fn publish_import(
                     ));
                 }
                 staged_tree(&root, path, local)
-                    .map_err(|e| agentlaw_storage::Error::Corrupt(e.to_string()))
+                    .map_err(|e| agentlaw_storage::Error::ExternalOperation(e.to_string()))
             })
             .map_err(|e| DomainError::new("stale_import_resolution", e.to_string()))?;
         if tree != resolution.reviewed_tree {
@@ -740,10 +810,7 @@ pub fn publish_import(
                 "--no-tags",
                 "--no-write-fetch-head",
                 "--",
-                &incoming
-                    .to_string_lossy()
-                    .trim_start_matches(r"\\?\")
-                    .replace('\\', "/"),
+                &git_path(&incoming).to_string_lossy(),
                 &stored.review.incoming_commit,
             ],
         )?;
@@ -789,14 +856,27 @@ pub fn publish_import(
             "A different approved import is already decided.",
         ));
     }
-    let publication = store
-        .publish_imported_source_at(
-            &plan.operation_id,
-            &staged,
-            stored.review.source_generation,
-            resolution.staged_generation,
+    let publication = if let Some(receipt) = store
+        .sync_receipt(&plan.operation_id)
+        .map_err(|e| DomainError::new("import_recovery", e.to_string()))?
+    {
+        receipt
+    } else {
+        let staged = Store::open_read_only_with_coordination(
+            &stored.review.staged_path,
+            dir.join("runtime/canonical"),
+            store.coordination_root(),
         )
-        .map_err(|e| DomainError::new("import_publication", e.to_string()))?;
+        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
+        store
+            .publish_imported_source_at(
+                &plan.operation_id,
+                &staged,
+                stored.review.source_generation,
+                resolution.staged_generation,
+            )
+            .map_err(|e| DomainError::new("import_publication", e.to_string()))?
+    };
     apply_ref_index(
         &root,
         &plan.reference,
@@ -817,18 +897,38 @@ pub fn publish_import(
     Ok(result)
 }
 
-fn io_error(stage: &str) -> DomainError {
+pub(crate) fn io_error(stage: &str) -> DomainError {
     DomainError::new(
         "git_io",
         format!("Git {stage} failed; local memory was preserved."),
     )
 }
-fn command(repo: &Path) -> Command {
+pub(crate) fn command(repo: &Path) -> Command {
     let mut c = Command::new("git");
-    c.arg("-C").arg(repo).env("GIT_TERMINAL_PROMPT", "0");
+    c.arg("--no-replace-objects")
+        .arg("-c")
+        .arg("core.longpaths=true")
+        .arg("-C")
+        .arg(git_path(repo))
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x08000000);
+    }
     c
 }
-fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(normal) = value.strip_prefix(r"\\?\") {
+        PathBuf::from(normal)
+    } else {
+        path.to_path_buf()
+    }
+}
+pub(crate) fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = command(repo)
         .args(args)
         .output()
@@ -845,12 +945,12 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     }
     Ok(out.stdout)
 }
-fn text(repo: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn text(repo: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(run(repo, args)?)
         .map(|s| s.trim().to_string())
         .map_err(|_| io_error("non-UTF8 metadata"))
 }
-fn optional_head(repo: &Path) -> Result<Option<String>> {
+pub(crate) fn optional_head(repo: &Path) -> Result<Option<String>> {
     let out = command(repo)
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
@@ -861,7 +961,7 @@ fn optional_head(repo: &Path) -> Result<Option<String>> {
         Ok(None)
     }
 }
-fn git_root(repo: &Path) -> Result<PathBuf> {
+pub(crate) fn git_root(repo: &Path) -> Result<PathBuf> {
     let root = text(repo, &["rev-parse", "--show-toplevel"])?;
     let actual = fs::canonicalize(root).map_err(|_| io_error("repository root"))?;
     let expected = fs::canonicalize(repo).map_err(|_| io_error("source root"))?;
@@ -873,7 +973,7 @@ fn git_root(repo: &Path) -> Result<PathBuf> {
     }
     Ok(actual)
 }
-fn lane(local: &Path) -> Result<File> {
+pub(crate) fn lane(local: &Path) -> Result<File> {
     fs::create_dir_all(local).map_err(|_| io_error("control directory"))?;
     let f = OpenOptions::new()
         .read(true)
@@ -885,10 +985,10 @@ fn lane(local: &Path) -> Result<File> {
     f.lock_exclusive().map_err(|_| io_error("lane lock"))?;
     Ok(f)
 }
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn valid_oid(s: &str) -> bool {
+pub(crate) fn valid_oid(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -896,6 +996,7 @@ fn valid_oid(s: &str) -> bool {
 /// No fetch, merge, push, user-index write, author invention or force-update occurs.
 pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<SaveReceipt> {
     let _lane = lane(local)?;
+    crate::sync::require_git_slot_clear(local)?;
     let handoff_path = local.join("save-handoff.json");
     if handoff_path.exists() {
         let pending: SaveHandoff = serde_json::from_reader(
@@ -933,7 +1034,8 @@ pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<Sav
                     "HEAD".to_string()
                 };
                 let mut read = command(root);
-                read.env("GIT_INDEX_FILE", &index).arg("read-tree");
+                read.env("GIT_INDEX_FILE", git_path(&index))
+                    .arg("read-tree");
                 if let Some(p) = &parent {
                     read.arg(p);
                 } else {
@@ -1012,7 +1114,7 @@ pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<Sav
                 let paths: Vec<_> = paths.into_iter().collect();
                 for group in paths.chunks(128) {
                     let out = command(root)
-                        .env("GIT_INDEX_FILE", &index)
+                        .env("GIT_INDEX_FILE", git_path(&index))
                         .args(["add", "-A", "-f", "--"])
                         .args(group)
                         .output()
@@ -1022,7 +1124,7 @@ pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<Sav
                     }
                 }
                 let out = command(root)
-                    .env("GIT_INDEX_FILE", &index)
+                    .env("GIT_INDEX_FILE", git_path(&index))
                     .arg("write-tree")
                     .output()
                     .map_err(|_| io_error("write-tree"))?;
@@ -1032,8 +1134,9 @@ pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<Sav
                 let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 Ok((root.to_path_buf(), generation, parent, reference, tree))
             })();
-            result
-                .map_err(|e| agentlaw_storage::Error::Corrupt(format!("{}: {}", e.code, e.message)))
+            result.map_err(|e| {
+                agentlaw_storage::Error::ExternalOperation(format!("{}: {}", e.code, e.message))
+            })
         })
         .map_err(|e| DomainError::new("git_capture_failed", e.to_string()));
     let _ = fs::remove_file(&index);
@@ -1105,7 +1208,7 @@ pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<Sav
     Ok(receipt)
 }
 
-fn endpoint(repo: &Path, remote: &str) -> Result<String> {
+pub(crate) fn endpoint(repo: &Path, remote: &str) -> Result<String> {
     if remote.is_empty() || remote.starts_with('-') {
         return Err(DomainError::new(
             "invalid_remote",
@@ -1120,88 +1223,6 @@ fn endpoint(repo: &Path, remote: &str) -> Result<String> {
         ));
     }
     Ok(values)
-}
-fn scan_blob(repo: &Path, oid: &str) -> Result<Vec<Finding>> {
-    let mut child = command(repo)
-        .args(["cat-file", "blob", oid])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| io_error("blob scan"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| io_error("blob stream"))?;
-    let patterns: [(&[u8], &str); 6] = [
-        (b"-----BEGIN PRIVATE KEY-----", "private_key"),
-        (b"-----BEGIN RSA PRIVATE KEY-----", "private_key"),
-        (b"-----BEGIN OPENSSH PRIVATE KEY-----", "private_key"),
-        (b"ghp_", "github_token_prefix"),
-        (b"github_pat_", "github_token_prefix"),
-        (b"sk-proj-", "openai_project_token_prefix"),
-    ];
-    let mut found = BTreeSet::new();
-    let mut carry = Vec::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = stdout
-            .read(&mut buffer)
-            .map_err(|_| io_error("blob read"))?;
-        if n == 0 {
-            break;
-        }
-        carry.extend_from_slice(&buffer[..n]);
-        for (pattern, category) in patterns {
-            if carry.windows(pattern.len()).any(|w| w == pattern) {
-                found.insert(category.to_string());
-            }
-        }
-        let keep = carry.len().saturating_sub(64);
-        carry.drain(..keep);
-    }
-    if !child.wait().map_err(|_| io_error("blob wait"))?.success() {
-        return Err(io_error("blob scan status"));
-    }
-    Ok(found
-        .into_iter()
-        .map(|category| Finding {
-            category,
-            blob_oid: oid.into(),
-        })
-        .collect())
-}
-fn closure_scan(repo: &Path, commit: &str) -> Result<(String, Vec<Finding>)> {
-    let mut child = command(repo)
-        .args(["rev-list", "--objects", "--no-object-names", commit])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| io_error("closure enumeration"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io_error("closure stream"))?;
-    let mut digest = Sha256::new();
-    let mut findings = BTreeSet::new();
-    for line in BufReader::new(stdout).lines() {
-        let oid = line.map_err(|_| io_error("closure read"))?;
-        if !valid_oid(&oid) {
-            return Err(io_error("closure OID"));
-        }
-        digest.update(oid.as_bytes());
-        digest.update(b"\n");
-        if text(repo, &["cat-file", "-t", &oid])? == "blob" {
-            findings.extend(scan_blob(repo, &oid)?);
-        }
-    }
-    if !child
-        .wait()
-        .map_err(|_| io_error("closure wait"))?
-        .success()
-    {
-        return Err(io_error("closure status"));
-    }
-    Ok((
-        format!("{:x}", digest.finalize()),
-        findings.into_iter().collect(),
-    ))
 }
 fn save_review(local: &Path, id: &str, value: &StoredReview) -> Result<()> {
     let dir = local.join("share-reviews");
@@ -1243,9 +1264,12 @@ pub fn inspect_share(
         )
     })?;
     let tree = text(&repo, &["rev-parse", &format!("{commit}^{{tree}}")])?;
-    let (closure_digest, findings) = closure_scan(&repo, &commit)?;
+    let review_id = uuid::Uuid::new_v4().to_string();
+    let scan = crate::git_scan::seal(&repo, &commit, &local.join("share-scans").join(&review_id))?;
+    let closure_digest = scan.object_set_digest.clone();
+    let findings = scan.findings.clone();
     let review = ShareReview {
-        review_ref: uuid::Uuid::new_v4().to_string(),
+        review_ref: review_id,
         commit_oid: commit,
         tree_oid: tree,
         remote: remote.into(),
@@ -1262,6 +1286,7 @@ pub fn inspect_share(
             repo: repo.to_string_lossy().into(),
             endpoint_digest: hash(endpoint.as_bytes()),
             closure_digest,
+            scan: Some(scan),
         },
     )?;
     Ok(review)
@@ -1300,10 +1325,12 @@ pub fn push_review(
             "Repository, destination, or scan policy changed; inspect again.",
         ));
     }
-    let (closure, findings) = closure_scan(&repo, &r.commit_oid)?;
-    if closure != stored.closure_digest
-        || findings != r.findings
-        || text(&repo, &["rev-parse", &format!("{}^{{tree}}", r.commit_oid)])? != r.tree_oid
+    let scan=stored.scan.as_ref().ok_or_else(||DomainError::new("sharing_scan_receipt_required","This older review has no sealed scan receipt. Inspect once with the current build before sharing."))?;
+    crate::git_scan::validate(scan)?;
+    if scan.object_set_digest != stored.closure_digest
+        || scan.findings != r.findings
+        || scan.tree_oid != r.tree_oid
+        || scan.commit_oid != r.commit_oid
     {
         return Err(DomainError::new(
             "sharing_review_stale",
@@ -1317,7 +1344,7 @@ pub fn push_review(
         ));
     }
     let refspec = format!("{}:{}", r.commit_oid, r.target_ref);
-    let outcome = command(&repo)
+    let outcome = command(&scan.transfer_store)
         .args(["push", "--porcelain", "--", &bound_endpoint, &refspec])
         .output()
         .map_err(|_| io_error("push launch"))?;
@@ -1453,10 +1480,7 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
             "--no-tags",
             "--no-write-fetch-head",
             "--",
-            &source
-                .to_string_lossy()
-                .trim_start_matches(r"\\?\")
-                .replace('\\', "/"),
+            &git_path(&source).to_string_lossy(),
             commit,
         ],
     )?;
@@ -1473,6 +1497,7 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
         .prepare_import_union(&validated, &merged, dir.join("runtime/canonical"))
         .map_err(|e| DomainError::new("import_union_requires_review", e.to_string()))?;
     let review = ImportReview {
+        completion: None,
         conflicting_memory_ids: conflicting_current_ids(&union)?,
         next_action: Some("Inspect structural_conflicts; use share import call with exact conflicting memory IDs to read full heads, then explicitly reconcile and resolve.".into()),
         structural_conflicts: union
@@ -1525,6 +1550,37 @@ pub fn inspect_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
         ));
     }
     let mut review = stored.review;
+    let dir = local.join("imports").join(import_ref);
+    if dir.join("completed.json").exists() {
+        let completed: ImportPublishReceipt = serde_json::from_reader(
+            File::open(dir.join("completed.json")).map_err(|_| io_error("import completion"))?,
+        )
+        .map_err(|_| io_error("import completion decode"))?;
+        review.status = completed.status.clone();
+        review.completion = Some(completed);
+        review.active_source_unchanged = false;
+        review.next_action=Some("Local memory publication and Git handoff completed; pushed=false means no remote sharing. Later memory saves do not invalidate this receipt.".into());
+        return Ok(review);
+    }
+    if dir.join("handoff.json").exists() {
+        let handoff: ImportHandoff = serde_json::from_reader(
+            File::open(dir.join("handoff.json")).map_err(|_| io_error("import handoff"))?,
+        )
+        .map_err(|_| io_error("import handoff decode"))?;
+        let applied = store
+            .sync_receipt(&handoff.operation_id)
+            .map_err(|e| DomainError::new("import_recovery", e.to_string()))?
+            .is_some();
+        review.status = if applied {
+            "canonical_published_git_handoff_pending"
+        } else {
+            "approved_publication_prepared"
+        }
+        .into();
+        review.active_source_unchanged = !applied;
+        review.next_action=Some("Resume publish with the retained resolution token. Finish only the unfinished publication/Git handoff; do not prepare a new import.".into());
+        return Ok(review);
+    }
     let stage = Store::open_read_only_with_coordination(
         &review.staged_path,
         local
@@ -1676,6 +1732,64 @@ mod tests {
                 .unwrap()
                 .contains("unrelated.txt")
         );
+    }
+    #[test]
+    fn stale_owner_sidecar_does_not_delete_later_full_index_lock() {
+        let (root, source, local) = fixture();
+        publish(&source, "base");
+        let before = continuity_save(&source, &local, "base").unwrap();
+        publish(&source, "second");
+        let tree = staged_tree(&root, &root, &local).unwrap();
+        let plan = prepare_index_plan(&root, &local, &tree).unwrap();
+        let commit = text(
+            &root,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &before.commit_oid,
+                "-m",
+                "handoff",
+            ],
+        )
+        .unwrap();
+        apply_ref_index(
+            &root,
+            "refs/heads/main",
+            Some(&before.commit_oid),
+            &commit,
+            &plan,
+        )
+        .unwrap();
+        let owner = plan.index.with_extension("lock.agentlaw-owner");
+        assert!(!owner.exists());
+        // Reproduce a crash after index installation but before owner cleanup,
+        // followed by later user staging and an unrelated full index lock.
+        let marker = format!(
+            "agentlaw-index-handoff-v2\n{}\n{commit}\n{}\n",
+            plan.owner_token, plan.desired
+        );
+        save_local_json(&owner, &marker).unwrap();
+        fs::write(root.join("later-user.txt"), "later staging").unwrap();
+        run(&root, &["add", "later-user.txt"]).unwrap();
+        let staged = run(&root, &["ls-files", "--stage"]).unwrap();
+        let foreign = fs::read(&plan.candidate).unwrap();
+        let lock = plan.index.with_extension("lock");
+        fs::write(&lock, &foreign).unwrap();
+        assert_eq!(
+            apply_ref_index(
+                &root,
+                "refs/heads/main",
+                Some(&before.commit_oid),
+                &commit,
+                &plan
+            )
+            .unwrap_err()
+            .code,
+            "index_handoff_pending"
+        );
+        assert_eq!(fs::read(&lock).unwrap(), foreign);
+        assert_eq!(run(&root, &["ls-files", "--stage"]).unwrap(), staged);
     }
     #[test]
     fn scan_history_masks_values_and_endpoint_change_invalidates_review() {
