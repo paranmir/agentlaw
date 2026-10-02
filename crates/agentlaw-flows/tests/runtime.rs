@@ -1,5 +1,8 @@
 use agentlaw_flows::{parse_request as parse_public_request, Runtime};
 use serde_json::{json, Value};
+
+const SEMANTIC_RECALL_NOTICE: &str = "Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.";
+
 fn parse_request(input: &str) -> agentlaw_flows::Result<agentlaw_flows::Request> {
     let mut fields = serde_json::from_str::<Value>(input)
         .unwrap()
@@ -512,6 +515,171 @@ fn first_recall_discovers_without_binding_even_one_candidate() {
         json!({"action":"recall","recall_for":"Continue work","project_path":"C:/work/copy"}),
     );
     assert_eq!(second["status"], "needs_user_input");
+}
+
+#[test]
+fn direct_restored_recall_preserves_lexical_candidates_and_adds_one_semantic_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let folder = dir.path().join("project").to_string_lossy().into_owned();
+    let connected = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Semantic notice"}),
+    );
+    assert!(connected["project_connection"].is_object(), "{connected}");
+    let body = "Capture choices and alternatives.";
+    let mut proposal = create(body);
+    proposal["project_path"] = json!(folder);
+    proposal["memories"][0]["applies_to"] = json!(["project"]);
+    let saved = call(&mut runtime, proposal);
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let reference = &saved["results"][0]["memory_ref"];
+    let diagnostic = json!({
+        "code":"semantic_channel_incomplete",
+        "message":"No semantic worker is attached; exact and indexed lexical retrieval remain available.",
+        "retryable":false
+    });
+
+    let ordinary = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle"}),
+    );
+    assert!(ordinary["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(ordinary["diagnostics"], json!([diagnostic.clone()]));
+
+    // A restore perspective supplies the lexical match absent from the original query.
+    let restored = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle","restore_context":true}),
+    );
+    assert!(restored.get("code").is_none(), "{restored}");
+    assert!(restored.get("project_connection").is_none());
+    assert!(restored.get("recall_result").is_none());
+    assert_eq!(restored["candidates"].as_array().unwrap().len(), 1);
+    let candidate = &restored["candidates"][0];
+    assert_eq!(candidate["memory_id"], reference["memory_id"]);
+    assert_eq!(candidate["excerpt"], body);
+    assert_eq!(
+        candidate["applicability"]["project_id"],
+        connected["project_connection"]["project_id"]
+    );
+    assert_eq!(
+        candidate["retrieval_paths"],
+        json!([{"via":["lexical"],"clue":body}])
+    );
+    assert_eq!(
+        restored["candidate_counts"]["memories"],
+        json!({"matched":1,"shown":1})
+    );
+    assert_eq!(
+        restored["diagnostics"],
+        json!(vec![
+            diagnostic;
+            agentlaw_flows::recall::RESTORE_PERSPECTIVES.len() + 1
+        ])
+    );
+    assert_eq!(restored["turn_instruction"], SEMANTIC_RECALL_NOTICE);
+}
+
+#[test]
+fn id_only_and_mixed_recall_preserve_full_body_and_semantic_notice_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let body = format!(
+        "## Exact memory\n\n{}\nFinal exact body line.\n",
+        "Retain the full Markdown evidence beyond the candidate preview.\n".repeat(16)
+    );
+    let saved = call(&mut runtime, create(&body));
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let reference = &saved["results"][0]["memory_ref"];
+    let discovered = call(&mut runtime, create("quartzneedle lexical candidate."));
+    assert_eq!(discovered["status"], "remembered", "{discovered}");
+
+    let id_only = call(
+        &mut runtime,
+        json!({"action":"recall","memory_ids":[reference["memory_id"]]}),
+    );
+    assert_eq!(id_only["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        id_only["memories"][0]["current_heads"][0]["what_to_remember"],
+        body
+    );
+    assert_eq!(
+        id_only["memories"][0]["current_heads"][0]["memory_ref"],
+        *reference
+    );
+    assert!(id_only["candidates"].as_array().unwrap().is_empty());
+    assert!(id_only.get("candidate_counts").is_none());
+    assert!(id_only.get("diagnostics").is_none());
+    assert!(id_only.get("turn_instruction").is_none());
+
+    let mixed = call(
+        &mut runtime,
+        json!({"action":"recall","memory_ids":[reference["memory_id"]],"recall_for":"quartzneedle"}),
+    );
+    assert_eq!(mixed["memories"], id_only["memories"]);
+    assert_eq!(mixed["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        mixed["candidates"][0]["memory_id"],
+        discovered["results"][0]["memory_ref"]["memory_id"]
+    );
+    assert_eq!(
+        mixed["candidates"][0]["retrieval_paths"],
+        json!([{"via":["lexical"],"clue":"quartzneedle lexical candidate."}])
+    );
+    assert_eq!(
+        mixed["diagnostics"],
+        json!([{
+            "code":"semantic_channel_incomplete",
+            "message":"No semantic worker is attached; exact and indexed lexical retrieval remain available.",
+            "retryable":false
+        }])
+    );
+    assert_eq!(mixed["turn_instruction"], SEMANTIC_RECALL_NOTICE);
+}
+
+#[test]
+fn connect_and_restore_retains_preparation_code_and_outer_instruction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let folder = dir.path().join("project").to_string_lossy().into_owned();
+    let connected = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Restoration"}),
+    );
+    assert!(connected["project_connection"].is_object(), "{connected}");
+    let saved = call(&mut runtime, create("quartzneedle restoration candidate."));
+    assert_eq!(saved["status"], "remembered", "{saved}");
+
+    let restored = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"connect","project_path":folder,"project_id":connected["project_connection"]["project_id"],"restore_context":true,"recall_for":"quartzneedle"}),
+    );
+    assert_eq!(
+        restored["project_connection"],
+        connected["project_connection"]
+    );
+    assert_eq!(restored["code"], "restore_preparation_incomplete");
+    assert_eq!(
+        restored["turn_instruction"],
+        "Project association is retained, but semantic context restoration is incomplete. Read the returned diagnostics and any full-content artifact; do not claim complete restoration. Repeat this connect request with restore_context after the provider recovers."
+    );
+    assert_eq!(
+        restored["diagnostics"],
+        json!([{
+            "code":"semantic_unavailable",
+            "message":"No model is configured; vector build was not performed."
+        }])
+    );
+    let recall = &restored["recall_result"];
+    assert_eq!(recall["turn_instruction"], SEMANTIC_RECALL_NOTICE);
+    assert_eq!(
+        recall["candidates"][0]["memory_id"],
+        saved["results"][0]["memory_ref"]["memory_id"]
+    );
 }
 
 #[test]

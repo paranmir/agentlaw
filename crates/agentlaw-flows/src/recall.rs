@@ -1,6 +1,8 @@
 use crate::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+const SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION: &str = "Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.";
+
 fn add_candidate(
     candidates: &mut Vec<MemoryCandidate>,
     positions: &mut BTreeMap<String, usize>,
@@ -275,6 +277,17 @@ pub fn recall(
             memory_ids: missing,
             procedure_ids: vec![],
         })
+    }
+    if r.recall_for.is_some()
+        && response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "semantic_channel_incomplete")
+    {
+        response.turn_instruction = Some(match response.turn_instruction.take() {
+            Some(existing) => format!("{existing} {SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION}"),
+            None => SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION.into(),
+        });
     }
     Ok(response)
 }
