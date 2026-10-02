@@ -232,6 +232,75 @@ pub enum Request {
     RememberThis(RememberRequest),
     History(HistoryRequest),
     ConnectProjectMemory(ConnectRequest),
+    Sync(SyncRequest),
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCommand {
+    Start,
+    Status,
+    Resolve,
+    Resume,
+    Hold,
+    Cancel,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncRequest {
+    pub command: SyncCommand,
+    pub policy_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub expected_revision: Option<u64>,
+    pub request_id: Option<String>,
+    pub solution: Option<SyncSolution>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSolution {
+    pub units: Vec<SyncUnit>,
+    pub redirects: Vec<SyncRedirect>,
+    pub projects: Vec<SyncProject>,
+    pub dependent_dispositions: Vec<SyncDependent>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncUnit {
+    /// A packet identity, or new:<label>. Runtime allocates new IDs once.
+    pub target: String,
+    pub metadata_from: String,
+    pub derived_from: Vec<String>,
+    pub body: String,
+    pub evidence: String,
+    pub is_rule: Option<bool>,
+    pub in_working_set: Option<bool>,
+    pub related_memory_ids: Option<Vec<String>>,
+    pub required_memory_ids: Option<Vec<String>>,
+    pub work_targets: Option<Vec<StoredTarget>>,
+    pub name: Option<String>,
+    pub use_when: Option<String>,
+    pub evidence_memory_ids: Option<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncRedirect {
+    pub source: String,
+    pub target: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncProject {
+    pub project_id: String,
+    /// Copy a frozen catalog packet handle, then supply the final metadata.
+    pub metadata_from: String,
+    pub name: String,
+    pub description: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncDependent {
+    pub identity: String,
+    pub disposition: String,
+    pub evidence: String,
 }
 pub fn parse_request(json: &str) -> Result<Request> {
     let value = wire::normalize(validation::decode_unique(json)?)?;

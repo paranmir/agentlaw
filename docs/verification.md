@@ -6,6 +6,54 @@ recorded below.
 
 ## Regression suite
 
+### 0.4.0 fixed-cutoff memory sync
+
+On 2026-10-02, `feature/memory-sync` implements one explicit typed sync operation,
+fixed B/R/M versus W/M/L, complete frozen conflict packets and whole solutions,
+default-off separate local delegation, receipt-first recovery and raw Git batch
+scan/sealed-transfer receipts. Ordinary memory writes still do not commit or push.
+Legacy import completion inspection and share scan reuse are also corrected.
+
+The first Windows locked workspace run passed 204 tests, 0 failed, 4 ignored.
+The subsequent full locked run passed 211 tests, 0 failed, 4 ignored, exit code 0.
+After the last app-only changes (authority flags, missing required views and exact
+existing commit reuse), the affected library run passed 52 app, 6 contracts and
+8 storage tests: 66 passed, 0 failed. That app run includes 15 sync tests and
+4 raw-scan tests. The implementation phase did not repeat the full suite after
+those last app changes; the authorized 0.4.0 release preparation did.
+Final locked workspace check, format check and both repositories' diff checks
+passed. All four workspace/product contract copies have identical SHA-256 hashes;
+53 input fixtures (7 sync) pass the validator. Tests use temporary stores/local
+bare remotes, not the live memory store. These implementation checks initially
+ran with source version 0.3.6. The separately authorized release preparation
+updates all seven workspace packages to 0.4.0; its final full-suite and PR/tag
+matrix results are recorded separately. These local checks do not establish
+release publication or active installation/policy enablement.
+
+The final 0.4.0 Windows `cargo test --locked --workspace --no-fail-fast` passed
+214 tests, with 0 failures and 4 opt-in tests ignored. After every case and
+doctest finished, a remaining managed-update fixture worker kept the output pipe
+open. Its isolated path, endpoint PID, creation time and exact current-test binary
+hash were verified before stopping only that worker; the command then returned
+exit code 0. Older fixture workers and the active harness were not stopped.
+This records the local result and cleanup intervention, not correct daemon
+cleanup on every exit. PR/tag matrix and public asset verification are separate.
+
+Capture/projection is limited to 100,000 canonical files/512 MiB, with a cooperative
+5-second capture budget. Final guarded context is limited to 256 nodes/paths and
+16 MiB. Large connected graphs may be explicitly refused. Convenience snapshot
+and request guards remain 64 MiB and 16 MiB. SHA-1/SHA-256 raw objects are supported;
+replace refs/grafts/shallow/partial/promisor/alternates and gitlinks are not.
+The existing six-pattern inspection is not complete secret/PII classification.
+
+No real 20-minute case was benchmarked. Pattern receipt reuse is not a single
+physical disk read, full fsck equivalence, scan exactly-once across incomplete
+attempts, whole-sync power-loss proof or all-platform CI. Real-model resolution
+quality and post-install model-visible tool adherence remain separate checks.
+The continuing OS-local policy is not signed per-call user authority and cannot
+defend against malicious tools running as the same OS user. Pro reviewed the
+design, not this completed source diff.
+
 ### 0.3.6 grouped recall paths release candidate
 
 The feature groups identical clue/source pairs into a single path with a

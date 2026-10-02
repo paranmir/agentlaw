@@ -382,7 +382,7 @@ impl Store {
         self.automatic_maintenance();
         Ok(receipt)
     }
-    fn check_cancel_before_decision(
+    pub(super) fn check_cancel_before_decision(
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         prior: u64,

@@ -7,6 +7,52 @@ use std::{
 };
 
 pub const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+/// Verified first state frame only. C6 redo already verifies the complete installed
+/// file; dependency-registry maintenance must not materialize arbitrarily large bodies.
+pub(crate) fn state_prefix(r: &mut impl BufRead) -> Result<serde_json::Value> {
+    if line(r)? != "<!-- agentlaw-file-v1 kind=current -->\n" {
+        return Err(Error::Corrupt("current prefix header".into()));
+    }
+    let header = line(r)?;
+    let fields = header
+        .strip_prefix("<!-- agentlaw-record-v1 type=state key=")
+        .and_then(|s| s.strip_suffix(" -->\n"))
+        .ok_or_else(|| Error::Corrupt("state prefix framing".into()))?
+        .split(' ')
+        .collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(Error::Corrupt("state prefix fields".into()));
+    }
+    crate::validate_id(fields[0])?;
+    let length = count(
+        fields[1]
+            .strip_prefix("bytes=")
+            .ok_or_else(|| Error::Corrupt("state prefix size".into()))?,
+    )?;
+    if length > 16 * 1024 * 1024 {
+        return Err(Error::Capacity);
+    }
+    let sha = fields[2]
+        .strip_prefix("sha256=")
+        .ok_or_else(|| Error::Corrupt("state prefix digest".into()))?;
+    let mut bytes = vec![0u8; length as usize];
+    r.read_exact(&mut bytes)?;
+    let mut footer = [0u8; 30];
+    r.read_exact(&mut footer)?;
+    if footer != *b"\n<!-- /agentlaw-record-v1 -->\n" || digest(&bytes) != sha {
+        return Err(Error::Corrupt("state prefix integrity".into()));
+    }
+    let state = parse_json(&bytes)?;
+    let id = if state["entity_type"] == "memory" {
+        "memory_id"
+    } else {
+        "procedure_id"
+    };
+    if state[id] != fields[0] {
+        return Err(Error::Corrupt("state prefix identity".into()));
+    }
+    Ok(state)
+}
 #[derive(Clone, Debug)]
 pub struct FrameInfo {
     pub kind: String,

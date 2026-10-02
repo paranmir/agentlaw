@@ -31,6 +31,19 @@ for an existing source; changing this code does not move existing bindings.
 
 ## Verification boundary
 
+Development sync support adds bounded canonical capture, isolated historical-ref
+resolution, connected read-set/predicate guards and scoped C6 overlay publication.
+The final gate does not re-read entire history: new immutable frames go into
+independent packs, preserving later appends to existing shards. Reverse relation,
+evidence, redirect and project stamps catch newly added dependents and ABA changes;
+known reviewed context paths are guarded too. Ordinary publication maintains this
+local registry once bootstrapped, without Git commits or MVCC snapshots.
+Sync uses the existing decision/redo journal and checks receipt/request identity
+before stale inputs; an operation ID cannot name another sync plan.
+Capture is capped at 100,000 files/512 MiB/cooperative 5s; final read-set at 256
+nodes/paths and 16 MiB. These are explicit fail-closed prototype budgets, not
+measured large-corpus performance or hard OS I/O deadlines.
+
 Tests exercise real Windows file replacement and a subprocess abort after a
 durable decision, in addition to stage-by-stage fault injection. They cover
 embedded framing markers, the golden digest/version, corruption, all-head stale

@@ -1,11 +1,19 @@
+---
+status: accepted
+date: 2026-09-23
+---
+
 # Agentlaw LLM-facing guidance
 
-Accepted tool, field and bootstrap wording compiled into the Rust runtime.
+This is the accepted development-document source for the tool description,
+field guidance and installation bootstrap. The product copy is compiled into
+the Rust runtime; keep its wording aligned with the sections below. The user
+accepted ADR-0133 and delegated final wording after Pro consultation.
 
 ## Tool description — exact accepted text
 
 Tool name: `agentlaw`. Actions: `recall`, `remember_this`, `history`,
-`connect_project_memory` (ADR-0140).
+`connect_project_memory` (ADR-0140), `sync` (ADR-0154).
 
 ```text
 Persistent memory for ordinary work. At a new work request or resumption, recall relevant memories before proceeding; for project work, check active Tasks and match by objective and scope before creating one. A recall with recall_for delivers applicable standing rules independently of search rank; read them before dependent work. During work, recall again when a new area, assumption, constraint, failure, or similarity to prior work raises a question not covered by recalled context. Combine related clues in one call. Skip a lookup only when recall results still in context cover the same question and conditions, including any needed Task selection. For project work after compaction or a session interruption, recall with confirmed project_path and include_active_tasks=true before dependent work unless that recall already succeeded since resumption. A summary does not replace this check; reconcile it with the recalled Task and current evidence.
@@ -17,6 +25,8 @@ For work needing intermediate state, reuse the matching Task or create one after
 Persistence is confirmed by status=remembered with memory_ref(ID, observed_version), or by an authoritative recovery read verifying the published checkpoint's content and ID/version. Errors, pending batches, and missing replies are not confirmation. Use the existing recovery contract; do not blindly reissue an uncertain write. If unresolved, report the recovery gap and pause only work relying on restart information not yet confirmed durable; independent work may continue. Keep a compact, complete handoff, not a command log. Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
 Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect or create a project only with an explicit user choice. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
+
+When explicitly asked to synchronize memory, use sync with an existing user-enabled local policy. Agentlaw owns Git capture, merge preparation, validation, recovery and fixed-commit delivery. Read the complete frozen conflict packet and submit one whole solution for semantic or structural conflicts; do not edit canonical headers or run pull/merge on active memory. Copy returned IDs, handles and revisions. After interruption, inspect status and resume the same operation. Never enable or broaden a policy through an LLM call. Sensitive findings require a separate explicit user decision. Completion covers the fixed cutoff, not later local writes; ordinary remember_this does not commit or push.
 ```
 
 Here “task” means the work being undertaken, not a prerequisite to create a
@@ -254,7 +264,7 @@ supported boundaries but are not required and do not provide semantic judgment.
 ## Executable schema and connection recovery
 
 MCP tools/list and CLI schema publish agentlaw-tool.schema.json: a single object
-with action and four explicitly typed, same-named action input objects. Supply
+with action and five explicitly typed, same-named action input objects. Supply
 exactly the selected object. Existing leaf field names stay inside their action
 namespace. No top-level action-specific fields are advertised. Describe each field's
 action, required companions and usage in English. Do not expose top-level union
@@ -280,6 +290,30 @@ select even a single candidate; empty candidates do not establish first-time
 adoption. Connect the local memory store first if none is selected, then retry
 the original recall. Instructions use English; user-facing explanations use
 the user's language. Do not create a separate recovery tool.
+
+### Explicit memory synchronization
+
+ADR-0154 replaces per-conflict confirmation only within a separately activated,
+bounded OS-local policy. The policy is disabled by default. `sync` accepts a
+registered policy ID on `start`, never inline endpoints, scope overrides or an
+enable flag. Policy setup and acceptance of sensitive findings remain explicit
+local CLI actions. This is continuing local delegation, not a signed per-call
+user authorization or protection against malicious tools running as that user.
+
+The normal surface is `start → resolve when needed → completed`; `status` and
+`resume` handle interruption. `resolve` receives one complete typed solution,
+including dependent dispositions, not a sequence of canonical-file edits.
+Runtime checks exact retained ancestry, identity, dependency and graph invariants;
+the LLM decides meaning. A rejected replacement closes the publication gate and
+keeps the complete packet available. Preserve and use the returned request ID
+after response loss rather than starting a duplicate operation.
+
+`canonical_applied`, `git_handoff_completed` and remote `delivery` describe distinct
+boundaries. Later local writes are preserved without changing the outgoing
+candidate. Only a confirmed target containing that candidate establishes fixed-
+cutoff completion; a clean working tree is neither required nor implied. Scan
+receipts reuse pattern findings for the same sealed candidate; payload-integrity
+checks on resume are not a second pattern scan. Changed candidates need new scans.
 
 ## MCP initialization instructions
 
