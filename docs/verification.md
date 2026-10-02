@@ -6,6 +6,23 @@ recorded below.
 
 ## Regression suite
 
+### 0.4.1 semantic notice and release reuse
+
+Contextual recall now adds one conditional instruction for actual incomplete
+semantic retrieval, including direct restoration, and preserves it through
+both complete-file envelopes. Fourteen new Rust regression tests and one
+extended delivery test passed in the preceding implementation run (228 passed,
+0 failed, 4 opt-in tests ignored). They verify instruction delivery, not actual
+downstream LLM compliance or real semantic-model quality.
+
+The release helper has 18 isolated Python tests covering admission/provenance,
+changed trees, candidate attempts, expiry/digests, unsafe ZIP members, complete
+target sets, unchanged versions, exact existing releases and draft recovery.
+These and focused workflow-structure checks passed locally during preparation.
+The final versioned Rust matrix, real artifact transfer and automatic publisher
+are checked in GitHub Actions; local helper tests alone do not prove publication.
+See [release operation and recovery](releasing.md) for its boundaries.
+
 ### 0.4.0 fixed-cutoff memory sync
 
 On 2026-10-02, `feature/memory-sync` implements one explicit typed sync operation,

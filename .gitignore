@@ -12,3 +12,4 @@
 *.onnx
 *.onnx_data
 *.safetensors
+__pycache__/

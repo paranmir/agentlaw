@@ -1,21 +1,19 @@
-name: Release
+name: Release candidate
 
 on:
-  push:
-    tags: ['v*']
   pull_request:
-  workflow_dispatch:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: candidate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Test and build (${{ matrix.target }})
+    name: Test and package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -38,6 +36,13 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check release helper
+        run: python -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt
@@ -49,7 +54,6 @@ jobs:
           if ($IsWindows) { 'RUSTFLAGS=-C target-feature=+crt-static' >> $env:GITHUB_ENV }
           $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
           if (-not $version) { throw 'Missing workspace version' }
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo version' }
       - name: Format and test
         run: |
           cargo fmt --all -- --check
@@ -61,12 +65,10 @@ jobs:
           cargo test --locked --workspace --no-fail-fast --target ${{ matrix.target }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build release executables
-        if: github.event_name != 'pull_request'
         run: |
           cargo build --locked --release --workspace --target ${{ matrix.target }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Package
-        if: github.event_name != 'pull_request'
         run: |
           New-Item -ItemType Directory -Path dist, bundle | Out-Null
           $suffix = if ($IsWindows) { '.exe' } else { '' }
@@ -83,41 +85,13 @@ jobs:
             tar -czf "dist/$name.tar.gz" -C bundle agentlaw agentlaw-worker agentlaw-launcher LICENSE
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
+          git diff --exit-code
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .github/scripts/release.py manifest --target '${{ matrix.target }}' --directory dist
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v7
-        if: github.event_name != 'pull_request'
         with:
-          name: agentlaw-${{ matrix.target }}
+          name: agentlaw-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    name: Publish GitHub Release
-    needs: build
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: agentlaw-*
-          path: dist
-          merge-multiple: true
-      - name: Publish tested commit and assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
-          if (-not $version) { throw 'Missing workspace version' }
-          $tag = "v$version"
-          Copy-Item install.sh, install.ps1 dist/
-          $checksums = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
-            "{0}  {1}" -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
-          }
-          [IO.File]::WriteAllLines((Join-Path $PWD 'dist/SHA256SUMS'), $checksums, [Text.UTF8Encoding]::new($false))
-          $assets = @(Get-ChildItem dist -File | ForEach-Object { $_.FullName })
-          gh release create $tag @assets --target $env:GITHUB_SHA --title "Agentlaw $version" --notes-file docs/release-notes.md --latest
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          retention-days: 30

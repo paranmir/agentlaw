@@ -98,7 +98,7 @@ cargo fmt --all -- --check
 cargo test --locked --workspace --no-fail-fast
 ~~~
 
-Real-model tests need local model and runtime assets and are opt-in; see [verification](docs/verification.md). The [release workflow](.github/workflows/release.yml) runs its ordinary target checks before publishing binaries.
+Real-model tests need local model and runtime assets and are opt-in; see [verification](docs/verification.md). The [candidate workflow](.github/workflows/release.yml) tests and packages each PR once. After a version-changing PR merges, the [publisher](.github/workflows/publish.yml) verifies and releases those same files without rerunning tests or rebuilding. See [release operation and recovery](docs/releasing.md).
 
 ## Security and license
 
