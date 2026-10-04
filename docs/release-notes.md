@@ -1,4 +1,24 @@
-# Agentlaw 0.4.0
+# Agentlaw 0.4.1
+
+- Adds a conditional instruction to disclose incomplete semantic retrieval in
+  the user's language. Direct context restoration is included; exact ID-only
+  lookup and healthy retrieval gain no notice. Existing required-context
+  warnings and complete recalled data are preserved.
+- Keeps the instruction visible when either delivery layer moves a large
+  response into a complete file. This preserves guidance delivery, not a
+  guarantee that every downstream model will follow it.
+- Tests and builds release files once in the PR. After merge, publication
+  verifies the successful candidate run, merged source tree and exact artifact
+  digests, then releases those same files without a second test/build pass.
+- Includes release provenance and SHA-256 checksums. A failed publication can
+  resume without overwriting existing assets or recreating a completed release.
+
+Publishing does not update an active installation or repair semantic retrieval.
+Real-model quality and downstream LLM notification behavior are separate from
+the regression and release-pipeline checks. See [release operation](releasing.md)
+and [verification](verification.md).
+
+## Previous release: 0.4.0
 
 - Adds one typed `sync` action and CLI operation for explicit memory
   synchronization. Agentlaw owns Git execution and recovery; the agent starts
