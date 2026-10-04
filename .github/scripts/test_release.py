@@ -184,12 +184,14 @@ class ReleaseTests(unittest.TestCase):
             published = {"draft": False, "prerelease": False, "html_url": "release-url", "assets": [
                 {"name": "asset", "state": "uploaded", "size": 4, "digest": "sha256:" + release.digest(b"data")}]}
             ref = {"object": {"type": "commit", "sha": MERGE}}
-            with patch.object(release, "api", side_effect=[published, ref]), patch.object(release, "command") as commands:
+            with patch.object(release, "find_release", return_value=published), \
+                    patch.object(release, "api", return_value=ref), patch.object(release, "command") as commands:
                 release.publish_files(REPOSITORY, MERGE, "0.4.1", {"asset": path}, path)
                 commands.assert_not_called()
 
     def test_existing_tag_for_other_commit_is_never_retargeted(self):
-        with patch.object(release, "api", side_effect=[None, {"object": {"type": "commit", "sha": HEAD}}]), \
+        with patch.object(release, "find_release", return_value=None), \
+                patch.object(release, "api", return_value={"object": {"type": "commit", "sha": HEAD}}), \
                 patch.object(release, "command") as commands:
             with self.assertRaises(ValueError):
                 release.publish_files(REPOSITORY, MERGE, "0.4.1", {}, Path("notes"))
@@ -199,15 +201,38 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "asset"
             path.write_bytes(b"data")
-            draft = {"draft": True, "prerelease": False, "html_url": "release-url", "assets": []}
+            draft = {"id": 42, "draft": True, "prerelease": False, "html_url": "release-url", "assets": []}
             complete = {**draft, "assets": [{"name": "asset", "state": "uploaded", "size": 4,
                                             "digest": "sha256:" + release.digest(b"data")}]}
-            responses = [draft, {"object": {"type": "commit", "sha": MERGE}}, {"tag_name": "v0.4.0"},
+            responses = [{"object": {"type": "commit", "sha": MERGE}}, {"tag_name": "v0.4.0"},
                          complete, {**complete, "draft": False}]
-            with patch.object(release, "api", side_effect=responses), patch.object(release, "command") as commands:
+            with patch.object(release, "find_release", return_value=draft), \
+                    patch.object(release, "api", side_effect=responses) as reads, patch.object(release, "command") as commands:
                 release.publish_files(REPOSITORY, MERGE, "0.4.1", {"asset": path}, path)
                 self.assertEqual([call.args[2] for call in commands.call_args_list], ["upload", "edit"])
                 self.assertNotIn("--clobber", str(commands.call_args_list))
+                self.assertEqual(reads.call_args.args[0], f"repos/{REPOSITORY}/releases/42")
+
+    def test_find_release_includes_drafts_and_rejects_duplicate_tags(self):
+        draft = {"id": 42, "tag_name": "v0.4.1", "draft": True}
+        with patch.object(release, "listing", return_value=[draft]) as listing:
+            self.assertEqual(release.find_release("repos/owner/product", "v0.4.1"), draft)
+            listing.assert_called_once_with("repos/owner/product/releases")
+            self.assertIsNone(release.find_release("repos/owner/product", "v0.4.2"))
+        with patch.object(release, "listing", return_value=[draft, draft]):
+            with self.assertRaises(ValueError):
+                release.find_release("repos/owner/product", "v0.4.1")
+
+    def test_new_draft_is_found_by_list_and_refreshed_by_id(self):
+        draft = {"id": 42, "draft": True, "prerelease": False, "assets": [], "html_url": "release-url"}
+        with patch.object(release, "find_release", side_effect=[None, draft]), \
+                patch.object(release, "api", side_effect=[None, None, draft, {**draft, "draft": False}]) as reads, \
+                patch.object(release, "command") as commands:
+            release.publish_files(REPOSITORY, MERGE, "0.4.1", {}, Path("notes"))
+            self.assertEqual([call.args[0] for call in reads.call_args_list][-2:],
+                             [f"repos/{REPOSITORY}/releases/42"] * 2)
+            self.assertEqual([call.args[1:3] for call in commands.call_args_list][1:],
+                             [("release", "create"), ("release", "edit")])
 
     def test_pagination_does_not_silently_truncate(self):
         with patch.object(release, "api", side_effect=[[1] * 100, [2]]) as request:
