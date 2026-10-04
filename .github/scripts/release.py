@@ -198,10 +198,17 @@ def verify_release_assets(assets, files, complete):
                 f"Existing release asset differs: {asset['name']}")
 
 
+def find_release(prefix, tag):
+    # The tag endpoint only finds published releases; drafts need the list API.
+    matches = [item for item in listing(f"{prefix}/releases") if item["tag_name"] == tag]
+    require(len(matches) <= 1, "Multiple releases name the same version")
+    return matches[0] if matches else None
+
+
 def publish_files(repository, commit, version, files, notes):
     prefix = f"repos/{repository}"
     tag = "v" + version
-    release = api(f"{prefix}/releases/tags/{tag}", optional=True)
+    release = find_release(prefix, tag)
     ref = api(f"{prefix}/git/ref/tags/{tag}", optional=True)
     if ref:
         obj = ref["object"]
@@ -229,15 +236,16 @@ def publish_files(repository, commit, version, files, notes):
     if not release:
         command("gh", "release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
                 "--title", f"Agentlaw {version}", "--notes-file", str(notes))
-        release = api(f"{prefix}/releases/tags/{tag}")
+        release = find_release(prefix, tag)
+        require(release is not None, "Created release is not visible; retry publication")
     existing = {asset["name"] for asset in release["assets"]}
     for name in sorted(files):
         if name not in existing:
             command("gh", "release", "upload", tag, str(files[name]), "--repo", repository)
-    release = api(f"{prefix}/releases/tags/{tag}")
+    release = api(f"{prefix}/releases/{release['id']}")
     verify_release_assets(release["assets"], files, complete=True)
     command("gh", "release", "edit", tag, "--repo", repository, "--draft=false", "--latest")
-    release = api(f"{prefix}/releases/tags/{tag}")
+    release = api(f"{prefix}/releases/{release['id']}")
     require(not release["draft"], "Release is still draft")
     verify_release_assets(release["assets"], files, complete=True)
     print(f"Published existing verified artifacts: {release['html_url']}")
