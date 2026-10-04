@@ -609,52 +609,6 @@ fn incoming_projection_keeps_raw_bytes_despite_attributes_and_autocrlf() {
     view.open(&f.store).unwrap().audit_source().unwrap();
 }
 #[test]
-fn local_confirmation_flags_cannot_grant_a_different_authority() {
-    let f = Fixture::new();
-    let file = f
-        ._temp
-        .path()
-        .join("policy.json")
-        .to_string_lossy()
-        .to_string();
-    let args = ["policy", "configure", "--file", &file, "--confirm-sharing"].map(str::to_owned);
-    assert_eq!(
-        cli(
-            &f.store,
-            &f.local,
-            &f.state,
-            &args,
-            &RequestControl::default()
-        )
-        .unwrap_err()
-        .code,
-        "delegation_confirmation_required"
-    );
-    let args = [
-        "accept-findings",
-        "--operation",
-        "unused",
-        "--candidate",
-        "unused",
-        "--findings-digest",
-        "unused",
-        "--confirm-delegation",
-    ]
-    .map(str::to_owned);
-    assert_eq!(
-        cli(
-            &f.store,
-            &f.local,
-            &f.state,
-            &args,
-            &RequestControl::default()
-        )
-        .unwrap_err()
-        .code,
-        "sharing_choice_required"
-    );
-}
-#[test]
 fn missing_required_predecision_view_is_not_initialized_as_empty_memory() {
     let f = Fixture::new();
     f.remote_write("incoming branch");

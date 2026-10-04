@@ -3,11 +3,12 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    time::Duration,
+    process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 fn binary_name() -> &'static str {
@@ -66,6 +67,89 @@ fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
         serde_json::from_slice(&line).unwrap_or_else(|_| panic!("Invalid CLI output: {line:?}"));
     assert!(status.success(), "{value}");
     value
+}
+
+struct OwnedStaticChild(Child);
+impl Drop for OwnedStaticChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn static_output(binary: &Path, state: &Path, cwd: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("AGENTLAW_HOME", state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in [
+        "AGENTLAW_ONNX_MODEL",
+        "AGENTLAW_TOKENIZER",
+        "AGENTLAW_ORT_LIBRARY",
+    ] {
+        command.env_remove(name);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = OwnedStaticChild(command.spawn().unwrap());
+    let mut stdout = child.0.stdout.take().unwrap();
+    let mut stderr = child.0.stderr.take().unwrap();
+    let output_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let error_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Static CLI did not finish: {args:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: output_reader.join().unwrap(),
+        stderr: error_reader.join().unwrap(),
+    }
+}
+
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<String>> {
+    fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Option<String>>) {
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
+        if path.is_dir() {
+            entries.insert(relative, None);
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), entries);
+            }
+        } else {
+            entries.insert(relative, Some(hash(path)));
+        }
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn cli_error(output: &Output) -> Value {
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{output:?}"))
 }
 
 struct McpClient {
@@ -518,6 +602,209 @@ fn released_stable_launcher_resumes_finalization_without_a_gate() {
             .count(),
         1
     );
+}
+
+#[test]
+#[ignore = "requires AGENTLAW_TEST_STABLE_LAUNCHER pointing to a released launcher"]
+fn released_stable_launcher_rejects_a_changed_candidate_hash_before_apply() {
+    let stable = PathBuf::from(std::env::var_os("AGENTLAW_TEST_STABLE_LAUNCHER").unwrap());
+    let stable_before = hash(&stable);
+    let fixture = Fixture::new();
+    let command = fixture.root.join("command");
+    fs::create_dir_all(&command).unwrap();
+    let launcher = command.join(binary_name());
+    fs::copy(&stable, &launcher).unwrap();
+
+    // The prepared fixture follows the real offline handoff path and creates
+    // its actual maintenance marker; only that owned marker is then damaged.
+    let runtime = fixture.root.join("bin").join(binary_name());
+    let handoff = run(
+        &runtime,
+        &fixture.state,
+        &["update", "--confirm-update", &fixture.id],
+    );
+    assert_eq!(handoff["status"], "handoff_ready", "{handoff}");
+    assert_eq!(handoff["plan_id"], fixture.id);
+    let marker_path = fixture.state.join("update-maintenance.json");
+    let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(marker["plan_id"], handoff["plan_id"]);
+    assert_eq!(marker["candidate"], handoff["candidate"]);
+    assert_eq!(marker["candidate_sha256"], handoff["candidate_sha256"]);
+    let candidate = PathBuf::from(marker["candidate"].as_str().unwrap());
+    let candidate_before = hash(&candidate);
+    assert_eq!(marker["candidate_sha256"], candidate_before);
+    let mut wrong_hash = candidate_before.clone();
+    wrong_hash.replace_range(
+        0..1,
+        if wrong_hash.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    marker["candidate_sha256"] = json!(wrong_hash);
+    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    let before = snapshot(&fixture.root);
+
+    let output = static_output(&launcher, &fixture.state, &fixture.root, &["update"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error = cli_error(&output);
+    assert_eq!(error["code"], "update_incomplete", "{error}");
+    assert_eq!(
+        error["message"], "The update candidate differs from the approved handoff.",
+        "{error}"
+    );
+    assert_ne!(error["status"], "installed", "{error}");
+    assert!(error.get("next_action").is_none(), "{error}");
+    assert!(!String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains("restart"));
+    assert_eq!(snapshot(&fixture.root), before);
+    assert_eq!(hash(&candidate), candidate_before);
+    assert_eq!(hash(&launcher), stable_before);
+    assert_eq!(hash(&stable), stable_before);
+}
+
+#[test]
+fn runtime_update_status_requires_exact_plan_before_state_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::write(&state, b"This state path must remain a file.\n").unwrap();
+    let before = snapshot(temp.path());
+    let binary = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
+    for args in [
+        vec!["update", "status"],
+        vec!["update", "status", "--root", temp.path().to_str().unwrap()],
+    ] {
+        let output = static_output(binary, &state, temp.path(), &args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(cli_error(&output)["code"], "invalid_arguments");
+        assert_eq!(snapshot(temp.path()), before, "{args:?}");
+    }
+}
+
+#[test]
+fn runtime_update_hidden_legacy_wires_reach_unmanaged_domain_guard() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("unmanaged root");
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("config.json"), b"not valid configuration").unwrap();
+    let before = snapshot(temp.path());
+    let binary = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
+    let plan = "299d6f05-ac1c-477d-9c0a-62b1ffb87c78";
+    for args in [
+        vec!["update", "--confirm-update", plan],
+        vec!["update", "apply", plan, "--root", root.to_str().unwrap()],
+    ] {
+        let output = static_output(binary, &state, temp.path(), &args);
+        assert_eq!(cli_error(&output)["code"], "update_unmanaged", "{output:?}");
+        assert_eq!(snapshot(temp.path()), before, "{args:?}");
+    }
+}
+
+#[test]
+fn source_runtime_update_rejects_unmanaged_and_foreign_managed_roots() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
+    for managed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("isolated root");
+        let state = root.join("state");
+        fs::create_dir_all(state.join("update-plans")).unwrap();
+        fs::write(state.join("config.json"), b"must not be loaded").unwrap();
+        fs::write(
+            state.join("update-plans/unreadable-plan.json"),
+            b"must not be scanned",
+        )
+        .unwrap();
+        if managed {
+            fs::write(
+                root.join(".agentlaw-layout"),
+                b"agentlaw-managed-layout-v1\n",
+            )
+            .unwrap();
+        }
+        let before = snapshot(temp.path());
+        let output = static_output(binary, &state, temp.path(), &["update"]);
+        assert_eq!(cli_error(&output)["code"], "update_unmanaged", "{output:?}");
+        assert_eq!(snapshot(temp.path()), before);
+    }
+}
+
+#[test]
+#[ignore = "requires AGENTLAW_TEST_STABLE_LAUNCHER pointing to a released launcher"]
+fn released_stable_launcher_forwards_context_help_and_describe_without_state_effects() {
+    // Read the supplied release only to copy/hash it; execute the isolated copy.
+    let stable = PathBuf::from(std::env::var_os("AGENTLAW_TEST_STABLE_LAUNCHER").unwrap());
+    let stable_before = hash(&stable);
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("managed root with spaces");
+    let state = root.join("state");
+    let bin = root.join("bin");
+    let command = root.join("command");
+    for directory in [&state, &bin, &command] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(
+        root.join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    fs::write(state.join("config.json"), b"invalid configuration").unwrap();
+    fs::write(state.join("machine.json"), b"invalid machine identity").unwrap();
+    fs::write(state.join("update-maintenance.json"), b"invalid gate").unwrap();
+    let runtime = bin.join(binary_name());
+    fs::copy(env!("CARGO_BIN_EXE_agentlaw"), &runtime).unwrap();
+    let launcher = command.join(binary_name());
+    fs::copy(&stable, &launcher).unwrap();
+    let before = snapshot(temp.path());
+    let state_before = snapshot(&state);
+    for (args, path, is_json) in [
+        (
+            &["sync", "resolve", "--help"][..],
+            &["sync", "resolve"][..],
+            false,
+        ),
+        (&["help", "update"][..], &["update"][..], false),
+        (
+            &["share", "import", "resolve", "-h"][..],
+            &["share", "import", "resolve"][..],
+            false,
+        ),
+        (&["describe", "update"][..], &["update"][..], true),
+        (
+            &["describe", "sync", "resolve"][..],
+            &["sync", "resolve"][..],
+            true,
+        ),
+        (
+            &["help", "sync", "resolve", "--format", "json"][..],
+            &["sync", "resolve"][..],
+            true,
+        ),
+    ] {
+        let direct = static_output(&runtime, &state, temp.path(), args);
+        let forwarded = static_output(&launcher, &state, temp.path(), args);
+        assert!(direct.status.success(), "{args:?}: {direct:?}");
+        assert!(forwarded.status.success(), "{args:?}: {forwarded:?}");
+        assert!(direct.stderr.is_empty(), "{direct:?}");
+        assert!(forwarded.stderr.is_empty(), "{forwarded:?}");
+        assert_eq!(forwarded.stdout, direct.stdout, "{args:?}");
+        if is_json {
+            let value: Value = serde_json::from_slice(&forwarded.stdout).unwrap();
+            assert_eq!(value["name"], "agentlaw", "{value}");
+            assert_eq!(value["path"], json!(path), "{value}");
+            assert!(value["options"].is_array(), "{value}");
+        } else {
+            let text = std::str::from_utf8(&forwarded.stdout).unwrap();
+            let usage = text.lines().find(|line| line.contains("Usage:")).unwrap();
+            assert!(usage.contains(&format!("agentlaw {}", path.join(" "))));
+        }
+        assert_eq!(snapshot(&state), state_before, "{args:?}");
+    }
+    assert_eq!(snapshot(temp.path()), before);
+    assert_eq!(hash(&launcher), stable_before);
+    assert_eq!(hash(&stable), stable_before);
 }
 
 #[test]

@@ -363,6 +363,7 @@ does not repeat it:
 
 ```text
 Report this notice in the next final reply unless you already reported the same version and status to the user in this conversation.
+If the user approves an update, run the installed public agentlaw update once. On exit 0 with status=installed, report completion and request a normal harness restart; do not revalidate unless the result is missing, inconsistent, or failed. Installation does not establish semantic readiness.
 ```
 
 Delivery of a result does not prove the user saw it. The advisor may repeat
@@ -376,14 +377,22 @@ When the user requests a managed update, run the stable public `agentlaw update`
 command from the installation's `command` directory. This one invocation pins
 and verifies the release, cooperatively stops the affected Agentlaw processes,
 replaces the managed bundle and registrations, probes the candidate MCP and
-read-only recall, and removes the exact approved update debris. Report success
-only for the command's `installed` result after its matching completed status.
-Then ask the user only for a normal harness restart; Agentlaw is immediately
-usable afterward. A handoff, prepared phase, deferred rename or incomplete
-cleanup is not success. For an incomplete update, inspect the reported plan and
-retry the same stable command after resolving its blocker. Do not ask the user
-to run an internal apply command, manage Agentlaw processes or cleanup files.
-Updating never authorizes an optional repository Star.
+read-only recall, and removes the exact approved update debris. These checks,
+including exact-plan completion, remain inside the updater. On exit 0 with a
+valid final `status=installed`, report completion and request a normal harness
+restart. Do not add check/status/version/schema/doctor/recall calls solely to
+prove installation again. Installation does not establish semantic readiness
+or that the current harness has reloaded the new runtime.
+
+`up_to_date` is a version result, not installation verification. A handoff,
+internal `handoff_ready` or plan `completed` alone, prepared phase, deferred
+rename or incomplete cleanup is not the public `installed` result. If the final
+result is missing, inconsistent, or failed, inspect its known plan ID or use
+the owned durable plan marker to recover and resume the same plan after its
+blocker is resolved. If the plan identity is unknown, recover it before retrying;
+do not blindly create another plan. Do not ask the user to run an internal apply
+command, manage Agentlaw processes or cleanup files. Updating never authorizes
+an optional repository Star.
 
 ## Boundaries and rationale
 

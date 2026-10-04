@@ -1,4 +1,29 @@
-# Agentlaw 0.4.1
+# Agentlaw 0.4.2
+
+- Adds contextual help and machine-readable command descriptions. Help works
+  without loading configuration, installation state or the memory store;
+  internal updater handoff commands remain hidden from public help.
+- Root help remains JSON, but its status is now `help` instead of
+  `implementation_in_progress`, and its command list contains only public
+  commands. Consumers must accommodate this content change rather than rely
+  on the former status or internal command list.
+- Uses typed CLI arguments with early syntax validation and bounded JSON input.
+  Invalid options, duplicate JSON keys and oversized payloads fail before
+  command execution, while established error codes and exit statuses are retained.
+- Clarifies that the installed public `agentlaw update` owns the complete
+  managed update. Successful installation requires only an ordinary harness
+  restart, without redundant caller-side diagnostics; internal verification
+  and incomplete-update recovery remain in place.
+- Preserves the MCP schema, durable data formats and existing updater wires.
+  Adds isolated regressions for help, malformed input and released-launcher
+  forwarding and recovery compatibility.
+
+This patch improves CLI usability without changing the memory tool contract.
+Publishing does not update an active installation or establish semantic-model
+readiness. See [usage](usage.md), [release operation](releasing.md) and
+[verification](verification.md) for supported commands and verification limits.
+
+## Previous release: 0.4.1
 
 - Adds a conditional instruction to disclose incomplete semantic retrieval in
   the user's language. Direct context restoration is included; exact ID-only
