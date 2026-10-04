@@ -25,6 +25,48 @@ past change. History retains causal changes separately. Indexes and embeddings
 are rebuildable; unpublished proposals and recovery decisions are not disposable
 caches. Git synchronization is explicit, not a condition of memory-write success.
 
+## CLI help and input
+
+No arguments, `--help`, `-h`, and bare `help` return root JSON with `name`, a
+`commands` array of generated usage strings, and `status: "help"`. Use
+`agentlaw help --format text` for root text help. A command's `--help`/`-h` and
+`agentlaw help <command-path>` show its options and examples without requiring
+its execution arguments:
+
+```text
+agentlaw sync resolve --help
+agentlaw help share import resolve
+agentlaw describe share import resolve
+agentlaw help sync resolve --format json
+```
+
+`describe` emits selected public CLI metadata: `name`, `path`, `usage`, nullable
+`about`, `options`, and `commands`. Each option includes `name`, nullable
+`long`/`short`, `required`, `takes_value`, and `possible_values`; each child
+command includes `name` and nullable `about`. Omit the describe path for root
+metadata. This is separate from the unchanged MCP schema returned by `schema`.
+Root help keeps its JSON shape but changes the old implementation status to
+`help`, generates its command strings, and omits internal commands. These are
+explicit content changes, not a promise of byte-identical old help.
+
+Option order is flexible. Duplicate singleton execution options or confirmation
+flags, unknown options/abbreviations, and unsupported combinations are rejected.
+Use `--value=--help` for an option-like literal value; `--` ends option parsing
+for positional values. Recognized help/version requests bypass required execution
+arguments, but do not override a missing value for a preceding option:
+`machine name --value --help` is invalid.
+
+Help and argv rejected by pure parsing do not read stdin/payload files or open configuration,
+stores, workers, or network connections. An older installed stable launcher
+still performs its existing read-only managed-root/layout-marker bootstrap.
+Call/import-call JSON, sync solution/policy JSON, and structural-choice JSON use
+only their explicit stdin/file source after valid argv, bounded to 16 MiB plus
+one byte to detect overflow. They pass UTF-8/JSON and existing domain validation
+before application resources open. Installation model manifests/assets and
+export files keep their existing limits. CLI syntax checks do not replace domain
+validation. Existing result/error streams remain intact; procedure inventory/search
+still stream JSONL or tables and diagnostics.
+
 ## Build
 
 ```powershell
@@ -148,14 +190,31 @@ processes to finish and exit. It replaces the bundle and registrations, probes
 the new MCP with initialize, tool discovery and read-only recall, then removes
 only the old bundle, previous registered version and staging objects approved
 by that plan. Memory, models, machine identity and pending work are preserved.
-An `installed` response means replacement, probe and cleanup all finished;
-restart the harness normally and use Agentlaw immediately. An incomplete result
-names its blocker and never asks for a restart as if installation succeeded.
-Retry the same `agentlaw update` command to resume an interrupted plan. The
-installed runtime checks unfinished plans on this explicit command before
-checking for a newer release; ordinary MCP memory calls do not scan them. A
-source build using `AGENTLAW_HOME` for an installed state cannot approve a
-managed update.
+On exit 0 with valid final `status: "installed"`, report completion and request
+a normal harness restart. The updater already verified its exact plan and
+finished replacement, probe, cleanup, and gate release. Do not repeat
+check/status/version/schema/doctor/recall solely to prove installation again.
+Installation does not establish semantic readiness or that the current harness
+has loaded the new runtime. `up_to_date` is a version result, not installation
+verification; an internal `handoff_ready` or completed plan alone is not the
+public `installed` result.
+
+An incomplete result names its blocker and never requests a restart as if
+installation succeeded. If the final result is missing, inconsistent, or failed,
+inspect the known plan ID with `update status <plan-id>`, or recover the same plan
+from its owned durable marker before retrying the stable command. An unknown
+plan identity is not permission to blindly create another plan. The installed
+runtime checks unfinished plans on the explicit update command before checking
+for a newer release; ordinary MCP memory calls do not scan them.
+
+The versioned runtime's bare `update` remains a preview for compatibility with
+already released stable launchers. Their prepare/apply/status wire remains
+accepted; this CLI change does not automatically replace those launchers.
+Prepare/apply entry points are hidden from public help, not protected by that
+hiding. Public `update status` requires a known plan ID; no planless status or
+new internal alias is added. Use the installed stable public command for the
+complete update. A source build using `AGENTLAW_HOME` for an installed state
+cannot approve a managed update.
 
 `agentlaw support star` is a separate optional action. With an authenticated
 GitHub CLI account, it checks whether that account already starred

@@ -197,7 +197,7 @@ impl Advisor {
                 "latest_version":tag,"release_url":format!("{RELEASE_PAGE}{tag}"),
                 "last_verified_at":cache.last_success,
                 "verification":if cache.last_success.is_some_and(|at|at.saturating_add(SUCCESS_TTL)>now()) {"fresh"} else {"stale"},
-                "next_action":"Use agentlaw update to preview the managed installation update.",
+                "next_action":"After explicit user approval, run the installed public agentlaw update for the complete managed update.",
                 "guidance":crate::update_notice_guidance()})
         })
     }
@@ -252,7 +252,12 @@ mod tests {
         };
         write_cache(root.path(), &cache);
         let advisor = Advisor::new(root.path().to_path_buf());
-        assert_eq!(advisor.notice().unwrap()["latest_version"], "v99.0.0");
+        let notice = advisor.notice().unwrap();
+        assert_eq!(notice["latest_version"], "v99.0.0");
+        let next_action = notice["next_action"].as_str().unwrap();
+        assert!(next_action.contains("After explicit user approval"));
+        assert!(next_action.contains("installed public agentlaw update"));
+        assert!(!next_action.contains("preview"));
     }
 
     #[test]
@@ -270,7 +275,9 @@ mod tests {
             .split_once("\n```")
             .unwrap()
             .0;
-        assert_eq!(body, crate::update_notice_guidance());
+        // Git checkout line endings may occur inside this multiline fence.
+        // Compare the complete wording with the same normalization on both sides.
+        assert_eq!(body, crate::update_notice_guidance().replace("\r\n", "\n"));
     }
 
     #[test]

@@ -66,12 +66,17 @@ impl Harness {
 fn err(s: &str) -> DomainError {
     DomainError::new("installation_failed", s)
 }
-fn absolute(p: PathBuf) -> Result<PathBuf> {
-    if p.is_absolute() {
-        Ok(p)
+/// Validate an installation target without inspecting files or harness state.
+pub fn validate_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        Ok(())
     } else {
         Err(err("Installation paths must be absolute."))
     }
+}
+fn absolute(p: PathBuf) -> Result<PathBuf> {
+    validate_path(&p)?;
+    Ok(p)
 }
 fn read_optional(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {

@@ -398,14 +398,24 @@ pub fn save_initial(root: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Only documented delivery settings are mutable here; binding changes go through setup.
-pub fn set_limit(root: &Path, key: &str, value: &str) -> Result<serde_json::Value> {
+/// Validate a delivery setting without opening installation state or coordination.
+pub fn validate_limit(key: &str, value: &str) -> Result<usize> {
     let number: usize = value.parse().map_err(|_| {
         DomainError::new(
             "invalid_configuration",
             "Use a positive integer byte count within the platform's supported range.",
         )
     })?;
+    match key {
+        "history.response_limit_bytes" if number > 0 => Ok(number),
+        "response_limit_bytes" if number >= 4096 => Ok(number),
+        _ => Err(DomainError::new("invalid_configuration", "Supported settings: history.response_limit_bytes (>0), response_limit_bytes (>=4096). These control delivery, never truncate memory.")),
+    }
+}
+
+/// Only documented delivery settings are mutable here; binding changes go through setup.
+pub fn set_limit(root: &Path, key: &str, value: &str) -> Result<serde_json::Value> {
+    let number = validate_limit(key, value)?;
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -431,13 +441,45 @@ pub fn set_limit(root: &Path, key: &str, value: &str) -> Result<serde_json::Valu
         )
     })?;
     let mut next = old.clone();
-    match key {
-        "history.response_limit_bytes" if number > 0 => next.history_response_limit_bytes = number,
-        "response_limit_bytes" if number >= 4096 => next.response_limit_bytes = number,
-        _ => return Err(DomainError::new("invalid_configuration", "Supported settings: history.response_limit_bytes (>0), response_limit_bytes (>=4096). These control delivery, never truncate memory.")),
+    if key == "history.response_limit_bytes" {
+        next.history_response_limit_bytes = number;
+    } else {
+        next.response_limit_bytes = number;
     }
     replace_selection(root, &old, &next)?;
     Ok(
         serde_json::json!({"key":key,"value":number,"applies":"next_request","config_path":root.join("config.json")}),
     )
+}
+
+#[cfg(test)]
+mod limit_validation_tests {
+    use super::*;
+
+    #[test]
+    fn delivery_ranges_are_checked_before_opening_setup_coordination() {
+        assert_eq!(
+            validate_limit("history.response_limit_bytes", "1").unwrap(),
+            1
+        );
+        assert_eq!(
+            validate_limit("response_limit_bytes", "4096").unwrap(),
+            4096
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let absent_state = directory.path().join("absent-state");
+        for (key, value) in [
+            ("history.response_limit_bytes", "0"),
+            ("response_limit_bytes", "4095"),
+            ("response_limit_bytes", "not-a-number"),
+            ("unknown", "8192"),
+        ] {
+            assert_eq!(
+                set_limit(&absent_state, key, value).unwrap_err().code,
+                "invalid_configuration"
+            );
+        }
+        assert!(!absent_state.exists());
+        assert!(!directory.path().join("setup.lock").exists());
+    }
 }

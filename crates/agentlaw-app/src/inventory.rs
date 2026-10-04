@@ -18,35 +18,6 @@ pub struct Options {
     pub table: bool,
 }
 
-pub fn parse(args: &[String]) -> Result<Options> {
-    if args.len() % 2 != 0 {
-        return Err(DomainError::new(
-            "invalid_arguments",
-            "Inventory options require values.",
-        ));
-    }
-    let mut options = Options::default();
-    let mut seen = std::collections::BTreeSet::new();
-    for pair in args.chunks_exact(2) {
-        if !seen.insert(&pair[0]) {
-            return Err(DomainError::new(
-                "invalid_arguments",
-                "Duplicate inventory option.",
-            ));
-        }
-        match pair[0].as_str() {
-            "--output" => options.output = Some(PathBuf::from(&pair[1])),
-            "--scope" if ["user", "project", "machine", "project_machine"].contains(&pair[1].as_str()) => options.scope = Some(pair[1].clone()),
-            "--project" => options.project = Some(pair[1].clone()),
-            "--machine" => options.machine = Some(pair[1].clone()),
-            "--format" if pair[1] == "jsonl" => {},
-            "--format" if pair[1] == "table" => options.table = true,
-            _ => return Err(DomainError::new("invalid_arguments", "Supported inventory options: --output, --scope user|project|machine|project_machine, --project, --machine, --format jsonl|table.")),
-        }
-    }
-    Ok(options)
-}
-
 fn failure() -> DomainError {
     DomainError::new(
         "inventory_failed",

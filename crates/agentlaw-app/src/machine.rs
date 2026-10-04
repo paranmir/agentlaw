@@ -45,13 +45,19 @@ pub fn load_or_create(state: &Path) -> Result<Machine> {
     }
 }
 
-pub fn name(state: &Path, display_name: &str) -> Result<Machine> {
+/// Validate a display name without reading or creating the machine identity.
+pub fn validate_name(display_name: &str) -> Result<()> {
     if display_name.trim().is_empty() || display_name.len() > 256 {
         return Err(DomainError::new(
             "invalid_machine_name",
             "Choose a nonempty human-readable name of at most 256 UTF-8 bytes.",
         ));
     }
+    Ok(())
+}
+
+pub fn name(state: &Path, display_name: &str) -> Result<Machine> {
+    validate_name(display_name)?;
     let mut machine = load_or_create(state)?;
     machine.display_name = Some(display_name.to_owned());
     let mut tmp = tempfile::NamedTempFile::new_in(state).map_err(|_| err())?;

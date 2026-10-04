@@ -13,6 +13,7 @@ agentlaw-contracts = { path = "../agentlaw-contracts" }
 agentlaw-storage = { path = "../agentlaw-storage" }
 agentlaw-flows = { path = "../agentlaw-flows" }
 agentlaw-worker = { path = "../agentlaw-worker" }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

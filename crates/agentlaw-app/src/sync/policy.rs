@@ -15,6 +15,38 @@ pub struct DelegationPolicy {
     pub allowed_scopes: Vec<String>,
     pub push_permission: bool,
 }
+/// An explicitly confirmed policy whose existing shape and static domain
+/// constraints were checked.
+/// Source/control and actual Git destination checks still require a store.
+#[derive(Debug)]
+pub struct PreparedPolicy(DelegationPolicy);
+
+pub fn require_delegation_confirmation(confirmed: bool) -> Result<()> {
+    if !confirmed {
+        return Err(DomainError::new("delegation_confirmation_required","The user must explicitly activate this continuing local delegation. It is not per-solution approval."));
+    }
+    Ok(())
+}
+
+pub fn require_sharing_confirmation(confirmed: bool) -> Result<()> {
+    if !confirmed {
+        return Err(DomainError::new(
+            "sharing_choice_required",
+            "User approval of these exact sensitive findings is required.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn prepare_policy_configuration(input: &str, confirmed: bool) -> Result<PreparedPolicy> {
+    require_delegation_confirmation(confirmed)?;
+    let value = agentlaw_contracts::validation::decode_unique(input)
+        .map_err(|_| git::io_error("sync record decode"))?;
+    let policy: DelegationPolicy =
+        serde_json::from_value(value).map_err(|_| git::io_error("sync record decode"))?;
+    validate_policy(&policy)?;
+    Ok(PreparedPolicy(policy))
+}
 pub(super) fn digest(policy: &DelegationPolicy) -> String {
     git::hash(&serde_json::to_vec(policy).unwrap())
 }
@@ -80,10 +112,19 @@ pub fn configure_policy(
     file: &Path,
     confirmed: bool,
 ) -> Result<Value> {
-    if !confirmed {
-        return Err(DomainError::new("delegation_confirmation_required","The user must explicitly activate this continuing local delegation. It is not per-solution approval."));
-    }
+    require_delegation_confirmation(confirmed)?;
     let policy: DelegationPolicy = read_json(file)?;
+    validate_policy(&policy)?;
+    configure_prepared_policy(state, store, local, PreparedPolicy(policy))
+}
+
+pub fn configure_prepared_policy(
+    state: &Path,
+    store: &Store,
+    local: &Path,
+    prepared: PreparedPolicy,
+) -> Result<Value> {
+    let policy = prepared.0;
     check_bindings(store, local, &policy)?;
     let dir = state.join("policies");
     fs::create_dir_all(&dir).map_err(|_| git::io_error("policy directory"))?;
@@ -108,29 +149,17 @@ pub(super) fn load(state: &Path, id: &str) -> Result<DelegationPolicy> {
     }
     Ok(policy)
 }
-fn check_bindings(store: &Store, local: &Path, policy: &DelegationPolicy) -> Result<()> {
+fn validate_policy(policy: &DelegationPolicy) -> Result<()> {
     agentlaw_storage::validate_id(&policy.policy_id).map_err(storage_error)?;
-    let source = store
-        .with_source_read(|p, _| Ok(p.to_path_buf()))
-        .map_err(storage_error)?;
-    if policy.version == 0
-        || source != policy.source
-        || fs::canonicalize(local).map_err(|_| git::io_error("policy local binding"))?
-            != policy.control
-    {
+    if policy.version == 0 {
         return Err(DomainError::new(
             "sync_policy_binding",
             "Delegation belongs to a different source/control binding.",
         ));
     }
-    let fetch = git::text(&source, &["remote", "get-url", "--all", &policy.remote])?;
-    if fetch != policy.fetch_endpoint
-        || git::endpoint(&source, &policy.remote)? != policy.push_endpoint
-        || !policy.target_ref.starts_with("refs/heads/")
-    {
+    if !policy.target_ref.starts_with("refs/heads/") {
         return Err(DomainError::new("sync_destination_changed","Actual Git fetch/push endpoints differ from the registered policy. No new destination was authorized."));
     }
-    git::run(&source, &["check-ref-format", &policy.target_ref])?;
     if policy
         .allowed_operations
         .iter()
@@ -149,7 +178,30 @@ fn check_bindings(store: &Store, local: &Path, policy: &DelegationPolicy) -> Res
     }
     Ok(())
 }
+fn check_bindings(store: &Store, local: &Path, policy: &DelegationPolicy) -> Result<()> {
+    let source = store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .map_err(storage_error)?;
+    if source != policy.source
+        || fs::canonicalize(local).map_err(|_| git::io_error("policy local binding"))?
+            != policy.control
+    {
+        return Err(DomainError::new(
+            "sync_policy_binding",
+            "Delegation belongs to a different source/control binding.",
+        ));
+    }
+    let fetch = git::text(&source, &["remote", "get-url", "--all", &policy.remote])?;
+    if fetch != policy.fetch_endpoint
+        || git::endpoint(&source, &policy.remote)? != policy.push_endpoint
+    {
+        return Err(DomainError::new("sync_destination_changed","Actual Git fetch/push endpoints differ from the registered policy. No new destination was authorized."));
+    }
+    git::run(&source, &["check-ref-format", &policy.target_ref])?;
+    Ok(())
+}
 pub(super) fn check(store: &Store, local: &Path, policy: &DelegationPolicy) -> Result<()> {
+    validate_policy(policy)?;
     check_bindings(store, local, policy)?;
     if !policy.enabled {
         return Err(DomainError::new(
@@ -197,12 +249,7 @@ pub fn accept_findings(
     findings_digest: &str,
     confirmed: bool,
 ) -> Result<Value> {
-    if !confirmed {
-        return Err(DomainError::new(
-            "sharing_choice_required",
-            "User approval of these exact sensitive findings is required.",
-        ));
-    }
+    require_sharing_confirmation(confirmed)?;
     let _lane = git::lane(&local.join("git"))?;
     let conn = db(local)?;
     let raw: String = conn
@@ -228,4 +275,85 @@ pub fn accept_findings(
     let accepted = json!({"candidate":candidate,"findings_digest":findings_digest,"scanner_digest":scan.scanner_build_digest,"policy_digest":op.policy_digest,"push_endpoint_digest":git::hash(op.policy.push_endpoint.as_bytes()),"target_ref":op.policy.target_ref,"authority_kind":"explicit_local_cli"});
     git::save_local_json(&op.owned.join("findings-acceptance.json"), &accepted)?;
     Ok(accepted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> Value {
+        json!({
+            "policy_id":"c62664c6-0988-43f5-878c-d2d14f59d210",
+            "version":1,
+            "enabled":true,
+            "source":"unavailable-source",
+            "control":"unavailable-control",
+            "remote":"origin",
+            "fetch_endpoint":"unavailable-remote",
+            "push_endpoint":"unavailable-remote",
+            "target_ref":"refs/heads/main",
+            "allowed_operations":["memory"],
+            "allowed_scopes":["user"],
+            "push_permission":true
+        })
+    }
+
+    #[test]
+    fn prepared_policy_requires_confirmation_before_decoding() {
+        assert_eq!(
+            prepare_policy_configuration("not JSON", false)
+                .unwrap_err()
+                .code,
+            "delegation_confirmation_required"
+        );
+    }
+
+    #[test]
+    fn prepares_existing_static_policy_contract_without_source_access() {
+        let prepared = prepare_policy_configuration(&policy().to_string(), true).unwrap();
+        assert!(prepared.0.enabled);
+        assert_eq!(prepared.0.version, 1);
+    }
+
+    #[test]
+    fn prepared_policy_reuses_existing_constraint_errors() {
+        for (field, value, expected) in [
+            ("version", json!(0), "sync_policy_binding"),
+            (
+                "target_ref",
+                json!("refs/tags/main"),
+                "sync_destination_changed",
+            ),
+            (
+                "allowed_operations",
+                json!(["unknown"]),
+                "invalid_policy_scope",
+            ),
+            ("allowed_scopes", json!(["unknown"]), "invalid_policy_scope"),
+        ] {
+            let mut input = policy();
+            input[field] = value;
+            assert_eq!(
+                prepare_policy_configuration(&input.to_string(), true)
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_policy_preserves_decode_error_and_rejects_duplicate_fields() {
+        for input in [
+            "{}".to_owned(),
+            policy()
+                .to_string()
+                .replacen("\"version\":1", "\"version\":1,\"version\":2", 1),
+        ] {
+            assert_eq!(
+                prepare_policy_configuration(&input, true).unwrap_err().code,
+                "git_io"
+            );
+        }
+    }
 }

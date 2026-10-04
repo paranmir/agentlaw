@@ -4,6 +4,17 @@ use agentlaw_contracts::{DomainError, Result};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
 
+/// Validate a proposed canonical-store path without preparing installation state.
+pub fn validate_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(DomainError::new(
+            "invalid_path",
+            "Provide an absolute memory store path.",
+        ));
+    }
+    Ok(())
+}
+
 pub fn connect(state: &Path, path: &Path, create: bool) -> Result<Value> {
     connect_with_control(
         state,
@@ -30,12 +41,7 @@ pub(crate) fn connect_selection_with_control(
     control: agentlaw_flows::RequestControl,
 ) -> Result<(Value, config::Config)> {
     control.check()?;
-    if !path.is_absolute() {
-        return Err(DomainError::new(
-            "invalid_path",
-            "Provide an absolute memory store path.",
-        ));
-    }
+    validate_path(path)?;
     fs::create_dir_all(state)
         .map_err(|_| DomainError::new("configuration_io", "Cannot prepare local setup state."))?;
     let lock = fs::OpenOptions::new()
