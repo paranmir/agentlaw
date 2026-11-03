@@ -601,7 +601,7 @@
                   "machine"
                 ]
               },
-              "description": "For procedure publication, choose exactly [user], [project], [machine], or [project, machine]. Omit during the authoring request."
+              "description": "Optional during authoring. For publication, create requires exactly [user], [project], [machine], or [project, machine]; evolve may omit it to inherit the scope when all parents have the same scope, or provide the intended scope explicitly."
             },
             "name": {
               "type": "string",
@@ -649,7 +649,7 @@
         "context_layers": {
           "type": "integer",
           "minimum": 0,
-          "description": "history only. Nonnegative ancestor-context depth for recent history or history_for search. Use 0 for no additional ancestor context. Do not combine with start_change_id/end_change_id."
+          "description": "history only. Nonnegative causal-context depth. Recent history follows ancestors of current heads; history_for search includes both ancestors and descendants of each matching change up to this depth in each direction. Use 0 for no surrounding layer. Do not combine with start_change_id/end_change_id."
         },
         "history_for": {
           "type": "string",
@@ -686,7 +686,7 @@
             "connect",
             "create"
           ],
-          "description": "connect_project_memory only. discover returns candidates without binding (default). connect requires a user-selected project_id. create requires project_name and confirmed first-time adoption; no candidates alone is not permission to create."
+          "description": "connect_project_memory only. discover returns candidates without binding (default). connect requires a returned project_id selected from sufficient observed evidence and user intent; ask when unclear. create requires project_name and confirmed first-time adoption; no candidates alone is not permission to create."
         },
         "clues": {
           "type": "object",
@@ -708,7 +708,7 @@
         },
         "project_id": {
           "type": "string",
-          "description": "connect_project_memory with intent=connect only. Copy the candidate ID explicitly selected by the user, even for one candidate."
+          "description": "connect_project_memory with intent=connect only. Copy the returned candidate ID selected from sufficient observed evidence and user intent. Reuse an already established user choice; ask when unclear. One candidate alone does not authorize connection."
         },
         "project_name": {
           "type": "string",

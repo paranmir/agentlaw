@@ -24,7 +24,7 @@ For work needing intermediate state, reuse the matching Task or create one after
 
 Persistence is confirmed by status=remembered with memory_ref(ID, observed_version), or by an authoritative recovery read verifying the published checkpoint's content and ID/version. Errors, pending batches, and missing replies are not confirmation. Use the existing recovery contract; do not blindly reissue an uncertain write. If unresolved, report the recovery gap and pause only work relying on restart information not yet confirmed durable; independent work may continue. Keep a compact, complete handoff, not a command log. Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
-Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect or create a project only with an explicit user choice. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
+Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect an existing project explicitly when observed evidence and user intent identify it; reuse an already established user choice and ask when unclear. Do not auto-connect merely because one candidate exists. Create a new project only with explicit user intent. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
 
 When explicitly asked to synchronize memory, use sync with an existing user-enabled local policy. Agentlaw owns Git capture, merge preparation, validation, recovery and fixed-commit delivery. Read the complete frozen conflict packet and submit one whole solution for semantic or structural conflicts; do not edit canonical headers or run pull/merge on active memory. Copy returned IDs, handles and revisions. After interruption, inspect status and resume the same operation. Never enable or broaden a policy through an LLM call. Sensitive findings require a separate explicit user decision. Completion covers the fixed cutoff, not later local writes; ordinary remember_this does not commit or push.
 ```
@@ -50,8 +50,8 @@ reason to discard an established understanding or correction (ADR-0012).
 The project path is observed work context, not project identity (ADR-0140).
 Do not infer it from the Agentlaw executable location or MCP process cwd. If
 workspace information and work tools do not establish it, ask the user. A
-separate helper call is not required; input field names and local-access
-transport remain implementation work.
+separate helper call is not required. The remaining local-access transport
+choices are tracked in interface specification HOLD-05.
 
 ## Connection action description
 
@@ -63,16 +63,15 @@ Connect the current project folder to its Agentlaw project identity in a memory 
 
 Connection-needed results point to this action on the already used agentlaw
 tool, not an additional tool. The input must distinguish the actual project
-root, selection of an existing identity and explicit creation intent. Exact
-payload fields remain implementation work. Ordinary cross-project recall is
-not a request to rebind the local project.
+root, selection of an existing identity and explicit creation intent. Ordinary
+cross-project recall is not a request to rebind the local project.
 
 Connection input contract: the verified project root is required; observed Git
 address, project name and description are optional clues. Supplying root/clues
 alone requests candidate discovery (or returns an established connection), not
 implicit creation or association. The same action accepts explicit existing-ID
 selection or explicit first-adoption creation intent in a subsequent request.
-Exact field names and discriminated input branches remain implementation work.
+Field names and discover/connect/create branches follow agentlaw-tool.schema.json and interface specification §8.
 
 LLM-facing operational next-action guidance is written in English. User-facing
 explanations, questions and results use the user's conversational language or
@@ -82,14 +81,14 @@ unassociated project location, use the following result guidance, adapted only
 to information actually missing from that result:
 
 ```text
-Project memory has not been retrieved because this folder has no approved connection. Explain the returned candidates. Use an already explicit user choice or ask the user to select one, approve a new project, or skip for now. Do not auto-select merely because one candidate exists. Use connect_project_memory only after approval; use its recall_result if requested, otherwise retry recall. No candidates alone is not permission to create. If discovery was incomplete or the memory store unavailable, do not claim there is no existing project.
+Project memory has not been retrieved because this folder has no approved connection. Explain the returned candidates. Select an existing identity only when observed evidence and user intent suffice, reusing an already established user choice. If the identity or intent is unclear, ask the user to select one, explicitly request a new project, or skip for now. Do not auto-select merely because one candidate exists. Submit the selected identity through connect_project_memory; use its recall_result if requested, otherwise retry recall. No candidates alone is not permission to create. If discovery was incomplete or the memory store unavailable, do not claim there is no existing project.
 ```
 
 Project observations come from the LLM's actual work environment. Runtime must
 not fill missing project Git information by inspecting its own cwd, its source
 checkout or the memory repository. A project's Git address is optional evidence,
-not identity. The exact observation input keys must be supplied by the action
-schema before this guidance can be treated as executable integration.
+not identity. Submit those observations through the connection fields defined
+by agentlaw-tool.schema.json.
 
 ## Existing schema descriptions
 
@@ -257,6 +256,30 @@ Pro review's illustrative `Saved: T@r` text as a replacement schema. Put
 operational guidance outside quoted/retrieved memory so historical instructions
 are not mistaken for current tool rules.
 
+### Runtime exception guidance
+
+Use the following text only for the corresponding exception response, outside recalled memory.
+
+For `execution_outcome_unknown` when the request contains an existing pending, authoring or sync reference:
+
+```text
+The connection ended before the operation's result was received. It may have completed. Use the existing reference to inspect or resume that work; do not repeat an unconfirmed write.
+```
+
+For `execution_outcome_unknown` without an existing work reference:
+
+```text
+The connection ended before the operation's result was received. It may have completed, and no execution reference is available to determine its outcome. Do not repeat this write automatically.
+```
+
+For `cancellation_requested`:
+
+```text
+Cancellation was requested. The operation's final result determines whether publication was cancelled or completed.
+```
+
+A completed pre-decision cancellation returns the existing retained-work reference after its state is persisted.
+
 ### Incomplete semantic recall
 
 A recall with `recall_for` and an actual `semantic_channel_incomplete`
@@ -313,8 +336,10 @@ When project context is unavailable because a folder is not connected, explain
 that project memory has not been retrieved and give a concrete
 connect_project_memory request with intent=discover and a verified project_path.
 Unknown paths remain explicitly marked placeholders, never the MCP process cwd.
-Discovery results also explain the next connect/create call. Ask the user to
-select even a single candidate; empty candidates do not establish first-time
+Discovery results also explain the next connect/create call. Select an existing
+identity when observed evidence and user intent suffice, reusing an already
+established user choice; ask the user when either is unclear. Do not auto-select
+merely because one candidate exists; empty candidates do not establish first-time
 adoption. Connect the local memory store first if none is selected, then retry
 the original recall. Instructions use English; user-facing explanations use
 the user's language. Do not create a separate recovery tool.
@@ -405,8 +430,9 @@ an optional repository Star.
   permanent bundle or graph engine is introduced. ADR-0139 adds durable pending
   write-review state, distinct from current memory and ordinary recall.
 - Required-link traversal follows ADR-0138; multi-call reading and write review
-  follow ADR-0139. Target metadata names, exact continuation/review fields, task
-  evidence revision tracking and project-entry delivery remain open.
+  follow ADR-0139. Target metadata and pending/review fields follow interface
+  specification §4–5 and the public tool schema. Task evidence revision tracking
+  and project-entry delivery remain open.
 
 These texts are accepted implementation inputs. Prototype use can identify
 revisions; a future evaluation does not need to precede this wording decision.
