@@ -427,7 +427,7 @@
               },
               "is_rule": {
                 "type": "boolean",
-                "description": "Use true only for explicitly established standing rules; evidence must support that intent."
+                "description": "Use true only for an explicitly established standing rule that stays needed across this project, machine or user's work; evidence must support that intent. If an existing rule overlaps or can be combined, evolve or consolidate it instead of adding another, preserving every scope, condition and exception."
               },
               "related_memory_ids": {
                 "type": "array",
