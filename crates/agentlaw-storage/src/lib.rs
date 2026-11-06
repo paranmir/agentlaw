@@ -756,6 +756,10 @@ impl Store {
         validate_id(project_id)?;
         let _l = self.lock()?;
         self.ensure_clean()?;
+        self.read_catalog_locked(project_id)
+    }
+    fn read_catalog_locked(&self, project_id: &str) -> Result<Value> {
+        validate_id(project_id)?;
         let p = self.safe_path(&format!(
             "catalog/projects/{}/{}.md",
             &project_id[..2],
@@ -770,6 +774,9 @@ impl Store {
     pub fn list_catalog(&self) -> Result<Vec<Value>> {
         let _l = self.lock()?;
         self.ensure_clean()?;
+        self.list_catalog_locked()
+    }
+    fn list_catalog_locked(&self) -> Result<Vec<Value>> {
         let base = self.root.join("catalog/projects");
         let mut result = Vec::new();
         if !base.exists() {
@@ -806,6 +813,16 @@ impl Store {
             .write(true)
             .open(self.local.join("source.lock"))?;
         f.lock_exclusive()?;
+        Ok(f)
+    }
+    fn lock_shared(&self) -> Result<File> {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.local.join("source.lock"))?;
+        FileExt::lock_shared(&f)?;
         Ok(f)
     }
     fn writer_id(&self) -> Result<String> {

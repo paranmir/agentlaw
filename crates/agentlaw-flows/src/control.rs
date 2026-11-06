@@ -8,6 +8,152 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// A lane-owned, writable control connection.
+pub struct ControlWriter {
+    pub(crate) connection: Connection,
+}
+impl ControlWriter {
+    pub fn open(local: impl AsRef<Path>) -> Result<Self> {
+        let local = local.as_ref();
+        if local.join("control-initialized.json").exists() && !local.join("control.sqlite").exists()
+        {
+            return Err(control_backup_required());
+        }
+        let marker_path = local.join("control-initialized.json");
+        if marker_path.exists() {
+            let marker: Value = serde_json::from_slice(
+                &std::fs::read(marker_path).map_err(|_| control_backup_required())?,
+            )
+            .map_err(|_| control_backup_required())?;
+            let existing = Connection::open_with_flags(
+                local.join("control.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|_| control_backup_required())?;
+            let binding: String = existing
+                .query_row(
+                    "SELECT value FROM settings WHERE key='binding_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| control_backup_required())?;
+            if marker["binding_id"] != binding {
+                return Err(control_backup_required());
+            }
+        }
+        let connection = sql(Connection::open(local.join("control.sqlite")))?;
+        sql(connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS associations(binding TEXT NOT NULL,path TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(binding,path));
+            CREATE TABLE IF NOT EXISTS project_creations(binding TEXT NOT NULL,path TEXT NOT NULL,project TEXT NOT NULL,operation TEXT NOT NULL,payload TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(binding,path));
+            CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,version TEXT NOT NULL,binding TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','published','discarded')),result TEXT,discard_reason TEXT);
+            CREATE TABLE IF NOT EXISTS authoring(token TEXT PRIMARY KEY,binding TEXT NOT NULL,basis TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS authoring_executions(token TEXT PRIMARY KEY,binding TEXT NOT NULL,operation TEXT NOT NULL,generation TEXT NOT NULL,mutation TEXT NOT NULL,submission TEXT NOT NULL,status TEXT NOT NULL,result TEXT);
+        "))?;
+        Ok(Self { connection })
+    }
+}
+/// A request-scoped read-only control snapshot.
+pub struct ControlReader {
+    connection: Connection,
+}
+impl ControlReader {
+    pub fn open(local: impl AsRef<Path>) -> Result<Self> {
+        let connection = sql(Connection::open_with_flags(
+            local.as_ref().join("control.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ))?;
+        sql(connection.execute_batch("BEGIN"))?;
+        let tables: i64 = sql(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('settings','associations','project_creations','pending','authoring','authoring_executions')", [], |r| r.get(0)))?;
+        if tables != 6 {
+            return Err(control_backup_required());
+        }
+        Ok(Self { connection })
+    }
+    pub fn exact_association(
+        &self,
+        binding: &str,
+        path: &str,
+    ) -> Result<Option<ProjectConnection>> {
+        exact_association(&self.connection, binding, path)
+    }
+    pub fn pending_inspect(&self, binding: &str, reference: &PendingBatchRef) -> Result<Value> {
+        let (retained, status, result) = load_pending(&self.connection, binding, reference)?;
+        if status == "published" {
+            return decode(result.as_deref().unwrap_or("null"));
+        }
+        Ok(Runtime::pending_response(&retained, &status))
+    }
+    pub fn pending_notices(&self, binding: &str, project_id: Option<&str>) -> Result<Vec<Value>> {
+        pending_notices(&self.connection, binding, project_id)
+    }
+    pub fn authoring_result(
+        &self,
+        binding: &str,
+        token: &str,
+    ) -> Result<Option<(String, String, Option<String>)>> {
+        authoring_result(&self.connection, binding, token)
+    }
+}
+pub(crate) fn pending_notices(
+    connection: &Connection,
+    binding: &str,
+    project_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    let mut statement = sql(connection.prepare("SELECT id,version FROM pending WHERE binding=?1 AND status='pending' AND (json_extract(payload,'$.context.project_id') IS NULL OR json_extract(payload,'$.context.project_id')=?2) ORDER BY id"))?;
+    let notices = sql(statement.query_map(params![binding, project_id], |row| {
+        Ok(json!({"pending_batch_ref":{"pending_batch_id":row.get::<_, String>(0)?,"observed_version":row.get::<_, String>(1)?}}))
+    }))?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|_| DomainError::new("control_storage_failed", "Pending notices could not be read; retained work was not discarded."));
+    notices
+}
+fn exact_association(
+    connection: &Connection,
+    binding: &str,
+    path: &str,
+) -> Result<Option<ProjectConnection>> {
+    let project: Option<String> = sql(connection
+        .query_row(
+            "SELECT project FROM associations WHERE binding=?1 AND path=?2",
+            params![binding, path],
+            |r| r.get(0),
+        )
+        .optional())?;
+    Ok(project.map(|project_id| ProjectConnection {
+        project_id,
+        project_path: path.into(),
+    }))
+}
+pub(crate) fn load_pending(
+    connection: &Connection,
+    binding: &str,
+    reference: &PendingBatchRef,
+) -> Result<(Retained, String, Option<String>)> {
+    validate_id(&reference.pending_batch_id)?;
+    let row: Option<(String, String, Option<String>)> = sql(connection
+        .query_row(
+            "SELECT payload,status,result FROM pending WHERE id=?1 AND binding=?2",
+            params![reference.pending_batch_id, binding],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional())?;
+    let (payload, status, result) = row.ok_or_else(|| {
+        DomainError::new(
+            "pending_not_found",
+            "Pending batch does not exist in the selected store binding.",
+        )
+    })?;
+    Ok((decode(&payload)?, status, result))
+}
+pub(crate) fn authoring_result(
+    connection: &Connection,
+    binding: &str,
+    token: &str,
+) -> Result<Option<(String, String, Option<String>)>> {
+    sql(connection.query_row("SELECT status,submission,result FROM authoring_executions WHERE token=?1 AND binding=?2", params![token,binding], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional())
+}
+
 impl Runtime {
     pub fn open(
         store_root: impl AsRef<Path>,
@@ -101,15 +247,7 @@ impl Runtime {
             DomainError::new("store_unavailable", "Cannot resolve memory store root.")
         })?;
         let local = local_root.as_ref().to_path_buf();
-        let control = sql(Connection::open(local.join("control.sqlite")))?;
-        sql(control.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS associations(binding TEXT NOT NULL,path TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(binding,path));
-            CREATE TABLE IF NOT EXISTS project_creations(binding TEXT NOT NULL,path TEXT NOT NULL,project TEXT NOT NULL,operation TEXT NOT NULL,payload TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(binding,path));
-            CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,version TEXT NOT NULL,binding TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','published','discarded')),result TEXT,discard_reason TEXT);
-            CREATE TABLE IF NOT EXISTS authoring(token TEXT PRIMARY KEY,binding TEXT NOT NULL,basis TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS authoring_executions(token TEXT PRIMARY KEY,binding TEXT NOT NULL,operation TEXT NOT NULL,generation TEXT NOT NULL,mutation TEXT NOT NULL,submission TEXT NOT NULL,status TEXT NOT NULL,result TEXT);
-        "))?;
+        let control = ControlWriter::open(&local)?.connection;
         let setting = |key: &str, default: String| -> Result<String> {
             sql(control.execute(
                 "INSERT OR IGNORE INTO settings VALUES(?1,?2)",
@@ -231,18 +369,7 @@ impl ContextRepository for Runtime {
         Err(DomainError::new("store_binding_transition_required","Select the store through installation configuration. The next request uses the selected binding while retained operations keep their original binding."))
     }
     fn exact_association(&self, path: &str) -> Result<Option<ProjectConnection>> {
-        let project: Option<String> = sql(self
-            .control
-            .query_row(
-                "SELECT project FROM associations WHERE binding=?1 AND path=?2",
-                params![self.binding_id, path],
-                |r| r.get(0),
-            )
-            .optional())?;
-        Ok(project.map(|project_id| ProjectConnection {
-            project_id,
-            project_path: path.into(),
-        }))
+        exact_association(&self.control, &self.binding_id, path)
     }
     fn discover(&self, clues: Option<&ProjectClues>) -> Result<Vec<ProjectCandidate>> {
         let root = self.root.join("catalog/projects");
@@ -441,5 +568,213 @@ impl ContextRepository for Runtime {
             return Err(DomainError::new("restore_preparation_failed","Project connection completed but semantic preparation failed. Retry preparation; existing source and connection are preserved."));
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod control_reader_tests {
+    use super::*;
+
+    #[test]
+    fn reader_is_read_only_and_does_not_create_database() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ControlReader::open(dir.path()).is_err());
+        assert!(!dir.path().join("control.sqlite").exists());
+        drop(ControlWriter::open(dir.path()).unwrap());
+        let path = dir.path().join("control.sqlite");
+        let before = std::fs::read(&path).unwrap();
+        {
+            let reader = ControlReader::open(dir.path()).unwrap();
+            assert!(reader
+                .connection
+                .execute("INSERT INTO settings VALUES('test','value')", [])
+                .is_err());
+        }
+        assert_eq!(before, std::fs::read(path).unwrap());
+    }
+
+    #[test]
+    fn reader_snapshot_is_stable_while_writer_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ControlWriter::open(dir.path()).unwrap();
+        writer
+            .connection
+            .execute(
+                "INSERT INTO associations VALUES('binding','path','old')",
+                [],
+            )
+            .unwrap();
+        let reader = ControlReader::open(dir.path()).unwrap();
+        assert_eq!(
+            reader
+                .exact_association("binding", "path")
+                .unwrap()
+                .unwrap()
+                .project_id,
+            "old"
+        );
+        writer
+            .connection
+            .execute("UPDATE associations SET project='new'", [])
+            .unwrap();
+        assert_eq!(
+            reader
+                .exact_association("binding", "path")
+                .unwrap()
+                .unwrap()
+                .project_id,
+            "old"
+        );
+        let fresh = ControlReader::open(dir.path()).unwrap();
+        assert_eq!(
+            fresh
+                .exact_association("binding", "path")
+                .unwrap()
+                .unwrap()
+                .project_id,
+            "new"
+        );
+    }
+
+    #[test]
+    fn reader_matches_runtime_association() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        let local = dir.path().join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Runtime::open(&root, &local, "user").unwrap();
+        runtime
+            .control
+            .execute(
+                "INSERT INTO associations VALUES(?1,'path','project')",
+                [&runtime.binding_id],
+            )
+            .unwrap();
+        let reader = ControlReader::open(&local).unwrap();
+        let expected = ContextRepository::exact_association(&runtime, "path")
+            .unwrap()
+            .unwrap();
+        let actual = reader
+            .exact_association(&runtime.binding_id, "path")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(expected).unwrap(),
+            serde_json::to_value(actual).unwrap()
+        );
+    }
+
+    #[test]
+    fn reader_matches_runtime_pending_and_authoring_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        let local = dir.path().join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+        let context = ContextRepository::request_context(&runtime, None).unwrap();
+        let batch = crate::write::PendingBatch::new(&context, vec![]);
+        let reference = batch.reference.clone();
+        let retained = Retained {
+            diagnostics: vec![],
+            batch,
+            context,
+            issues: vec![],
+            basis: String::new(),
+            resolution_ref: None,
+            review_refs: vec![],
+            approved_review_refs: vec![],
+            overlap_approved: false,
+            operation_id: None,
+            mutations: vec![],
+            expected_generation: None,
+            publication_basis: None,
+        };
+        runtime.save_pending(&retained, None).unwrap();
+        runtime.control.execute("INSERT INTO authoring_executions VALUES(?1,?2,'op','1','{}','submission','published','result')", params!["token", runtime.binding_id]).unwrap();
+        let reader = ControlReader::open(&local).unwrap();
+        let expected = runtime
+            .remember(
+                serde_json::from_value(
+                    json!({"pending_batch_ref": reference, "pending_action": "inspect"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            reader
+                .pending_inspect(&runtime.binding_id, &reference)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            reader
+                .authoring_result(&runtime.binding_id, "token")
+                .unwrap(),
+            authoring_result(&runtime.control, &runtime.binding_id, "token").unwrap()
+        );
+    }
+
+    #[test]
+    fn reader_pending_notices_match_runtime_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("source");
+        let local = dir.path().join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = Runtime::open(&root, &local, "user").unwrap();
+        for (id, binding, project, status) in [
+            (
+                "b",
+                runtime.binding_id.as_str(),
+                Some("project-a"),
+                "pending",
+            ),
+            ("a", runtime.binding_id.as_str(), None, "pending"),
+            (
+                "c",
+                runtime.binding_id.as_str(),
+                Some("project-b"),
+                "pending",
+            ),
+            ("d", runtime.binding_id.as_str(), None, "discarded"),
+            ("e", "other-binding", None, "pending"),
+        ] {
+            runtime.control.execute(
+                "INSERT INTO pending(id,version,binding,payload,status) VALUES(?1,'version',?2,?3,?4)",
+                params![id, binding, json!({"context":{"project_id":project}}).to_string(), status],
+            ).unwrap();
+        }
+        let reader = ControlReader::open(&local).unwrap();
+        for (project, expected_ids) in [
+            (None, vec!["a"]),
+            (Some("project-a"), vec!["a", "b"]),
+            (Some("project-b"), vec!["a", "c"]),
+        ] {
+            let context =
+                ContextRepository::request_context(&runtime, project.map(str::to_owned)).unwrap();
+            let response = runtime
+                .recall_with_context(RecallRequest::default(), context)
+                .unwrap();
+            let actual = reader
+                .pending_notices(&runtime.binding_id, project)
+                .unwrap();
+            assert_eq!(json!(actual), response["pending_batches"]);
+            let ids: Vec<_> = actual
+                .iter()
+                .map(|v| v["pending_batch_ref"]["pending_batch_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected_ids);
+        }
+    }
+
+    #[test]
+    fn writer_is_send_and_not_sync() {
+        fn send<T: Send>() {}
+        send::<ControlWriter>();
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+        let _ = <ControlWriter as AmbiguousIfSync<_>>::check;
     }
 }

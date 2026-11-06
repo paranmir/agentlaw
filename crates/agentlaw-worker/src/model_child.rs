@@ -20,7 +20,7 @@ pub(crate) struct Launch {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Input {
-    Embed { id: i64, attempt: i64, text: String },
+    Embed { id: u64, attempt: i64, text: String },
     Stop,
 }
 #[derive(Serialize, Deserialize)]
@@ -36,7 +36,7 @@ pub(crate) enum Output {
         cause: String,
     },
     Result {
-        id: i64,
+        id: u64,
         attempt: i64,
         result: std::result::Result<Vec<f32>, EmbeddingError>,
     },

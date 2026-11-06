@@ -7,6 +7,52 @@ use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+pub enum Prepared {
+    Replay(Value),
+    Remember(RememberPlan),
+    Discard(DiscardPlan),
+    Authoring(AuthoringPlan),
+    Procedure(ProcedurePlan),
+    Connect(ConnectPlan),
+}
+pub(crate) enum PendingExpectation {
+    New,
+    Version(String),
+}
+pub struct RememberPlan {
+    pub(crate) retained: Retained,
+    pub(crate) expectation: PendingExpectation,
+}
+pub struct DiscardPlan {
+    pub(crate) reference: PendingBatchRef,
+    pub(crate) reason: String,
+}
+pub struct AuthoringPlan {
+    pub(crate) token: uuid::Uuid,
+    pub(crate) basis: String,
+    pub(crate) response: Value,
+}
+pub struct ProcedurePlan {
+    pub(crate) token: String,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) generation: u64,
+    pub(crate) mutation: Mutation,
+    pub(crate) submission: String,
+}
+pub struct ConnectPlan(pub(crate) ConnectPlanKind);
+pub(crate) enum ConnectPlanKind {
+    Select { path: String, project_id: String },
+    Create { path: String, saga: ProjectSaga },
+    Discovered(ConnectResponse),
+}
+pub struct ProjectSaga {
+    pub(crate) path: String,
+    pub(crate) project_id: String,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) payload: Value,
+    pub(crate) resume: bool,
+}
+
 pub(crate) fn requires_overlap(
     snapshot: &Snapshot,
     p: &MemoryProposal,
@@ -83,22 +129,7 @@ impl Runtime {
         &self,
         reference: &PendingBatchRef,
     ) -> Result<(Retained, String, Option<String>)> {
-        validate_id(&reference.pending_batch_id)?;
-        let row: Option<(String, String, Option<String>)> = sql(self
-            .control
-            .query_row(
-                "SELECT payload,status,result FROM pending WHERE id=?1 AND binding=?2",
-                params![reference.pending_batch_id, self.binding_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional())?;
-        let (payload, status, result) = row.ok_or_else(|| {
-            DomainError::new(
-                "pending_not_found",
-                "Pending batch does not exist in the selected store binding.",
-            )
-        })?;
-        Ok((decode(&payload)?, status, result))
+        crate::control::load_pending(&self.control, &self.binding_id, reference)
     }
     pub(crate) fn pending_response(retained: &Retained, status: &str) -> Value {
         json!({"status":status,"pending_batch_ref":retained.batch.reference,"proposal_map":retained.batch.proposals.iter().enumerate().map(|(i,p)|json!({"proposal_index":i,"proposal_id":p.proposal_id})).collect::<Vec<_>>(),"proposals":retained.batch.proposals,"issues":retained.issues,"resolution_ref":retained.resolution_ref,"diagnostics":retained.diagnostics})
@@ -484,13 +515,12 @@ impl Runtime {
         Ok(result)
     }
     fn procedure(&self, r: &RememberRequest) -> Result<Value> {
-        let previous: Option<(String, String, Option<String>)> = if let Some(token) =
-            &r.authoring_ref
-        {
-            sql(self.control.query_row("SELECT status,submission,result FROM authoring_executions WHERE token=?1 AND binding=?2",params![token,self.binding_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional())?
-        } else {
-            None
-        };
+        let previous: Option<(String, String, Option<String>)> =
+            if let Some(token) = &r.authoring_ref {
+                crate::control::authoring_result(&self.control, &self.binding_id, token)?
+            } else {
+                None
+            };
         if let Some((status, submission, Some(result))) = &previous {
             if status == "published"
                 && decode::<RememberRequest>(submission).and_then(|stored| encode(&stored))?

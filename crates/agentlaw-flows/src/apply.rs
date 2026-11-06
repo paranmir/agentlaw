@@ -4,6 +4,18 @@ use crate::*;
 use agentlaw_storage::UnitState;
 use rusqlite::params;
 use serde_json::{json, Value};
+pub enum Applied {
+    Response(Value),
+    Connected {
+        response: ConnectResponse,
+        follow_up: Option<FollowUp>,
+    },
+}
+pub struct FollowUp {
+    pub restore: bool,
+    pub recall_for: Option<String>,
+}
+
 impl Runtime {
     pub(crate) fn publish_retained(&self, mut retained: Retained) -> Result<Value> {
         let generation = retained.expected_generation.ok_or_else(|| {

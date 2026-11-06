@@ -72,6 +72,30 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub struct StoreIdentity {
+    pub root: PathBuf,
+    pub local: PathBuf,
+    pub user_id: String,
+    pub machine_id: String,
+    pub binding_id: String,
+    pub history_limit: usize,
+}
+pub struct ReadCtx<'a> {
+    pub identity: &'a StoreIdentity,
+    pub source: &'a agentlaw_storage::published::OwnedPublishedReader,
+    pub control: &'a crate::control::ControlReader,
+    pub semantic: &'a dyn crate::semantic::SemanticPort,
+    pub history_semantic: &'a dyn crate::semantic::HistorySemanticPort,
+    pub history_cache: &'a crate::history_cache::HistoryCacheGuards,
+    pub request: &'a RequestControl,
+}
+pub struct LaneCtx<'a> {
+    pub identity: &'a StoreIdentity,
+    pub source: &'a Store,
+    pub control: &'a mut crate::control::ControlWriter,
+    pub request: &'a RequestControl,
+}
+
 pub struct Runtime {
     pub(crate) store: Store,
     pub(crate) control: Connection,

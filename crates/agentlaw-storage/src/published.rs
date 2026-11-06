@@ -41,6 +41,12 @@ pub struct PublishedReader<'a> {
 pub struct OwnedPublishedReader {
     pub(super) store: Store,
 }
+/// A clean source position protected by a shared source gate.
+pub struct SourceReadGuard<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) _gate: fs::File,
+    pub(crate) position: SourcePosition,
+}
 impl Clone for OwnedPublishedReader {
     fn clone(&self) -> Self {
         Self {
@@ -53,8 +59,16 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
-    /// Bounded ledger page without loading any current body. Exact acquisitions may
-    /// be newer than this position; consumers replay subsequent pages before ack.
+    pub fn read_snapshot(&self) -> Result<SourceReadGuard<'_>> {
+        let gate = self.store.lock_shared()?;
+        let sequence = self.store.ensure_clean()?;
+        let epoch = self.store.load(&self.store.local.join("source-epoch"))?;
+        Ok(SourceReadGuard {
+            store: &self.store,
+            _gate: gate,
+            position: SourcePosition { epoch, sequence },
+        })
+    }
     pub fn read_published_paths(
         &self,
         after: &SourcePosition,
@@ -63,10 +77,36 @@ impl OwnedPublishedReader {
         if limit == 0 || limit > 1024 {
             return Err(Error::Capacity);
         }
-        let s = &self.store;
-        let _gate = s.lock()?;
-        let generation = s.ensure_clean()?;
-        let epoch: String = s.load(&s.local.join("source-epoch"))?;
+        self.read_snapshot()?.read_published_paths(after, limit)
+    }
+    // These legacy acquisition paths read the epoch before checking the fence.
+    fn read_snapshot_epoch_first(&self) -> Result<SourceReadGuard<'_>> {
+        let gate = self.store.lock_shared()?;
+        let epoch = self.store.load(&self.store.local.join("source-epoch"))?;
+        let sequence = self.store.ensure_clean()?;
+        Ok(SourceReadGuard {
+            store: &self.store,
+            _gate: gate,
+            position: SourcePosition { epoch, sequence },
+        })
+    }
+}
+impl SourceReadGuard<'_> {
+    pub fn position(&self) -> &SourcePosition {
+        &self.position
+    }
+    /// A bounded ledger page at this guard's pinned source position.
+    pub fn read_published_paths(
+        &self,
+        after: &SourcePosition,
+        limit: u32,
+    ) -> Result<PublishedPaths> {
+        if limit == 0 || limit > 1024 {
+            return Err(Error::Capacity);
+        }
+        let s = self.store;
+        let generation = self.position.sequence;
+        let epoch = self.position.epoch.clone();
         if epoch != after.epoch || after.sequence > generation {
             return Err(Error::CoverageLost);
         }
@@ -113,10 +153,12 @@ impl OwnedPublishedReader {
         })
     }
     pub fn acquire_current(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store.acquire_current(id)
+        self.store
+            .acquire_kind_locked(id, "memory", self.position.clone())
     }
     pub fn acquire_procedure(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store.acquire_procedure(id)
+        self.store
+            .acquire_kind_locked(id, "procedure", self.position.clone())
     }
     pub fn acquire_closure(
         &self,
@@ -126,13 +168,112 @@ impl OwnedPublishedReader {
         Vec<crate::acquire::AcquiredResolvedCurrent>,
         Vec<String>,
     )> {
-        self.store.acquire_closure(ids)
+        self.store
+            .acquire_closure_locked(ids, self.position.clone())
     }
     pub fn read_current(&self, id: &str) -> Result<CurrentUnit> {
-        self.store.read_current(id)
+        self.store.read_kind(id, "memory")
     }
     pub fn read_procedure(&self, id: &str) -> Result<CurrentUnit> {
-        self.store.read_procedure(id)
+        self.store.read_kind(id, "procedure")
+    }
+    pub fn read_catalog(&self, id: &str) -> Result<serde_json::Value> {
+        self.store.read_catalog_locked(id)
+    }
+    pub fn list_catalog(&self) -> Result<Vec<serde_json::Value>> {
+        self.store.list_catalog_locked()
+    }
+    pub fn read_closure(
+        &self,
+        ids: &[String],
+    ) -> Result<(SourcePosition, Vec<crate::ResolvedCurrent>, Vec<String>)> {
+        let mut queue = std::collections::VecDeque::from(ids.to_vec());
+        let mut visited = std::collections::BTreeSet::new();
+        let mut resolved_ids = std::collections::BTreeSet::new();
+        let mut result = Vec::new();
+        let mut missing = Vec::new();
+        let mut bytes = 0u64;
+        while let Some(requested_id) = queue.pop_front() {
+            if !visited.insert(requested_id.clone()) {
+                continue;
+            }
+            crate::validate_id(&requested_id)?;
+            let mut next = requested_id.clone();
+            let mut redirect_path = Vec::new();
+            let mut chain = std::collections::BTreeSet::new();
+            loop {
+                if !chain.insert(next.clone()) {
+                    return Err(Error::Corrupt("redirect cycle".into()));
+                }
+                let current = match self.store.read_kind(&next, "memory") {
+                    Ok(unit) => unit,
+                    Err(Error::NotFound(_)) => {
+                        missing.push(next);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let crate::UnitState::Redirect { redirect_to, .. } = &current.state {
+                    redirect_path.push(next);
+                    next = redirect_to.clone();
+                    continue;
+                }
+                if resolved_ids.insert(current.entity_id.clone()) {
+                    for head in current.heads() {
+                        bytes = bytes
+                            .checked_add(head.body.len() as u64)
+                            .ok_or(Error::Capacity)?;
+                        if bytes > crate::codec::MAX_FRAME_BYTES {
+                            return Err(Error::Capacity);
+                        }
+                        for relation in head.metadata["relations"].as_array().into_iter().flatten()
+                        {
+                            if relation["kind"] == "required" {
+                                queue.push_back(
+                                    relation["target_memory_id"]
+                                        .as_str()
+                                        .ok_or_else(|| Error::Corrupt("required target".into()))?
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                    }
+                    result.push(crate::ResolvedCurrent {
+                        requested_id,
+                        redirect_path,
+                        current,
+                    });
+                }
+                break;
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        Ok((self.position.clone(), result, missing))
+    }
+}
+impl OwnedPublishedReader {
+    pub fn acquire_current(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
+        self.read_snapshot_epoch_first()?.acquire_current(id)
+    }
+    pub fn acquire_procedure(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
+        self.read_snapshot_epoch_first()?.acquire_procedure(id)
+    }
+    pub fn acquire_closure(
+        &self,
+        ids: &[String],
+    ) -> Result<(
+        SourcePosition,
+        Vec<crate::acquire::AcquiredResolvedCurrent>,
+        Vec<String>,
+    )> {
+        self.read_snapshot_epoch_first()?.acquire_closure(ids)
+    }
+    pub fn read_current(&self, id: &str) -> Result<CurrentUnit> {
+        self.read_snapshot()?.read_current(id)
+    }
+    pub fn read_procedure(&self, id: &str) -> Result<CurrentUnit> {
+        self.read_snapshot()?.read_procedure(id)
     }
     /// Cursor is `memory/<uuid>` or `procedure/<uuid>`. Filename discovery does not
     /// retain a source gate across consumer work; replay the ledger from the first page's position.
@@ -205,7 +346,14 @@ impl OwnedPublishedReader {
         &self,
         ids: &[String],
     ) -> Result<(SourcePosition, Vec<crate::ResolvedCurrent>, Vec<String>)> {
-        self.store.read_closure(ids)
+        self.read_snapshot_epoch_first()?.read_closure(ids)
+    }
+    pub fn read_catalog(&self, id: &str) -> Result<serde_json::Value> {
+        crate::validate_id(id)?;
+        self.read_snapshot()?.read_catalog(id)
+    }
+    pub fn list_catalog(&self) -> Result<Vec<serde_json::Value>> {
+        self.read_snapshot()?.list_catalog()
     }
 }
 impl PublishedChangeSource for OwnedPublishedReader {
