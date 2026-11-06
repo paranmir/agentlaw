@@ -2,6 +2,8 @@
 //! Readers and writers sharing a local root cooperate through an OS file lock.
 //! Power-loss durability is deliberately NOT asserted by this implementation.
 pub mod acquire;
+mod binding;
+pub use binding::{binding_identity, BindingKey};
 pub mod codec;
 mod current;
 mod delta_stream;
@@ -617,9 +619,7 @@ impl Store {
                 "source coordination directory must be absolute".into(),
             ));
         }
-        let identity = self.root.to_string_lossy().to_string();
-        #[cfg(windows)]
-        let identity = identity.to_lowercase();
+        let identity = binding::path_identity(&self.root);
         let source_key = codec::digest(identity.as_bytes());
         let dir = self.coordination.join(&source_key);
         if create {
@@ -633,9 +633,7 @@ impl Store {
             .open(dir.join("binding.lock"))?;
         guard.lock_exclusive()?;
         let record = dir.join("binding.json");
-        let binding = self.local.to_string_lossy().to_string();
-        #[cfg(windows)]
-        let binding = binding.to_lowercase();
+        let binding = binding::path_identity(&self.local);
         if record.exists() {
             let old: String = self.load(&record)?;
             if old != binding {

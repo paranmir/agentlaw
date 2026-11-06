@@ -2,7 +2,7 @@
 //! this lane. The local delegation policy is separate from canonical/LLM content.
 mod policy;
 mod resolution;
-use crate::{git_ops as git, git_scan};
+use super::{git_ops as git, git_scan};
 use agentlaw_contracts::{DomainError, Result, SyncCommand, SyncRequest};
 use agentlaw_flows::RequestControl;
 use agentlaw_storage::{

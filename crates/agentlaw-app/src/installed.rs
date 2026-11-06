@@ -103,6 +103,7 @@ impl Backend for InstalledBackend {
                     Path::new(&path),
                     false,
                     control.clone(),
+                    crate::installed::worker_config,
                 )?;
                 connected_selection = Some(selected);
             }

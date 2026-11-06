@@ -9,15 +9,15 @@ struct BodySlice {
     bytes: u64,
 }
 #[derive(Clone, Default)]
-pub(super) struct StreamedSelection {
+pub(crate) struct StreamedSelection {
     bodies: BTreeMap<String, BodySlice>,
     versions: BTreeMap<String, String>,
 }
 impl StreamedSelection {
-    pub(super) fn actual_version(&self, version: String) -> String {
+    pub(crate) fn actual_version(&self, version: String) -> String {
         self.versions.get(&version).cloned().unwrap_or(version)
     }
-    pub(super) fn excerpt(&self, body: &str, chars: usize) -> Result<String> {
+    pub(crate) fn excerpt(&self, body: &str, chars: usize) -> Result<String> {
         let Some(slice) = self.bodies.get(body) else {
             return Ok(body.chars().take(chars).collect());
         };
@@ -62,7 +62,7 @@ impl StreamedSelection {
             )
         }))
     }
-    pub(super) fn finish(
+    pub(crate) fn finish(
         &self,
         value: Value,
         local: &Path,
@@ -270,7 +270,7 @@ fn task_ranges(body: &agentlaw_storage::acquire::SpoolBody) -> Result<Vec<(u64, 
     Ok(ranges)
 }
 impl Runtime {
-    pub(super) fn snapshot_for_recall(
+    pub(crate) fn snapshot_for_recall(
         &self,
         ids: &[String],
         procedures: &[String],
@@ -511,7 +511,7 @@ fn head(
     out.write_all(b"}").map_err(|_| failed())
 }
 impl Runtime {
-    pub(super) fn stream_exact_recall(&self, r: &RecallRequest) -> Result<Value> {
+    pub(crate) fn stream_exact_recall(&self, r: &RecallRequest) -> Result<Value> {
         self.request_control.check()?;
         let (position, memories, missing) = source(
             self.store

@@ -1,9 +1,91 @@
 //! One tool with explicit action namespaces.
-use crate::{tool_input_schema, DomainError, Result};
+use crate::{tool_input_schema, DomainError, Request, Result};
 use serde_json::{json, Map, Value};
+
+/// `Result` using the existing contracts error.
+pub type ContractResult<T> = Result<T>;
+
+/// A request that passed the public or internal validation path.
+/// The field is private: this module's constructors are the only way to obtain one.
+#[derive(Debug, Clone)]
+pub struct ValidatedRequest(Request);
+
+impl ValidatedRequest {
+    pub fn parse_public(raw: &str) -> ContractResult<Self> {
+        crate::parse_request(raw).map(Self)
+    }
+
+    pub fn request(&self) -> &Request {
+        &self.0
+    }
+
+    pub fn into_request(self) -> Request {
+        self.0
+    }
+}
 
 fn invalid(message: impl Into<String>) -> DomainError {
     DomainError::new("invalid_input", message)
+}
+
+/// Project a typed request into the flat form accepted by the runtime validator.
+pub fn validation_value(request: &Request) -> ContractResult<Value> {
+    let mut value = serde_json::to_value(request).map_err(|_| {
+        DomainError::new(
+            "invalid_input",
+            "The request could not be represented for validation.",
+        )
+    })?;
+    remove_null_entries(&mut value);
+    Ok(value)
+}
+
+/// Encode a request as the runtime's compact JSON call body.
+pub fn encode_wire(request: &Request) -> ContractResult<Vec<u8>> {
+    let value = validation_value(request)?;
+    serde_json::to_vec(&value).map_err(|_| {
+        DomainError::new(
+            "invalid_input",
+            "The request could not be encoded for the runtime.",
+        )
+    })
+}
+
+/// Decode and validate the runtime's flat JSON call body.
+pub fn decode_wire(body: &[u8]) -> ContractResult<ValidatedRequest> {
+    let text = std::str::from_utf8(body).map_err(|_| {
+        DomainError::new(
+            "invalid_input",
+            "Invalid JSON, duplicate object key, or invalid Unicode.",
+        )
+    })?;
+    let value = crate::validation::decode_unique(text)?;
+    crate::validation::validate_input(&value)?;
+    serde_json::from_value::<Request>(value)
+        .map(ValidatedRequest)
+        .map_err(|_| {
+            DomainError::new(
+                "invalid_input",
+                "Input exceeds supported numeric bounds or has invalid typed fields.",
+            )
+        })
+}
+
+fn remove_null_entries(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|_, value| !value.is_null());
+            for value in object.values_mut() {
+                remove_null_entries(value);
+            }
+        }
+        Value::Array(array) => {
+            for value in array {
+                remove_null_entries(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn normalize(value: Value) -> Result<Value> {
@@ -111,6 +193,199 @@ mod tests {
     use super::*;
     use crate::parse_request;
     use serde_json::json;
+
+    fn examples() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../docs/design/contracts/agentlaw-input.examples.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_wire_round_trips_public_examples() {
+        let fixtures = examples();
+        for example in fixtures["examples"].as_array().unwrap() {
+            if example["valid"] != true {
+                continue;
+            }
+            let id = example["id"].as_str().unwrap();
+            let input = &example["input"];
+            let mut fields = input.as_object().unwrap().clone();
+            let action = fields.remove("action").unwrap();
+            let mut public = Map::new();
+            public.insert("action".into(), action.clone());
+            public.insert(action.as_str().unwrap().into(), Value::Object(fields));
+            let request = ValidatedRequest::parse_public(&Value::Object(public).to_string())
+                .unwrap_or_else(|error| panic!("{id}: public parsing failed: {error:?}"));
+            let bytes = encode_wire(request.request())
+                .unwrap_or_else(|error| panic!("{id}: encoding failed: {error:?}"));
+            let decoded = decode_wire(&bytes)
+                .unwrap_or_else(|error| panic!("{id}: decoding failed: {error:?}"));
+            let actual = validation_value(decoded.request())
+                .unwrap_or_else(|error| panic!("{id}: projection failed: {error:?}"));
+            assert_eq!(&actual, input, "{id}");
+        }
+    }
+
+    #[test]
+    fn decode_wire_preserves_typed_serialization() {
+        let fixtures = examples();
+        for example in fixtures["examples"].as_array().unwrap() {
+            if example["valid"] != true {
+                continue;
+            }
+            let id = example["id"].as_str().unwrap();
+            let before: Request = serde_json::from_value(example["input"].clone())
+                .unwrap_or_else(|error| panic!("{id}: deserialization failed: {error}"));
+            let bytes = encode_wire(&before)
+                .unwrap_or_else(|error| panic!("{id}: encoding failed: {error:?}"));
+            let after = decode_wire(&bytes)
+                .unwrap_or_else(|error| panic!("{id}: decoding failed: {error:?}"))
+                .into_request();
+            assert_eq!(
+                serde_json::to_string(&before).unwrap(),
+                serde_json::to_string(&after).unwrap(),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_wire_rejects_invalid_examples() {
+        let fixtures = examples();
+        for example in fixtures["examples"].as_array().unwrap() {
+            if example["valid"] != false {
+                continue;
+            }
+            let id = example["id"].as_str().unwrap();
+            let bytes = serde_json::to_vec(&example["input"]).unwrap();
+            let error = decode_wire(&bytes).expect_err(id);
+            assert_eq!(error.code, "invalid_input", "{id}");
+        }
+    }
+
+    #[test]
+    fn decode_wire_rejects_invalid_boundary_inputs() {
+        let cases: &[(&str, &[u8])] = &[
+            ("invalid UTF-8", &[0xff, 0xfe]),
+            (
+                "duplicate key",
+                br#"{"action":"recall","recall_for":"a","recall_for":"b"}"#,
+            ),
+            (
+                "public nested form",
+                br#"{"action":"recall","recall":{"recall_for":"x"}}"#,
+            ),
+            (
+                "numeric bound",
+                br#"{"action":"recall","recall_for":"x","memory_candidate_limit":4294967296}"#,
+            ),
+        ];
+        for (name, body) in cases {
+            let error = decode_wire(body).expect_err(name);
+            assert_eq!(error.code, "invalid_input", "{name}");
+        }
+    }
+
+    #[test]
+    fn encode_wire_preserves_text_and_compact_projection() {
+        let text = "기억 \"a\\b\"\n끝";
+        let input = json!({
+            "action": "recall",
+            "recall": {"recall_for": text, "restore_context": false}
+        });
+        let request = parse_request(&input.to_string()).unwrap();
+        let bytes = encode_wire(&request).unwrap();
+        assert!(std::str::from_utf8(&bytes).is_ok());
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value, validation_value(&request).unwrap());
+        assert_eq!(value["recall_for"], text);
+        assert_eq!(value["restore_context"], false);
+        assert!(!value.as_object().unwrap().values().any(Value::is_null));
+        assert_eq!(bytes, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn validation_projection_preserves_valid_examples() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../docs/design/contracts/agentlaw-input.examples.json"
+        ))
+        .unwrap();
+        for example in fixtures["examples"].as_array().unwrap() {
+            if example["valid"] != true {
+                continue;
+            }
+            let id = example["id"].as_str().unwrap();
+            let input = &example["input"];
+            let request: Request = serde_json::from_value(input.clone())
+                .unwrap_or_else(|error| panic!("{id}: deserialization failed: {error}"));
+            let projected = validation_value(&request)
+                .unwrap_or_else(|error| panic!("{id}: projection failed: {error:?}"));
+            assert_eq!(&projected, input, "{id}");
+            assert!(
+                crate::validation::validate_input(&projected).is_ok(),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_projection_keeps_false_and_empty_array() {
+        let request: Request = serde_json::from_value(json!({
+            "action": "recall", "restore_context": false, "memory_ids": []
+        }))
+        .unwrap();
+        let projected = validation_value(&request).unwrap();
+        assert_eq!(
+            projected,
+            json!({
+                "action": "recall", "restore_context": false, "memory_ids": []
+            })
+        );
+    }
+
+    #[test]
+    fn validation_projection_removes_nested_optional_nulls() {
+        let request: Request = serde_json::from_value(json!({
+            "action": "remember_this",
+            "procedure": {
+                "operation": "create",
+                "evidence_memory_ids": ["11111111-1111-4111-8111-111111111111"]
+            }
+        }))
+        .unwrap();
+        let projected = validation_value(&request).unwrap();
+        fn contains_null(value: &Value) -> bool {
+            match value {
+                Value::Null => true,
+                Value::Array(items) => items.iter().any(contains_null),
+                Value::Object(fields) => fields.values().any(contains_null),
+                _ => false,
+            }
+        }
+        assert!(!contains_null(&projected), "{projected}");
+        assert_eq!(projected["procedure"]["operation"], "create");
+    }
+
+    #[test]
+    fn validated_request_preserves_public_parsing() {
+        let raw = r#"{"action":"recall","recall":{"recall_for":"x","restore_context":false}}"#;
+        let validated = ValidatedRequest::parse_public(raw).unwrap();
+        assert!(matches!(
+            validated.request(),
+            Request::Recall(input) if input.restore_context == Some(false)
+        ));
+        assert!(matches!(
+            validated.into_request(),
+            Request::Recall(input) if input.restore_context == Some(false)
+        ));
+
+        let invalid = r#"{"action":"recall","recall_for":"x"}"#;
+        let expected = parse_request(invalid).unwrap_err();
+        let actual = ValidatedRequest::parse_public(invalid).unwrap_err();
+        assert_eq!(actual.code, expected.code);
+        assert_eq!(actual.message, expected.message);
+    }
 
     #[test]
     fn action_boundaries_types_and_no_secret_echo() {

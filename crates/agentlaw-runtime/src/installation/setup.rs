@@ -1,5 +1,5 @@
 //! Prepare a store independently, then atomically select it. No in-flight rebinding.
-use crate::{config, machine};
+use super::{config, machine};
 use agentlaw_contracts::{DomainError, Result};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -15,12 +15,18 @@ pub fn validate_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn connect(state: &Path, path: &Path, create: bool) -> Result<Value> {
+pub fn connect(
+    state: &Path,
+    path: &Path,
+    create: bool,
+    worker_config: impl FnOnce(&Path) -> Result<agentlaw_worker::RuntimeConfig>,
+) -> Result<Value> {
     connect_with_control(
         state,
         path,
         create,
         agentlaw_flows::RequestControl::default(),
+        worker_config,
     )
 }
 pub fn connect_with_control(
@@ -28,17 +34,20 @@ pub fn connect_with_control(
     path: &Path,
     create: bool,
     control: agentlaw_flows::RequestControl,
+    worker_config: impl FnOnce(&Path) -> Result<agentlaw_worker::RuntimeConfig>,
 ) -> Result<Value> {
-    connect_selection_with_control(state, path, create, control).map(|(result, _)| result)
+    connect_selection_with_control(state, path, create, control, worker_config)
+        .map(|(result, _)| result)
 }
 
 /// Return the exact selection prepared under setup.lock so the initiating
 /// request cannot drift to a later concurrent global store selection.
-pub(crate) fn connect_selection_with_control(
+pub fn connect_selection_with_control(
     state: &Path,
     path: &Path,
     create: bool,
     control: agentlaw_flows::RequestControl,
+    worker_config: impl FnOnce(&Path) -> Result<agentlaw_worker::RuntimeConfig>,
 ) -> Result<(Value, config::Config)> {
     control.check()?;
     validate_path(path)?;
@@ -133,7 +142,7 @@ pub(crate) fn connect_selection_with_control(
         &machine.machine_id,
         config::coordination_root(state),
     )?;
-    let worker_configuration = crate::installed::worker_config(state)?;
+    let worker_configuration = worker_config(state)?;
     let semantic_required = worker_configuration.model.is_some();
     if semantic_required {
         control.phase("attaching_embedding_worker");

@@ -1,4 +1,5 @@
 //! Context, recall assembly and write preflight, separated from canonical persistence.
+pub mod apply;
 pub mod artifacts;
 pub mod context;
 pub mod control;
@@ -6,11 +7,16 @@ pub use control::RequestControl;
 pub mod derived;
 pub mod exact;
 pub mod history;
+pub mod history_cache;
 pub mod history_diff;
 pub mod history_projection;
 pub mod history_search;
+pub mod prepare;
+pub mod read;
 pub mod recall;
+pub mod recovery;
 pub mod runtime;
+pub mod semantic;
 pub mod write;
 pub use agentlaw_contracts::*;
 pub use runtime::Runtime;

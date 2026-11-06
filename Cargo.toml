@@ -6,6 +6,7 @@ members = [
   "crates/agentlaw-search",
   "crates/agentlaw-worker",
   "crates/agentlaw-flows",
+  "crates/agentlaw-runtime",
   "crates/agentlaw-app",
   "crates/agentlaw-launcher",
 ]

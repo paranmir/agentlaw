@@ -92,6 +92,7 @@ pub(super) fn store(command: StoreCommand) -> Result<Value> {
         &path,
         create,
         cli_control(),
+        agentlaw_app::installed::worker_config,
     )
 }
 

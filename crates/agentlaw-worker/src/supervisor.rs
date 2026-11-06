@@ -1,7 +1,7 @@
 //! One serialized owner for model-process transitions. Native inference is never in this process.
 use crate::{
+    daemon::{RuntimeConfig, Signal},
     model_child::{self, Input, Launch, Output, Result},
-    process::{RuntimeConfig, Signal},
     Broker, EmbeddingError, Job, WorkerState, MODEL_ID,
 };
 use fs2::FileExt;
@@ -16,6 +16,37 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+/// One number per model computation, issued by the host for both queries and indexing and
+/// never reused. A result carrying an unknown number is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelRequestId(pub u64);
+
+#[derive(Debug, Clone)]
+pub struct IndexWork {
+    pub id: ModelRequestId,
+    pub text: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWorkStatus {
+    pub runnable: bool,
+    pub next_retry_at: Option<Instant>,
+    pub awaiting_model: bool,
+}
+
+/// Implemented by the runtime and called by the model supervisor.
+/// Calls handle RAM values only and must not wait for SQL or files.
+pub trait IndexWorkPort: Send + Sync {
+    fn model_ready(&self, model_digest: &str);
+    fn next_work(&self, model_digest: &str) -> Option<IndexWork>;
+    fn finish(
+        &self,
+        id: ModelRequestId,
+        outcome: std::result::Result<Vec<f32>, crate::EmbeddingError>,
+    );
+    fn status(&self) -> IndexWorkStatus;
+}
 enum Event {
     Output(String, Output),
     Exit(String),
@@ -201,7 +232,7 @@ struct Recovery {
     config: String,
 }
 fn now() -> i64 {
-    crate::process::now()
+    crate::util::now()
 }
 fn diagnostic(b: &Broker, name: &str, cause: &str) -> Result<()> {
     b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",params![name,cause])?;
@@ -851,3 +882,65 @@ mod tests;
 #[cfg(all(test, windows))]
 #[path = "supervisor_native_tests.rs"]
 mod native_tests;
+
+#[cfg(test)]
+mod index_work_port_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct TestPort {
+        work: Mutex<Option<IndexWork>>,
+        finished: Mutex<
+            Option<(
+                ModelRequestId,
+                std::result::Result<Vec<f32>, EmbeddingError>,
+            )>,
+        >,
+    }
+
+    impl IndexWorkPort for TestPort {
+        fn model_ready(&self, _: &str) {}
+
+        fn next_work(&self, _: &str) -> Option<IndexWork> {
+            self.work.lock().unwrap().take()
+        }
+
+        fn finish(
+            &self,
+            id: ModelRequestId,
+            outcome: std::result::Result<Vec<f32>, EmbeddingError>,
+        ) {
+            *self.finished.lock().unwrap() = Some((id, outcome));
+        }
+
+        fn status(&self) -> IndexWorkStatus {
+            IndexWorkStatus {
+                runnable: false,
+                next_retry_at: None,
+                awaiting_model: false,
+            }
+        }
+    }
+
+    #[test]
+    fn index_work_port_crosses_threads_and_records_outcome() {
+        let concrete = Arc::new(TestPort {
+            work: Mutex::new(Some(IndexWork {
+                id: ModelRequestId(42),
+                text: Arc::from("queued text"),
+            })),
+            finished: Mutex::new(None),
+        });
+        let port: Arc<dyn IndexWorkPort> = concrete.clone();
+        std::thread::spawn(move || {
+            let work = port.next_work("model").unwrap();
+            assert_eq!(&*work.text, "queued text");
+            port.finish(work.id, Ok(vec![1.0, 2.0]));
+        })
+        .join()
+        .unwrap();
+        let finished = concrete.finished.lock().unwrap().take().unwrap();
+        assert_eq!(finished.0, ModelRequestId(42));
+        assert_eq!(finished.1.unwrap(), vec![1.0, 2.0]);
+    }
+}

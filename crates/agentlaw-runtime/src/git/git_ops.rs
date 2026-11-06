@@ -45,7 +45,7 @@ struct StoredReview {
     endpoint_digest: String,
     closure_digest: String,
     #[serde(default)]
-    scan: Option<crate::git_scan::ScanReceipt>,
+    scan: Option<super::git_scan::ScanReceipt>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushReceipt {
@@ -736,7 +736,7 @@ pub fn publish_import(
         ));
     }
     let _lane = lane(local)?;
-    crate::sync::require_git_slot_clear(local)?;
+    super::sync::require_git_slot_clear(local)?;
     let (dir, stored) = import_record(local, import_ref)?;
     let root = store
         .with_source_read(|r, _| Ok(r.to_path_buf()))
@@ -996,7 +996,7 @@ pub(crate) fn valid_oid(s: &str) -> bool {
 /// No fetch, merge, push, user-index write, author invention or force-update occurs.
 pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<SaveReceipt> {
     let _lane = lane(local)?;
-    crate::sync::require_git_slot_clear(local)?;
+    super::sync::require_git_slot_clear(local)?;
     let handoff_path = local.join("save-handoff.json");
     if handoff_path.exists() {
         let pending: SaveHandoff = serde_json::from_reader(
@@ -1265,7 +1265,7 @@ pub fn inspect_share(
     })?;
     let tree = text(&repo, &["rev-parse", &format!("{commit}^{{tree}}")])?;
     let review_id = uuid::Uuid::new_v4().to_string();
-    let scan = crate::git_scan::seal(&repo, &commit, &local.join("share-scans").join(&review_id))?;
+    let scan = super::git_scan::seal(&repo, &commit, &local.join("share-scans").join(&review_id))?;
     let closure_digest = scan.object_set_digest.clone();
     let findings = scan.findings.clone();
     let review = ShareReview {
@@ -1326,7 +1326,7 @@ pub fn push_review(
         ));
     }
     let scan=stored.scan.as_ref().ok_or_else(||DomainError::new("sharing_scan_receipt_required","This older review has no sealed scan receipt. Inspect once with the current build before sharing."))?;
-    crate::git_scan::validate(scan)?;
+    super::git_scan::validate(scan)?;
     if scan.object_set_digest != stored.closure_digest
         || scan.findings != r.findings
         || scan.tree_oid != r.tree_oid

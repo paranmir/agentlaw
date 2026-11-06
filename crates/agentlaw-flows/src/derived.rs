@@ -21,7 +21,7 @@ impl<R: PublishedChangeSource> PublishedAdapter<R> {
 impl PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader> {
     fn stage_paths(
         &self,
-        worker: &agentlaw_worker::process::Client,
+        worker: &agentlaw_worker::Client,
         canonical_paths: &[String],
         position: &agentlaw_storage::published::SourcePosition,
     ) -> Result<(
@@ -146,7 +146,7 @@ impl PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader> {
     }
     pub fn bootstrap_page(
         &self,
-        worker: &agentlaw_worker::process::Client,
+        worker: &agentlaw_worker::Client,
         basis: &SourcePosition,
         after: Option<&str>,
     ) -> Result<(
@@ -186,7 +186,7 @@ impl PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader> {
     }
     pub fn spooled_page(
         &self,
-        worker: &agentlaw_worker::process::Client,
+        worker: &agentlaw_worker::Client,
         basis: &SourcePosition,
     ) -> Result<agentlaw_worker::spool::PublishedSpoolPage> {
         use agentlaw_worker::spool::PublishedSpoolPage;

@@ -302,7 +302,7 @@ fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
     b.connection
         .execute("UPDATE jobs SET state='ready_to_index',result=?1", [&bytes])
         .unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     assert_eq!(
         channel_position(&b, &c, Channel::Vector).unwrap().sequence,
         1
@@ -322,7 +322,7 @@ fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
             [],
         )
         .unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     let snapshot = crate::inspect_runtime(&dir).unwrap();
     assert!(!snapshot["diagnostics"]
         .as_array()
@@ -351,7 +351,7 @@ fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
         )
         .unwrap();
     std::fs::remove_file(directory(&dir, &c).unwrap().join("vector.sqlite")).unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     let snapshot = crate::inspect_runtime(&dir).unwrap();
     assert!(snapshot["diagnostics"]
         .as_array()
@@ -381,7 +381,7 @@ fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
     .unwrap()
     .advance(&other, 1)
     .unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     assert!(
         crate::inspect_runtime(&dir).unwrap()["diagnostics"]
             .as_array()
@@ -392,7 +392,7 @@ fn recovered_vector_diagnostic_requires_backend_proof_for_every_context() {
     );
 
     b.connection.execute("UPDATE jobs SET state='ready_to_index',result=?1 WHERE config='other-config:repository:r'", [&bytes]).unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     let snapshot = crate::inspect_runtime(&dir).unwrap();
     assert!(!snapshot["diagnostics"]
         .as_array()
@@ -433,7 +433,7 @@ fn one_repository_vector_failure_does_not_block_another() {
             [&bytes],
         )
         .unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     DerivedWorkCoordinator::new(
         &mut b,
         &Source {
@@ -456,7 +456,7 @@ fn one_repository_vector_failure_does_not_block_another() {
     .unwrap();
     b.connection.execute("UPDATE jobs SET state='ready_to_index',result=?1 WHERE config IN('c:repository:a','c:repository:b')", [&bytes]).unwrap();
     std::fs::remove_file(directory(&dir, &a).unwrap().join("vector.sqlite")).unwrap();
-    crate::process::index_background_pass(&mut b, &dir).unwrap();
+    crate::semantic_store::index_background_pass(&mut b, &dir).unwrap();
     assert_eq!(
         channel_position(&b, &other, Channel::Vector)
             .unwrap()

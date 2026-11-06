@@ -1,9 +1,21 @@
 //! Source-exact reads following disk-backed membership and discovery selection.
-use super::*;
 use crate::exact::ExactIndex;
+use crate::prepare::{admitted, query_records};
+use crate::runtime::*;
+use crate::*;
+use crate::{context::*, recall::*, write::*};
 use agentlaw_storage::published::PublishedChangeSource;
-pub(super) fn pump(
-    worker: &agentlaw_worker::process::Client,
+use agentlaw_storage::{CurrentUnit, Head, UnitState};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+pub(crate) mod streaming;
+pub(crate) fn pump(
+    worker: &agentlaw_worker::Client,
     adapter: &crate::derived::PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader>,
     binding: &str,
     local: &Path,
@@ -58,7 +70,7 @@ pub(super) fn pump(
     Ok(())
 }
 fn bootstrap(
-    worker: &agentlaw_worker::process::Client,
+    worker: &agentlaw_worker::Client,
     adapter: &crate::derived::PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader>,
     context: &agentlaw_worker::derived::DerivedContext,
     local: &Path,
@@ -178,89 +190,18 @@ impl Drop for Runtime {
     }
 }
 
-pub(super) struct IndexedSearch {
+struct IndexedSearch {
     queries: BTreeMap<String, Discovery>,
-    pub(super) procedure_order: Vec<String>,
-    pub(super) full_procedure: Option<String>,
+    procedure_order: Vec<String>,
+    full_procedure: Option<String>,
 }
-struct Channels {
+pub(crate) struct Channels {
     hits: Vec<agentlaw_search::Hit>,
     lexical_ids: BTreeSet<String>,
-    lexical: Vec<agentlaw_search::Hit>,
-    vector: Vec<agentlaw_search::Hit>,
-    complete: bool,
-    diagnostics: Vec<DomainError>,
-}
-pub(super) fn requires_overlap(
-    snapshot: &Snapshot,
-    p: &MemoryProposal,
-    scope: &Applicability,
-) -> bool {
-    p.operation == Operation::Create
-        || p.parent_refs
-            .iter()
-            .flatten()
-            .chain(p.consolidation_refs.iter().flatten())
-            .any(|r| {
-                snapshot
-                    .states
-                    .get(&r.memory_id)
-                    .is_none_or(|s| s.heads.iter().any(|h| &h.applicability != scope))
-            })
-}
-fn winner(hits: &[agentlaw_search::Hit], minimum: f64, margin: f64) -> Option<(&str, bool)> {
-    let top = hits.first()?;
-    if top.score < minimum || hits.get(1).is_some_and(|h| h.score == top.score) {
-        return None;
-    }
-    Some((
-        &top.memory_id,
-        hits.get(1).is_none_or(|h| top.score - h.score >= margin),
-    ))
-}
-fn admitted(channels: &Channels) -> Option<String> {
-    if !channels.complete {
-        return None;
-    }
-    let (a, am) = winner(&channels.lexical, 0.90, 0.05)?;
-    let (b, bm) = winner(&channels.vector, 0.92, 0.03)?;
-    (a == b && (am || bm)).then(|| a.to_owned())
-}
-fn query_records(body: &str) -> Vec<&str> {
-    let mut starts = Vec::new();
-    let mut offset = 0;
-    let mut fence: Option<(char, usize)> = None;
-    for line in body.split_inclusive('\n') {
-        let s = line.trim_start();
-        if let Some(c) = s.chars().next().filter(|c| *c == '`' || *c == '~') {
-            let n = s.chars().take_while(|x| *x == c).count();
-            if n >= 3 {
-                match fence {
-                    None => fence = Some((c, n)),
-                    Some((old, count)) if old == c && n >= count => fence = None,
-                    _ => {}
-                }
-                offset += line.len();
-                continue;
-            }
-        }
-        if fence.is_none() {
-            let n = s.chars().take_while(|c| *c == '#').count();
-            if (1..=6).contains(&n) && s.as_bytes().get(n) == Some(&b' ') {
-                starts.push(offset)
-            }
-        }
-        offset += line.len();
-    }
-    let mut result = vec![body];
-    for (i, start) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).copied().unwrap_or(body.len());
-        let section = &body[*start..end];
-        if section != body && !section.trim().is_empty() {
-            result.push(section)
-        }
-    }
-    result
+    pub(crate) lexical: Vec<agentlaw_search::Hit>,
+    pub(crate) vector: Vec<agentlaw_search::Hit>,
+    pub(crate) complete: bool,
+    pub(crate) diagnostics: Vec<DomainError>,
 }
 impl RecallSearch for IndexedSearch {
     fn search(&self, _: &RequestContext, q: &str, _: &[String]) -> Result<Discovery> {
@@ -278,65 +219,227 @@ impl RecallSearch for IndexedSearch {
     }
 }
 impl Runtime {
-    pub(super) fn overlap_candidates(
+    pub(crate) fn recall_request(&self, r: RecallRequest) -> Result<Value> {
+        let context = match resolve_context(self, r.project_path.as_deref()) {
+            Ok(context) => context,
+            Err(error) if error.code == "project_connection_required" => {
+                // Discovery is read-only. A candidate, even a sole candidate, is not a binding.
+                let candidates = self.discover(None)?;
+                let mut result = json!({
+                    "status":"needs_user_input",
+                    "code":"project_connection_required",
+                    "message":"Choose a project memory for this folder.",
+                    "candidates":candidates,
+                    "project_path":r.project_path,
+                    "turn_instruction": if r.recall_for.is_some() { "Project rules, active Tasks and work targets have not been checked. Read partial_recall for available user/machine context, including its artifact when content_read=false, or partial_recall_error if that check failed; do not infer that missing rules do not exist. Use an already explicit user choice, or ask the user to select a project candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, repeat the original recall with its goal and options." } else { "Project memory has not been retrieved. Use an already explicit user choice, or ask the user to select a candidate, approve creating a new project, or skip for now. Never auto-select merely because one candidate exists. After approved connect_project_memory, repeat the original recall." }
+                });
+                if r.recall_for.is_some() {
+                    let mut partial_request = r.clone();
+                    partial_request.project_path = None;
+                    partial_request.project_hint = None;
+                    partial_request.selected_project_id = None;
+                    partial_request.memory_ids = None;
+                    partial_request.procedure_ids = None;
+                    partial_request.restore_context = None;
+                    partial_request.include_active_tasks = None;
+                    partial_request.work_targets = None;
+                    match self
+                        .request_context(None)
+                        .and_then(|context| self.recall_with_context(partial_request, context))
+                    {
+                        Ok(partial) => result["partial_recall"] = partial,
+                        Err(error) => result["partial_recall_error"] = to_value(error)?,
+                    }
+                }
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
+        self.recall_with_context(r, context)
+    }
+    pub(crate) fn recall_with_context(
         &self,
-        snapshot: &Snapshot,
-        prepared: &PreparedIntent,
-        affected: &BTreeSet<String>,
-    ) -> Result<(Vec<CurrentState>, Vec<DomainError>)> {
-        let index = self.exact_index()?;
-        let mut chosen = BTreeSet::new();
-        let mut diagnostics = Vec::new();
-        for (p, scope) in prepared
-            .proposals
-            .iter()
-            .zip(&prepared.resolved_applicability)
-        {
-            if !requires_overlap(snapshot, p, scope) {
-                continue;
-            }
-            for record in query_records(&p.what_to_remember) {
-                let channels =
-                    self.search_scopes_channels(&index, &[scope_token(scope)], record, 128)?;
-                if let Some(id) = admitted(&channels) {
-                    if !affected.contains(&id) {
-                        chosen.insert(id);
-                    }
-                }
-                for diagnostic in channels.diagnostics {
-                    if !diagnostics.contains(&diagnostic) {
-                        diagnostics.push(diagnostic)
-                    }
-                }
-            }
-            for state in snapshot.states.values() {
-                if !affected.contains(&state.resolved_id)
-                    && state.heads.iter().any(|h| {
-                        &h.applicability == scope && h.what_to_remember == p.what_to_remember
-                    })
-                {
-                    chosen.insert(state.resolved_id.clone());
-                }
-            }
-        }
-        let mut result = Vec::new();
-        for id in chosen {
-            if let Some(state) = snapshot.current(&id)? {
-                result.push(state)
-            } else {
-                let selected = self.snapshot_selected(&[id.clone()], &[])?;
-                if selected.generation != snapshot.generation {
+        r: RecallRequest,
+        mut context: RequestContext,
+    ) -> Result<Value> {
+        if let Some(hint) = &r.project_hint {
+            let candidates = self.discover(Some(&ProjectClues {
+                name: Some(hint.clone()),
+                description: Some(hint.clone()),
+                repository_url: None,
+            }))?;
+            if let Some(selected) = &r.selected_project_id {
+                validate_id(selected)?;
+                if !candidates.iter().any(|c| &c.project_id == selected) {
                     return Err(DomainError::new(
-                        "source_changed",
-                        "Overlap evidence changed during review.",
+                        "project_selection_invalid",
+                        "The selected project no longer matches the repeated project hint.",
                     ));
                 }
-                if let Some(state) = selected.current(&id)? {
-                    result.push(state)
+                context.project_id = Some(selected.clone());
+            } else if candidates.len() == 1 {
+                context.project_id = Some(candidates[0].project_id.clone());
+            } else {
+                return Ok(
+                    json!({"code":"project_selection_required","project_candidates":candidates,"turn_instruction":"Repeat this recall with the same project_hint and a selected_project_id after resolving the intended project. Current project associations were not changed."}),
+                );
+            }
+        }
+        if let Some(machine) = &r.machine_id {
+            validate_id(machine)?;
+            context.machine_id = machine.clone()
+        }
+        let (mut snapshot, search) = match self.recall_material(&r, &context) {
+            Ok(material) => material,
+            Err(e) if e.code == "source_payload_requires_spool" && r.recall_for.is_none() => {
+                return self.stream_exact_recall(&r)
+            }
+            Err(e) => return Err(e),
+        };
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| DomainError::new("clock_failed", "Cannot format the current time."))?;
+        let mut memory_request = r.clone();
+        memory_request.procedure_ids = None;
+        memory_request.project_hint = None;
+        memory_request.selected_project_id = None;
+        let mut result = recall(&snapshot, &search, &context, &memory_request, now)?;
+        result
+            .diagnostics
+            .retain(|d| !d.message.starts_with("Learned procedure discovery"));
+        if r.include_active_tasks == Some(true) {
+            for candidate in &mut result.candidates {
+                if snapshot
+                    .states
+                    .get(&candidate.memory_id)
+                    .is_some_and(|state| {
+                        state.heads.iter().any(|head| {
+                            head.in_working_set == Some(true)
+                                && scope_matches(&head.applicability, &context)
+                        })
+                    })
+                {
+                    candidate.retrieval_paths.push(RetrievalPath {
+                        via: vec!["active_working_set".into()],
+                        clue: "Active Task".into(),
+                        source_memory_id: None,
+                    });
+                    candidate.retrieval_paths =
+                        group_retrieval_paths(std::mem::take(&mut candidate.retrieval_paths));
                 }
             }
         }
-        Ok((result, diagnostics))
+        let mut result = to_value(result)?;
+        if r.include_active_tasks == Some(true) {
+            let mut output = Vec::new();
+            for candidate in result["candidates"].as_array().cloned().unwrap_or_default() {
+                let id = candidate["memory_id"].as_str().unwrap_or("");
+                if let Some(state) = snapshot.states.get(id) {
+                    let active: Vec<_> = state
+                        .heads
+                        .iter()
+                        .filter(|h| {
+                            h.in_working_set == Some(true)
+                                && scope_matches(&h.applicability, &context)
+                        })
+                        .collect();
+                    if !active.is_empty() {
+                        for head in active {
+                            let [objective, current_position, resume_point] =
+                                snapshot.streaming.task_sections(&head.what_to_remember)?;
+                            let paths = candidate["retrieval_paths"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            output.push(json!({"memory_id":id,"objective":objective,"current_position":current_position,"resume_point":resume_point,"retrieval_paths":paths}));
+                        }
+                        continue;
+                    }
+                }
+                output.push(candidate)
+            }
+            result["candidates"] = json!(output);
+        }
+        let exact: BTreeSet<_> = r
+            .procedure_ids
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut procedures = Vec::new();
+        let mut missing = Vec::new();
+        for id in &exact {
+            validate_id(id)?;
+            match snapshot
+                .units
+                .iter()
+                .find(|u| u.entity_type == "learned_procedure" && u.entity_id == *id)
+            {
+                None => missing.push(id.clone()),
+                Some(u) => procedures.push(procedure_output(u, true)?),
+            }
+        }
+        if r.recall_for.is_some() {
+            let automatic = search
+                .full_procedure
+                .as_ref()
+                .filter(|id| !exact.contains(*id));
+            if let Some(id) = automatic {
+                if let Some(unit) = snapshot
+                    .units
+                    .iter()
+                    .find(|u| u.entity_type == "learned_procedure" && u.entity_id == *id)
+                {
+                    procedures.push(procedure_output(unit, true)?);
+                }
+            }
+            let ids: Vec<_> = search
+                .procedure_order
+                .iter()
+                .filter(|id| !exact.contains(*id) && Some(*id) != automatic)
+                .collect();
+            let count = ids.len();
+            let limit = r.procedure_candidate_limit.unwrap_or(5) as usize;
+            for id in ids.into_iter().take(limit) {
+                if let Some(unit) = snapshot
+                    .units
+                    .iter()
+                    .find(|u| u.entity_type == "learned_procedure" && u.entity_id == *id)
+                {
+                    let mut descriptors = Vec::new();
+                    for head in unit.heads() {
+                        let a = scope_value(&head.metadata["applicability"])?;
+                        if scope_matches(&a, &context) {
+                            let descriptor = json!({"procedure_id":id,"name":head.metadata["name"],"use_when":head.metadata["use_when"],"applicability":a});
+                            if !descriptors.contains(&descriptor) {
+                                descriptors.push(descriptor);
+                            }
+                        }
+                    }
+                    descriptors.sort_by_key(Value::to_string);
+                    procedures.extend(descriptors);
+                }
+            }
+            result["candidate_counts"]["learned_procedures"] =
+                json!({"matched":count,"shown":count.min(limit)});
+        }
+        result["learned_procedures"] = json!(procedures);
+        if !missing.is_empty() {
+            result["code"] = json!("exact_selection_incomplete");
+            if result.get("missing_ids").is_none() {
+                result["missing_ids"] = json!({"memory_ids":[],"procedure_ids":[]})
+            }
+            result["missing_ids"]["procedure_ids"] = json!(missing)
+        }
+        let mut statement=sql(self.control.prepare("SELECT id,version FROM pending WHERE binding=?1 AND status='pending' AND (json_extract(payload,'$.context.project_id') IS NULL OR json_extract(payload,'$.context.project_id')=?2) ORDER BY id"))?;
+        let pending=sql(statement.query_map(params![self.binding_id,context.project_id],|row|Ok(json!({"pending_batch_ref":{"pending_batch_id":row.get::<_,String>(0)?,"observed_version":row.get::<_,String>(1)?}}))))?.collect::<std::result::Result<Vec<_>,_>>().map_err(|_|DomainError::new("control_storage_failed","Pending notices could not be read; retained work was not discarded."))?;
+        if !pending.is_empty() {
+            result["pending_batches"] = json!(pending);
+            result["pending_work_instruction"]=json!("Retained proposals still need attention. Use remember_this pending_action=inspect with a listed pending_batch_ref before revising or continuing them. This notice does not publish or approve the proposals.");
+        }
+        snapshot
+            .streaming
+            .finish(result, &self.local, &self.request_control)
     }
     fn search_channels(
         &self,
@@ -347,7 +450,7 @@ impl Runtime {
     ) -> Result<Channels> {
         self.search_scopes_channels(index, &crate::exact::allowed_scopes(c), query, limit)
     }
-    fn search_scopes_channels(
+    pub(crate) fn search_scopes_channels(
         &self,
         index: &ExactIndex,
         scopes: &[String],
@@ -448,7 +551,7 @@ impl Runtime {
             )),
         }
     }
-    fn exact_index(&self) -> Result<ExactIndex> {
+    pub(crate) fn exact_index(&self) -> Result<ExactIndex> {
         let filename: Option<String> = sql(self
             .control
             .query_row(
@@ -477,7 +580,7 @@ impl Runtime {
         }
         Ok(index)
     }
-    pub(super) fn snapshot_selected(
+    pub(crate) fn snapshot_selected(
         &self,
         ids: &[String],
         procedures: &[String],
@@ -576,7 +679,7 @@ impl Runtime {
             units,
         })
     }
-    pub(super) fn recall_material(
+    fn recall_material(
         &self,
         r: &RecallRequest,
         c: &RequestContext,
@@ -802,7 +905,7 @@ impl Runtime {
             },
         ))
     }
-    pub(super) fn write_material(
+    pub(crate) fn write_material(
         &self,
         c: &RequestContext,
         proposals: &[MemoryProposal],
@@ -1080,5 +1183,24 @@ impl Runtime {
             .map(|s| format!("procedure:{s}"))
             .collect::<Vec<_>>();
         self.procedure_search_scopes(&index, query, &scopes, limit)
+    }
+}
+pub(crate) fn procedure_output(u: &CurrentUnit, full: bool) -> Result<Value> {
+    let mut heads = Vec::new();
+    for h in u.heads() {
+        let mut value = json!({"procedure_id":u.entity_id,"name":h.metadata["name"],"use_when":h.metadata["use_when"],"applicability":scope_value(&h.metadata["applicability"])?});
+        if full {
+            value["instructions"] = json!(h.body);
+            value["procedure_ref"] = json!({"procedure_id":u.entity_id,"observed_version":source(agentlaw_storage::version(u,h))?});
+            value["evidence_memory_ids"] = h.metadata["evidence_memory_ids"].clone();
+        }
+        heads.push(value)
+    }
+    if heads.len() == 1 {
+        Ok(heads.remove(0))
+    } else {
+        Ok(
+            json!({"procedure_id":u.entity_id,"current_heads":heads,"head_reconciliation_required":true,"head_reconciliation_instruction":"Review all competing procedure heads; do not merge their instructions implicitly."}),
+        )
     }
 }

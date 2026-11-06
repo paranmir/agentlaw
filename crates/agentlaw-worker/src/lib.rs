@@ -1,4 +1,5 @@
 //! Durable derived job coordination. Does not pretend to provide an inference engine.
+pub mod daemon;
 pub mod derived;
 pub mod execution;
 pub mod indexing;
@@ -6,12 +7,13 @@ pub mod indexing;
 mod indexing_tests;
 mod model_child;
 pub mod onnx;
-pub mod process;
+pub mod semantic_store;
 pub mod spool;
-mod supervisor;
+pub mod supervisor;
+pub(crate) mod util;
+pub use daemon::{run_daemon, Client, ProcessRuntime, RuntimeConfig};
 pub use model_child::run_model_child;
 pub use onnx::{ModelAssets, OnnxProvider};
-pub use process::{run_daemon, Client, ProcessRuntime, RuntimeConfig};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

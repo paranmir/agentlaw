@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 agentlaw-contracts = { path = "../agentlaw-contracts" }
+agentlaw-runtime = { path = "../agentlaw-runtime" }
 agentlaw-storage = { path = "../agentlaw-storage" }
 agentlaw-flows = { path = "../agentlaw-flows" }
 agentlaw-worker = { path = "../agentlaw-worker" }

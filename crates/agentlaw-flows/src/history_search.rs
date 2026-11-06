@@ -2,7 +2,7 @@
 //! Caller supplies C6-acquired readers only for previously unseen changes.
 use agentlaw_worker::{
     derived::{DerivedContext, DerivedDocument, PublishedBatch, PublishedPage, SourcePosition},
-    process::SearchPacket,
+    semantic_store::SearchPacket,
     spool::{PublishedSpoolPage, SpoolBodyRef},
     Client,
 };
