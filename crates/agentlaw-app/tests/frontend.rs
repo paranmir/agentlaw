@@ -755,10 +755,11 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
     assert!(!out.status.success());
     assert_eq!(invalid["code"], "invalid_configuration");
     assert_eq!(std::fs::read(state.join("config.json")).unwrap(), original);
-    let (out, doctor) = run(&state, &["doctor"], None);
+    let (out, doctor) = run(&state, &["doctor", "--audit"], None);
     assert!(out.status.success(), "{doctor}");
     assert_eq!(doctor["read_only"], true);
-    assert_eq!(doctor["source"]["validated"], true);
+    assert_eq!(doctor["audit"]["status"], "passed", "{doctor}");
+    assert_eq!(doctor["audit"]["source"]["validated"], true);
     verify_content();
     assert_eq!(export("after-doctor.jsonl"), history);
     // Damage only a disposable exact index, then require repair to install a
@@ -850,9 +851,15 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
     let format = std::fs::read(source.join("format.md")).unwrap();
     std::fs::write(source.join("format.md"), b"invalid fixture format").unwrap();
     let invalid_source = source_bytes(&source);
-    for action in ["doctor", "repair"] {
-        let (out, error) = run(&state, &[action], None);
-        assert!(!out.status.success(), "{action}: {error}");
+    for args in [&["doctor", "--audit"][..], &["repair"][..]] {
+        let action = args.join(" ");
+        let (out, result) = run(&state, args, None);
+        if args[0] == "doctor" {
+            assert!(out.status.success(), "{action}: {result}");
+            assert_eq!(result["audit"]["status"], "failed", "{action}: {result}");
+        } else {
+            assert!(!out.status.success(), "{action}: {result}");
+        }
         assert_eq!(
             source_bytes(&source),
             invalid_source,
@@ -946,10 +953,10 @@ fn managed_install_cli_create_and_doctor_use_installation_local_coordination() {
     assert!(create.status.success(), "{created}");
     assert_eq!(created["created"], true);
 
-    let doctor_output = invoke(&["doctor"]);
+    let doctor_output = invoke(&["doctor", "--audit"]);
     let doctor: Value = serde_json::from_slice(&doctor_output.stdout).unwrap();
     assert!(doctor_output.status.success(), "{doctor}");
-    assert_eq!(doctor["source"]["validated"], true);
+    assert_eq!(doctor["audit"]["source"]["validated"], true);
 
     let selected_registry = root.join("state").join("source-coordination");
     assert!(

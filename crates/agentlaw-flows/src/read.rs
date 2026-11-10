@@ -1,6 +1,6 @@
 //! Source-exact reads following disk-backed membership and discovery selection.
 use crate::exact::ExactIndex;
-use crate::prepare::{admitted, query_records};
+use crate::prepare::admitted;
 use crate::runtime::*;
 use crate::*;
 use crate::{context::*, recall::*, write::*};
@@ -15,6 +15,7 @@ use std::{
 };
 mod owner;
 pub(crate) mod streaming;
+pub(crate) use owner::preparation_channels;
 pub use owner::{
     discover, prepare_recall, recall, recall_for_project, recall_prepared, PreparedRecall,
 };
@@ -210,7 +211,7 @@ struct IndexedSearch {
     full_procedure: Option<String>,
 }
 pub(crate) struct Channels {
-    hits: Vec<agentlaw_search::Hit>,
+    pub(crate) hits: Vec<agentlaw_search::Hit>,
     lexical_ids: BTreeSet<String>,
     pub(crate) lexical: Vec<agentlaw_search::Hit>,
     pub(crate) vector: Vec<agentlaw_search::Hit>,
@@ -603,99 +604,12 @@ impl Runtime {
         ids: &[String],
         procedures: &[String],
     ) -> Result<Snapshot> {
-        self.request_control.check()?;
-        let (position, resolved, missing) = source(self.store.read_closure(ids))?;
-        let mut states = BTreeMap::new();
-        let mut units = BTreeMap::new();
-        let mut refs = Vec::new();
-        for value in resolved {
-            let unit = value.current;
-            let memories = unit
-                .heads()
-                .iter()
-                .map(|h| memory_from(&unit, h))
-                .collect::<Result<Vec<_>>>()?;
-            refs.extend(memories.iter().map(|m| m.memory_ref.clone()));
-            let state = CurrentState {
-                requested_id: value.requested_id.clone(),
-                resolved_id: unit.entity_id.clone(),
-                heads: memories,
-                redirect_path: value.redirect_path,
-            };
-            states.insert(
-                unit.entity_id.clone(),
-                CurrentState {
-                    requested_id: unit.entity_id.clone(),
-                    redirect_path: vec![],
-                    ..state.clone()
-                },
-            );
-            states.insert(value.requested_id, state);
-            units.insert(unit.entity_id.clone(), unit);
-        }
-        let mut owned_bytes: usize = units
-            .values()
-            .flat_map(|u| u.heads())
-            .map(|h| h.body.len())
-            .sum();
-        for id in procedures {
-            validate_id(id)?;
-            match self.store.read_procedure(id) {
-                Ok(unit) => {
-                    owned_bytes = owned_bytes
-                        .saturating_add(unit.heads().iter().map(|h| h.body.len()).sum::<usize>());
-                    if owned_bytes > 64 * 1024 * 1024 {
-                        return Err(DomainError::new(
-                            "source_payload_requires_spool",
-                            "Selected source requires file-backed delivery.",
-                        ));
-                    }
-                    units.insert(id.clone(), unit);
-                }
-                Err(agentlaw_storage::Error::NotFound(_)) => {}
-                Err(e) => return source(Err(e)),
-            }
-        }
-        if source(self.store.published_reader().position())? != position {
-            return Err(DomainError::new(
-                "source_changed",
-                "Source changed during exact reads; retry against a fresh read view.",
-            ));
-        }
-        let units: Vec<_> = units.into_values().collect();
-        refs.sort_by(|a, b| {
-            (&a.memory_id, &a.observed_version).cmp(&(&b.memory_id, &b.observed_version))
-        });
-        refs.dedup();
-        Ok(Snapshot {
-            streaming: Default::default(),
-            generation: position.sequence,
-            publication_basis: agentlaw_storage::ReadSet {
-                source_position: position,
-                observed: units
-                    .iter()
-                    .filter(|u| u.entity_type == "memory")
-                    .map(|u| {
-                        Ok((
-                            u.entity_id.clone(),
-                            source(u.references())?
-                                .into_iter()
-                                .map(|r| r.observed_version)
-                                .collect(),
-                        ))
-                    })
-                    .collect::<Result<_>>()?,
-                absent: missing,
-                reverse_required: BTreeMap::new(),
-                watched_scopes: vec![],
-            },
-            states,
-            basis: ReadSet {
-                memory_refs: refs,
-                fingerprint: digest(&units)?,
-            },
-            units,
-        })
+        snapshot_selected_read(
+            &self.store.owned_published_reader(),
+            &self.request_control,
+            ids,
+            procedures,
+        )
     }
     fn recall_material(
         &self,
@@ -922,69 +836,6 @@ impl Runtime {
                 full_procedure,
             },
         ))
-    }
-    pub(crate) fn write_material(
-        &self,
-        c: &RequestContext,
-        proposals: &[MemoryProposal],
-    ) -> Result<Snapshot> {
-        let index = self.exact_index()?;
-        let position = index.position()?.unwrap();
-        let mut ids = BTreeSet::new();
-        let mut affected = BTreeSet::new();
-        for p in proposals {
-            for reference in p
-                .parent_refs
-                .iter()
-                .flatten()
-                .chain(p.consolidation_refs.iter().flatten())
-            {
-                ids.insert(reference.memory_id.clone());
-                affected.insert(reference.memory_id.clone());
-            }
-            ids.extend(p.related_memory_ids.iter().flatten().cloned());
-            ids.extend(p.required_memory_ids.iter().flatten().cloned());
-            let mut context = c.clone();
-            if p.applies_to.is_none() {
-                if let Some(reference) = p.parent_refs.iter().flatten().next() {
-                    if let Some(head) = index.heads(&[reference.memory_id.clone()])?.first() {
-                        let a = scope_value(&head.metadata["applicability"])?;
-                        context.project_id = a.project_id;
-                        if let Some(machine) = a.machine_id {
-                            context.machine_id = machine;
-                        }
-                    }
-                }
-            }
-            if p.operation == Operation::Create || p.applies_to.is_some() {
-                ids.extend(index.identical_bodies(&p.what_to_remember)?);
-                for record in query_records(&p.what_to_remember) {
-                    ids.extend(
-                        self.search_channels(&index, &context, record, 128)?
-                            .hits
-                            .into_iter()
-                            .map(|h| h.memory_id),
-                    );
-                }
-            }
-        }
-        let affected = affected.into_iter().collect::<Vec<_>>();
-        ids.extend(index.related(&affected)?.into_iter().map(|x| x.1));
-        ids.extend(index.reverse_required(&affected)?);
-        let mut snapshot = self.snapshot_selected(&ids.into_iter().collect::<Vec<_>>(), &[])?;
-        for id in affected {
-            snapshot
-                .publication_basis
-                .reverse_required
-                .insert(id.clone(), index.reverse_required(&[id])?);
-        }
-        if snapshot.generation != position.sequence {
-            return Err(DomainError::new(
-                "source_changed",
-                "Source changed during write candidate selection; repeat review.",
-            ));
-        }
-        Ok(snapshot)
     }
     pub fn prepare_for_connection(&mut self, control: RequestControl) -> Result<Value> {
         let old = std::mem::replace(&mut self.request_control, control);
@@ -1221,4 +1072,106 @@ pub(crate) fn procedure_output(u: &CurrentUnit, full: bool) -> Result<Value> {
             json!({"procedure_id":u.entity_id,"current_heads":heads,"head_reconciliation_required":true,"head_reconciliation_instruction":"Review all competing procedure heads; do not merge their instructions implicitly."}),
         )
     }
+}
+
+pub(crate) fn snapshot_selected_read(
+    source_reader: &agentlaw_storage::published::OwnedPublishedReader,
+    request_control: &RequestControl,
+    ids: &[String],
+    procedures: &[String],
+) -> Result<Snapshot> {
+    request_control.check()?;
+    let guard = source(source_reader.read_snapshot())?;
+    let (position, resolved, missing) = source(guard.read_closure(ids))?;
+    let mut states = BTreeMap::new();
+    let mut units = BTreeMap::new();
+    let mut refs = Vec::new();
+    for value in resolved {
+        let unit = value.current;
+        let memories = unit
+            .heads()
+            .iter()
+            .map(|h| memory_from(&unit, h))
+            .collect::<Result<Vec<_>>>()?;
+        refs.extend(memories.iter().map(|m| m.memory_ref.clone()));
+        let state = CurrentState {
+            requested_id: value.requested_id.clone(),
+            resolved_id: unit.entity_id.clone(),
+            heads: memories,
+            redirect_path: value.redirect_path,
+        };
+        states.insert(
+            unit.entity_id.clone(),
+            CurrentState {
+                requested_id: unit.entity_id.clone(),
+                redirect_path: vec![],
+                ..state.clone()
+            },
+        );
+        states.insert(value.requested_id, state);
+        units.insert(unit.entity_id.clone(), unit);
+    }
+    let mut owned_bytes: usize = units
+        .values()
+        .flat_map(|u| u.heads())
+        .map(|h| h.body.len())
+        .sum();
+    for id in procedures {
+        validate_id(id)?;
+        match guard.read_procedure(id) {
+            Ok(unit) => {
+                owned_bytes = owned_bytes
+                    .saturating_add(unit.heads().iter().map(|h| h.body.len()).sum::<usize>());
+                if owned_bytes > 64 * 1024 * 1024 {
+                    return Err(DomainError::new(
+                        "source_payload_requires_spool",
+                        "Selected source requires file-backed delivery.",
+                    ));
+                }
+                units.insert(id.clone(), unit);
+            }
+            Err(agentlaw_storage::Error::NotFound(_)) => {}
+            Err(e) => return source(Err(e)),
+        }
+    }
+    if *guard.position() != position {
+        return Err(DomainError::new(
+            "source_changed",
+            "Source changed during exact reads; retry against a fresh read view.",
+        ));
+    }
+    let units: Vec<_> = units.into_values().collect();
+    refs.sort_by(|a, b| {
+        (&a.memory_id, &a.observed_version).cmp(&(&b.memory_id, &b.observed_version))
+    });
+    refs.dedup();
+    Ok(Snapshot {
+        streaming: Default::default(),
+        generation: position.sequence,
+        publication_basis: agentlaw_storage::ReadSet {
+            source_position: position,
+            observed: units
+                .iter()
+                .filter(|u| u.entity_type == "memory")
+                .map(|u| {
+                    Ok((
+                        u.entity_id.clone(),
+                        source(u.references())?
+                            .into_iter()
+                            .map(|r| r.observed_version)
+                            .collect(),
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            absent: missing,
+            reverse_required: BTreeMap::new(),
+            watched_scopes: vec![],
+        },
+        states,
+        basis: ReadSet {
+            memory_refs: refs,
+            fingerprint: digest(&units)?,
+        },
+        units,
+    })
 }

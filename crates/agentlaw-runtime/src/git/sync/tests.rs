@@ -657,3 +657,463 @@ fn unchanged_sync_reuses_existing_commit_without_empty_git_history() {
         before
     );
 }
+
+#[test]
+fn handle_sync_completes_with_legacy_response_shape() {
+    use crate::{store::service::StoreService, test_support::store_service::deps};
+    use agentlaw_flows::runtime::StoreIdentity;
+    let f = Fixture::new();
+    let source = f
+        .store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .unwrap();
+    let identity = StoreIdentity {
+        root: source,
+        local: f.local.clone(),
+        user_id: "test".into(),
+        machine_id: f.machine.clone(),
+        binding_id: uid(),
+        history_limit: 8192,
+        response_limit: 65536,
+    };
+    let mut dependencies = deps(f._temp.path());
+    dependencies.coordination = f.store.coordination_root().to_owned();
+    dependencies.state = f.state.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    let request_id = uid();
+    let input = json!({"action":"sync","sync":{"command":"start","policy_id":f.policy.policy_id,"request_id":request_id}});
+    let agentlaw_contracts::Request::Sync(request) =
+        agentlaw_contracts::parse_request(&input.to_string()).unwrap()
+    else {
+        panic!()
+    };
+    let result = call_with_handle(
+        &service.git_handle(),
+        &f.state,
+        "test",
+        &f.machine,
+        request,
+        RequestControl::default(),
+    )
+    .unwrap();
+    assert_eq!(result["status"], "completed_for_cutoff", "{result:#}");
+    for field in [
+        "operation_id",
+        "revision",
+        "status",
+        "phase",
+        "cutoff",
+        "canonical_applied",
+        "git_handoff_completed",
+        "delivery",
+        "policy_id",
+        "diagnostic",
+        "next_action",
+    ] {
+        assert!(result.get(field).is_some(), "missing {field}: {result:#}");
+    }
+    assert_eq!(result["canonical_applied"], true);
+    assert_eq!(result["git_handoff_completed"], true);
+    let legacy = Fixture::new().start(RequestControl::default());
+    let legacy_keys = legacy.as_object().unwrap().keys().collect::<Vec<_>>();
+    let handle_keys = result.as_object().unwrap().keys().collect::<Vec<_>>();
+    assert_eq!(handle_keys, legacy_keys);
+    let agentlaw_contracts::Request::Sync(replay) =
+        agentlaw_contracts::parse_request(&input.to_string()).unwrap()
+    else {
+        panic!()
+    };
+    let replayed = call_with_handle(
+        &service.git_handle(),
+        &f.state,
+        "test",
+        &f.machine,
+        replay,
+        RequestControl::default(),
+    )
+    .unwrap();
+    assert_eq!(replayed, result);
+    let reused = SyncRequest {
+        command: SyncCommand::Resume,
+        policy_id: None,
+        operation_id: Some(result["operation_id"].as_str().unwrap().into()),
+        expected_revision: Some(0),
+        request_id: Some(request_id),
+        solution: None,
+    };
+    assert!(
+        matches!(call_with_handle(&service.git_handle(), &f.state, "test", &f.machine, reused, RequestControl::default()), Err(e) if e.code == "request_id_reused")
+    );
+}
+
+// Uses a real SSH transport child to hold upload-pack at a file barrier. Sync
+// invokes the policy's resolved URL, so remote.origin.uploadpack is bypassed.
+struct SlowGit {
+    started: PathBuf,
+    release: PathBuf,
+}
+impl Drop for SlowGit {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release");
+    }
+}
+fn slow_git_remote(f: &mut Fixture) -> SlowGit {
+    let source = f
+        .store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .unwrap();
+    let script = f._temp.path().join("slow-upload-pack.sh");
+    let started = f._temp.path().join("upload-started");
+    let release = f._temp.path().join("upload-release");
+    let shell_path = |p: &Path| {
+        git::git_path(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''")
+    };
+    let body = format!("#!/bin/sh\ncase \"$*\" in *git-receive-pack*) exec git-receive-pack '{}' ;; esac\nprintf started > '{}'\ni=0\nwhile [ ! -f '{}' ]; do\n  i=$((i+1)); [ $i -lt 300 ] || exit 124\n  sleep 0.1\ndone\nexec git-upload-pack '{}'\n", shell_path(&f.remote), shell_path(&started), shell_path(&release), shell_path(&f.remote));
+    fs::write(&script, body).unwrap();
+    let command = format!("sh '{}'", shell_path(&script));
+    git::run(&source, &["config", "core.sshCommand", &command]).unwrap();
+    git::run(&source, &["config", "ssh.variant", "ssh"]).unwrap();
+    git::run(
+        &source,
+        &["remote", "set-url", "origin", "ssh://fixture/remote"],
+    )
+    .unwrap();
+    let mut policy = propose_policy(&f.store, &f.local, "origin", "refs/heads/main").unwrap();
+    policy.enabled = true;
+    let file = f._temp.path().join("slow-policy.json");
+    git::save_local_json(&file, &policy).unwrap();
+    configure_policy(&f.state, &f.store, &f.local, &file, true).unwrap();
+    f.policy = policy;
+    SlowGit { started, release }
+}
+fn sync_service(f: &Fixture) -> crate::store::service::StoreService {
+    use agentlaw_flows::runtime::StoreIdentity;
+    let source = f
+        .store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .unwrap();
+    let identity = StoreIdentity {
+        root: source,
+        local: f.local.clone(),
+        user_id: "test".into(),
+        machine_id: f.machine.clone(),
+        binding_id: uid(),
+        history_limit: 8192,
+        response_limit: 65536,
+    };
+    let mut dependencies = crate::test_support::store_service::deps(f._temp.path());
+    dependencies.coordination = f.store.coordination_root().to_owned();
+    dependencies.state = f.state.clone();
+    crate::store::service::StoreService::open(identity, dependencies, &RequestControl::default())
+        .unwrap()
+}
+fn parsed_sync(input: Value) -> SyncRequest {
+    let agentlaw_contracts::Request::Sync(request) =
+        agentlaw_contracts::parse_request(&json!({"action":"sync","sync":input}).to_string())
+            .unwrap()
+    else {
+        panic!()
+    };
+    request
+}
+fn wait_for_path(path: &Path, limit: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    path.exists()
+}
+
+#[test]
+fn delayed_git_fetch_leaves_query_and_lane_available() {
+    use crate::protocol::QueryRequest;
+    use agentlaw_flows::RecallRequest;
+    use std::{sync::mpsc, thread, time::Duration};
+    let mut f = Fixture::new();
+    let barrier = slow_git_remote(&mut f);
+    let service = Arc::new(sync_service(&f));
+    let ready_until = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if service
+            .query(
+                QueryRequest::Recall(RecallRequest::default()),
+                &RequestControl::default(),
+            )
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < ready_until,
+            "recall did not become ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let request =
+        parsed_sync(json!({"command":"start","policy_id":f.policy.policy_id,"request_id":uid()}));
+    let handle = service.git_handle();
+    let state = f.state.clone();
+    let machine = f.machine.clone();
+    let (sync_tx, sync_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        sync_tx
+            .send(call_with_handle(
+                &handle,
+                &state,
+                "test",
+                &machine,
+                request,
+                RequestControl::default(),
+            ))
+            .ok();
+    });
+    let started = wait_for_path(&barrier.started, Duration::from_secs(15));
+    let (query_tx, query_rx) = mpsc::channel();
+    let query_service = service.clone();
+    let query = thread::spawn(move || {
+        query_tx
+            .send(query_service.query(
+                QueryRequest::Recall(RecallRequest::default()),
+                &RequestControl::default(),
+            ))
+            .ok();
+    });
+    let (lane_tx, lane_rx) = mpsc::channel();
+    let lane_service = service.clone();
+    let lane = thread::spawn(move || {
+        lane_tx
+            .send(lane_service.recover(&RequestControl::default()))
+            .ok();
+    });
+    let (remember_tx, remember_rx) = mpsc::channel();
+    let remember_service = service.clone();
+    let remember = thread::spawn(move || {
+        let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"Saved while Git waits","evidence":"Observed during a delayed fetch","applies_to":["user"]}]})).unwrap();
+        remember_tx
+            .send(remember_service.command(
+                crate::protocol::CommandRequest::Remember(request),
+                &RequestControl::default(),
+            ))
+            .ok();
+    });
+    let query_result = query_rx.recv_timeout(Duration::from_secs(5));
+    let lane_result = lane_rx.recv_timeout(Duration::from_secs(5));
+    let remember_result = remember_rx.recv_timeout(Duration::from_secs(5));
+    fs::write(&barrier.release, b"release").unwrap();
+    let sync_result = sync_rx.recv_timeout(Duration::from_secs(25));
+    assert!(started, "Git upload-pack did not reach the barrier");
+    assert!(
+        matches!(query_result, Ok(Ok(_))),
+        "query did not complete while Git waited"
+    );
+    assert!(
+        matches!(lane_result, Ok(Ok(()))),
+        "lane did not complete while Git waited"
+    );
+    assert!(
+        matches!(&remember_result, Ok(Ok(value)) if value["status"] == "remembered"),
+        "remember did not complete while Git waited: {remember_result:?}"
+    );
+    assert!(
+        matches!(sync_result, Ok(Ok(_))),
+        "sync did not finish after releasing Git"
+    );
+    query.join().unwrap();
+    lane.join().unwrap();
+    remember.join().unwrap();
+    worker.join().unwrap();
+}
+
+fn packet_files(local: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let root = local.join("git").join("syncs");
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if let Ok(children) = fs::read_dir(entry.path()) {
+                for child in children.flatten() {
+                    let name = child.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("packet-") && name.ends_with(".json") {
+                        files.push(child.path());
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn packet_file_is_created_only_after_lane_persistence_succeeds() {
+    use std::{sync::mpsc, thread, time::Duration};
+    let mut failed = Fixture::new();
+    failed.remote_write("incoming conflicting edit");
+    save(
+        &failed.store,
+        &failed.id,
+        &failed.machine,
+        "local conflicting edit",
+    );
+    let barrier = slow_git_remote(&mut failed);
+    let service = sync_service(&failed);
+    let request = parsed_sync(
+        json!({"command":"start","policy_id":failed.policy.policy_id,"request_id":uid()}),
+    );
+    let handle = service.git_handle();
+    let state = failed.state.clone();
+    let machine = failed.machine.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        tx.send(call_with_handle(
+            &handle,
+            &state,
+            "test",
+            &machine,
+            request,
+            RequestControl::default(),
+        ))
+        .ok();
+    });
+    let started = wait_for_path(&barrier.started, Duration::from_secs(15));
+    let before = packet_files(&failed.local);
+    service.close();
+    fs::write(&barrier.release, b"release").unwrap();
+    let result = rx.recv_timeout(Duration::from_secs(25));
+    assert!(started, "Git upload-pack did not reach the barrier");
+    assert!(result.is_ok(), "sync failed to return after lane closure");
+    match result.unwrap() {
+        Err(_) => {}
+        Ok(value) => assert_ne!(
+            value["status"], "needs_resolution",
+            "packet cannot be reported as persisted: {value:#}"
+        ),
+    }
+    assert_eq!(packet_files(&failed.local), before);
+    worker.join().unwrap();
+
+    let success = Fixture::new();
+    success.remote_write("incoming conflicting edit");
+    save(
+        &success.store,
+        &success.id,
+        &success.machine,
+        "local conflicting edit",
+    );
+    let service = sync_service(&success);
+    let request = parsed_sync(
+        json!({"command":"start","policy_id":success.policy.policy_id,"request_id":uid()}),
+    );
+    let response = call_with_handle(
+        &service.git_handle(),
+        &success.state,
+        "test",
+        &success.machine,
+        request,
+        RequestControl::default(),
+    )
+    .unwrap();
+    assert_eq!(response["status"], "needs_resolution", "{response:#}");
+    let revision = response["revision"].as_u64().unwrap();
+    let operation = response["operation_id"].as_str().unwrap();
+    let expected = success
+        .local
+        .join("git")
+        .join("syncs")
+        .join(operation)
+        .join(format!("packet-{revision}.json"));
+    assert!(
+        expected.is_file(),
+        "missing persisted packet {}",
+        expected.display()
+    );
+    let packet: Value = serde_json::from_slice(&fs::read(expected).unwrap()).unwrap();
+    assert_eq!(packet, response["resolution_packet"]);
+}
+
+#[test]
+fn changed_inputs_during_index_preparation_are_preserved_and_resume() {
+    use std::{sync::mpsc, thread, time::Duration};
+    let f = Fixture::new();
+    f.remote_write("remote update requiring local publication");
+    let source = f
+        .store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .unwrap();
+    let arm = f._temp.path().join("arm-index-delay");
+    let started = f._temp.path().join("index-delay-started");
+    let release = f._temp.path().join("index-delay-release");
+    let script = f._temp.path().join("slow-fsmonitor.sh");
+    let shell_path = |p: &Path| {
+        git::git_path(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''")
+    };
+    let body = format!("#!/bin/sh\nif [ -f '{}' ] && [ ! -f '{}' ]; then\n  printf started > '{}'\n  i=0\n  while [ ! -f '{}' ]; do\n    i=$((i+1)); [ $i -lt 300 ] || exit 124\n    sleep 0.1\n  done\nfi\nprintf 'token\\000'\n", shell_path(&arm), shell_path(&started), shell_path(&started), shell_path(&release));
+    fs::write(&script, body).unwrap();
+    let command = format!("sh '{}'", shell_path(&script));
+    git::run(&source, &["config", "core.fsmonitor", &command]).unwrap();
+    git::run(&source, &["update-index", "--fsmonitor"]).unwrap();
+    let service = sync_service(&f);
+    let request =
+        parsed_sync(json!({"command":"start","policy_id":f.policy.policy_id,"request_id":uid()}));
+    let handle = service.git_handle();
+    let state = f.state.clone();
+    let machine = f.machine.clone();
+    let armed = arm.clone();
+    let control = RequestControl::new(Arc::new(AtomicBool::new(false)), move |phase| {
+        if phase == "preserving_post_cutoff_local_writes" {
+            fs::write(&armed, b"armed").unwrap();
+        }
+    });
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        tx.send(call_with_handle(
+            &handle, &state, "test", &machine, request, control,
+        ))
+        .ok();
+    });
+    let reached = wait_for_path(&started, Duration::from_secs(20));
+    if reached {
+        save(
+            &f.store,
+            &f.id,
+            &f.machine,
+            "real local write after overlay guard",
+        );
+    }
+    fs::write(&release, b"release").unwrap();
+    let first = rx.recv_timeout(Duration::from_secs(30));
+    assert!(reached, "Git index preparation did not reach the barrier");
+    let first = first
+        .expect("sync did not finish after releasing index child")
+        .unwrap();
+    assert_eq!(first["phase"], "local_inputs_changed", "{first:#}");
+    assert_eq!(
+        f.store.read_current(&f.id).unwrap().heads()[0].body,
+        "real local write after overlay guard"
+    );
+    worker.join().unwrap();
+    let resume = parsed_sync(
+        json!({"command":"resume","operation_id":first["operation_id"],"expected_revision":first["revision"],"request_id":uid()}),
+    );
+    let result = call_with_handle(
+        &service.git_handle(),
+        &f.state,
+        "test",
+        &f.machine,
+        resume,
+        RequestControl::default(),
+    )
+    .unwrap();
+    assert_ne!(result["phase"], "local_inputs_changed", "{result:#}");
+    assert_eq!(
+        f.store.read_current(&f.id).unwrap().heads()[0].body,
+        "real local write after overlay guard"
+    );
+}

@@ -192,6 +192,47 @@ fn search_one(
     })
 }
 
+pub(crate) fn preparation_channels(
+    ctx: &ReadCtx<'_>,
+    exact: &mut ExactSnapshot,
+    text: &str,
+    scopes: &[String],
+) -> Result<Channels> {
+    let vector = match ctx.semantic.embed_query(text, ctx.request) {
+        Ok(vector) => Some(vector),
+        Err(SemanticError::Cancelled) => {
+            ctx.request.check()?;
+            return Err(DomainError::new(
+                "cancelled",
+                "Query embedding was cancelled.",
+            ));
+        }
+        Err(_) => None,
+    };
+    let query = PreparedQuery {
+        text: text.to_owned(),
+        combined: text.to_owned(),
+        vector,
+    };
+    let found = search_one(ctx, exact, &query, scopes)?;
+    let diagnostics = if found.complete {
+        vec![]
+    } else {
+        vec![DomainError::new(
+            "semantic_channel_incomplete",
+            "Semantic retrieval did not establish a complete view.",
+        )]
+    };
+    Ok(Channels {
+        hits: found.hits,
+        lexical_ids: found.lexical_ids,
+        lexical: found.lexical,
+        vector: found.vector,
+        complete: found.complete,
+        diagnostics,
+    })
+}
+
 fn connection(ctx: &ReadCtx<'_>, path: Option<&str>) -> Result<Option<String>> {
     match path {
         None => Ok(None),

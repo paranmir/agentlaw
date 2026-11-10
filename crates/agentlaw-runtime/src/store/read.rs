@@ -3,11 +3,15 @@
 use crate::projection::ProjectionHandle;
 use crate::protocol::QueryRequest;
 use agentlaw_flows::exact::{DeltaBudget, ExactSnapshot};
+use agentlaw_flows::prepare::Prepared;
 use agentlaw_flows::runtime::ReadCtx;
-use agentlaw_flows::{DomainError, RecallRequest};
+use agentlaw_flows::{
+    ConnectRequest, DomainError, RecallRequest, RememberRequest, Result as FlowResult,
+};
 use serde_json::Value;
 
-/// Runs ordinary queries against one pinned projection generation and source position.
+/// Runs ordinary queries and command preparation against one pinned projection
+/// generation and source position.
 pub struct ReadCoordinator {
     projection: ProjectionHandle,
     budget: DeltaBudget,
@@ -16,11 +20,7 @@ impl ReadCoordinator {
     pub fn new(projection: ProjectionHandle, budget: DeltaBudget) -> Self {
         Self { projection, budget }
     }
-    pub fn run_query(
-        &self,
-        ctx: &ReadCtx<'_>,
-        request: QueryRequest,
-    ) -> agentlaw_flows::Result<Value> {
+    pub fn run_query(&self, ctx: &ReadCtx<'_>, request: QueryRequest) -> FlowResult<Value> {
         ctx.request.check()?;
         match request {
             QueryRequest::Recall(request) => self.run_recall(ctx, &request, None),
@@ -41,8 +41,26 @@ impl ReadCoordinator {
         ctx: &ReadCtx<'_>,
         request: RecallRequest,
         project_id: &str,
-    ) -> agentlaw_flows::Result<Value> {
+    ) -> FlowResult<Value> {
         self.run_recall(ctx, &request, Some(project_id))
+    }
+
+    /// Prepares a remember or procedure command outside the mutation lane.
+    pub fn run_prepare(&self, ctx: &ReadCtx<'_>, request: RememberRequest) -> FlowResult<Prepared> {
+        ctx.request.check()?;
+        self.with_exact(ctx, |exact| {
+            agentlaw_flows::prepare::prepare(ctx, exact, request)
+        })
+    }
+
+    /// Prepares a connect command outside the mutation lane.
+    pub fn run_prepare_connect(
+        &self,
+        ctx: &ReadCtx<'_>,
+        request: ConnectRequest,
+    ) -> FlowResult<Prepared> {
+        ctx.request.check()?;
+        agentlaw_flows::prepare::prepare_connect(ctx, request)
     }
 
     fn run_recall(
@@ -50,10 +68,29 @@ impl ReadCoordinator {
         ctx: &ReadCtx<'_>,
         request: &RecallRequest,
         project_id: Option<&str>,
-    ) -> agentlaw_flows::Result<Value> {
+    ) -> FlowResult<Value> {
         ctx.request.check()?;
+        let prepared = agentlaw_flows::read::prepare_recall(ctx, request)?;
+        self.with_exact(ctx, |exact| {
+            agentlaw_flows::read::recall_prepared(
+                ctx,
+                exact,
+                request,
+                project_id,
+                self.budget,
+                &prepared,
+            )
+        })
+    }
+
+    /// Pins the active generation at the current source position and wakes
+    /// projection recovery when the pinned view cannot serve the request.
+    fn with_exact<T>(
+        &self,
+        ctx: &ReadCtx<'_>,
+        work: impl FnOnce(&mut ExactSnapshot) -> FlowResult<T>,
+    ) -> FlowResult<T> {
         let result = (|| {
-            let prepared = agentlaw_flows::read::prepare_recall(ctx, request)?;
             let pinned = self.projection.generations().pin()?;
             let guard = ctx.source.read_snapshot().map_err(|_| {
                 DomainError::new(
@@ -63,14 +100,7 @@ impl ReadCoordinator {
             })?;
             let mut exact = ExactSnapshot::build(pinned, &guard, self.budget)?;
             drop(guard);
-            agentlaw_flows::read::recall_prepared(
-                ctx,
-                &mut exact,
-                request,
-                project_id,
-                self.budget,
-                &prepared,
-            )
+            work(&mut exact)
         })();
         if result.as_ref().err().is_some_and(|e| {
             matches!(

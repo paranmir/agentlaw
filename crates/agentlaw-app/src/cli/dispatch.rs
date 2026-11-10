@@ -58,7 +58,14 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             command: SupportCommand::Star(args),
         } => agentlaw_app::update::support::star(args.ask_again)?,
         Command::Install(args) => general::install(args)?,
-        Command::Doctor => agentlaw_app::diagnostics::doctor(&config::state_root()?)?,
+        Command::Doctor(args) => {
+            let mode = if args.audit {
+                agentlaw_app::diagnostics::DoctorMode::Audit
+            } else {
+                agentlaw_app::diagnostics::DoctorMode::Health
+            };
+            agentlaw_app::diagnostics::doctor(&config::state_root()?, mode)?
+        }
         Command::Repair => {
             agentlaw_app::diagnostics::repair(&config::state_root()?, cli_control())?
         }

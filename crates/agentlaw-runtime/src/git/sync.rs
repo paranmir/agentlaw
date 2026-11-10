@@ -155,17 +155,15 @@ fn db(local: &Path) -> Result<rusqlite::Connection> {
     conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS sync_operations(operation_id TEXT PRIMARY KEY,source TEXT NOT NULL,state TEXT NOT NULL,active INTEGER NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS sync_source_slot ON sync_operations(source) WHERE active=1; CREATE TABLE IF NOT EXISTS sync_requests(request_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,digest TEXT NOT NULL,response TEXT);").map_err(|_|git::io_error("sync control schema"))?;
     Ok(conn)
 }
-fn persist(conn: &rusqlite::Connection, op: &Operation) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_operations VALUES(?1,?2,?3,?4)",
-        rusqlite::params![
-            op.id,
-            op.source.to_string_lossy(),
-            serde_json::to_string(op).unwrap(),
-            i64::from(!op.terminal())
-        ],
-    )
-    .map_err(|_| git::io_error("sync operation persistence"))?;
+fn sync_row(op: &Operation) -> crate::store::lane::SyncOperationRow {
+    crate::store::lane::SyncOperationRow {
+        id: op.id.clone(),
+        source: op.source.to_string_lossy().into_owned(),
+        state_json: serde_json::to_string(op).unwrap(),
+        active: !op.terminal(),
+    }
+}
+fn save_packet(op: &Operation) -> Result<()> {
     if let Some(packet) = &op.packet {
         git::save_local_json(
             &op.owned.join(format!("packet-{}.json", op.revision)),
@@ -173,6 +171,145 @@ fn persist(conn: &rusqlite::Connection, op: &Operation) -> Result<()> {
         )?;
     }
     Ok(())
+}
+fn persist(conn: &rusqlite::Connection, op: &Operation) -> Result<()> {
+    let row = sync_row(op);
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_operations VALUES(?1,?2,?3,?4)",
+        rusqlite::params![row.id, row.source, row.state_json, i64::from(row.active)],
+    )
+    .map_err(|_| git::io_error("sync operation persistence"))?;
+    save_packet(op)
+}
+enum SyncBackend<'a> {
+    Legacy {
+        conn: rusqlite::Connection,
+        store: &'a Store,
+    },
+    Handle {
+        sync: super::SyncControl,
+        handle: &'a super::handle::GitStoreHandle,
+    },
+}
+impl SyncBackend<'_> {
+    fn request(&self, id: &str) -> Result<Option<super::control::SyncReceipt>> {
+        use rusqlite::OptionalExtension;
+        match self {
+            Self::Handle { sync, .. } => sync.request(id),
+            Self::Legacy { conn, .. } => conn
+                .query_row(
+                    "SELECT operation_id,digest,response FROM sync_requests WHERE request_id=?1",
+                    [id],
+                    |r| {
+                        Ok(super::control::SyncReceipt {
+                            operation_id: r.get(0)?,
+                            digest: r.get(1)?,
+                            response: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|_| git::io_error("sync request replay")),
+        }
+    }
+    fn active_for(&self, source: &Path) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        match self {
+            Self::Handle { sync, .. } => sync.active_for(source),
+            Self::Legacy { conn, .. } => conn
+                .query_row(
+                    "SELECT operation_id FROM sync_operations WHERE source=?1 AND active=1",
+                    [source.to_string_lossy().as_ref()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| git::io_error("sync source slot")),
+        }
+    }
+    fn operation(&self, id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        match self {
+            Self::Handle { sync, .. } => sync.operation(id),
+            Self::Legacy { conn, .. } => conn
+                .query_row(
+                    "SELECT state FROM sync_operations WHERE operation_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| git::io_error("sync operation lookup")),
+        }
+    }
+    fn persist(&self, op: &Operation, control: &RequestControl) -> Result<()> {
+        match self {
+            Self::Handle { sync, .. } => {
+                sync.persist(sync_row(op), control)?;
+                save_packet(op)
+            }
+            Self::Legacy { conn, .. } => persist(conn, op),
+        }
+    }
+    fn reserve(
+        &self,
+        id: &str,
+        operation: &str,
+        digest: &str,
+        control: &RequestControl,
+    ) -> Result<bool> {
+        match self {
+            Self::Handle { sync, .. } => sync.reserve(id, operation, digest, control),
+            Self::Legacy { conn, .. } => conn
+                .execute(
+                    "INSERT OR IGNORE INTO sync_requests VALUES(?1,?2,?3,NULL)",
+                    rusqlite::params![id, operation, digest],
+                )
+                .map(|n| n != 0)
+                .map_err(|_| git::io_error("sync request intent")),
+        }
+    }
+    fn complete(&self, id: &str, response: String, control: &RequestControl) -> Result<()> {
+        match self {
+            Self::Handle { sync, .. } => sync.complete(id, response, control),
+            Self::Legacy { conn, .. } => {
+                conn.execute(
+                    "UPDATE sync_requests SET response=?1 WHERE request_id=?2",
+                    rusqlite::params![response, id],
+                )
+                .map_err(|_| git::io_error("sync request receipt"))?;
+                Ok(())
+            }
+        }
+    }
+    fn publish(&self, store: &Store, plan: &LocalPlan, control: &RequestControl) -> Result<()> {
+        match self {
+            Self::Handle { handle, .. } => {
+                handle.publish_sync_overlay(
+                    crate::store::lane::SyncOverlayInput {
+                        publication_id: plan.publication_id.clone(),
+                        baseline_root: plan.baseline.root.clone(),
+                        baseline_local: plan.baseline.local.clone(),
+                        resolved_root: plan.resolved.root.clone(),
+                        resolved_local: plan.resolved.local.clone(),
+                        guard: plan.guard.as_ref().unwrap().clone(),
+                    },
+                    control,
+                )?;
+            }
+            Self::Legacy { store: owner, .. } => {
+                owner
+                    .publish_sync_overlay_control(
+                        &plan.publication_id,
+                        &plan.baseline.open(store)?,
+                        &plan.resolved.open(store)?,
+                        plan.guard.as_ref().unwrap(),
+                        None,
+                        Some(&control.cancel),
+                    )
+                    .map_err(storage_error)?;
+            }
+        }
+        Ok(())
+    }
 }
 pub fn require_git_slot_clear(local: &Path) -> Result<()> {
     let runtime = local.parent().unwrap_or(local);
@@ -201,45 +338,48 @@ pub fn call(
     request: SyncRequest,
     control: RequestControl,
 ) -> Result<Value> {
-    use rusqlite::OptionalExtension;
+    let backend = SyncBackend::Legacy {
+        conn: db(local)?,
+        store,
+    };
+    call_inner(
+        store, local, state, user, machine, request, control, &backend,
+    )
+}
+fn call_inner(
+    store: &Store,
+    local: &Path,
+    state: &Path,
+    user: &str,
+    machine: &str,
+    request: SyncRequest,
+    control: RequestControl,
+    backend: &SyncBackend<'_>,
+) -> Result<Value> {
     let _lane = git::lane(&local.join("git"))?;
-    let conn = db(local)?;
     let source = store
         .with_source_read(|p, _| Ok(p.to_path_buf()))
         .map_err(storage_error)?;
     let digest = git::hash(&serde_json::to_vec(&request).unwrap());
     if let Some(id) = &request.request_id {
-        let previous: Option<(String, String, Option<String>)> = conn
-            .query_row(
-                "SELECT operation_id,digest,response FROM sync_requests WHERE request_id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(|_| git::io_error("sync request replay"))?;
-        if let Some((_, old, response)) = &previous {
-            if old != &digest {
+        if let Some(previous) = backend.request(id)? {
+            if previous.digest != digest {
                 return Err(DomainError::new(
                     "request_id_reused",
                     "This request ID already names different input. No replacement was executed.",
                 ));
             }
-            if let Some(response) = response {
-                return serde_json::from_str(response)
+            if let Some(response) = previous.response {
+                return serde_json::from_str(&response)
                     .map_err(|_| git::io_error("sync cached response"));
             }
         }
     }
     let mut op = if request.command == SyncCommand::Start {
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT state FROM sync_operations WHERE source=?1 AND active=1",
-                [source.to_string_lossy().as_ref()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|_| git::io_error("sync source slot"))?;
-        if let Some(existing) = existing {
+        if let Some(id) = backend.active_for(&source)? {
+            let existing = backend
+                .operation(&id)?
+                .ok_or_else(|| git::io_error("sync existing operation"))?;
             let existing: Operation = serde_json::from_str(&existing)
                 .map_err(|_| git::io_error("sync existing operation"))?;
             return Ok(existing.response());
@@ -294,18 +434,12 @@ pub fn call(
         let id = request.operation_id.as_deref().ok_or_else(|| {
             DomainError::new("invalid_input", "Copy operation_id from sync start/status.")
         })?;
-        let raw: String = conn
-            .query_row(
-                "SELECT state FROM sync_operations WHERE operation_id=?1",
-                [id],
-                |r| r.get(0),
+        let raw = backend.operation(id)?.ok_or_else(|| {
+            DomainError::new(
+                "sync_operation_not_found",
+                "Use an operation ID returned by this store.",
             )
-            .map_err(|_| {
-                DomainError::new(
-                    "sync_operation_not_found",
-                    "Use an operation ID returned by this store.",
-                )
-            })?;
+        })?;
         serde_json::from_str(&raw).map_err(|_| git::io_error("sync operation decode"))?
     };
     if op.source != source || op.local != local {
@@ -333,16 +467,11 @@ pub fn call(
                 Err(error) => op.diagnostic = Some(error),
             }
         }
-        persist(&conn, &op)?;
+        backend.persist(&op, &control)?;
         return Ok(op.response());
     }
     let replaying = if let Some(id) = &request.request_id {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_requests WHERE request_id=?1)",
-            [id],
-            |r| r.get::<_, bool>(0),
-        )
-        .map_err(|_| git::io_error("sync replay state"))?
+        backend.request(id)?.is_some()
     } else {
         false
     };
@@ -365,12 +494,8 @@ pub fn call(
                 "Mutating sync commands require a unique request_id.",
             )
         })?;
-    persist(&conn, &op)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO sync_requests VALUES(?1,?2,?3,NULL)",
-        rusqlite::params![request_id, op.id, digest],
-    )
-    .map_err(|_| git::io_error("sync request intent"))?;
+    backend.persist(&op, &control)?;
+    backend.reserve(request_id, &op.id, &digest, &control)?;
     op.diagnostic = None;
     let effect = (|| -> Result<()> {
         if op.terminal() {
@@ -401,7 +526,7 @@ pub fn call(
                             .is_some_and(|v| s.digest == git::hash(&serde_json::to_vec(v).unwrap()))
                     })
                 {
-                    return advance(store, state, &conn, &mut op, &control);
+                    return advance(store, state, backend, &mut op, &control);
                 }
                 if op.packet.is_none() {
                     return Err(DomainError::new(
@@ -415,16 +540,16 @@ pub fn call(
                 op.phase = "solution_submitted".into();
                 op.submission = None;
                 // Close the old gate durably before validating a replacement solution.
-                persist(&conn, &op)?;
+                backend.persist(&op, &control)?;
                 let solution = request.solution.as_ref().ok_or_else(|| {
                     DomainError::new("invalid_input", "sync resolve requires solution.")
                 })?;
                 resolution::submit(store, &mut op, solution)?;
-                persist(&conn, &op)?;
+                backend.persist(&op, &control)?;
             }
             _ => {}
         }
-        advance(store, state, &conn, &mut op, &control)
+        advance(store, state, backend, &mut op, &control)
     })();
     if let Err(error) = effect {
         op.diagnostic = Some(error);
@@ -435,13 +560,13 @@ pub fn call(
         }
         // Persist a resumable failure, not an empty-success replacement.
     }
-    persist(&conn, &op)?;
+    backend.persist(&op, &control)?;
     let response = op.response();
-    conn.execute(
-        "UPDATE sync_requests SET response=?1 WHERE request_id=?2",
-        rusqlite::params![serde_json::to_string(&response).unwrap(), request_id],
-    )
-    .map_err(|_| git::io_error("sync request receipt"))?;
+    backend.complete(
+        request_id,
+        serde_json::to_string(&response).unwrap(),
+        &control,
+    )?;
     Ok(response)
 }
 fn head_reference(repo: &Path) -> Result<String> {
@@ -909,7 +1034,7 @@ fn request_packet(
 fn advance(
     store: &Store,
     state: &Path,
-    conn: &rusqlite::Connection,
+    backend: &SyncBackend<'_>,
     op: &mut Operation,
     control: &RequestControl,
 ) -> Result<()> {
@@ -920,12 +1045,12 @@ fn advance(
         control.phase("git_ref_index_handoff");
         finish_handoff(op)?;
         op.phase = "git_handoff_completed".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     if op.cancelled || op.held {
         if op.canonical_applied && !op.handoff_completed {
             finish_handoff(op)?;
-            persist(conn, op)?;
+            backend.persist(op, control)?;
         }
         if op.cancelled && matches!(op.phase.as_str(), "pushing" | "delivery_unknown") {
             let observed = fetch_target(&op.source, &op.policy)?;
@@ -970,7 +1095,7 @@ fn advance(
         op.cutoff = Some(capture);
         op.baseline_commit = Some(commit);
         op.phase = "incoming".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     if op.outgoing.is_none() {
         control.phase("preparing_fixed_incoming");
@@ -1011,7 +1136,7 @@ fn advance(
             let candidate = View { root, local };
             op.outgoing = Some(candidate.clone());
             if request_packet(store, op, left, right, candidate.clone(), "outgoing")? {
-                persist(conn, op)?;
+                backend.persist(op, control)?;
                 return Ok(());
             }
             candidate
@@ -1020,7 +1145,7 @@ fn advance(
         };
         op.outgoing = Some(outgoing);
         op.phase = "candidate_ready".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     if op.candidate.is_none() {
         control.phase("sealing_outgoing_candidate");
@@ -1054,7 +1179,7 @@ fn advance(
         op.candidate = Some(commit);
         op.candidate_tree = Some(tree);
         op.phase = "sealed".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     let scanned_now = op.scan.is_none();
     if scanned_now {
@@ -1065,11 +1190,11 @@ fn advance(
             &op.owned.join(format!("scan-{}", op.remote_updates)),
         )?);
         op.phase = "scanned".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     if !op.scan.as_ref().unwrap().findings.is_empty() && !policy::findings_accepted(op)? {
         op.phase = "needs_user_findings".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
         return Ok(());
     }
     if !op.canonical_applied {
@@ -1094,10 +1219,10 @@ fn advance(
                 handoff: None,
             });
             if request_packet(store, op, baseline, outgoing, resolved, "local_overlay")? {
-                persist(conn, op)?;
+                backend.persist(op, control)?;
                 return Ok(());
             }
-            persist(conn, op)?;
+            backend.persist(op, control)?;
         }
         let plan = op.local_plan.as_mut().unwrap();
         let guarded = store.prepare_overlay_guard(
@@ -1112,9 +1237,9 @@ fn advance(
                 op.local_retries += 1;
                 op.revision += 1;
                 op.phase = "local_inputs_changed".into();
-                persist(conn, op)?;
+                backend.persist(op, control)?;
                 if op.local_retries <= 3 {
-                    return advance(store, state, conn, op, control);
+                    return advance(store, state, backend, op, control);
                 }
                 return Ok(());
             }
@@ -1137,38 +1262,31 @@ fn advance(
             });
         }
         op.phase = "local_decision_prepared".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
         policy::recheck(state, store, &op.local, &op.policy, &op.policy_digest)?;
         control.check()?;
         let plan = op.local_plan.as_ref().unwrap();
-        match store.publish_sync_overlay_control(
-            &plan.publication_id,
-            &plan.baseline.open(store)?,
-            &plan.resolved.open(store)?,
-            plan.guard.as_ref().unwrap(),
-            None,
-            Some(&control.cancel),
-        ) {
-            Ok(_) => {}
-            Err(agentlaw_storage::Error::Stale(_)) => {
+        match backend.publish(store, plan, control) {
+            Ok(()) => {}
+            Err(error) if error.code == "sync_inputs_changed" => {
                 op.local_plan = None;
                 op.local_retries += 1;
                 op.revision += 1;
                 op.phase = "local_inputs_changed".into();
-                persist(conn, op)?;
+                backend.persist(op, control)?;
                 return Ok(());
             }
-            Err(error) => return Err(storage_error(error)),
+            Err(error) => return Err(error),
         }
         op.canonical_applied = true;
         op.phase = "local_applied".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     if !op.handoff_completed {
         control.phase("git_ref_index_handoff");
         finish_handoff(op)?;
         op.phase = "git_handoff_completed".into();
-        persist(conn, op)?;
+        backend.persist(op, control)?;
     }
     policy::recheck(state, store, &op.local, &op.policy, &op.policy_digest)?;
     if !op.policy.push_permission {
@@ -1220,8 +1338,8 @@ fn advance(
         op.canonical_applied = false;
         op.handoff_completed = false;
         op.phase = "incoming".into();
-        persist(conn, op)?;
-        return advance(store, state, conn, op, control);
+        backend.persist(op, control)?;
+        return advance(store, state, backend, op, control);
     }
     let scan = op.scan.as_ref().unwrap();
     // A resumed process validates compressed payload+manifest, without pattern scan.
@@ -1236,7 +1354,7 @@ fn advance(
     policy::recheck(state, store, &op.local, &op.policy, &op.policy_digest)?;
     control.check()?;
     op.phase = "pushing".into();
-    persist(conn, op)?;
+    backend.persist(op, control)?;
     let spec = format!("{candidate}:{}", op.policy.target_ref);
     let lease = format!(
         "--force-with-lease={}:{}",
@@ -1296,5 +1414,35 @@ fn is_ancestor(repo: &Path, old: &str, new: &str) -> Result<bool> {
         _ => Err(git::io_error("ancestry validation")),
     }
 }
+pub fn call_with_handle(
+    handle: &super::handle::GitStoreHandle,
+    state: &Path,
+    user: &str,
+    machine: &str,
+    request: SyncRequest,
+    control: RequestControl,
+) -> Result<Value> {
+    let store = Store::open_read_only_with_coordination(
+        &handle.root,
+        handle.local.join("canonical"),
+        &handle.coordination,
+    )
+    .map_err(storage_error)?;
+    let backend = SyncBackend::Handle {
+        sync: handle.sync_control(),
+        handle,
+    };
+    call_inner(
+        &store,
+        &handle.local,
+        state,
+        user,
+        machine,
+        request,
+        control,
+        &backend,
+    )
+}
+
 #[cfg(test)]
 mod tests;

@@ -101,6 +101,9 @@ impl SourceReadGuard<'_> {
     pub fn position(&self) -> &SourcePosition {
         &self.position
     }
+    pub fn validate_read_set(&self, read_set: &crate::ReadSet) -> Result<()> {
+        self.store.validate_read_set_locked(read_set)
+    }
     /// A bounded ledger page at this guard's pinned source position.
     pub fn read_published_paths(
         &self,

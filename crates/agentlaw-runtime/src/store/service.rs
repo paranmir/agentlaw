@@ -1,12 +1,13 @@
 //! Owns one binding's control database, source and maintenance handles.
 
 use crate::{
+    git::handle::GitStoreHandle,
     installation::registry::ConfigSnapshot,
     ports::{HealthSink, RuntimeError, RuntimeResult},
     projection::{
         ActiveGeneration, ActivePointerSink, ExactPreparation, ProjectionConfig, ProjectionHandle,
     },
-    protocol::{BindingRef, QueryRequest},
+    protocol::{BindingRef, CommandRequest, QueryRequest},
     semantic::{SemanticIndexer, SemanticPreparationHandle, SemanticSearch},
     store::{
         lane::{LaneCommand, LaneReply, LaneSender, MutationLane},
@@ -44,6 +45,8 @@ pub struct StoreDeps {
     pub indexer: SemanticIndexer,
     pub projection: ProjectionConfig,
     pub coordination: PathBuf,
+    /// Installation state that holds the local Git delegation policies.
+    pub state: PathBuf,
 }
 pub struct TargetPreparation {
     pub exact: ExactPreparation,
@@ -53,6 +56,8 @@ pub struct TargetPreparation {
 pub struct StoreService {
     identity: StoreIdentity,
     reference: BindingRef,
+    coordination: PathBuf,
+    state: PathBuf,
     source: OwnedPublishedReader,
     lane: MutationLane,
     projection: ProjectionHandle,
@@ -81,6 +86,46 @@ impl ActivePointerSink for PointerSink {
 }
 
 impl StoreService {
+    pub fn command(&self, request: CommandRequest, control: &RequestControl) -> Result<Value> {
+        self.command_identity(request, control, &self.identity)
+    }
+
+    pub fn command_with_snapshot(
+        &self,
+        request: CommandRequest,
+        snapshot: &ConfigSnapshot,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        let identity = self.request_identity(snapshot)?;
+        self.command_identity(request, control, &identity)
+    }
+    fn command_identity(
+        &self,
+        request: CommandRequest,
+        control: &RequestControl,
+        identity: &StoreIdentity,
+    ) -> Result<Value> {
+        let prepared = match request {
+            CommandRequest::Remember(request) | CommandRequest::Procedure(request) => self
+                .with_read_ctx(identity, control, |ctx| {
+                    self.reads.run_prepare(ctx, request)
+                })?,
+            CommandRequest::Connect(request) => self.with_read_ctx(identity, control, |ctx| {
+                self.reads.run_prepare_connect(ctx, request)
+            })?,
+            CommandRequest::Sync(request) => {
+                return crate::git::sync::call_with_handle(
+                    &self.git_handle(),
+                    &self.state,
+                    &identity.user_id,
+                    &identity.machine_id,
+                    request,
+                    control.clone(),
+                )
+            }
+        };
+        self.apply_identity(prepared, control, identity)
+    }
     pub fn open(
         identity: StoreIdentity,
         deps: StoreDeps,
@@ -184,6 +229,8 @@ impl StoreService {
         Ok(Self {
             identity,
             reference,
+            coordination: deps.coordination,
+            state: deps.state,
             source,
             lane,
             projection,
@@ -233,17 +280,7 @@ impl StoreService {
         control: &RequestControl,
         identity: &StoreIdentity,
     ) -> Result<Value> {
-        let reader = ControlReader::open(&self.identity.local)?;
-        let ctx = ReadCtx {
-            identity,
-            source: &self.source,
-            control: &reader,
-            semantic: self.semantic.as_ref(),
-            history_semantic: self.semantic.as_ref(),
-            history_cache: &self.history_cache,
-            request: control,
-        };
-        self.reads.run_query(&ctx, request)
+        self.with_read_ctx(identity, control, |ctx| self.reads.run_query(ctx, request))
     }
 
     pub fn apply_prepared(&self, prepared: Prepared, control: &RequestControl) -> Result<Value> {
@@ -348,8 +385,19 @@ impl StoreService {
         control: &RequestControl,
         identity: &StoreIdentity,
     ) -> Result<Value> {
+        self.with_read_ctx(identity, control, |ctx| {
+            self.reads.run_recall_for_project(ctx, request, project_id)
+        })
+    }
+    /// Builds the request-scoped read context over a fresh read-only control connection.
+    fn with_read_ctx<T>(
+        &self,
+        identity: &StoreIdentity,
+        control: &RequestControl,
+        read: impl FnOnce(&ReadCtx<'_>) -> Result<T>,
+    ) -> Result<T> {
         let reader = ControlReader::open(&self.identity.local)?;
-        let ctx = ReadCtx {
+        read(&ReadCtx {
             identity,
             source: &self.source,
             control: &reader,
@@ -357,8 +405,7 @@ impl StoreService {
             history_semantic: self.semantic.as_ref(),
             history_cache: &self.history_cache,
             request: control,
-        };
-        self.reads.run_recall_for_project(&ctx, request, project_id)
+        })
     }
     pub fn ensure_exact_target(
         &self,
@@ -389,6 +436,15 @@ impl StoreService {
     }
     pub fn lane_sender(&self) -> LaneSender {
         self.lane.sender()
+    }
+    pub fn git_handle(&self) -> GitStoreHandle {
+        GitStoreHandle {
+            root: self.identity.root.clone(),
+            local: self.identity.local.clone(),
+            coordination: self.coordination.clone(),
+            source: self.source.clone(),
+            lane: self.lane.sender(),
+        }
     }
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {

@@ -56,7 +56,7 @@ pub(crate) enum Command {
     )]
     Install(InstallArgs),
     /// Diagnose the selected installation and memory store.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Recover recorded publication and rebuild derived generations.
     Repair,
     /// Inspect and change delivery settings.
@@ -109,6 +109,16 @@ pub(crate) enum Command {
     WorkerDaemon(WorkerDaemonArgs),
     #[command(hide = true)]
     ModelChild,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Show runtime health without running a source audit (the default).
+    #[arg(long, conflicts_with = "audit")]
+    pub health: bool,
+    /// Also audit the source and local database integrity.
+    #[arg(long)]
+    pub audit: bool,
 }
 
 #[derive(Debug, Args)]

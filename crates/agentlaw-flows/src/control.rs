@@ -305,6 +305,23 @@ impl ControlReader {
     ) -> Result<Option<(String, String, Option<String>)>> {
         authoring_result(&self.connection, binding, token)
     }
+    pub(crate) fn load_pending(
+        &self,
+        binding: &str,
+        reference: &PendingBatchRef,
+    ) -> Result<(Retained, String, Option<String>)> {
+        load_pending(&self.connection, binding, reference)
+    }
+    pub(crate) fn authoring_basis(&self, binding: &str, token: &str) -> Result<Option<String>> {
+        sql(self
+            .connection
+            .query_row(
+                "SELECT basis FROM authoring WHERE token=?1 AND binding=?2 AND used=0",
+                params![token, binding],
+                |row| row.get(0),
+            )
+            .optional())
+    }
 }
 pub(crate) fn pending_notices(
     connection: &Connection,

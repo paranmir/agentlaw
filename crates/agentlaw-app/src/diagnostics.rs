@@ -3,7 +3,10 @@ use crate::{config, installed, machine};
 use agentlaw_contracts::{DomainError, Result};
 use agentlaw_storage::Store;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn storage_error(e: agentlaw_storage::Error) -> DomainError {
     let code = match &e {
@@ -49,47 +52,101 @@ fn database_health(path: &Path) -> Result<Value> {
         })?;
     Ok(json!({"present":true,"integrity_ok":result=="ok"}))
 }
-pub fn doctor(state: &Path) -> Result<Value> {
-    // Inspect durable worker state only. Diagnosis does not start or reconnect it.
-    let worker=agentlaw_worker::inspect_runtime(&state.join("worker")).unwrap_or_else(|error|json!({
+pub enum DoctorMode {
+    Health,
+    Audit,
+}
+
+pub fn doctor(state: &Path, mode: DoctorMode) -> Result<Value> {
+    doctor_with_health(state, mode, &|| {
+        agentlaw_worker::inspect_runtime(&state.join("worker"))
+            .map_err(|error| DomainError::new("worker_diagnosis_incomplete", error.to_string()))
+    })
+}
+
+pub fn doctor_with_health(
+    state: &Path,
+    mode: DoctorMode,
+    health: &dyn Fn() -> Result<Value>,
+) -> Result<Value> {
+    let selected = config::load(state)?;
+    let worker=health().unwrap_or_else(|error|json!({
         "code":"worker_diagnosis_incomplete","message":error.to_string(),
         "next_action":"Preserve worker state and inspect its database access/integrity. No worker was started or reset by this diagnosis."
     }));
-    let Some(selected) = config::load(state)? else {
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let Some(selected) = selected else {
         return Ok(
-            json!({"status":"setup_required","read_only":true,"worker_runtime":worker,"next_action":"Propose a memory store location and ask the user before creating or connecting it."}),
+            json!({"status":"setup_required","read_only":true,"worker_runtime":worker,"observed_at_ms":observed_at_ms,"next_action":"Propose a memory store location and ask the user before creating or connecting it."}),
         );
     };
-    let local = selected.runtime_root(state);
-    // Does not bootstrap/recover/migrate the store. Owned temporary disk spools
-    // are necessary to check a large DAG without holding all bodies in RAM.
-    let store = Store::open_read_only_with_coordination(
-        &selected.memory_store_path,
-        local.join("canonical"),
-        config::coordination_root(state),
-    )
-    .map_err(storage_error)?;
-    let audit = store.audit_source().map_err(storage_error)?;
-    let control = database_health(&local.join("control.sqlite"))?;
-    let journal = database_health(&local.join("canonical/journal.sqlite"))?;
-    let background = match agentlaw_flows::Runtime::background_status(&local) {
-        Ok(status) => status,
-        Err(error) => Some(error),
-    };
-    let missing = [&control, &journal].iter().any(|v| v["present"] == false);
-    let healthy = [&control, &journal]
-        .iter()
-        .all(|v| v["integrity_ok"] == true);
-    Ok(
-        json!({"status":if healthy{"source_and_local_integrity_checked"}else if missing{"local_state_missing"}else{"local_state_corrupt"},
-        "read_only":true,"temporary_derived_audit":true,"source":audit,
+    let mut result = json!({"status":"health_checked","read_only":true,"worker_runtime":worker,"observed_at_ms":observed_at_ms});
+    if matches!(mode, DoctorMode::Health) {
+        return Ok(result);
+    }
+    let audit = (|| -> Result<Value> {
+        let local = selected.runtime_root(state);
+        // Does not bootstrap/recover/migrate the store. Owned temporary disk spools
+        // are necessary to check a large DAG without holding all bodies in RAM.
+        let store = Store::open_read_only_with_coordination(
+            &selected.memory_store_path,
+            local.join("canonical"),
+            config::coordination_root(state),
+        )
+        .map_err(storage_error)?;
+        let audit = store.audit_source().map_err(storage_error)?;
+        let control = database_health(&local.join("control.sqlite"))?;
+        let journal = database_health(&local.join("canonical/journal.sqlite"))?;
+        let background = match agentlaw_flows::Runtime::background_status(&local) {
+            Ok(status) => status,
+            Err(error) => Some(error),
+        };
+        if control["present"] == false {
+            return Err(DomainError::new(
+                "local_state_missing",
+                "The local control database is missing.",
+            ));
+        }
+        let corrupt = [&control, &journal]
+            .iter()
+            .any(|v| v["present"] == true && v["integrity_ok"] != true);
+        if corrupt {
+            return Err(DomainError::new(
+                "local_state_corrupt",
+                "A local database failed its integrity check.",
+            ));
+        }
+        Ok(json!({"status":"passed","source":audit,
         "local_databases":{"control":control,"publication_journal":journal},
-        "background_indexing":background,
-        "worker_runtime":worker,
-        "checks":["current_frame_lengths_digests_and_domain_values","history_frame_integrity","causal_parents_and_ownership","lossless_delta_reconstruction","checkpoint_state_digests","current_history_agreement","redirect_destinations_and_cycles","local_database_integrity"],
-        "not_checked":["semantic_retrieval_quality","all_platform_power_loss_behavior","harness_instruction_visibility"],
-        "next_action":"Diagnosis does not modify memory or proposals. For interrupted publication or a missing derived ledger/index, use repair. Never delete canonical Markdown, pending proposals or original recovery decisions to make a warning disappear."}),
-    )
+        "background_indexing":background}))
+    })();
+    result["audit"] = match audit {
+        Ok(value) => value,
+        Err(error) => {
+            json!({"status":"failed","error":{"code":error.code,"message":error.message}})
+        }
+    };
+    result["temporary_derived_audit"] = json!(true);
+    result["checks"] = json!([
+        "current_frame_lengths_digests_and_domain_values",
+        "history_frame_integrity",
+        "causal_parents_and_ownership",
+        "lossless_delta_reconstruction",
+        "checkpoint_state_digests",
+        "current_history_agreement",
+        "redirect_destinations_and_cycles",
+        "local_database_integrity"
+    ]);
+    result["not_checked"] = json!([
+        "semantic_retrieval_quality",
+        "all_platform_power_loss_behavior",
+        "harness_instruction_visibility"
+    ]);
+    result["next_action"] = json!("Diagnosis does not modify memory or proposals. For interrupted publication or a missing derived ledger/index, use repair. Never delete canonical Markdown, pending proposals or original recovery decisions to make a warning disappear.");
+    Ok(result)
 }
 pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<Value> {
     let selected = config::load(state)?.ok_or_else(|| {
@@ -170,13 +227,4 @@ pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<V
     )
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_installation_is_not_created_by_diagnosis() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = tmp.path().join("absent");
-        assert_eq!(doctor(&state).unwrap()["status"], "setup_required");
-        assert!(!state.exists());
-    }
-}
+mod tests;

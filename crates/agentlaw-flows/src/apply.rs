@@ -26,7 +26,7 @@ pub fn apply(ctx: &mut LaneCtx<'_>, prepared: Prepared) -> Result<Applied> {
     ctx.request.check()?;
     match prepared {
         Prepared::Replay(value) => Ok(Applied::Response(value)),
-        Prepared::Remember(plan) => {
+        Prepared::Remember(mut plan) => {
             if plan.retained.batch.store_binding_id != ctx.identity.binding_id {
                 return Err(DomainError::new(
                     "store_binding_mismatch",
@@ -37,6 +37,23 @@ pub fn apply(ctx: &mut LaneCtx<'_>, prepared: Prepared) -> Result<Applied> {
                 PendingExpectation::New => None,
                 PendingExpectation::Version(version) => Some(version.as_str()),
             };
+            if !plan.retained.issues.is_empty() {
+                if let Some(basis) = &plan.review_basis {
+                    let reader = ctx.source.owned_published_reader();
+                    let guard = source(reader.read_snapshot())?;
+                    match guard.validate_read_set(basis) {
+                        Ok(()) => {}
+                        Err(agentlaw_storage::Error::Stale(_)) => {
+                            plan.retained.basis.clear();
+                            plan.retained.resolution_ref = Some(uuid::Uuid::new_v4().to_string());
+                            plan.retained.issues = vec![
+                                json!({"code":"source_changed","message":"The source changed after review. Inspect retained proposals and continue to revalidate all heads and new dependencies."}),
+                            ];
+                        }
+                        Err(error) => return source(Err(error)),
+                    }
+                }
+            }
             save_pending(ctx, &plan.retained, old)?;
             let value = if plan.retained.issues.is_empty() {
                 publish_retained(ctx, plan.retained)?
@@ -434,9 +451,7 @@ pub(crate) fn publish_procedure_parts(
 }
 
 impl Runtime {
-    pub(crate) fn publish_retained(&self, retained: Retained) -> Result<Value> {
-        publish_retained_parts(&self.store, &self.control, &self.request_control, retained)
-    }
+    #[cfg(test)]
     pub(crate) fn save_pending(&self, retained: &Retained, old: Option<&str>) -> Result<()> {
         save_pending_parts(&self.control, retained, old)
     }

@@ -149,12 +149,38 @@ pub enum SetupRequest {
     ConfigSet { key: String, value: String },
 }
 
+pub fn request_kind(request: &ValidatedRequest) -> RequestKind {
+    match request.request() {
+        Request::Recall(_) | Request::History(_) => RequestKind::Query,
+        Request::RememberThis(request) => {
+            if request.pending_action == Some(PendingAction::Inspect) {
+                RequestKind::Query
+            } else {
+                RequestKind::Command
+            }
+        }
+        Request::ConnectProjectMemory(request) => {
+            if request.memory_store_path.is_some() {
+                RequestKind::Setup
+            } else if matches!(request.intent, None | Some(ConnectIntent::Discover))
+                && request.restore_context != Some(true)
+            {
+                RequestKind::Query
+            } else {
+                RequestKind::Command
+            }
+        }
+        Request::Sync(_) => RequestKind::Command,
+    }
+}
+
 pub fn classify(request: ValidatedRequest) -> Classified {
+    let kind = request_kind(&request);
     match request.into_request() {
         Request::Recall(request) => Classified::Query(QueryRequest::Recall(request)),
         Request::History(request) => Classified::Query(QueryRequest::History(request)),
         Request::RememberThis(request) => {
-            if request.pending_action == Some(PendingAction::Inspect) {
+            if kind == RequestKind::Query {
                 Classified::Query(QueryRequest::PendingInspect(request))
             } else if request.procedure.is_some() {
                 Classified::Command(CommandRequest::Procedure(request))
@@ -163,11 +189,9 @@ pub fn classify(request: ValidatedRequest) -> Classified {
             }
         }
         Request::ConnectProjectMemory(request) => {
-            if request.memory_store_path.is_some() {
+            if kind == RequestKind::Setup {
                 Classified::Setup(SetupRequest::ConnectStore(request))
-            } else if matches!(request.intent, None | Some(ConnectIntent::Discover))
-                && request.restore_context != Some(true)
-            {
+            } else if kind == RequestKind::Query {
                 Classified::Query(QueryRequest::Discover(request))
             } else {
                 Classified::Command(CommandRequest::Connect(request))

@@ -1,51 +1,321 @@
 use super::*;
-use crate::{model::ModelHandle, semantic::SemanticConfig, store::lane::SyncOperationRow};
-use agentlaw_worker::supervisor::ModelRequestIds;
+use crate::{
+    store::lane::SyncOperationRow,
+    test_support::store_service::{deps, fixture, id},
+};
 use std::{sync::mpsc, thread, time::Instant};
 
-fn id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-fn fixture() -> (tempfile::TempDir, StoreIdentity) {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("source");
-    let local = dir.path().join("local");
-    std::fs::create_dir_all(&local).unwrap();
-    drop(Store::open(&root, local.join("canonical")).unwrap());
-    let identity = StoreIdentity {
-        root,
-        local,
-        user_id: id(),
-        machine_id: id(),
-        binding_id: id(),
-        history_limit: 8192,
-        response_limit: 65536,
-    };
-    (dir, identity)
-}
-fn deps(dir: &std::path::Path) -> StoreDeps {
-    let health = HealthSink::default();
-    let indexer = SemanticIndexer::start(
-        SemanticConfig::new(dir.join("semantic"), "test".into()),
-        ModelRequestIds::new(),
-        health.clone(),
-    )
-    .unwrap();
-    let semantic = Arc::new(SemanticSearch::new(indexer.clone(), ModelHandle::new()));
-    StoreDeps {
-        health,
-        semantic,
-        indexer,
-        projection: ProjectionConfig::new(),
-        coordination: dir.join("coordination"),
-    }
-}
 fn wait_for(mut predicate: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(10);
     while !predicate() {
         assert!(Instant::now() < until, "condition timed out");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn prepare_remember(service: &StoreService, body: &str) -> Result<Prepared> {
+    let reader = ControlReader::open(&service.identity.local)?;
+    let control = RequestControl::default();
+    let ctx = ReadCtx {
+        identity: &service.identity,
+        source: &service.source,
+        control: &reader,
+        semantic: service.semantic.as_ref(),
+        history_semantic: service.semantic.as_ref(),
+        history_cache: &service.history_cache,
+        request: &control,
+    };
+    let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed","applies_to":["user"]}]})).unwrap();
+    service.reads.run_prepare(&ctx, request)
+}
+
+#[test]
+fn busy_apply_allows_query_and_another_preparation_before_lane_entry() {
+    let (dir, identity) = fixture();
+    let local = identity.local.clone();
+    let service = Arc::new(
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap(),
+    );
+    let first = prepare_remember(&service, "first distinct observation").unwrap();
+    let lock = rusqlite::Connection::open(local.join("control.sqlite")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let first_service = service.clone();
+    let worker = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(first_service.apply_prepared(first, &RequestControl::default()))
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    let (query_tx, query_rx) = mpsc::channel();
+    let other = service.clone();
+    let query = thread::spawn(move || {
+        query_tx
+            .send(other.query(
+                QueryRequest::Recall(RecallRequest::default()),
+                &RequestControl::default(),
+            ))
+            .unwrap()
+    });
+    assert!(query_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .is_ok());
+    let (invalid_tx, invalid_rx) = mpsc::channel();
+    let other = service.clone();
+    let invalid = thread::spawn(move || {
+        let request = serde_json::from_value(json!({})).unwrap();
+        invalid_tx
+            .send(other.command(
+                crate::protocol::CommandRequest::Remember(request),
+                &RequestControl::default(),
+            ))
+            .unwrap();
+    });
+    assert!(
+        matches!(invalid_rx.recv_timeout(Duration::from_secs(2)).unwrap(), Err(error) if error.code == "invalid_input")
+    );
+    let (prepare_tx, prepare_rx) = mpsc::channel();
+    let other = service.clone();
+    let preparing = thread::spawn(move || {
+        prepare_tx
+            .send(prepare_remember(&other, "second distinct observation"))
+            .unwrap()
+    });
+    let _second = prepare_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let cancellation = RequestControl::default();
+    let queued_control = cancellation.clone();
+    let queued_service = service.clone();
+    let (queued_tx, queued_rx) = mpsc::channel();
+    let queued = thread::spawn(move || {
+        let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"second distinct observation","evidence":"Observed","applies_to":["user"]}]})).unwrap();
+        queued_tx
+            .send(queued_service.command(
+                crate::protocol::CommandRequest::Remember(request),
+                &queued_control,
+            ))
+            .unwrap()
+    });
+    assert!(queued_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    cancellation.cancel.store(true, Ordering::Release);
+    assert!(
+        matches!(queued_rx.recv_timeout(Duration::from_secs(2)).unwrap(), Err(error) if error.code == "cancelled")
+    );
+    lock.execute_batch("COMMIT").unwrap();
+    assert!(done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .is_ok());
+    worker.join().unwrap();
+    query.join().unwrap();
+    preparing.join().unwrap();
+    invalid.join().unwrap();
+    queued.join().unwrap();
+}
+
+#[test]
+fn command_remember_then_recall_returns_published_memory() {
+    let (dir, identity) = fixture();
+    let service =
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
+    let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"A unique remembered rule.","evidence":"Observed","applies_to":["user"],"is_rule":true}]})).unwrap();
+    let result = service
+        .command(
+            crate::protocol::CommandRequest::Remember(request),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(result["status"], "remembered");
+    let id = result["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap();
+    let recall = serde_json::from_value(json!({"memory_ids":[id]})).unwrap();
+    let result = service
+        .query(QueryRequest::Recall(recall), &RequestControl::default())
+        .unwrap();
+    assert!(result["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |memory| memory["current_heads"][0]["what_to_remember"] == "A unique remembered rule."
+        ));
+}
+
+#[test]
+fn cancelled_command_does_not_publish_memory() {
+    let (dir, identity) = fixture();
+    let service =
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
+    let before = service.source.read_snapshot().unwrap().position().clone();
+    let control = RequestControl::default();
+    control.cancel.store(true, Ordering::Release);
+    let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"Cancelled observation","evidence":"Observed","applies_to":["user"]}]})).unwrap();
+    let result = service.command(crate::protocol::CommandRequest::Remember(request), &control);
+    assert!(matches!(result, Err(error) if error.code == "cancelled"));
+    assert_eq!(*service.source.read_snapshot().unwrap().position(), before);
+}
+
+#[test]
+fn command_connect_create_returns_association_and_restore() {
+    let (dir, identity) = fixture();
+    let local = identity.local.clone();
+    let binding = identity.binding_id.clone();
+    let service =
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
+    let path = dir.path().to_string_lossy().into_owned();
+    let request = serde_json::from_value(json!({"intent":"create","project_path":path,"project_name":"Example","restore_context":true,"recall_for":"Restore the connected project context"})).unwrap();
+    let result = service
+        .command(
+            crate::protocol::CommandRequest::Connect(request),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    let id = result["project_connection"]["project_id"].as_str().unwrap();
+    assert!(result["recall_result"].is_object());
+    let reader = ControlReader::open(&local).unwrap();
+    assert_eq!(
+        reader
+            .exact_association(&binding, &path)
+            .unwrap()
+            .unwrap()
+            .project_id,
+        id
+    );
+}
+
+#[test]
+fn command_snapshot_response_limit_applies_to_connected_restore() {
+    let (dir, identity) = fixture();
+    let service =
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
+    let body = "mandatory rule text ".repeat(600);
+    let request = serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed","applies_to":["user"],"is_rule":true}]})).unwrap();
+    let saved = service
+        .command(
+            crate::protocol::CommandRequest::Remember(request),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(saved["status"], "remembered");
+    let key = agentlaw_storage::binding_identity(&service.identity.root, &service.identity.local)
+        .unwrap();
+    let snapshot = ConfigSnapshot {
+        reference: service.reference,
+        key,
+        config: crate::installation::config::Config {
+            memory_store_path: service.identity.root.clone(),
+            user_id: service.identity.user_id.clone(),
+            history_response_limit_bytes: 512,
+            runtime_path: Some(service.identity.local.clone()),
+            response_limit_bytes: 4096,
+        },
+    };
+    let request = serde_json::from_value(json!({"intent":"create","project_path":dir.path().to_string_lossy(),"project_name":"Limited restore","restore_context":true,"recall_for":"Restore the connected project context"})).unwrap();
+    let result = service
+        .command_with_snapshot(
+            crate::protocol::CommandRequest::Connect(request),
+            &snapshot,
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(result["recall_result"]["code"], "complete_content_in_file");
+    assert!(result["recall_result"]["artifact"]["path"].is_string());
+}
+
+#[test]
+fn command_restore_stays_pinned_when_path_is_reconnected() {
+    let (dir, identity) = fixture();
+    let service = Arc::new(
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap(),
+    );
+    let path_a = dir.path().join("a").to_string_lossy().into_owned();
+    let path_b = dir.path().join("b").to_string_lossy().into_owned();
+    let connect = |path: &str, name: &str| {
+        let request = serde_json::from_value(
+            json!({"intent":"create","project_path":path,"project_name":name}),
+        )
+        .unwrap();
+        service
+            .command(
+                crate::protocol::CommandRequest::Connect(request),
+                &RequestControl::default(),
+            )
+            .unwrap()["project_connection"]["project_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let a = connect(&path_a, "Project A");
+    let b = connect(&path_b, "Project B");
+    for (path, body) in [(&path_a, "Project A rule"), (&path_b, "Project B rule")] {
+        let request = serde_json::from_value(json!({"project_path":path,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed","applies_to":["project"],"is_rule":true}]})).unwrap();
+        assert_eq!(
+            service
+                .command(
+                    crate::protocol::CommandRequest::Remember(request),
+                    &RequestControl::default()
+                )
+                .unwrap()["status"],
+            "remembered"
+        );
+    }
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let resume = std::sync::Mutex::new(resume_rx);
+    let control = RequestControl::new(Arc::new(AtomicBool::new(false)), move |phase| {
+        if phase == "waiting_exact" {
+            reached_tx.send(()).unwrap();
+            resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+    });
+    let restoring = service.clone();
+    let restore_path = path_a.clone();
+    let restore_id = a.clone();
+    let worker = thread::spawn(move || {
+        let request = serde_json::from_value(json!({"intent":"connect","project_path":restore_path,"project_id":restore_id,"restore_context":true,"recall_for":"Restore the connected project context"})).unwrap();
+        restoring.command(crate::protocol::CommandRequest::Connect(request), &control)
+    });
+    reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let request =
+        serde_json::from_value(json!({"intent":"connect","project_path":path_a,"project_id":b}))
+            .unwrap();
+    let changed = service
+        .command(
+            crate::protocol::CommandRequest::Connect(request),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(changed["project_connection"]["project_id"], b);
+    resume_tx.send(()).unwrap();
+    let result = worker.join().unwrap().unwrap();
+    assert_eq!(result["project_connection"]["project_id"], a);
+    let memories = result["recall_result"]["memories"].as_array().unwrap();
+    assert!(memories
+        .iter()
+        .any(|m| m["current_heads"][0]["what_to_remember"] == "Project A rule"));
+    assert!(!memories
+        .iter()
+        .any(|m| m["current_heads"][0]["what_to_remember"] == "Project B rule"));
+    let reader = ControlReader::open(&service.identity.local).unwrap();
+    assert_eq!(
+        reader
+            .exact_association(&service.identity.binding_id, &path_a)
+            .unwrap()
+            .unwrap()
+            .project_id,
+        b
+    );
 }
 
 #[test]
@@ -459,4 +729,20 @@ fn locked_retired_file_is_retried_on_next_start() {
         StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
     wait_for(|| !old.exists());
     reopened.close();
+}
+
+#[test]
+fn sync_command_runs_git_work_through_the_store_handle() {
+    let (dir, identity) = fixture();
+    let service =
+        StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap();
+    let request = serde_json::from_value(
+        json!({"command":"status","operation_id":"00000000-0000-4000-8000-000000000000"}),
+    )
+    .unwrap();
+    let result = service.command(CommandRequest::Sync(request), &RequestControl::default());
+    assert!(
+        matches!(&result, Err(error) if error.code == "sync_operation_not_found"),
+        "{result:?}"
+    );
 }

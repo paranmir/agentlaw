@@ -10,3 +10,5 @@ pub use files::*;
 pub use index_work::*;
 pub use installation::*;
 pub use semantic::*;
+#[cfg(test)]
+pub(crate) mod store_service;
