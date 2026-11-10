@@ -1,5 +1,5 @@
 //! Immutable-history semantic index, isolated from current recall by context.
-//! Caller supplies C6-acquired readers only for previously unseen changes.
+//! Caller supplies source-acquired readers only for previously unseen changes.
 use agentlaw_worker::{
     derived::{DerivedContext, DerivedDocument, PublishedBatch, PublishedPage, SourcePosition},
     semantic_store::SearchPacket,
@@ -51,7 +51,7 @@ impl<'a> HistoricalSearch<'a> {
             key,
         })
     }
-    /// Pending entries are durable too; `search` resumes them without rereading C6.
+    /// Pending entries are durable too; `search` resumes them without rereading the source.
     pub fn contains(&self, change_id: &str) -> Result<bool> {
         Ok(self
             .db

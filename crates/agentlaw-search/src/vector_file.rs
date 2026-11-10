@@ -348,6 +348,38 @@ impl VectorFileReadView {
     pub fn progress(&self) -> &VectorFileProgress {
         &self.progress
     }
+    /// Validate the stored pages, profile and vectors before publishing a rebuilt file.
+    pub fn validate(&self) -> VectorFileResult<()> {
+        let c = &self.view.connection;
+        let result: String = c
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(stored_value_error)?;
+        if result != "ok" {
+            return Err(VectorFileError::Corrupt(result));
+        }
+        let profile: i64 = c
+            .query_row("SELECT version FROM ann_profile", [], |r| r.get(0))
+            .map_err(stored_value_error)?;
+        if profile != 1 {
+            return Err(VectorFileError::Corrupt("unsupported ann profile".into()));
+        }
+        let mut rows = c
+            .prepare("SELECT vector FROM vectors")
+            .map_err(stored_value_error)?;
+        let mut rows = rows.query([]).map_err(stored_value_error)?;
+        while let Some(row) = rows.next().map_err(stored_value_error)? {
+            let bytes: Vec<u8> = row.get(0).map_err(stored_value_error)?;
+            if bytes.len() != self.view.dimension * 4 {
+                return Err(VectorFileError::Corrupt("vector length".into()));
+            }
+            let values: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            cosine(&values, &values).map_err(|e| VectorFileError::Corrupt(e.to_string()))?;
+        }
+        Ok(())
+    }
     pub fn is_change_completed(&self, memory: &str, change: &str) -> VectorFileResult<bool> {
         change_completed(&self.view.connection, memory, change)
     }

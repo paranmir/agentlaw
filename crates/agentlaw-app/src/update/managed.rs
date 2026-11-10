@@ -29,6 +29,11 @@ fn maintenance_path(state: &Path) -> PathBuf {
 pub fn check_frontend_start(state: &Path) -> Result<()> {
     let path = maintenance_path(state);
     if !path.exists() {
+        if let Ok(Some(root)) = config::managed_install_root(state) {
+            if let Ok(root) = fs::canonicalize(root) {
+                cleanup::retry_pending(&root);
+            }
+        }
         return Ok(());
     }
     let raw = fs::read(&path).map_err(|_| {
@@ -609,6 +614,7 @@ pub fn preview() -> Result<Value> {
             "A managed update already owns the maintenance gate; use the stable launcher.",
         ));
     }
+    cleanup::retry_pending_under_update_lock(&root);
     if let Some(plan) = unfinished_plan(&root)? {
         return Ok(json!({"status":"confirmation_required","plan_id":plan.id,
             "running_version":env!("CARGO_PKG_VERSION"),"latest_version":plan.tag,
@@ -1703,6 +1709,7 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
                 let (executable, expected) = registration_after(&mut plan, index)?;
                 install::apply_pinned_registration_locked(
                     &state,
+                    &plan.id,
                     &expected,
                     &candidate,
                     &executable,

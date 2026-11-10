@@ -68,7 +68,7 @@ impl SemanticPort for SemanticSearch {
                 .lanes
                 .get(&LaneKey::current(query.binding))
                 .ok_or_else(|| SemanticError::Unavailable("binding not open".into()))?;
-            if lane.quarantined {
+            if lane.quarantined || lane.active_quarantined {
                 return Err(SemanticError::Unavailable(
                     lane.reason
                         .clone()
@@ -229,7 +229,8 @@ impl SemanticPort for SemanticSearch {
                         lane.token == token
                             && !lane.quarantined
                             && lane.active.as_ref().is_some_and(|a| {
-                                a.identity == active.identity && a.path == active.path
+                                a.identity.epoch == active.identity.epoch
+                                    && a.identity.model_digest == active.identity.model_digest
                             })
                     })
             {

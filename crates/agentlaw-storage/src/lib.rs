@@ -13,6 +13,7 @@ pub mod history_spool;
 mod import;
 pub mod import_conflict;
 mod journal;
+pub use journal::JournalWriter;
 pub mod journal_repair;
 pub mod maintenance;
 pub mod persistence;
@@ -352,6 +353,16 @@ fn local_coordination(local: &Path) -> PathBuf {
     local.parent().unwrap_or(local).join("source-coordination")
 }
 impl Store {
+    /// Keep this binding's journal writer open until the returned guard is dropped.
+    pub fn hold_journal_writer(&self) -> Result<JournalWriter> {
+        let _gate = self.lock_shared()?;
+        journal::hold(&self.local)
+    }
+    /// Retry a failed journal keeper under the source write gate.
+    pub fn retry_journal_writer(&self, writer: &JournalWriter) -> Result<()> {
+        let _gate = self.lock_unchecked()?;
+        writer.retry(&self.local)
+    }
     /// Existing source/control state only: never bootstrap, migrate, recover, or publish.
     /// Diagnostic audits may create disposable local streaming spools.
     pub fn open_read_only(root: impl AsRef<Path>, local: impl AsRef<Path>) -> Result<Self> {
@@ -726,6 +737,12 @@ impl Store {
         Ok(result)
     }
     fn lock(&self) -> Result<File> {
+        journal::ensure_ready(&self.local)?;
+        let f = self.lock_unchecked()?;
+        journal::ensure_ready(&self.local)?;
+        Ok(f)
+    }
+    fn lock_unchecked(&self) -> Result<File> {
         let f = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -736,6 +753,7 @@ impl Store {
         Ok(f)
     }
     fn lock_shared(&self) -> Result<File> {
+        journal::ensure_ready(&self.local)?;
         let f = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -743,6 +761,7 @@ impl Store {
             .write(true)
             .open(self.local.join("source.lock"))?;
         FileExt::lock_shared(&f)?;
+        journal::ensure_ready(&self.local)?;
         Ok(f)
     }
     fn writer_id(&self) -> Result<String> {

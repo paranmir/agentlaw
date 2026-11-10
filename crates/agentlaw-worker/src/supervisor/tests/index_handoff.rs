@@ -31,38 +31,207 @@ impl IndexWorkPort for TestPort {
     }
 }
 
+const HELPER_MARKER: &[u8] = b"model-helper-ready\n";
+
+struct HelperProcess;
+
+impl WorkerProcessPort for HelperProcess {
+    fn spawn(&self, _: &RuntimeConfig) -> Result<Child> {
+        use std::io::Read;
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--ignored",
+                "--exact",
+                "supervisor::native_tests::index_handoff::model_handoff_helper",
+            ])
+            .env("AGENTLAW_HANDOFF_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        // Discard the test harness banner before handing the protocol pipe to the supervisor.
+        let stdout = child.stdout.as_mut().unwrap();
+        let mut matched = 0;
+        while matched < HELPER_MARKER.len() {
+            let mut byte = [0];
+            stdout.read_exact(&mut byte)?;
+            matched = if byte[0] == HELPER_MARKER[matched] {
+                matched + 1
+            } else {
+                0
+            };
+        }
+        Ok(child)
+    }
+
+    fn observe(
+        &self,
+        child: &Child,
+        inc: String,
+        events: mpsc::Sender<Event>,
+        signal: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
+        NativeProcess.observe(child, inc, events, signal)
+    }
+    fn stop(&self, child: &mut Child) -> Result<()> {
+        NativeProcess.stop(child)
+    }
+    fn control(&self, _: &str, _: &str, _: &str, _: bool) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
 #[test]
-fn query_load_handoff_respects_ready_and_loading() {
+#[ignore = "helper process for model handoff test"]
+fn model_handoff_helper() {
+    use std::io::Write;
+    if std::env::var("AGENTLAW_HANDOFF_HELPER").as_deref() != Ok("1") {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(HELPER_MARKER).unwrap();
+    stdout.flush().unwrap();
+    let mut stdin = std::io::stdin().lock();
+    let launch: Launch = model_child::read(&mut stdin).unwrap();
+    let assets = launch.assets.unwrap();
+    assert!(assets.onnx_model.is_file());
+    assert!(assets.tokenizer_json.is_file());
+    assert!(assets.runtime_library.is_file());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !launch.state.join("release-ready").exists() {
+        assert!(Instant::now() < deadline, "ready gate timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    model_child::write(
+        &mut stdout,
+        &Output::Ready {
+            model: "helper-model".into(),
+        },
+    )
+    .unwrap();
+    loop {
+        match model_child::read::<Input>(&mut stdin).unwrap() {
+            Input::Embed { id, attempt, .. } => {
+                let mut vector = vec![0.0; crate::DIMENSIONS];
+                vector[0] = 1.0;
+                model_child::write(
+                    &mut stdout,
+                    &Output::Result {
+                        id,
+                        attempt,
+                        result: Ok(vector),
+                    },
+                )
+                .unwrap();
+            }
+            Input::Stop => std::process::exit(0),
+        }
+    }
+}
+
+#[test]
+fn query_load_handoff_follows_real_child_loading_and_ready() {
     let dir = tempfile::tempdir().unwrap();
+    let asset = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"test asset").unwrap();
+        path
+    };
     let config = RuntimeConfig {
         state_dir: dir.path().into(),
         executable: std::env::current_exe().unwrap(),
-        model: None,
+        model: Some(crate::ModelAssets {
+            onnx_model: asset("model.onnx"),
+            tokenizer_json: asset("tokenizer.json"),
+            runtime_library: asset("runtime"),
+        }),
     };
     let index = Arc::new(TestPort {
         work: Mutex::new(None),
         finished: Mutex::new(None),
     });
-    let mut supervisor = ModelSupervisor::start(config, index, ModelRequestIds::new());
-    {
-        let mut state = supervisor.shared.state.lock().unwrap();
-        state.snapshot.state = WorkerState::Ready;
-    }
-    supervisor.request_load();
-    let after_ready = supervisor.has_query_demand();
-    {
-        let mut state = supervisor.shared.state.lock().unwrap();
-        state.snapshot.state = WorkerState::Loading;
-        state.loading_demand = false;
-    }
-    supervisor.request_load();
-    let during_loading = supervisor.has_query_demand();
-    supervisor.stop().unwrap();
-    assert!(
-        !after_ready,
-        "demand handed to a Ready model must be consumed"
+    let (events, incoming) = mpsc::channel();
+    let shared = Arc::new(SupervisorShared {
+        state: Mutex::new(SupervisorState {
+            snapshot: ModelSnapshot {
+                state: WorkerState::Stopped,
+                incarnation: None,
+                model_digest: None,
+                cause: None,
+            },
+            warm: false,
+            stop: false,
+            loading_demand: false,
+            queries: QueryQueue::default(),
+            terminated: None,
+        }),
+        signal: Arc::new(RamSignal {
+            events: events.clone(),
+        }),
+        changed: std::sync::Condvar::new(),
+        events,
+        wake_pending: AtomicBool::new(false),
+    });
+    let worker_shared = shared.clone();
+    let thread = std::thread::spawn(move || {
+        model_supervision_loop(
+            config,
+            index,
+            worker_shared,
+            HelperProcess,
+            Instant::now,
+            incoming,
+        )
+    });
+    let owner = Arc::new(ModelSupervisor {
+        shared,
+        thread: Some(thread),
+        ids: ModelRequestIds::new(),
+        stop_result: None,
+    });
+    owner.set_warm(true);
+    let wait = |predicate: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "supervisor did not reach expected state: {:?}",
+                owner.snapshot().state
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait(&|| owner.snapshot().state == WorkerState::Loading);
+    assert!(owner.snapshot().incarnation.is_some());
+    assert!(!owner.has_query_demand());
+    owner.request_load();
+    assert!(owner.has_query_demand());
+    std::fs::write(dir.path().join("release-ready"), b"ready").unwrap();
+    wait(&|| owner.snapshot().state == WorkerState::Ready);
+    assert_eq!(
+        owner.snapshot().model_digest.as_deref(),
+        Some("helper-model")
     );
-    assert!(during_loading, "loading model must retain demand");
+    assert!(!owner.has_query_demand());
+    owner.request_load();
+    assert!(!owner.has_query_demand());
+    let (tx, rx) = mpsc::channel();
+    let query_owner = owner.clone();
+    let query = std::thread::spawn(move || {
+        tx.send(query_owner.embed_query("real query", &AtomicBool::new(false)))
+            .unwrap()
+    });
+    let result = rx.recv_timeout(Duration::from_secs(10));
+    if result.is_err() {
+        owner.request_stop();
+    }
+    query.join().unwrap();
+    let result = result.unwrap().unwrap();
+    assert_eq!(result.model_digest, "helper-model");
+    assert_eq!(result.vector.len(), crate::DIMENSIONS);
+    assert_eq!(result.vector[0], 1.0);
+    assert!(!owner.has_query_demand());
+    Arc::try_unwrap(owner).ok().unwrap().stop().unwrap();
 }
 
 #[test]

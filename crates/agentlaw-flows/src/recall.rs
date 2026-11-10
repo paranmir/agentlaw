@@ -53,6 +53,16 @@ pub fn recall(
     r: &RecallRequest,
     current_time: String,
 ) -> Result<RecallResponse> {
+    recall_with_control(source, search, context, r, current_time, None)
+}
+pub(crate) fn recall_with_control(
+    source: &impl SourceSnapshot,
+    search: &impl RecallSearch,
+    context: &RequestContext,
+    r: &RecallRequest,
+    current_time: String,
+    control: Option<&RequestControl>,
+) -> Result<RecallResponse> {
     if r.procedure_ids.is_some() {
         return Err(DomainError::unsupported(
             "Procedure current-state recall adapter is not connected.",
@@ -148,6 +158,9 @@ pub fn recall(
             let inventory = source.inventory()?;
             let mut tasks = BTreeSet::new();
             for state in inventory {
+                if let Some(control) = control {
+                    control.check()?;
+                }
                 for head in &state.heads {
                     if !scope_matches(&head.applicability, &effective) {
                         continue;
@@ -220,6 +233,9 @@ pub fn recall(
     let mut visited = BTreeSet::new();
     let mut queue: VecDeque<_> = selected.into_iter().collect();
     while let Some(id) = queue.pop_front() {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let state = match source.current(&id)? {
             Some(s) => s,
             None => {
@@ -251,6 +267,14 @@ pub fn recall(
         .candidates
         .retain(|c| !visited.contains(&c.memory_id));
     if r.recall_for.is_some() {
+        if r.include_active_tasks == Some(true) {
+            response.candidates.sort_by_key(|candidate| {
+                !candidate
+                    .retrieval_paths
+                    .iter()
+                    .any(|path| path.via.iter().any(|via| via == "active_task"))
+            });
+        }
         let matched = response.candidates.len();
         response
             .candidates

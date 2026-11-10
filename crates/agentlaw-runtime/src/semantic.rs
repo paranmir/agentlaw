@@ -1,6 +1,7 @@
 //! Semantic index writer, feeder and search port.
 
 mod batch;
+mod generation;
 mod history;
 mod pump;
 mod quarantine;
@@ -65,13 +66,28 @@ pub struct SemanticProgress {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticRepairState {
+    Building,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct SemanticRepairProgress {
+    pub generation: String,
+    pub state: SemanticRepairState,
+    pub ack: Option<SourcePosition>,
+    pub reason: Option<String>,
+}
+
 struct Shared {
     config: SemanticConfig,
     ids: ModelRequestIds,
     health: HealthSink,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<SharedState>,
-    changed: Condvar,
+    changed: Arc<Condvar>,
     threads: Mutex<Vec<(String, JoinHandle<()>)>>,
     model_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -82,6 +98,16 @@ struct Shared {
     readview_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     history_init_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    repair_validation_hook: Mutex<Option<Arc<dyn Fn(&std::path::Path) + Send + Sync>>>,
+    #[cfg(test)]
+    repair_transition_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    repair_published_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    reclaim_busy_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    reclaim_decision_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -103,7 +129,7 @@ struct SharedState {
     next_token: u64,
     stopping: bool,
     closing: std::collections::BTreeSet<String>,
-    retiring_readers: Vec<Arc<state::Readers>>,
+    retiring_readers: Vec<(String, Arc<state::Readers>)>,
     quarantined: Vec<(agentlaw_search::vector_file::VectorFileIdentity, String)>,
     sources: std::collections::BTreeMap<String, OwnedPublishedReader>,
     history_completed: std::collections::VecDeque<history::Completed>,
@@ -154,6 +180,7 @@ impl SemanticPreparationHandle {
         use agentlaw_worker::WorkerState;
         control.phase("semantic_preparation");
         let mut reported_ack = None;
+        let mut awaited_repair: Option<String> = None;
         loop {
             control.check().map_err(|_| SemanticError::Cancelled)?;
             let model = snapshot();
@@ -178,6 +205,39 @@ impl SemanticPreparationHandle {
                 .lanes
                 .get(&LaneKey::current(&self.binding))
                 .ok_or_else(|| SemanticError::Unavailable("binding not open".into()))?;
+            if let Some(repair) = &lane.repair {
+                if awaited_repair.as_ref().is_some_and(|id| id != &repair.id) {
+                    return Err(SemanticError::Unavailable(
+                        "semantic repair was superseded".into(),
+                    ));
+                }
+                match repair.state {
+                    SemanticRepairState::Building => {
+                        awaited_repair = Some(repair.id.clone());
+                        drop(
+                            self.indexer
+                                .inner
+                                .changed
+                                .wait_timeout(state, interval)
+                                .unwrap_or_else(|e| e.into_inner()),
+                        );
+                        continue;
+                    }
+                    SemanticRepairState::Failed => {
+                        return Err(SemanticError::Unavailable(
+                            repair
+                                .reason
+                                .clone()
+                                .unwrap_or_else(|| "semantic repair failed".into()),
+                        ))
+                    }
+                    SemanticRepairState::Complete => {}
+                }
+            } else if awaited_repair.is_some() {
+                return Err(SemanticError::Unavailable(
+                    "semantic repair was interrupted".into(),
+                ));
+            }
             if matches!(
                 lane.state,
                 ComponentState::Degraded | ComponentState::Failed | ComponentState::Stopped
@@ -282,7 +342,7 @@ impl SemanticIndexer {
             health,
             clock,
             state: Mutex::new(SharedState::default()),
-            changed: Condvar::new(),
+            changed: Arc::new(Condvar::new()),
             threads: Mutex::new(Vec::new()),
             model_waker: Mutex::new(None),
             #[cfg(test)]
@@ -293,6 +353,16 @@ impl SemanticIndexer {
             readview_hook: Mutex::new(None),
             #[cfg(test)]
             history_init_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_validation_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_transition_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_published_hook: Mutex::new(None),
+            #[cfg(test)]
+            reclaim_busy_hook: Mutex::new(None),
+            #[cfg(test)]
+            reclaim_decision_hook: Mutex::new(None),
         });
         let dispatcher = inner.clone();
         let thread = std::thread::Builder::new()
@@ -347,6 +417,8 @@ impl SemanticIndexer {
             token,
             ..Lane::default()
         };
+        *lane.readers.wake.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&self.inner));
         shared
             .schedule
             .lanes
@@ -399,7 +471,15 @@ impl SemanticIndexer {
             .history_completed
             .retain(|item| item.binding != binding);
         let readers = lane.readers;
-        state.retiring_readers.push(readers.clone());
+        state
+            .retiring_readers
+            .push((binding.to_owned(), readers.clone()));
+        let binding_readers: Vec<_> = state
+            .retiring_readers
+            .iter()
+            .filter(|(name, _)| name == binding)
+            .map(|(_, readers)| readers.clone())
+            .collect();
         state.closing.insert(binding.to_owned());
         let handles = {
             let mut threads = self.inner.threads.lock().unwrap_or_else(|e| e.into_inner());
@@ -411,20 +491,15 @@ impl SemanticIndexer {
         };
         drop(state);
         self.inner.changed.notify_all();
-        let mut count = readers.count.lock().unwrap_or_else(|e| e.into_inner());
-        while *count != 0 {
-            count = readers
-                .changed
-                .wait(count)
-                .unwrap_or_else(|e| e.into_inner());
+        for readers in &binding_readers {
+            let mut count = readers.count.lock().unwrap_or_else(|e| e.into_inner());
+            while *count != 0 {
+                count = readers
+                    .changed
+                    .wait(count)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
         }
-        drop(count);
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retiring_readers
-            .retain(|entry| !Arc::ptr_eq(entry, &readers));
         let mut deferred = false;
         for handle in handles {
             if handle.thread().id() == std::thread::current().id() {
@@ -493,6 +568,78 @@ impl SemanticIndexer {
         })
     }
 
+    /// Starts a binding-local rebuild without exposing its partial results.
+    pub fn start_repair(&self, binding: &str) -> RuntimeResult<()> {
+        let gate = {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .schedule
+                .lanes
+                .get(&LaneKey::current(binding))
+                .ok_or_else(|| RuntimeError::Unavailable("binding not open".into()))?
+                .io_gate
+                .clone()
+        };
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopping {
+            return Err(RuntimeError::Unavailable("semantic indexer stopped".into()));
+        }
+        let lane = state
+            .schedule
+            .lanes
+            .get_mut(&LaneKey::current(binding))
+            .filter(|lane| Arc::ptr_eq(&lane.io_gate, &gate))
+            .ok_or_else(|| RuntimeError::Unavailable("binding not open".into()))?;
+        if (lane.active.is_none() || !lane.complete)
+            && !lane.quarantined
+            && !lane.active_quarantined
+        {
+            return Err(RuntimeError::Unavailable(
+                "complete semantic index unavailable".into(),
+            ));
+        }
+        if lane
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.state == SemanticRepairState::Building)
+        {
+            return Err(RuntimeError::Unavailable(
+                "semantic repair already running".into(),
+            ));
+        }
+        lane.invalidate();
+        lane.quarantined = false;
+        lane.repair = Some(state::Repair {
+            id: uuid::Uuid::new_v4().to_string(),
+            state: SemanticRepairState::Building,
+            published: false,
+            ack: None,
+            reason: None,
+        });
+        lane.dirty = true;
+        drop(state);
+        self.inner.changed.notify_all();
+        self.inner.wake_model();
+        Ok(())
+    }
+
+    pub fn repair_progress(&self, binding: &str) -> Option<SemanticRepairProgress> {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let repair = state
+            .schedule
+            .lanes
+            .get(&LaneKey::current(binding))?
+            .repair
+            .as_ref()?;
+        Some(SemanticRepairProgress {
+            generation: repair.id.clone(),
+            state: repair.state.clone(),
+            ack: repair.ack.clone(),
+            reason: repair.reason.clone(),
+        })
+    }
+
     pub fn shutdown(&self, timeout: Duration) -> bool {
         self.inner
             .model_waker
@@ -511,8 +658,8 @@ impl SemanticIndexer {
             let readers: Vec<_> = shared
                 .schedule
                 .lanes
-                .values()
-                .map(|lane| lane.readers.clone())
+                .iter()
+                .map(|(key, lane)| (key.binding.clone(), lane.readers.clone()))
                 .collect();
             for lane in shared.schedule.lanes.values() {
                 lane.cancel
@@ -542,7 +689,7 @@ impl SemanticIndexer {
         let deadline = Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
-        for readers in readers {
+        for (_, readers) in readers {
             let mut count = readers.count.lock().unwrap_or_else(|e| e.into_inner());
             while *count != 0 {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -555,12 +702,6 @@ impl SemanticIndexer {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
-            self.inner
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retiring_readers
-                .retain(|entry| !Arc::ptr_eq(entry, &readers));
         }
         let mut threads = self.inner.threads.lock().unwrap_or_else(|e| e.into_inner());
         while threads.iter().any(|(_, h)| !h.is_finished()) {
@@ -602,7 +743,10 @@ impl IndexWorkPort for SemanticIndexer {
                 lane.ack = None;
                 lane.complete = false;
                 lane.active = None;
+                lane.repair = None;
+                lane.cleaned_dir = None;
                 lane.quarantined = false;
+                lane.active_quarantined = false;
             }
         }
         drop(shared);

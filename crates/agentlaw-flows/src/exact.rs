@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
 };
 #[cfg(test)]
 mod tests;
@@ -108,8 +108,84 @@ struct RetiredGeneration {
     exact: PathBuf,
     lexical: PathBuf,
 }
+struct AcquisitionState {
+    accepting: bool,
+    version: u64,
+    in_flight: usize,
+}
+struct AcquisitionGate {
+    state: Mutex<AcquisitionState>,
+    drained: Condvar,
+}
+impl AcquisitionGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AcquisitionState {
+                accepting: true,
+                version: 0,
+                in_flight: 0,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+    fn acquire(&self) -> Result<Acquisition<'_>> {
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        if !state.accepting {
+            return Err(not_ready());
+        }
+        state.in_flight = state.in_flight.checked_add(1).ok_or_else(not_ready)?;
+        Ok(Acquisition {
+            gate: self,
+            version: state.version,
+        })
+    }
+    fn stop(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        if state.accepting {
+            state.version = state.version.checked_add(1).ok_or_else(not_ready)?;
+            state.accepting = false;
+        }
+        Ok(())
+    }
+    fn start(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        if !state.accepting {
+            state.version = state.version.checked_add(1).ok_or_else(not_ready)?;
+            state.accepting = true;
+        }
+        Ok(())
+    }
+    fn wait(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        while state.in_flight != 0 {
+            state = self.drained.wait(state).map_err(|_| not_ready())?;
+        }
+        Ok(())
+    }
+}
+struct Acquisition<'a> {
+    gate: &'a AcquisitionGate,
+    version: u64,
+}
+impl Acquisition<'_> {
+    fn valid(&self) -> Result<bool> {
+        let state = self.gate.state.lock().map_err(|_| not_ready())?;
+        Ok(state.accepting && state.version == self.version)
+    }
+}
+impl Drop for Acquisition<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
 struct GenerationState {
     current: Arc<ProjectionGeneration>,
+    acquisition: Arc<AcquisitionGate>,
     retired: Vec<RetiredGeneration>,
     untrusted: bool,
 }
@@ -139,25 +215,27 @@ impl ProjectionGenerations {
             exact_file: exact_file.into(),
             lexical_file: lexical_file.into(),
         })?;
+        let generation = registry
+            .state
+            .lock()
+            .map_err(|_| not_ready())?
+            .current
+            .clone();
+        if generation.exact_file.parent() != generation.lexical_file.parent() {
+            return Err(not_ready());
+        }
+        if !generation.exact_file.is_file() || !generation.lexical_file.is_file() {
+            return Err(not_ready());
+        }
+        let filename = generation
+            .exact_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(not_ready)?;
+        if filename != format!("exact-{}.sqlite", generation.id)
+            && filename != format!("exact-repair-{}.sqlite", generation.id)
         {
-            let state = registry.state.lock().map_err(|_| not_ready())?;
-            if state.current.exact_file.parent() != state.current.lexical_file.parent() {
-                return Err(not_ready());
-            }
-            if !state.current.exact_file.is_file() || !state.current.lexical_file.is_file() {
-                return Err(not_ready());
-            }
-            let filename = state
-                .current
-                .exact_file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(not_ready)?;
-            if filename != format!("exact-{}.sqlite", state.current.id)
-                && filename != format!("exact-repair-{}.sqlite", state.current.id)
-            {
-                return Err(not_ready());
-            }
+            return Err(not_ready());
         }
         drop(registry.pin()?);
         Ok(registry)
@@ -210,6 +288,7 @@ impl ProjectionGenerations {
             id: uuid::Uuid::new_v4(),
             state: Mutex::new(GenerationState {
                 current: generation,
+                acquisition: Arc::new(AcquisitionGate::new()),
                 retired: Vec::new(),
                 untrusted: false,
             }),
@@ -217,13 +296,25 @@ impl ProjectionGenerations {
     }
     pub fn pin(&self) -> Result<PinnedProjection> {
         for _ in 0..2 {
-            let generation = {
+            let (generation, gate) = {
                 let state = self.state.lock().map_err(|_| not_ready())?;
                 if state.untrusted {
                     return Err(not_ready());
                 }
-                state.current.clone()
+                (state.current.clone(), state.acquisition.clone())
             };
+            let acquisition = match gate.acquire() {
+                Ok(acquisition) => acquisition,
+                Err(error) => {
+                    let state = self.state.lock().map_err(|_| not_ready())?;
+                    if !Arc::ptr_eq(&state.current, &generation) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            #[cfg(test)]
+            tests::oracle::on_acquisition(self);
             let exact = db(Connection::open_with_flags(
                 &generation.exact_file,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -233,6 +324,7 @@ impl ProjectionGenerations {
             if generation.lexical_file.file_name().and_then(|v| v.to_str())
                 != Some(pointer.as_str())
             {
+                drop(acquisition);
                 #[cfg(test)]
                 tests::oracle::on_pointer_mismatch(self);
                 continue;
@@ -254,6 +346,15 @@ impl ProjectionGenerations {
                 .parent()
                 .ok_or_else(not_ready)?
                 .to_path_buf();
+            {
+                let state = self.state.lock().map_err(|_| not_ready())?;
+                if !Arc::ptr_eq(&state.current, &generation) {
+                    continue;
+                }
+                if state.untrusted || !acquisition.valid()? {
+                    return Err(not_ready());
+                }
+            }
             return Ok(PinnedProjection {
                 generation,
                 exact: ExactIndex {
@@ -269,7 +370,19 @@ impl ProjectionGenerations {
     }
     /// Reject new pins until a validated shadow replaces the damaged generation.
     pub fn mark_untrusted(&self) -> Result<()> {
-        self.state.lock().map_err(|_| not_ready())?.untrusted = true;
+        let gate = {
+            let mut state = self.state.lock().map_err(|_| not_ready())?;
+            state.untrusted = true;
+            state.acquisition.stop()?;
+            state.acquisition.clone()
+        };
+        gate.wait()
+    }
+    /// Allow pins again after the active generation's writer has been reopened.
+    pub fn mark_trusted(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        state.acquisition.start()?;
+        state.untrusted = false;
         Ok(())
     }
     pub fn stage(&self, shadow: ShadowGeneration) -> Result<StagedActivation> {
@@ -285,6 +398,8 @@ impl ProjectionGenerations {
             return Err(not_ready());
         }
         let mut state = self.state.lock().map_err(|_| not_ready())?;
+        state.acquisition.stop()?;
+        state.acquisition = Arc::new(AcquisitionGate::new());
         state.untrusted = false;
         let old = std::mem::replace(&mut state.current, staged.generation);
         state.retired.push(RetiredGeneration {
@@ -1058,6 +1173,7 @@ impl ExactIndexWriter {
                         lazy_head_streams(&units, &acquired),
                     )
                     .map_err(lexical_error)?;
+                control.phase("lexical_batch_committed");
                 let tx = db(self.exact.connection.transaction())?;
                 for (_, id) in &changed {
                     delete_unit(&tx, id)?;

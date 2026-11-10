@@ -435,10 +435,25 @@ fn history_corruption_isolated_and_files_release_after_close() {
     let before = snapshot();
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(snapshot(), before);
-    let db = rusqlite::Connection::open(&file).unwrap();
-    db.execute("UPDATE vectors SET vector='not a blob'", [])
+    let copy = temp.path().join("damaged-history.sqlite");
+    let db =
+        rusqlite::Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    db.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
         .unwrap();
     drop(db);
+    corrupt_vectors_page(&copy);
+    indexer
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .history_completed
+        .back_mut()
+        .unwrap()
+        .active
+        .path = copy.clone();
+    let damaged_file = copy;
     let vector = QueryVector {
         model: "model".into(),
         values: Arc::from([1.0, 0.0]),
@@ -471,23 +486,27 @@ fn history_corruption_isolated_and_files_release_after_close() {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&file)
-            .unwrap();
+        for path in [&file, &damaged_file] {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap();
+        }
     }
     assert!(indexer.shutdown(Duration::from_secs(5)));
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&file)
-            .unwrap();
+        for path in [&file, &damaged_file] {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap();
+        }
     }
 }
 

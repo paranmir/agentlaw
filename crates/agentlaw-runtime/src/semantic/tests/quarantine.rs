@@ -76,9 +76,7 @@ fn search_corruption_is_reported_only_for_affected_binding() {
     conn.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
         .unwrap();
     drop(conn);
-    let conn = rusqlite::Connection::open(&copy).unwrap();
-    conn.execute("UPDATE vectors SET vector=x'00'", []).unwrap();
-    drop(conn);
+    corrupt_vectors_page(&copy);
     let _updated = a
         .publish(
             &uuid::Uuid::new_v4().to_string(),
@@ -249,36 +247,23 @@ fn stored_invalid_vectors_and_profiles_quarantine_but_bad_queries_do_not() {
                 .clone()
         };
         let copy = temp.path().join("corrupt.sqlite");
-        let conn = rusqlite::Connection::open_with_flags(
-            active,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        conn.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        if corrupt == "profile" {
+            incompatible_profile_fixture(&active, &copy);
+        } else {
+            let conn = rusqlite::Connection::open_with_flags(
+                active,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
             .unwrap();
-        drop(conn);
-        let conn = rusqlite::Connection::open(&copy).unwrap();
-        match corrupt {
-            "zero" | "nan" => {
-                let values = if corrupt == "zero" {
-                    [0.0_f32, 0.0]
-                } else {
-                    [f32::NAN, 0.0]
-                };
-                let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
-                conn.execute("UPDATE vectors SET vector=?1", [&bytes])
-                    .unwrap();
-            }
-            "profile" => {
-                conn.execute("UPDATE ann_profile SET version=999", [])
-                    .unwrap();
-            }
-            _ => {
-                conn.execute("UPDATE vectors SET vector='not a blob'", [])
-                    .unwrap();
-            }
+            conn.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+                .unwrap();
         }
-        drop(conn);
+        match corrupt {
+            "zero" => corrupt_vector_bytes(&copy, [0.0, 0.0]),
+            "nan" => corrupt_vector_bytes(&copy, [f32::NAN, 0.0]),
+            "profile" => {}
+            _ => corrupt_vectors_page(&copy),
+        }
         {
             let mut state = indexer.inner.state.lock().unwrap();
             state
@@ -374,6 +359,13 @@ fn mismatched_vector_file_is_reported_without_rewriting_identity() {
         .unwrap();
     first.model_ready("model");
     drive(&first, receipt.generation);
+    let mut other_identity = first.inner.state.lock().unwrap().schedule.lanes
+        [&LaneKey::current("binding")]
+        .active
+        .as_ref()
+        .unwrap()
+        .identity
+        .clone();
     assert!(first.shutdown(Duration::from_secs(5)));
     let path = std::fs::read_dir(&config.indices_root)
         .unwrap()
@@ -382,10 +374,13 @@ fn mismatched_vector_file_is_reported_without_rewriting_identity() {
         .unwrap()
         .path()
         .join("vector.sqlite");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE binding_vector_meta SET binding = 'other'", [])
-        .unwrap();
-    drop(db);
+    other_identity.binding = "other".into();
+    let other_path = temp.path().join("other.sqlite");
+    let mut other =
+        agentlaw_search::vector_file::VectorFileWriter::open(&other_path, &other_identity).unwrap();
+    other.checkpoint().unwrap();
+    drop(other);
+    std::fs::copy(&other_path, &path).unwrap();
     let health = HealthSink::default();
     let second = SemanticIndexer::start(config, ModelRequestIds::new(), health.clone()).unwrap();
     second

@@ -38,6 +38,19 @@ pub(super) fn mark_guarded(
     }) else {
         return false;
     };
+    if lane.repair.as_ref().is_some_and(|repair| {
+        repair.state == super::SemanticRepairState::Building
+            && !repair.published
+            && repair.id == identity.generation
+    }) {
+        let repair = lane.repair.as_mut().unwrap();
+        repair.state = super::SemanticRepairState::Failed;
+        repair.reason = Some(format!("index corrupt: {reason}"));
+        lane.invalidate();
+        drop(state);
+        shared.changed.notify_all();
+        return true;
+    }
     if require_active
         && !lane
             .active
@@ -47,8 +60,17 @@ pub(super) fn mark_guarded(
         return false;
     }
     let message = format!("index corrupt: {reason}");
+    if let Some(repair) = lane
+        .repair
+        .as_mut()
+        .filter(|r| r.state == super::SemanticRepairState::Building)
+    {
+        repair.state = super::SemanticRepairState::Failed;
+        repair.reason = Some(message.clone());
+    }
     lane.invalidate();
     lane.quarantined = true;
+    lane.active_quarantined = true;
     lane.state = ComponentState::Degraded;
     lane.reason = Some(message.clone());
     if !state

@@ -2218,8 +2218,8 @@ mod tests;
 
 #[cfg(test)]
 #[path = "supervisor/tests/mod.rs"]
-mod ram_tests;
+mod native_tests;
 
 #[cfg(all(test, windows))]
 #[path = "supervisor_native_tests.rs"]
-mod native_tests;
+mod legacy_native_tests;

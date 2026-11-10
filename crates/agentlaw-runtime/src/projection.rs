@@ -153,20 +153,12 @@ impl ProjectionHandle {
                 &active.lexical_file,
             )?
         } else if unavailable {
-            ProjectionGenerations::open(
+            ProjectionGenerations::open_for_recovery(
                 &active.id,
                 &active.epoch,
                 &active.exact_file,
                 &active.lexical_file,
-            )
-            .or_else(|_| {
-                ProjectionGenerations::open_unavailable(
-                    &active.id,
-                    &active.epoch,
-                    &active.exact_file,
-                    &active.lexical_file,
-                )
-            })?
+            )?
         } else {
             ProjectionGenerations::open(
                 &active.id,
@@ -203,6 +195,9 @@ impl ProjectionHandle {
             binding,
             health,
         });
+        let initial_retry_at = initial_error
+            .as_ref()
+            .map(|_| config.clock.now() + config.retry_initial.max(Duration::from_millis(1)));
         if let Some(reason) = initial_error.clone() {
             inner.publish(ProjectionState::Blocked, None, Some(reason));
         } else {
@@ -224,6 +219,7 @@ impl ProjectionHandle {
                         config,
                         corrupt,
                         initial_error,
+                        initial_retry_at,
                     )
                 }))
                 .is_err()
@@ -376,20 +372,36 @@ fn add_retired_file(pending: &mut Vec<PathBuf>, path: PathBuf) {
     pending.push(path);
 }
 
+struct MaintainerWriter {
+    generations: Arc<ProjectionGenerations>,
+    current: Option<ExactIndexWriter>,
+}
+impl Drop for MaintainerWriter {
+    fn drop(&mut self) {
+        let _ = self.generations.mark_untrusted();
+        drop(self.current.take());
+    }
+}
+
 fn run(
     inner: Arc<Inner>,
     source: OwnedPublishedReader,
     mut active: ActiveGeneration,
-    mut writer: Option<ExactIndexWriter>,
+    writer: Option<ExactIndexWriter>,
     pointer: Arc<dyn ActivePointerSink>,
     retired: Arc<dyn RetiredFileSink>,
     config: ProjectionConfig,
     mut recovery: bool,
     initial_error: Option<String>,
+    initial_retry_at: Option<Instant>,
 ) {
+    let mut writer = MaintainerWriter {
+        generations: inner.generations.clone(),
+        current: writer,
+    };
     let mut retry = config.retry_initial.max(Duration::from_millis(1));
     let maximum = config.retry_max.max(retry);
-    let mut retry_at: Option<Instant> = initial_error.as_ref().map(|_| config.clock.now() + retry);
+    let mut retry_at = initial_retry_at;
     let mut cleanup_at: Option<Instant> = None;
     let mut sync_pending = initial_error.is_some();
     let mut reopen = initial_error.is_some();
@@ -469,8 +481,19 @@ fn run(
         if reopen && needs_sync {
             match ExactIndexWriter::open(&active.exact_file) {
                 Ok(opened) => {
-                    writer = Some(opened);
-                    reopen = false;
+                    writer.current = Some(opened);
+                    if inner.generations.mark_trusted().is_ok() {
+                        reopen = false;
+                    } else {
+                        sync_pending = true;
+                        retry_at = Some(config.clock.now() + retry);
+                        retry = (retry * 2).min(maximum);
+                        inner.publish(
+                            ProjectionState::Blocked,
+                            through.clone(),
+                            Some("projection registry unavailable".into()),
+                        );
+                    }
                 }
                 Err(error) if error.code == "exact_index_corrupt" => {
                     reopen = false;
@@ -484,14 +507,14 @@ fn run(
                     );
                 }
                 Err(error) => {
+                    sync_pending = true;
+                    retry_at = Some(config.clock.now() + retry);
+                    retry = (retry * 2).min(maximum);
                     inner.publish(
                         ProjectionState::Blocked,
                         through.clone(),
                         Some(error.to_string()),
                     );
-                    sync_pending = true;
-                    retry_at = Some(config.clock.now() + retry);
-                    retry = (retry * 2).min(maximum);
                 }
             }
         }
@@ -516,30 +539,27 @@ fn run(
                         exact_file: staged.exact_file().to_owned(),
                         lexical_file: staged.lexical_file().to_owned(),
                     };
+                    let opened = match ExactIndexWriter::open(&next.exact_file) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            let (a, b) = staged.into_files();
+                            add_retired_file(&mut pending, a);
+                            add_retired_file(&mut pending, b);
+                            return Err(error.into());
+                        }
+                    };
                     if let Err(error) = pointer.persist_active(&inner.binding, &next) {
                         let (a, b) = staged.into_files();
                         add_retired_file(&mut pending, a);
                         add_retired_file(&mut pending, b);
                         return Err(error);
                     }
+                    writer.current = Some(opened);
                     inner.generations.commit(staged)?;
                     active = next;
                     retired_generations += 1;
                     recovery = false;
                     failures = 0;
-                    match ExactIndexWriter::open(&active.exact_file) {
-                        Ok(opened) => writer = Some(opened),
-                        Err(error) if error.code == "exact_index_corrupt" => {
-                            recovery = true;
-                            recovery_reason = format!("{}: {}", error.code, error.message);
-                            let _ = inner.generations.mark_untrusted();
-                            return Err(error.into());
-                        }
-                        Err(error) => {
-                            reopen = true;
-                            return Err(error.into());
-                        }
-                    }
                     Ok(())
                 });
             match result {
@@ -556,19 +576,19 @@ fn run(
                     } else {
                         ProjectionState::Blocked
                     };
+                    sync_pending = true;
+                    retry_at = Some(config.clock.now() + retry);
+                    retry = (retry * 2).min(maximum);
                     inner.publish(
                         state,
                         through.clone(),
                         Some(format!("{recovery_reason}; {e}")),
                     );
-                    sync_pending = true;
-                    retry_at = Some(config.clock.now() + retry);
-                    retry = (retry * 2).min(maximum);
                 }
             }
         }
         if !recovery && !reopen && needs_sync {
-            let current = writer.as_mut().expect("active writer");
+            let current = writer.current.as_mut().expect("active writer");
             match current
                 .validate_active()
                 .and_then(|()| current.synchronize(&source, &inner.cancel))
@@ -585,10 +605,10 @@ fn run(
                         "exact_index_corrupt" | "source_epoch_changed" | "source_coverage_lost"
                     ) =>
                 {
-                    writer = None;
+                    let _ = inner.generations.mark_untrusted();
+                    writer.current = None;
                     recovery = true;
                     recovery_reason = format!("{}: {}", e.code, e.message);
-                    let _ = inner.generations.mark_untrusted();
                     inner.publish(
                         ProjectionState::Recovering,
                         through.clone(),
@@ -598,17 +618,18 @@ fn run(
                 }
                 Err(e) => {
                     if e.code == "exact_index_unavailable" {
-                        writer = None;
+                        let _ = inner.generations.mark_untrusted();
+                        writer.current = None;
                         reopen = true;
                     }
+                    sync_pending = true;
+                    retry_at = Some(config.clock.now() + retry);
+                    retry = (retry * 2).min(maximum);
                     inner.publish(
                         ProjectionState::Blocked,
                         through.clone(),
                         Some(e.to_string()),
                     );
-                    sync_pending = true;
-                    retry_at = Some(config.clock.now() + retry);
-                    retry = (retry * 2).min(maximum);
                 }
             }
         }
@@ -645,6 +666,7 @@ fn run(
                 Some(config.clock.now() + config.retry_initial.max(Duration::from_millis(1)));
         }
     }
+    drop(writer);
     let mut s = inner.state.lock().unwrap_or_else(|e| e.into_inner());
     s.stopped = true;
     inner.changed.notify_all();

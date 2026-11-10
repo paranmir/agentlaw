@@ -13,7 +13,21 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+mod owner;
 pub(crate) mod streaming;
+pub use owner::{
+    discover, prepare_recall, recall, recall_for_project, recall_prepared, PreparedRecall,
+};
+/// Inspect retained pending work without opening a writable control connection.
+pub fn pending_inspect(ctx: &ReadCtx<'_>, request: &RememberRequest) -> Result<Value> {
+    ctx.request.check()?;
+    let reference = request
+        .pending_batch_ref
+        .as_ref()
+        .ok_or_else(|| DomainError::new("invalid_input", "pending_batch_ref is required."))?;
+    ctx.control
+        .pending_inspect(&ctx.identity.binding_id, reference)
+}
 pub(crate) fn pump(
     worker: &agentlaw_worker::Client,
     adapter: &crate::derived::PublishedAdapter<agentlaw_storage::published::OwnedPublishedReader>,
@@ -303,7 +317,7 @@ impl Runtime {
         memory_request.procedure_ids = None;
         memory_request.project_hint = None;
         memory_request.selected_project_id = None;
-        let mut result = recall(&snapshot, &search, &context, &memory_request, now)?;
+        let mut result = crate::recall::recall(&snapshot, &search, &context, &memory_request, now)?;
         result
             .diagnostics
             .retain(|d| !d.message.starts_with("Learned procedure discovery"));
@@ -333,6 +347,7 @@ impl Runtime {
         if r.include_active_tasks == Some(true) {
             let mut output = Vec::new();
             for candidate in result["candidates"].as_array().cloned().unwrap_or_default() {
+                self.request_control.check()?;
                 let id = candidate["memory_id"].as_str().unwrap_or("");
                 if let Some(state) = snapshot.states.get(id) {
                     let active: Vec<_> = state
@@ -431,8 +446,11 @@ impl Runtime {
             }
             result["missing_ids"]["procedure_ids"] = json!(missing)
         }
-        let mut statement=sql(self.control.prepare("SELECT id,version FROM pending WHERE binding=?1 AND status='pending' AND (json_extract(payload,'$.context.project_id') IS NULL OR json_extract(payload,'$.context.project_id')=?2) ORDER BY id"))?;
-        let pending=sql(statement.query_map(params![self.binding_id,context.project_id],|row|Ok(json!({"pending_batch_ref":{"pending_batch_id":row.get::<_,String>(0)?,"observed_version":row.get::<_,String>(1)?}}))))?.collect::<std::result::Result<Vec<_>,_>>().map_err(|_|DomainError::new("control_storage_failed","Pending notices could not be read; retained work was not discarded."))?;
+        let pending = crate::control::pending_notices(
+            &self.control,
+            &self.binding_id,
+            context.project_id.as_deref(),
+        )?;
         if !pending.is_empty() {
             result["pending_batches"] = json!(pending);
             result["pending_work_instruction"]=json!("Retained proposals still need attention. Use remember_this pending_action=inspect with a listed pending_batch_ref before revising or continuing them. This notice does not publish or approve the proposals.");

@@ -4,6 +4,7 @@ pub mod files;
 pub mod index_work;
 pub mod installation;
 pub mod semantic;
+pub mod write_audit;
 
 pub use files::*;
 pub use index_work::*;

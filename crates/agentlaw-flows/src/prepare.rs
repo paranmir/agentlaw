@@ -39,7 +39,10 @@ pub struct ProcedurePlan {
     pub(crate) mutation: Mutation,
     pub(crate) submission: String,
 }
-pub struct ConnectPlan(pub(crate) ConnectPlanKind);
+pub struct ConnectPlan {
+    pub(crate) kind: ConnectPlanKind,
+    pub(crate) follow_up: Option<crate::apply::FollowUp>,
+}
 pub(crate) enum ConnectPlanKind {
     Select { path: String, project_id: String },
     Create { path: String, saga: ProjectSaga },
@@ -738,47 +741,18 @@ impl Runtime {
         }
         sql(tx.execute("INSERT INTO authoring_executions(token,binding,operation,generation,mutation,submission,status) VALUES(?1,?2,?3,?4,?5,?6,'pending')",params![r.authoring_ref,self.binding_id,operation,snapshot.generation.to_string(),encode(&mutation)?,encode(r)?]))?;
         sql(tx.commit())?;
-        self.request_control.phase("publishing");
-        let receipt = match self.store.publish_if_generation_control(
+        crate::apply::publish_procedure_parts(
+            &self.store,
+            &self.control,
+            &self.request_control,
+            r.authoring_ref.as_deref().ok_or_else(|| {
+                DomainError::new("stale_authoring_ref", "Authoring context is missing.")
+            })?,
             &operation,
-            vec![mutation],
             snapshot.generation,
-            &self.request_control.cancel,
-        ) {
-            Ok(receipt) => receipt,
-            Err(agentlaw_storage::Error::CancelledBeforeDecision) => {
-                sql(self.control.execute(
-                    "UPDATE authoring_executions SET status='needs_review' WHERE token=?1",
-                    params![r.authoring_ref],
-                ))?;
-                return Ok(
-                    json!({"status":"authoring_required","code":"cancelled","authoring_ref":r.authoring_ref,"retained_submission":r,"turn_instruction":"Publication was cancelled before its durable decision. Repeat the complete retained final submission with its authoring_ref to inspect and revise the retained submission; it will not publish automatically."}),
-                );
-            }
-            Err(agentlaw_storage::Error::Stale(_)) => {
-                sql(self.control.execute(
-                    "UPDATE authoring_executions SET status='needs_review' WHERE token=?1",
-                    params![r.authoring_ref],
-                ))?;
-                return Ok(
-                    json!({"status":"authoring_required","code":"source_changed","authoring_ref":r.authoring_ref,"retained_submission":r,"turn_instruction":"Source evidence changed before publication. Repeat the complete retained final submission with this authoring_ref to inspect the retained submission and fresh evidence."}),
-                );
-            }
-            Err(e) => return source(Err(e)),
-        };
-        self.request_control.phase("published");
-        let reference = receipt.references.first().ok_or_else(|| {
-            DomainError::new(
-                "publication_result_invalid",
-                "Procedure reference is absent.",
-            )
-        })?;
-        let result = json!({"status":"remembered","procedure_ref":{"procedure_id":reference.memory_id,"observed_version":reference.observed_version}});
-        sql(self.control.execute(
-            "UPDATE authoring_executions SET status='published',result=?1 WHERE token=?2",
-            params![encode(&result)?, r.authoring_ref],
-        ))?;
-        Ok(result)
+            mutation,
+            &encode(r)?,
+        )
     }
     fn overlap_candidates(
         &self,

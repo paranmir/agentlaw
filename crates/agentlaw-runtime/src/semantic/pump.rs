@@ -1,6 +1,6 @@
 //! Per-binding source and vector writer. No source or SQLite I/O holds the RAM lock.
 use super::state::{ActiveFile, LaneKey};
-use super::{quarantine, source, Shared};
+use super::{generation as generations, quarantine, source, SemanticRepairState, Shared};
 use crate::ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus};
 use agentlaw_search::vector_file::{
     CurrentHeads, InventoryCursor, SourcePosition, VectorFileBatch, VectorFileError,
@@ -147,6 +147,131 @@ fn committed(shared: &Shared, name: &str, token: u64, generation: u64) {
     }
 }
 
+fn reclaim(shared: &Shared, name: &str) {
+    let readers: Vec<_> = {
+        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .retiring_readers
+            .iter()
+            .filter(|(binding, _)| binding == name)
+            .map(|(_, r)| r.clone())
+            .collect()
+    };
+    for reader in readers {
+        if *reader.count.lock().unwrap_or_else(|e| e.into_inner()) != 0 {
+            #[cfg(test)]
+            if let Some(hook) = shared
+                .reclaim_busy_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                hook();
+            }
+            continue;
+        }
+        let path = reader
+            .retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(path) = path else { continue };
+        let is_active = {
+            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .schedule
+                .lanes
+                .get(&LaneKey::current(name))
+                .and_then(|l| l.active.as_ref())
+                .is_some_and(|active| active.path == path)
+        };
+        if is_active {
+            continue;
+        }
+        if let generations::Removal::Failed { path, reason } = generations::remove_files(&path) {
+            let message = format!("cleanup {}: {reason}", path.display());
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lane) = state.schedule.lanes.get_mut(&LaneKey::current(name)) {
+                lane.cleaned_dir = None;
+                lane.cleanup_error = Some(message.clone());
+                lane.state = ComponentState::Degraded;
+                lane.reason = Some(message.clone());
+                if let Some(repair) = lane.repair.as_mut() {
+                    repair.state = SemanticRepairState::Failed;
+                    repair.reason = Some(message.clone());
+                }
+            }
+            drop(state);
+            report(shared, name, ComponentState::Degraded, Some(message));
+        }
+    }
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retiring_readers
+        .retain(|(_, r)| {
+            *r.count.lock().unwrap_or_else(|e| e.into_inner()) != 0
+                || r.retired
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+        });
+}
+
+fn cleanup_dir(shared: &Shared, name: &str, token: u64, dir: &std::path::Path, selected: &str) {
+    let protected: Vec<_> = {
+        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .retiring_readers
+            .iter()
+            .filter_map(|(_, r)| r.retired.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .collect()
+    };
+    let result = if dir.join("active-generation").exists() {
+        generations::sync(dir).map(|level| {
+            Some(format!(
+                "semantic pointer durability: {level:?}; power-loss durability unverified"
+            ))
+        })
+    } else {
+        Ok(None)
+    };
+    let (result, durability) = match result {
+        Ok(durability) => (generations::cleanup(dir, selected, &protected), durability),
+        Err(error) => (
+            Err(format!("semantic pointer namespace sync: {error}")),
+            None,
+        ),
+    };
+    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(lane) = state
+        .schedule
+        .lanes
+        .get_mut(&LaneKey::current(name))
+        .filter(|l| l.token == token)
+    {
+        if durability.is_some() {
+            lane.durability_reason = durability;
+        }
+        match result {
+            Ok(true) => {
+                lane.cleaned_dir = Some(dir.to_path_buf());
+                lane.cleanup_error = None;
+            }
+            Ok(false) => {
+                lane.cleaned_dir = None;
+                lane.cleanup_error = None;
+            }
+            Err(error) => {
+                lane.cleaned_dir = None;
+                lane.cleanup_error = Some(error.clone());
+                report(shared, name, ComponentState::Degraded, Some(error));
+            }
+        }
+    }
+}
+
 pub(super) fn run(shared: Arc<Shared>, name: String, token: u64, source: OwnedPublishedReader) {
     let existing_quarantine = {
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -164,9 +289,10 @@ pub(super) fn run(shared: Arc<Shared>, name: String, token: u64, source: OwnedPu
     } else {
         report(&shared, &name, ComponentState::Starting, None);
     }
-    loop {
+    'writer: loop {
+        reclaim(&shared, &name);
         let (model, generation) = {
-            let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 let Some(lane) = lock
                     .schedule
@@ -174,29 +300,63 @@ pub(super) fn run(shared: Arc<Shared>, name: String, token: u64, source: OwnedPu
                     .get(&LaneKey::current(&name))
                     .filter(|lane| lane.token == token)
                 else {
+                    let (ready, waiting) = lock
+                        .retiring_readers
+                        .iter()
+                        .filter(|(binding, _)| binding == &name)
+                        .fold((false, false), |(ready, waiting), (_, r)| {
+                            let count = r.count.lock().unwrap_or_else(|e| e.into_inner());
+                            let retired = r
+                                .retired
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .is_some();
+                            (ready || (*count == 0 && retired), waiting || *count != 0)
+                        });
+                    #[cfg(test)]
+                    if ready || waiting {
+                        if let Some(hook) = shared
+                            .reclaim_decision_hook
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                        {
+                            hook();
+                        }
+                    }
+                    if ready {
+                        drop(lock);
+                        continue 'writer;
+                    }
+                    if waiting {
+                        drop(shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner()));
+                        continue 'writer;
+                    }
                     return;
                 };
                 if lock.stopping {
                     return;
                 }
                 if lane.quarantined {
-                    lock = shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner());
-                    continue;
+                    drop(shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner()));
+                    continue 'writer;
                 }
                 let now = (shared.clock)();
                 if let Some(at) = lane.writer_retry.until.filter(|at| *at > now) {
                     let wait = at.saturating_duration_since(now);
-                    lock = shared
-                        .changed
-                        .wait_timeout(lock, wait)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
-                    continue;
+                    drop(
+                        shared
+                            .changed
+                            .wait_timeout(lock, wait)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                    continue 'writer;
                 }
                 if let Some(model) = &lock.schedule.model {
                     break (model.clone(), lane.generation);
                 }
-                lock = shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner());
+                drop(shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner()));
+                continue 'writer;
             }
         };
         match session(&shared, &name, token, generation, &model, &source) {
@@ -211,10 +371,28 @@ pub(super) fn run(shared: Arc<Shared>, name: String, token: u64, source: OwnedPu
                 {
                     lane.invalidate();
                     lane.dirty = true;
-                    lane.state = ComponentState::Degraded;
-                    lane.reason = Some(error.clone());
-                    lane.writer_retry.fail((shared.clock)());
-                    report(&shared, &name, ComponentState::Degraded, Some(error));
+                    if let Some(repair) = lane
+                        .repair
+                        .as_mut()
+                        .filter(|r| r.state == SemanticRepairState::Building)
+                    {
+                        repair.reason = Some(error.clone());
+                        if error.starts_with("repair validation:")
+                            || error.starts_with("repair publication:")
+                        {
+                            repair.state = SemanticRepairState::Failed;
+                        } else {
+                            lane.writer_retry.fail((shared.clock)());
+                        }
+                        lane.state = ComponentState::Degraded;
+                        lane.reason = Some(error.clone());
+                        report(&shared, &name, ComponentState::Degraded, Some(error));
+                    } else {
+                        lane.state = ComponentState::Degraded;
+                        lane.reason = Some(error.clone());
+                        lane.writer_retry.fail((shared.clock)());
+                        report(&shared, &name, ComponentState::Degraded, Some(error));
+                    }
                 }
                 drop(lock);
                 shared.changed.notify_all();
@@ -224,7 +402,7 @@ pub(super) fn run(shared: Arc<Shared>, name: String, token: u64, source: OwnedPu
 }
 
 fn session(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     name: &str,
     token: u64,
     generation: u64,
@@ -237,7 +415,7 @@ fn session(
         .position()
         .clone();
     let start = position(&start)?;
-    let identity = VectorFileIdentity {
+    let mut identity = VectorFileIdentity {
         binding: name.into(),
         kind: VectorFileKind::Current,
         epoch: start.epoch.clone(),
@@ -246,7 +424,8 @@ fn session(
         generation: "initial".into(),
         dimension: shared.config.dimension,
     };
-    let path = id_path(shared, name, model, &start.epoch);
+    let initial_path = id_path(shared, name, model, &start.epoch);
+    let dir = initial_path.parent().unwrap();
     let gate = {
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(lane) = state
@@ -260,6 +439,25 @@ fn session(
         lane.io_gate.clone()
     };
     let io_guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let selected = generations::selected(dir)?;
+    let repair_id = {
+        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(lane) = state
+            .schedule
+            .lanes
+            .get(&LaneKey::current(name))
+            .filter(|l| l.token == token && l.generation == generation)
+        else {
+            return Ok(());
+        };
+        lane.repair
+            .as_ref()
+            .filter(|r| r.state == SemanticRepairState::Building && !r.published)
+            .map(|r| r.id.clone())
+    };
+    identity.generation = repair_id.clone().unwrap_or_else(|| selected.clone());
+    let path = generations::file(dir, &identity.generation);
     let quarantined = {
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -280,7 +478,6 @@ fn session(
         );
         return Ok(());
     }
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     if path.exists() {
         let view = VectorFileReadView::open(&path, &identity).map_err(|error| {
             let reason = error.to_string();
@@ -325,7 +522,15 @@ fn session(
             );
             return Err("invalid vector progress metadata".into());
         }
-    } else {
+    } else if repair_id.is_none() {
+        let pointer_exists = dir.join("active-generation").exists();
+        let other_generation = std::fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name().to_string_lossy().starts_with("vector-")
+                    && e.file_name().to_string_lossy().ends_with(".sqlite")
+            });
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lane) = state
             .schedule
@@ -336,6 +541,44 @@ fn session(
             lane.active = None;
             lane.ack = None;
             lane.complete = false;
+            if pointer_exists || other_generation {
+                lane.invalidate();
+                lane.state = ComponentState::Degraded;
+                lane.reason = Some("active semantic generation is missing; rebuilding".into());
+                lane.repair = Some(super::state::Repair {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    state: SemanticRepairState::Building,
+                    published: false,
+                    ack: None,
+                    reason: None,
+                });
+                drop(state);
+                shared.changed.notify_all();
+                report(
+                    shared,
+                    name,
+                    ComponentState::Degraded,
+                    Some("active semantic generation is missing; rebuilding".into()),
+                );
+                return Ok(());
+            }
+        }
+    }
+    if repair_id.is_none() {
+        let needs_cleanup = {
+            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(lane) = state
+                .schedule
+                .lanes
+                .get(&LaneKey::current(name))
+                .filter(|l| l.token == token && l.generation == generation)
+            else {
+                return Ok(());
+            };
+            lane.cleaned_dir.as_deref() != Some(dir)
+        };
+        if needs_cleanup {
+            cleanup_dir(shared, name, token, dir, &selected);
         }
     }
     let mut writer = VectorFileWriter::open(&path, &identity).map_err(|error| {
@@ -418,11 +661,34 @@ fn session(
             writer.checkpoint().map_err(|error| error.to_string())?;
         }
     }
+    drop(writer);
+    if repair_id.is_some()
+        && result.as_ref().is_err_and(|e| {
+            e.starts_with("repair validation:") || e.starts_with("repair publication:")
+        })
+        && generations::selected(dir).ok().as_deref() != Some(identity.generation.as_str())
+    {
+        if let generations::Removal::Failed { path, reason } = generations::remove_files(&path) {
+            let message = format!("cleanup {}: {reason}", path.display());
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lane) = state
+                .schedule
+                .lanes
+                .get_mut(&LaneKey::current(name))
+                .filter(|l| l.token == token)
+            {
+                lane.cleaned_dir = None;
+                lane.cleanup_error = Some(message.clone());
+            }
+            drop(state);
+            report(shared, name, ComponentState::Degraded, Some(message));
+        }
+    }
     result
 }
 
 fn session_run(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     name: &str,
     token: u64,
     generation: u64,
@@ -468,12 +734,18 @@ fn session_run(
         else {
             return Ok(());
         };
-        lane.ack = progress.ack.clone();
-        lane.complete = progress.complete;
-        lane.active = Some(ActiveFile {
-            path: path.to_path_buf(),
-            identity: identity.clone(),
-        });
+        if lane.repair.as_ref().is_some_and(|r| {
+            r.state == SemanticRepairState::Building && !r.published && r.id == identity.generation
+        }) {
+            lane.repair.as_mut().unwrap().ack = progress.ack.clone();
+        } else {
+            lane.ack = progress.ack.clone();
+            lane.complete = progress.complete;
+            lane.active = Some(ActiveFile {
+                path: path.to_path_buf(),
+                identity: identity.clone(),
+            });
+        }
         lane.state = ComponentState::Busy;
         lane.reason = None;
         lane.dirty = false;
@@ -633,6 +905,206 @@ fn session_run(
             ack = covered;
             progress.complete |= caught_up;
         }
+        if caught_up {
+            let is_repair = {
+                let lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                lock.schedule
+                    .lanes
+                    .get(&LaneKey::current(name))
+                    .is_some_and(|lane| {
+                        lane.token == token
+                            && lane.generation == generation
+                            && lane.repair.as_ref().is_some_and(|r| {
+                                r.state == SemanticRepairState::Building
+                                    && !r.published
+                                    && r.id == identity.generation
+                            })
+                    })
+            };
+            if is_repair {
+                writer.checkpoint().map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                if let Some(hook) = shared
+                    .repair_validation_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    hook(path);
+                }
+                let view = VectorFileReadView::open(path, identity).map_err(|e| {
+                    if quarantine::is_corrupt(&e) {
+                        format!("repair validation: {e}")
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+                view.validate().map_err(|e| {
+                    if quarantine::is_corrupt(&e) {
+                        format!("repair validation: {e}")
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+                let verified = view.progress();
+                if !verified.complete
+                    || verified.ack.as_ref() != Some(&ack)
+                    || verified.inventory.as_ref().is_none_or(|i| {
+                        i.start.epoch != ack.epoch || i.start.sequence > ack.sequence
+                    })
+                    || ack.epoch != start.epoch
+                    || ack.sequence < start.sequence
+                {
+                    return Err("repair validation: invalid repair progress".into());
+                }
+                drop(view);
+                let _io = gate.lock().unwrap_or_else(|e| e.into_inner());
+                {
+                    let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if lock.stopping || lock.schedule.model.as_deref() != Some(model) {
+                        return Ok(());
+                    }
+                    let Some(lane) =
+                        lock.schedule
+                            .lanes
+                            .get_mut(&LaneKey::current(name))
+                            .filter(|l| {
+                                l.token == token
+                                    && l.generation == generation
+                                    && l.repair.as_ref().is_some_and(|r| {
+                                        r.state == SemanticRepairState::Building
+                                            && !r.published
+                                            && r.id == identity.generation
+                                    })
+                            })
+                    else {
+                        return Ok(());
+                    };
+                    if lane
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.path == path && active.identity == *identity)
+                    {
+                        let repair = lane.repair.as_mut().unwrap();
+                        repair.published = true;
+                        repair.state = SemanticRepairState::Complete;
+                        shared.changed.notify_all();
+                        return Ok(());
+                    }
+                    lane.transition = Some(identity.generation.clone());
+                }
+                #[cfg(test)]
+                if let Some(hook) = shared
+                    .repair_transition_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    hook();
+                }
+                let publication =
+                    generations::publish(path.parent().unwrap(), &identity.generation);
+                #[cfg(test)]
+                if matches!(&publication, Ok(generations::Publication::Replaced(_))) {
+                    generations::crash_point("before_ram");
+                }
+                let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                let valid = !lock.stopping && lock.schedule.model.as_deref() == Some(model);
+                let Some(lane) = lock
+                    .schedule
+                    .lanes
+                    .get_mut(&LaneKey::current(name))
+                    .filter(|l| {
+                        l.token == token
+                            && l.transition.as_deref() == Some(identity.generation.as_str())
+                    })
+                else {
+                    return Ok(());
+                };
+                lane.transition = None;
+                if !valid
+                    || lane.generation != generation
+                    || !lane.repair.as_ref().is_some_and(|r| {
+                        r.state == SemanticRepairState::Building
+                            && !r.published
+                            && r.id == identity.generation
+                    })
+                {
+                    return Ok(());
+                }
+                let level = match publication {
+                    Err(error) => return Err(format!("repair publication: {error}")),
+                    Ok(generations::Publication::ReplacedButUnsynced(error)) => {
+                        return Err(format!("semantic pointer namespace sync: {error}"))
+                    }
+                    Ok(generations::Publication::Replaced(level)) => level,
+                };
+                let old = lane.active.replace(ActiveFile {
+                    path: path.to_path_buf(),
+                    identity: identity.clone(),
+                });
+                let readers = std::mem::replace(
+                    &mut lane.readers,
+                    Arc::new(super::state::Readers::default()),
+                );
+                *lane.readers.wake.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Arc::downgrade(shared));
+                lane.repair.as_mut().unwrap().ack = Some(ack.clone());
+                lane.repair.as_mut().unwrap().reason = None;
+                lane.repair.as_mut().unwrap().published = true;
+                lane.ack = Some(ack.clone());
+                lane.complete = true;
+                lane.active_quarantined = false;
+                lane.quarantined = false;
+                lane.durability_reason = Some(format!(
+                    "semantic pointer durability: {level:?}; power-loss durability unverified"
+                ));
+                if let Some(old) = old.filter(|old| old.path != path && old.identity != *identity) {
+                    readers.retire(old.path);
+                    lock.retiring_readers.push((name.to_owned(), readers));
+                }
+                drop(lock);
+                #[cfg(test)]
+                if let Some(hook) = shared
+                    .repair_published_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    hook();
+                }
+                #[cfg(test)]
+                generations::crash_point("after_ram");
+                cleanup_dir(
+                    shared,
+                    name,
+                    token,
+                    path.parent().unwrap(),
+                    &identity.generation,
+                );
+                let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(lane) = lock
+                    .schedule
+                    .lanes
+                    .get_mut(&LaneKey::current(name))
+                    .filter(|l| l.token == token)
+                {
+                    let error = lane.cleanup_error.clone();
+                    if let Some(repair) = lane.repair.as_mut().filter(|r| {
+                        r.id == identity.generation
+                            && r.published
+                            && r.state == SemanticRepairState::Building
+                    }) {
+                        repair.state = if error.is_some() {
+                            SemanticRepairState::Failed
+                        } else {
+                            SemanticRepairState::Complete
+                        };
+                        repair.reason = error;
+                    }
+                }
+            }
+        }
         {
             let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(lane) = lock
@@ -643,17 +1115,38 @@ fn session_run(
             else {
                 return Ok(());
             };
-            lane.ack = Some(ack.clone());
-            lane.complete = progress.complete;
+            if let Some(repair) = lane.repair.as_mut().filter(|r| {
+                r.state == SemanticRepairState::Building
+                    && !r.published
+                    && r.id == identity.generation
+            }) {
+                repair.ack = Some(ack.clone());
+            } else {
+                lane.ack = Some(ack.clone());
+                lane.complete = progress.complete;
+            }
             if caught_up {
-                lane.state = ComponentState::Ready;
-                report(shared, name, ComponentState::Ready, None);
+                lane.state = if lane.cleanup_error.is_some() {
+                    ComponentState::Degraded
+                } else {
+                    ComponentState::Ready
+                };
+                lane.reason = lane.cleanup_error.clone();
+                report(
+                    shared,
+                    name,
+                    lane.state,
+                    lane.cleanup_error
+                        .clone()
+                        .or_else(|| lane.durability_reason.clone()),
+                );
             }
         }
         shared.changed.notify_all();
         if caught_up {
-            let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                reclaim(shared, name);
+                let lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                 if lock.stopping
                     || lock.schedule.model.as_deref() != Some(model)
                     || !lock
@@ -664,7 +1157,19 @@ fn session_run(
                 {
                     return Ok(());
                 }
-                lock = shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner());
+                let eligible = lock.retiring_readers.iter().any(|(binding, r)| {
+                    binding == name
+                        && *r.count.lock().unwrap_or_else(|e| e.into_inner()) == 0
+                        && r.retired
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some()
+                });
+                if eligible {
+                    drop(lock);
+                    continue;
+                }
+                drop(shared.changed.wait(lock).unwrap_or_else(|e| e.into_inner()));
             }
         }
     }

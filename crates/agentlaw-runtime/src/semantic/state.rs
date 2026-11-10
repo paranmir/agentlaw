@@ -76,7 +76,13 @@ pub(super) struct Lane {
     pub reason: Option<String>,
     pub dirty: bool,
     pub active: Option<ActiveFile>,
+    pub repair: Option<Repair>,
+    pub cleaned_dir: Option<std::path::PathBuf>,
+    pub transition: Option<String>,
+    pub cleanup_error: Option<String>,
+    pub durability_reason: Option<String>,
     pub quarantined: bool,
+    pub active_quarantined: bool,
     pub io_gate: Arc<std::sync::Mutex<()>>,
     pub readers: Arc<Readers>,
     pub history_target: Option<agentlaw_storage::published::SourcePosition>,
@@ -88,6 +94,22 @@ pub(super) struct Lane {
 pub(super) struct Readers {
     pub count: Mutex<usize>,
     pub changed: Condvar,
+    pub retired: Mutex<Option<std::path::PathBuf>>,
+    pub wake: Mutex<Option<std::sync::Weak<super::Shared>>>,
+}
+
+pub(super) struct Repair {
+    pub id: String,
+    pub state: super::SemanticRepairState,
+    pub published: bool,
+    pub ack: Option<SourcePosition>,
+    pub reason: Option<String>,
+}
+
+impl Readers {
+    pub fn retire(&self, path: std::path::PathBuf) {
+        *self.retired.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
 }
 
 pub(super) struct ReaderGuard(pub Arc<Readers>);
@@ -100,6 +122,18 @@ impl Drop for ReaderGuard {
             .unwrap_or_else(|error| error.into_inner());
         *count -= 1;
         self.0.changed.notify_all();
+        drop(count);
+        if let Some(shared) = self
+            .0
+            .wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|w| w.upgrade())
+        {
+            let _state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            shared.changed.notify_all();
+        }
     }
 }
 
@@ -127,7 +161,13 @@ impl Default for Lane {
             reason: None,
             dirty: true,
             active: None,
+            repair: None,
+            cleaned_dir: None,
+            transition: None,
+            cleanup_error: None,
+            durability_reason: None,
             quarantined: false,
+            active_quarantined: false,
             io_gate: Arc::new(std::sync::Mutex::new(())),
             readers: Arc::new(Readers::default()),
             history_target: None,

@@ -295,6 +295,91 @@ fn review_mixed_delta_matches_rebuilt_exact_and_lexical() {
     }
 }
 
+type AcquisitionHook = Box<dyn FnOnce() + Send>;
+static ACQUISITION_HOOK: Mutex<Option<(uuid::Uuid, AcquisitionHook)>> = Mutex::new(None);
+pub(in crate::exact) fn on_acquisition(registry: &ProjectionGenerations) {
+    let hook = {
+        let mut slot = ACQUISITION_HOOK.lock().unwrap();
+        if slot.as_ref().is_some_and(|(id, _)| *id == registry.id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
+#[test]
+fn acquisition_does_not_block_other_pins_or_commits_and_drains_before_writer_drop() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let old = generation(dir.path(), "acquiring", "lexical-acquiring.sqlite");
+    let writer = ExactIndexWriter::open(&old.exact_file).unwrap();
+    let new = generation(dir.path(), "replacement", "lexical-replacement.sqlite");
+    let new_writer = ExactIndexWriter::open(&new.exact_file).unwrap();
+    let registry = Arc::new(ProjectionGenerations::from_generation(old).unwrap());
+    let staged = registry
+        .stage(ShadowGeneration { generation: new })
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *ACQUISITION_HOOK.lock().unwrap() = Some((
+        registry.id,
+        Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        }),
+    ));
+    let delayed_registry = registry.clone();
+    let delayed = std::thread::spawn(move || delayed_registry.pin());
+    entered_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    let (other_tx, other_rx) = mpsc::channel();
+    let other_registry = registry.clone();
+    let other = std::thread::spawn(move || {
+        let pin = other_registry.pin().unwrap();
+        other_tx.send(pin.generation.id.clone()).unwrap();
+    });
+    assert_eq!(
+        other_rx.recv_timeout(Duration::from_secs(15)).unwrap(),
+        "acquiring"
+    );
+    other.join().unwrap();
+    let (drained_tx, drained_rx) = mpsc::channel();
+    let blocking_registry = registry.clone();
+    let blocking = std::thread::spawn(move || {
+        blocking_registry.mark_untrusted().unwrap();
+        writer.validate_active().unwrap();
+        drop(writer);
+        drained_tx.send(()).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match registry.pin() {
+            Err(error) if error.code == "exact_not_ready" => break,
+            Ok(pin) => drop(pin),
+            Err(error) => panic!("unexpected pin error: {error}"),
+        }
+        assert!(Instant::now() < deadline, "acquisitions were not stopped");
+        std::thread::yield_now();
+    }
+    assert!(drained_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    registry.commit(staged).unwrap();
+    assert_eq!(registry.pin().unwrap().generation.id, "replacement");
+    assert!(drained_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    release_tx.send(()).unwrap();
+    drained_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    blocking.join().unwrap();
+    assert_eq!(
+        delayed.join().unwrap().unwrap().generation.id,
+        "replacement"
+    );
+    drop(new_writer);
+}
+
 type PinHook = Box<dyn FnOnce() + Send>;
 static PIN_HOOK: Mutex<Option<(uuid::Uuid, PinHook)>> = Mutex::new(None);
 pub(in crate::exact) fn on_pointer_mismatch(registry: &ProjectionGenerations) {
@@ -436,17 +521,40 @@ fn writer_bounded_batches_resume_after_interruption_and_match_rebuild() {
 }
 #[test]
 fn review_synchronize_recovers_between_lexical_and_exact_commits() {
+    const CHILD_DIR: &str = "AGENTLAW_TEST_COMMIT_CHILD_DIR";
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        let dir = std::path::PathBuf::from(dir);
+        let store = Store::open(dir.join("source"), dir.join("canonical")).unwrap();
+        let source = store.owned_published_reader();
+        let mut writer = ExactIndexWriter::open(dir.join("exact-audit.sqlite")).unwrap();
+        let control = RequestControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |phase| {
+                if phase == "lexical_batch_committed" {
+                    std::process::exit(73);
+                }
+            },
+        );
+        writer.synchronize(&source, &control).unwrap();
+        panic!("child did not reach lexical commit");
+    }
     let dir = tempfile::tempdir().unwrap();
-    let (store, registry, mut writer) = fixture(dir.path());
+    let (store, registry, writer) = fixture(dir.path());
     let source = store.owned_published_reader();
     let mut u = unit("interrupted unique rule");
     head(&mut u).metadata["is_rule"] = json!(true);
     publish(&store, u.clone());
-    writer.exact.connection.execute_batch("CREATE TRIGGER reviewer_fail_position BEFORE UPDATE ON exact_position BEGIN SELECT RAISE(ABORT,'review injected exact failure'); END;").unwrap();
-    let err = writer
-        .synchronize(&source, &RequestControl::default())
-        .unwrap_err();
-    assert_eq!(err.code, "exact_index_failed");
+    drop(writer);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exact::tests::oracle::review_synchronize_recovers_between_lexical_and_exact_commits",
+        ])
+        .env(CHILD_DIR, dir.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    let writer = ExactIndexWriter::open(dir.path().join("exact-audit.sqlite")).unwrap();
     let al = writer.lexical.read_view().unwrap().stamp.ack as u64;
     let ae = writer.exact.position().unwrap().unwrap().sequence;
     assert!(al > ae);
@@ -467,10 +575,6 @@ fn review_synchronize_recovers_between_lexical_and_exact_commits() {
     );
     let path = dir.path().join("exact-audit.sqlite");
     drop(writer);
-    let c = Connection::open(&path).unwrap();
-    c.execute_batch("DROP TRIGGER reviewer_fail_position")
-        .unwrap();
-    drop(c);
     let mut reopened = ExactIndexWriter::open(&path).unwrap();
     let through = reopened
         .synchronize(&source, &RequestControl::default())

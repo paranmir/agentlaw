@@ -16,9 +16,86 @@ mod history;
 mod lifecycle;
 mod preparation;
 mod quarantine;
+mod repair;
 mod search;
 mod state;
 mod writer;
+
+fn corrupt_vectors_page(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let page: u64 = db
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name='vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let page_size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+    drop(db);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start((page - 1) * page_size)).unwrap();
+    file.write_all(&[0]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn corrupt_vector_bytes(path: &std::path::Path, replacement: [f32; 2]) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let page: u64 = db
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name='vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: usize = db.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+    drop(db);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let offset = (page - 1) * size as u64;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes).unwrap();
+    let original: Vec<u8> = [1.0_f32, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let matches: Vec<_> = bytes
+        .windows(original.len())
+        .enumerate()
+        .filter_map(|(i, b)| (b == original).then_some(i))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    file.seek(SeekFrom::Start(offset + matches[0] as u64))
+        .unwrap();
+    for value in replacement {
+        file.write_all(&value.to_le_bytes()).unwrap();
+    }
+    file.sync_all().unwrap();
+}
+
+fn incompatible_profile_fixture(source: &std::path::Path, dest: &std::path::Path) {
+    let db = rusqlite::Connection::open(dest).unwrap();
+    db.execute("ATTACH DATABASE ?1 AS original", [source.to_str().unwrap()])
+        .unwrap();
+    db.execute_batch(
+        "CREATE TABLE binding_vector_meta AS SELECT * FROM original.binding_vector_meta;
+        CREATE TABLE vectors AS SELECT * FROM original.vectors;
+        CREATE TABLE vector_buckets AS SELECT * FROM original.vector_buckets;
+        CREATE TABLE completed_changes AS SELECT * FROM original.completed_changes;
+        CREATE TABLE ann_profile(singleton INTEGER PRIMARY KEY, version INTEGER);
+        INSERT INTO ann_profile VALUES(1, 999);",
+    )
+    .unwrap();
+}
 
 fn mutation(body: &str, expected_versions: Vec<String>) -> Mutation {
     Mutation {

@@ -34,6 +34,40 @@ fn schema(path: &Path) -> Vec<(String, String, String, Option<String>)> {
 }
 
 #[test]
+fn temporary_file_index_limits_cache_and_uses_file_temporary_store() {
+    let directory = Fixture::new();
+    let index = SearchIndex::open_temporary(directory.path().join("temporary.sqlite")).unwrap();
+    assert_eq!(
+        index
+            .connection
+            .query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        -2048
+    );
+    assert_eq!(
+        index
+            .connection
+            .query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        index
+            .connection
+            .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let view = index.read_view().unwrap();
+    assert_eq!(
+        view.connection
+            .query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn existing_open_rejects_missing_schema_and_metadata_without_repair() {
     for (table, delete_row) in [
         ("docs", false),

@@ -1,5 +1,39 @@
 use super::*;
 
+fn corrupt_table_page(path: &std::path::Path, table: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let db = Connection::open(path).unwrap();
+    let root: u64 = db
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name=?1",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let page_size: u64 = db
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(db);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start((root - 1) * page_size)).unwrap();
+    file.write_all(&[0xff]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn corrupt_schema_page(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let db = Connection::open(path).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(db);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(100)).unwrap();
+    file.write_all(&[0xff]).unwrap();
+    file.sync_all().unwrap();
+}
+
 #[test]
 fn pinned_old_generation_survives_activation_until_last_reader_drops() {
     let dir = tempfile::tempdir().unwrap();
@@ -148,37 +182,20 @@ fn work_target_case_and_component_boundaries_match_rebuilt_index() {
 }
 
 #[test]
-fn writer_rejects_missing_active_tables_without_recreating_them() {
-    for (file, table) in [
-        ("exact-damaged.sqlite", "exact_heads"),
-        ("lexical-damaged.sqlite", "docs"),
-    ] {
+fn writer_rejects_corrupt_active_schema_without_modifying_it() {
+    for file in ["exact-damaged.sqlite", "lexical-damaged.sqlite"] {
         let dir = tempfile::tempdir().unwrap();
         let active = generation(dir.path(), "damaged", "lexical-damaged.sqlite");
-        let connection = Connection::open(dir.path().join(file)).unwrap();
-        connection
-            .execute_batch(&format!("DROP TABLE {table}"))
-            .unwrap();
-        drop(connection);
+        let path = dir.path().join(file);
+        corrupt_schema_page(&path);
+        let damaged = std::fs::read(&path).unwrap();
         assert!(ExactIndexWriter::open(&active.exact_file).is_err());
-        let check = Connection::open_with_flags(
-            dir.path().join(file),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let count: i64 = check
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
     }
 }
 
 #[test]
-fn writer_reports_missing_projection_metadata_as_corruption() {
+fn writer_reports_corrupt_projection_metadata_pages() {
     for (filename, table) in [
         ("exact-meta.sqlite", "exact_position"),
         ("exact-meta.sqlite", "exact_lexical"),
@@ -187,11 +204,7 @@ fn writer_reports_missing_projection_metadata_as_corruption() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let active = generation(dir.path(), "meta", "lexical-meta.sqlite");
-        let connection = Connection::open(dir.path().join(filename)).unwrap();
-        connection
-            .execute(&format!("DELETE FROM {table}"), [])
-            .unwrap();
-        drop(connection);
+        corrupt_table_page(&dir.path().join(filename), table);
         assert_eq!(
             ExactIndexWriter::open(&active.exact_file)
                 .err()
@@ -199,6 +212,197 @@ fn writer_reports_missing_projection_metadata_as_corruption() {
                 .code,
             "exact_index_corrupt"
         );
+    }
+}
+
+unsafe extern "C" fn stop_before_initialization_statement(
+    _: std::os::raw::c_uint,
+    _: *mut std::ffi::c_void,
+    statement: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+) -> std::os::raw::c_int {
+    let sql = rusqlite::ffi::sqlite3_sql(statement.cast());
+    if !sql.is_null() {
+        let sql = std::ffi::CStr::from_ptr(sql).to_string_lossy();
+        let target = std::env::var("AGENTLAW_TEST_INITIALIZATION_STATEMENT").unwrap();
+        if sql.trim_start().starts_with(&target) {
+            std::process::exit(76);
+        }
+    }
+    0
+}
+
+unsafe extern "C" fn trace_initialization(
+    db: *mut rusqlite::ffi::sqlite3,
+    _: *mut *mut std::os::raw::c_char,
+    _: *const rusqlite::ffi::sqlite3_api_routines,
+) -> std::os::raw::c_int {
+    rusqlite::ffi::sqlite3_trace_v2(
+        db,
+        rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+        Some(stop_before_initialization_statement),
+        std::ptr::null_mut(),
+    )
+}
+
+fn initialization_state(path: &Path, table: &str) -> (Vec<(String, Option<String>)>, Option<i64>) {
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut statement = db
+        .prepare("SELECT name,sql FROM sqlite_master ORDER BY name")
+        .unwrap();
+    let schema = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let rows = if schema.iter().any(|(name, _)| name == table) {
+        Some(
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    (schema, rows)
+}
+
+#[test]
+fn interrupted_initialization_is_rejected_without_completing_schema_or_metadata() {
+    const CHILD_DIR: &str = "AGENTLAW_TEST_INITIALIZATION_CHILD_DIR";
+    const CHILD_MODE: &str = "AGENTLAW_TEST_INITIALIZATION_CHILD_MODE";
+    if let Some(path) = std::env::var_os(CHILD_DIR) {
+        let dir = PathBuf::from(path);
+        let mode = std::env::var(CHILD_MODE).unwrap();
+        let store =
+            agentlaw_storage::Store::open(dir.join("source"), dir.join("canonical")).unwrap();
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_auto_extension(Some(trace_initialization)) },
+            rusqlite::ffi::SQLITE_OK
+        );
+        match mode.as_str() {
+            "exact_schema" => {
+                let _ = ExactIndex::open(dir.join("exact-partial.sqlite")).unwrap();
+            }
+            "exact_metadata" => {
+                let _ = ExactIndexWriter::rebuild_shadow_in(
+                    &dir,
+                    &store.owned_published_reader(),
+                    &RequestControl::default(),
+                )
+                .unwrap();
+            }
+            _ => {
+                let _ =
+                    agentlaw_search::SearchIndex::open(dir.join("lexical-partial.sqlite")).unwrap();
+            }
+        }
+        panic!("initializer did not reach the requested interruption point");
+    }
+
+    for (mode, target, table, expected_rows) in [
+        (
+            "exact_schema",
+            "CREATE TABLE IF NOT EXISTS exact_heads",
+            "exact_heads",
+            None,
+        ),
+        (
+            "exact_metadata",
+            "INSERT INTO exact_position VALUES",
+            "exact_position",
+            Some(0),
+        ),
+        (
+            "lexical_metadata",
+            "INSERT OR IGNORE INTO metadata",
+            "metadata",
+            Some(0),
+        ),
+        (
+            "lexical_schema",
+            "CREATE TABLE IF NOT EXISTS docs",
+            "docs",
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            agentlaw_storage::Store::open(dir.path().join("source"), dir.path().join("canonical"))
+                .unwrap();
+        let source = store.owned_published_reader();
+        let epoch = source.read_snapshot().unwrap().position().epoch.clone();
+        let mut generation = if mode == "exact_metadata" {
+            None
+        } else {
+            let generation = generation(dir.path(), "partial", "lexical-partial.sqlite");
+            let path = if mode == "exact_schema" {
+                &generation.exact_file
+            } else {
+                &generation.lexical_file
+            };
+            std::fs::remove_file(path).unwrap();
+            Some(generation)
+        };
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "exact::tests::projection::interrupted_initialization_is_rejected_without_completing_schema_or_metadata"])
+            .env(CHILD_DIR, dir.path())
+            .env(CHILD_MODE, mode)
+            .env("AGENTLAW_TEST_INITIALIZATION_STATEMENT", target)
+            .status().unwrap();
+        assert_eq!(status.code(), Some(76), "{mode}");
+        if mode == "exact_metadata" {
+            let exact_file = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("exact-repair-")
+                        && path.extension().is_some_and(|ext| ext == "sqlite")
+                })
+                .unwrap();
+            let db = Connection::open_with_flags(
+                &exact_file,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let lexical: String = db
+                .query_row("SELECT filename FROM exact_lexical", [], |row| row.get(0))
+                .unwrap();
+            drop(db);
+            generation = Some(ProjectionGeneration {
+                id: "partial".into(),
+                epoch: epoch.clone(),
+                exact_file,
+                lexical_file: dir.path().join(lexical),
+            });
+        }
+        let active = generation.unwrap();
+        let damaged = if mode.starts_with("exact_") {
+            active.exact_file.clone()
+        } else {
+            active.lexical_file.clone()
+        };
+        let before = initialization_state(&damaged, table);
+        assert_eq!(before.1, expected_rows, "{mode}");
+        assert_eq!(
+            ExactIndexWriter::open(&active.exact_file)
+                .err()
+                .unwrap()
+                .code,
+            "exact_index_corrupt",
+            "{mode}"
+        );
+        let registry = ProjectionGenerations::from_generation(active).unwrap();
+        assert_eq!(
+            registry.pin().err().unwrap().code,
+            "exact_index_corrupt",
+            "{mode}"
+        );
+        assert_eq!(initialization_state(&damaged, table), before, "{mode}");
     }
 }
 
@@ -668,15 +872,12 @@ fn missing_ledger_is_not_an_empty_success() {
     )
     .unwrap();
     remember(&mut runtime, "publication that will lose ledger coverage");
-    let journal = Connection::open(dir.path().join("local/canonical/journal.sqlite")).unwrap();
-    journal
-        .execute(
-            "DELETE FROM publications WHERE sequence>?1",
-            [position.sequence.to_be_bytes().as_slice()],
-        )
-        .unwrap();
-    drop(journal);
     let guard = source.read_snapshot().unwrap();
+    std::fs::rename(
+        dir.path().join("local/canonical/journal.sqlite"),
+        dir.path().join("local/canonical/lost-journal.sqlite"),
+    )
+    .unwrap();
     let error = ExactSnapshot::build(registry.pin().unwrap(), &guard, DeltaBudget::default())
         .err()
         .unwrap();
@@ -1259,9 +1460,11 @@ fn recovery_registry_rejects_pins_until_valid_shadow_is_committed() {
     let source = store.owned_published_reader();
     let pos = source.read_snapshot().unwrap().position().clone();
     let old = generation(dir.path(), "damaged", "lexical-damaged.sqlite");
-    let db = Connection::open(&old.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_table_page(&old.exact_file, "exact_position");
+    assert_eq!(
+        ExactIndexWriter::open(&old.exact_file).err().unwrap().code,
+        "exact_index_corrupt"
+    );
     let registry = ProjectionGenerations::open_for_recovery(
         "damaged",
         &pos.epoch,
@@ -1378,12 +1581,10 @@ fn sqlite_schema_errors_distinguish_locking_from_corrupt_files() {
 }
 
 #[test]
-fn pin_reports_lexical_metadata_corruption() {
+fn pin_reports_lexical_metadata_page_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let active = generation(dir.path(), "corrupt-pin", "lexical-corrupt-pin.sqlite");
-    let lexical = Connection::open(&active.lexical_file).unwrap();
-    lexical.execute("DELETE FROM metadata", []).unwrap();
-    drop(lexical);
+    corrupt_table_page(&active.lexical_file, "metadata");
     assert_eq!(
         ProjectionGenerations::open(
             &active.id,
@@ -1423,7 +1624,7 @@ fn pin_reports_lexical_sharing_violation_as_unavailable() {
 }
 
 #[test]
-fn lexical_snapshot_reports_missing_schema_as_corrupt() {
+fn lexical_snapshot_reports_corrupt_docs_page() {
     let dir = tempfile::tempdir().unwrap();
     let store =
         agentlaw_storage::Store::open(dir.path().join("source"), dir.path().join("local")).unwrap();
@@ -1436,9 +1637,21 @@ fn lexical_snapshot_reports_missing_schema_as_corrupt() {
         .execute("UPDATE exact_position SET epoch=?1", [&position.epoch])
         .unwrap();
     drop(exact);
-    let lexical = Connection::open(&active.lexical_file).unwrap();
-    lexical.execute_batch("DROP TABLE docs").unwrap();
+    let mut lexical = agentlaw_search::SearchIndex::open(&active.lexical_file).unwrap();
+    lexical
+        .commit(
+            0,
+            &[agentlaw_search::SearchDocument {
+                memory_id: "fixture-memory".into(),
+                change_id: "fixture-change".into(),
+                body: "fixture body".into(),
+                scope: "user".into(),
+            }],
+            &[],
+        )
+        .unwrap();
     drop(lexical);
+    corrupt_table_page(&active.lexical_file, "docs");
     let registry = ProjectionGenerations::from_generation(active).unwrap();
     let guard = source.read_snapshot().unwrap();
     let mut snapshot =

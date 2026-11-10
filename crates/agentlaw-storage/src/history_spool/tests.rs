@@ -56,6 +56,39 @@ fn scratch_fixture(corrupt: bool) -> (tempfile::TempDir, Store) {
     }
     (temp, store)
 }
+
+#[test]
+fn spilling_acquired_history_keeps_prior_component_handles_and_cleans_up() {
+    let (_temp, store) = scratch_fixture(false);
+    let reader = store.owned_published_reader();
+    let mut spool = reader
+        .acquire_history(&AtomicBool::new(false))
+        .unwrap()
+        .into_spool()
+        .unwrap();
+    let mut prior = None;
+    spool
+        .visit_metadata_closure("11111111-1111-4111-8111-111111111111", |change| {
+            prior = Some(change.body);
+            Ok(())
+        })
+        .unwrap();
+    let prior = prior.unwrap();
+    spool.spill_to_file().unwrap();
+    let path = spool.path().to_path_buf();
+    assert!(path.is_file());
+    assert_eq!(prior.read_owned().unwrap(), b"small body");
+    let mut after = None;
+    spool
+        .visit_metadata_closure("11111111-1111-4111-8111-111111111111", |change| {
+            after = Some(change.body);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(after.unwrap().read_owned().unwrap(), b"small body");
+    drop(spool);
+    assert!(!path.exists());
+}
 fn scratch_paths(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
         return vec![];

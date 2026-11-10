@@ -46,6 +46,7 @@ pub struct ViewStamp {
 pub struct SearchIndex {
     connection: Connection,
     path: std::path::PathBuf,
+    temporary: bool,
 }
 pub struct ReadView {
     connection: Connection,
@@ -100,6 +101,65 @@ impl StreamTokenizer {
         counts
     }
 }
+fn validate_existing(connection: &Connection) -> Result<()> {
+    let invalid = || Error::Invalid("lexical projection is incomplete; rebuild required".into());
+    let classify = |error: rusqlite::Error| match &error {
+        rusqlite::Error::SqliteFailure(code, message)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) || message
+                .as_deref()
+                .is_some_and(|s| s.contains("no such table") || s.contains("no such column")) =>
+        {
+            invalid()
+        }
+        rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::InvalidColumnType(..) => invalid(),
+        _ => Error::Sql(error),
+    };
+    for query in [
+        "SELECT singleton,generation,commit_id,ack FROM metadata LIMIT 0",
+        "SELECT id,memory,change_id,scope,len FROM docs LIMIT 0",
+        "SELECT id,digest FROM lexicon LIMIT 0",
+        "SELECT term,doc,tf FROM postings LIMIT 0",
+        "SELECT singleton,version FROM analyzer LIMIT 0",
+        "SELECT filter,n,total_len,heads FROM query_stats LIMIT 0",
+        "SELECT filter,scope FROM query_stat_scopes LIMIT 0",
+    ] {
+        connection.prepare(query).map_err(&classify)?;
+    }
+    for name in ["postings_doc", "docs_scope"] {
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(&classify)?;
+        if count != 1 {
+            return Err(invalid());
+        }
+    }
+    let (singleton, generation, commit, ack): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT singleton,generation,commit_id,ack FROM metadata",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(&classify)?;
+    let analyzer: i64 = connection
+        .query_row(
+            "SELECT version FROM analyzer WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(&classify)?;
+    if singleton != 1 || generation < 0 || commit < 0 || ack < 0 || analyzer != 3 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 impl SearchIndex {
     /// Open an existing lexical projection without creating or repairing schema.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
@@ -117,6 +177,7 @@ impl SearchIndex {
         let index = Self {
             connection,
             path: path.as_ref().to_path_buf(),
+            temporary: false,
         };
         index.validate_existing()?;
         Ok(index)
@@ -124,78 +185,38 @@ impl SearchIndex {
 
     /// Validate an existing projection without creating, repairing, or writing it.
     pub fn validate_existing(&self) -> Result<()> {
-        let connection = &self.connection;
-        let invalid =
-            || Error::Invalid("lexical projection is incomplete; rebuild required".into());
-        let classify = |error: rusqlite::Error| match &error {
-            rusqlite::Error::SqliteFailure(code, message)
-                if matches!(
-                    code.code,
-                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
-                ) || message.as_deref().is_some_and(|s| {
-                    s.contains("no such table") || s.contains("no such column")
-                }) =>
-            {
-                invalid()
-            }
-            rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::InvalidColumnType(..) => {
-                invalid()
-            }
-            _ => Error::Sql(error),
-        };
-        for query in [
-            "SELECT singleton,generation,commit_id,ack FROM metadata LIMIT 0",
-            "SELECT id,memory,change_id,scope,len FROM docs LIMIT 0",
-            "SELECT id,digest FROM lexicon LIMIT 0",
-            "SELECT term,doc,tf FROM postings LIMIT 0",
-            "SELECT singleton,version FROM analyzer LIMIT 0",
-            "SELECT filter,n,total_len,heads FROM query_stats LIMIT 0",
-            "SELECT filter,scope FROM query_stat_scopes LIMIT 0",
-        ] {
-            connection.prepare(query).map_err(&classify)?;
-        }
-        for name in ["postings_doc", "docs_scope"] {
-            let count: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
-                    [name],
-                    |row| row.get(0),
-                )
-                .map_err(&classify)?;
-            if count != 1 {
-                return Err(invalid());
-            }
-        }
-        let (singleton, generation, commit, ack): (i64, i64, i64, i64) = connection
-            .query_row(
-                "SELECT singleton,generation,commit_id,ack FROM metadata",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(&classify)?;
-        let analyzer: i64 = connection
-            .query_row(
-                "SELECT version FROM analyzer WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(&classify)?;
-        if singleton != 1 || generation < 0 || commit < 0 || ack < 0 || analyzer != 3 {
-            return Err(invalid());
-        }
-        Ok(())
+        validate_existing(&self.connection)
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open(path.as_ref())?;
+        Self::open_mode(path.as_ref(), false)
+    }
+    /// Open a private, non-durable lexical index at a named memory URI or file.
+    pub fn open_temporary(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mode(path.as_ref(), true)
+    }
+    fn open_mode(path: &Path, temporary: bool) -> Result<Self> {
+        let connection = Connection::open(path)?;
         configure(&connection)?;
+        if temporary {
+            let store = if path.to_string_lossy().contains("mode=memory") {
+                "MEMORY"
+            } else {
+                "FILE"
+            };
+            connection.execute_batch(&format!(
+                "PRAGMA temp_store={store}; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;"
+            ))?;
+        }
         let old_schema:i64=connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='docs' AND sql LIKE '%memory TEXT UNIQUE%'",[],|r|r.get(0))?;
         if old_schema != 0 {
             return Err(Error::Invalid(
                 "obsolete lexical schema; rebuild derived index".into(),
             ));
         }
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-          CREATE TABLE IF NOT EXISTS metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,commit_id INTEGER NOT NULL,ack INTEGER NOT NULL);
+        if !temporary {
+            connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        }
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,commit_id INTEGER NOT NULL,ack INTEGER NOT NULL);
           INSERT OR IGNORE INTO metadata VALUES(1,1,0,0);
           CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY,memory TEXT NOT NULL,change_id TEXT NOT NULL,scope TEXT NOT NULL,len INTEGER NOT NULL,UNIQUE(memory,change_id));
           CREATE TABLE IF NOT EXISTS lexicon(id INTEGER PRIMARY KEY,digest BLOB NOT NULL UNIQUE CHECK(length(digest)=32));
@@ -212,7 +233,8 @@ impl SearchIndex {
         connection.execute_batch("CREATE INDEX IF NOT EXISTS docs_scope ON docs(scope,memory);CREATE TABLE IF NOT EXISTS query_stats(filter TEXT PRIMARY KEY,n INTEGER NOT NULL,total_len INTEGER NOT NULL,heads INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS query_stat_scopes(filter TEXT NOT NULL,scope TEXT NOT NULL,PRIMARY KEY(filter,scope));")?;
         Ok(Self {
             connection,
-            path: path.as_ref().to_path_buf(),
+            path: path.to_path_buf(),
+            temporary,
         })
     }
     /// Records and acknowledgment are committed in the SAME durable SQLite backend transaction.
@@ -283,6 +305,16 @@ impl SearchIndex {
     pub fn read_view(&self) -> Result<ReadView> {
         let c = Connection::open(&self.path)?;
         configure(&c)?;
+        if self.temporary {
+            let store = if self.path.to_string_lossy().contains("mode=memory") {
+                "MEMORY"
+            } else {
+                "FILE"
+            };
+            c.execute_batch(&format!(
+                "PRAGMA temp_store={store}; PRAGMA synchronous=OFF;"
+            ))?;
+        }
         c.execute_batch("BEGIN DEFERRED;")?;
         let stamp = c.query_row("SELECT generation,commit_id,ack FROM metadata", [], |r| {
             Ok(ViewStamp {
@@ -473,6 +505,7 @@ impl ReadView {
                     ack: r.get(2)?,
                 })
             })?;
+        validate_existing(&connection)?;
         Ok(Self { connection, stamp })
     }
     pub fn effective<'v>(

@@ -2,6 +2,22 @@ use super::*;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+fn full_disk() -> RuntimeError {
+    #[cfg(windows)]
+    let code = 112;
+    #[cfg(not(windows))]
+    let code = 28;
+    RuntimeError::Unavailable(std::io::Error::from_raw_os_error(code).to_string())
+}
+
+fn sharing_violation() -> RuntimeError {
+    #[cfg(windows)]
+    let code = 32;
+    #[cfg(not(windows))]
+    let code = 13;
+    RuntimeError::Unavailable(std::io::Error::from_raw_os_error(code).to_string())
+}
+
 #[derive(Default)]
 struct Sink {
     pointers: Mutex<Vec<ActiveGeneration>>,
@@ -16,7 +32,7 @@ impl ActivePointerSink for Sink {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(RuntimeError::Unavailable("injected pointer error".into()));
+            return Err(full_disk());
         }
         self.pointers.lock().unwrap().push(value.clone());
         Ok(())
@@ -30,9 +46,7 @@ impl RetiredFileSink for Sink {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(RuntimeError::Unavailable(
-                "injected retirement error".into(),
-            ));
+            return Err(sharing_violation());
         }
         Ok(())
     }
@@ -70,6 +84,40 @@ fn fixture() -> (tempfile::TempDir, agentlaw_storage::Store, ActiveGeneration) {
         lexical_file: lexical,
     };
     (dir, store, active)
+}
+fn corrupt_page(path: &Path, table: Option<&str>) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let db = Connection::open(path).unwrap();
+    let page_size: u64 = db
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    let offset = if let Some(table) = table {
+        let root: u64 = db
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (root - 1) * page_size
+    } else {
+        100
+    };
+    let (busy, _, _): (i64, i64, i64) = db
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        busy, 0,
+        "test setup must checkpoint the page before damaging it"
+    );
+    drop(db);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&[0xff]).unwrap();
+    file.sync_all().unwrap();
 }
 fn start(
     store: &agentlaw_storage::Store,
@@ -145,15 +193,17 @@ fn publication_wake_advances_and_cancelled_wait_returns() {
         ExactPreparation::Incomplete { .. }
     ));
     assert!(handle.shutdown(Duration::from_secs(5)));
+    assert_eq!(
+        handle.generations().pin().err().unwrap().code,
+        "exact_not_ready"
+    );
 }
 #[test]
 fn corrupt_start_recovers_retries_pointer_and_restores_saved_pointer() {
     let (_dir, store, active) = fixture();
     let sink = Arc::new(Sink::default());
     sink.fail_pointer.store(1, Ordering::SeqCst);
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&active.lexical_file, Some("metadata"));
     let handle = start(&store, active.clone(), sink.clone());
     await_condition(|| !sink.pointers.lock().unwrap().is_empty());
     await_condition(|| handle.status().state == ProjectionState::Running);
@@ -175,9 +225,7 @@ fn pinned_generation_is_retired_only_after_drop_and_failed_sink_is_retried() {
     let handle = start(&store, active.clone(), sink.clone());
     await_condition(|| handle.status().state == ProjectionState::Running);
     let pin = handle.generations().pin().unwrap();
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&active.lexical_file, Some("metadata"));
     handle.wake();
     await_condition(|| !sink.pointers.lock().unwrap().is_empty());
     await_condition(|| handle.status().state == ProjectionState::Running);
@@ -314,7 +362,7 @@ impl ActivePointerSink for GatePointer {
         if self.release.lock().unwrap().recv().unwrap() {
             Ok(())
         } else {
-            Err(RuntimeError::Unavailable("injected".into()))
+            Err(full_disk())
         }
     }
 }
@@ -343,9 +391,7 @@ fn persistence_precedes_commit_and_failure_keeps_registry_untrusted() {
     )
     .unwrap();
     await_condition(|| handle.status().state == ProjectionState::Running);
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&active.lexical_file, Some("metadata"));
     handle.wake();
     let first = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(handle.generations().pin().is_err());
@@ -359,36 +405,99 @@ fn persistence_precedes_commit_and_failure_keeps_registry_untrusted() {
     assert!(handle.shutdown(Duration::from_secs(5)));
 }
 
-#[derive(Default)]
-struct CrashAfterPersist {
-    saved: Mutex<Option<ActiveGeneration>>,
+struct ExitAfterPersist {
+    path: PathBuf,
+    registry: Mutex<Option<Arc<ProjectionGenerations>>>,
 }
-impl ActivePointerSink for CrashAfterPersist {
+impl ActivePointerSink for ExitAfterPersist {
     fn persist_active(&self, _: &str, active: &ActiveGeneration) -> RuntimeResult<()> {
-        *self.saved.lock().unwrap() = Some(active.clone());
-        panic!("simulated interruption after pointer persistence")
+        use std::io::Write;
+        let mut file = std::fs::File::create(&self.path).unwrap();
+        writeln!(
+            file,
+            "{}\n{}\n{}\n{}",
+            active.id,
+            active.epoch,
+            active.exact_file.display(),
+            active.lexical_file.display()
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        assert!(self
+            .registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pin()
+            .is_err());
+        std::process::exit(75);
     }
 }
 #[test]
 fn restart_uses_pointer_persisted_before_interrupted_commit() {
-    let (_dir, store, active) = fixture();
-    let crash = Arc::new(CrashAfterPersist::default());
-    let sink = Arc::new(Sink::default());
-    let handle = ProjectionHandle::start(
-        "interrupted".into(),
-        store.owned_published_reader(),
-        active.clone(),
-        crash.clone(),
-        sink.clone(),
-        HealthSink::default(),
-        ProjectionConfig::new(),
-    )
-    .unwrap();
-    await_condition(|| handle.status().state == ProjectionState::Running);
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
-    handle.wake();
+    const CHILD_DIR: &str = "AGENTLAW_TEST_POINTER_CHILD_DIR";
+    if let Some(path) = std::env::var_os(CHILD_DIR) {
+        let dir = PathBuf::from(path);
+        let store = agentlaw_storage::Store::open(dir.join("source"), dir.join("local")).unwrap();
+        let pos = store
+            .owned_published_reader()
+            .read_snapshot()
+            .unwrap()
+            .position()
+            .clone();
+        let active = ActiveGeneration {
+            id: "old".into(),
+            epoch: pos.epoch,
+            exact_file: dir.join("exact-old.sqlite"),
+            lexical_file: dir.join("lexical-old.sqlite"),
+        };
+        let pointer = Arc::new(ExitAfterPersist {
+            path: dir.join("saved-pointer"),
+            registry: Mutex::new(None),
+        });
+        let handle = ProjectionHandle::start(
+            "interrupted".into(),
+            store.owned_published_reader(),
+            active.clone(),
+            pointer.clone(),
+            Arc::new(Sink::default()),
+            HealthSink::default(),
+            ProjectionConfig::new(),
+        )
+        .unwrap();
+        await_condition(|| handle.status().state == ProjectionState::Running);
+        *pointer.registry.lock().unwrap() = Some(handle.generations());
+        corrupt_page(&active.lexical_file, Some("metadata"));
+        handle.wake();
+        panic_after_timeout(&handle);
+    }
+    let (dir, store, active) = fixture();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "projection::tests::restart_uses_pointer_persisted_before_interrupted_commit",
+        ])
+        .env(CHILD_DIR, dir.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(75));
+    let persisted = std::fs::read_to_string(dir.path().join("saved-pointer")).unwrap();
+    let mut fields = persisted.lines();
+    let saved = ActiveGeneration {
+        id: fields.next().unwrap().to_owned(),
+        epoch: fields.next().unwrap().to_owned(),
+        exact_file: PathBuf::from(fields.next().unwrap()),
+        lexical_file: PathBuf::from(fields.next().unwrap()),
+    };
+    assert_ne!(saved.id, active.id);
+    let restarted = start(&store, saved, Arc::new(Sink::default()));
+    await_condition(|| restarted.status().state == ProjectionState::Running);
+    assert!(restarted.generations().pin().is_ok());
+    assert!(restarted.shutdown(Duration::from_secs(5)));
+}
+
+fn panic_after_timeout(handle: &ProjectionHandle) -> ! {
     await_condition(|| {
         handle
             .inner
@@ -399,14 +508,7 @@ fn restart_uses_pointer_persisted_before_interrupted_commit() {
             .unwrap()
             .is_finished()
     });
-    let saved = crash.saved.lock().unwrap().clone().unwrap();
-    assert_ne!(saved.id, active.id);
-    assert!(handle.generations().pin().is_err());
-    // The worker has exited before RAM commit; this start consumes the persisted value.
-    let restarted = start(&store, saved, sink);
-    await_condition(|| restarted.status().state == ProjectionState::Running);
-    assert!(restarted.generations().pin().is_ok());
-    assert!(restarted.shutdown(Duration::from_secs(5)));
+    panic!("worker exited without persisting its pointer");
 }
 
 #[test]
@@ -415,17 +517,13 @@ fn restart_does_not_retire_repair_file_still_held_by_old_reader() {
     let first_sink = Arc::new(Sink::default());
     let handle = start(&store, active.clone(), first_sink.clone());
     await_condition(|| handle.status().state == ProjectionState::Running);
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&active.lexical_file, Some("metadata"));
     handle.wake();
     await_condition(|| first_sink.pointers.lock().unwrap().len() == 1);
     await_condition(|| handle.status().state == ProjectionState::Running);
     let previous = first_sink.pointers.lock().unwrap()[0].clone();
     let pin = handle.generations().pin().unwrap();
-    let db = Connection::open(&previous.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&previous.lexical_file, Some("metadata"));
     handle.wake();
     await_condition(|| first_sink.pointers.lock().unwrap().len() == 2);
     await_condition(|| handle.status().state == ProjectionState::Running);
@@ -491,7 +589,7 @@ fn restart_does_not_retire_repair_file_still_held_by_old_reader() {
 
 #[test]
 fn running_lexical_corruption_blocks_pins_and_rebuilds() {
-    for statement in ["DROP TABLE docs", "DELETE FROM metadata"] {
+    for table in [None, Some("metadata")] {
         let (_dir, store, active) = fixture();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -542,9 +640,7 @@ fn running_lexical_corruption_blocks_pins_and_rebuilds() {
             handle.wait_exact(&target, &RequestControl::default()),
             ExactPreparation::Complete { .. }
         ));
-        let db = Connection::open(&active.lexical_file).unwrap();
-        db.execute_batch(statement).unwrap();
-        drop(db);
+        corrupt_page(&active.lexical_file, table);
         handle.wake();
         let next = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_ne!(next.id, active.id);
@@ -598,7 +694,7 @@ impl ActivePointerSink for TimedPointer {
         let mut attempts = self.attempts.lock().unwrap();
         attempts.push(self.clock.millis.load(Ordering::SeqCst));
         if attempts.len() <= 7 {
-            Err(RuntimeError::Unavailable("injected".into()))
+            Err(full_disk())
         } else {
             Ok(())
         }
@@ -607,9 +703,7 @@ impl ActivePointerSink for TimedPointer {
 #[test]
 fn wake_does_not_bypass_exponential_retry_deadlines() {
     let (_dir, store, active) = fixture();
-    let db = Connection::open(&active.exact_file).unwrap();
-    db.execute_batch("DROP TABLE exact_heads").unwrap();
-    drop(db);
+    corrupt_page(&active.lexical_file, Some("metadata"));
     let clock = Arc::new(FakeClock {
         base: Instant::now(),
         millis: std::sync::atomic::AtomicU64::new(0),
@@ -717,12 +811,25 @@ fn windows_sharing_violations_retry_without_rebuild() {
         )
         .unwrap();
         assert_eq!(handle.status().state, ProjectionState::Blocked);
+        assert_eq!(
+            handle.generations().pin().err().unwrap().code,
+            "exact_not_ready"
+        );
         assert!(sink.pointers.lock().unwrap().is_empty());
         thread::sleep(Duration::from_millis(100));
         drop(guard);
-        clock.millis.store(1100, Ordering::SeqCst);
-        handle.inner.changed.notify_all();
-        await_condition(|| handle.status().state == ProjectionState::Running);
+        // The files are accessible again, but no writer has been reopened yet.
+        assert_eq!(
+            handle.generations().pin().err().unwrap().code,
+            "exact_not_ready"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while handle.status().state != ProjectionState::Running {
+            assert!(Instant::now() < deadline, "reopening the writer timed out");
+            clock.millis.fetch_add(1000, Ordering::SeqCst);
+            handle.inner.changed.notify_all();
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(handle.generations().pin().is_ok());
         assert!(sink.pointers.lock().unwrap().is_empty());
         assert!(handle.shutdown(Duration::from_secs(5)));
@@ -806,6 +913,66 @@ fn expect_repair_reason(
     assert_eq!(status.1.state, ComponentState::Recovering);
     assert!(status.1.reason.as_deref().unwrap().contains(reason));
     next
+}
+
+#[cfg(windows)]
+#[test]
+fn concurrent_pin_observes_generation_only_after_writer_is_open() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_dir, store, active) = fixture();
+    let (handle, ready, release, _) = gated_repair(&store, active.clone());
+    await_condition(|| handle.status().state == ProjectionState::Running);
+    corrupt_page(&active.lexical_file, Some("metadata"));
+    handle.wake();
+    let next = ready.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert_ne!(next.id, active.id);
+
+    let mut sidecars = Vec::new();
+    for path in [&next.exact_file, &next.lexical_file] {
+        // No reader has pinned this generation yet: this handle is the writer.
+        assert!(std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .is_err());
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            let sidecar = PathBuf::from(name);
+            assert!(sidecar.is_file());
+            sidecars.push(sidecar);
+        }
+    }
+    let registry = handle.generations();
+    let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        assert_eq!(registry.pin().err().unwrap().code, "exact_not_ready");
+        attempted_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let pin = loop {
+            match registry.pin() {
+                Ok(pin) => break pin,
+                Err(error) if error.code == "exact_not_ready" => {}
+                Err(error) => panic!("unexpected pin error: {error}"),
+            }
+            assert!(Instant::now() < deadline, "generation was not published");
+            thread::yield_now();
+        };
+        pinned_tx.send(()).unwrap();
+        drop_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        drop(pin);
+    });
+    attempted_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    release.send(true).unwrap();
+    pinned_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert!(sidecars.iter().all(|path| path.is_file()));
+    drop_tx.send(()).unwrap();
+    reader.join().unwrap();
+    await_condition(|| handle.status().state == ProjectionState::Running);
+    assert!(handle.shutdown(Duration::from_secs(5)));
 }
 
 #[test]
@@ -909,9 +1076,27 @@ fn lost_unapplied_publication_ledger_rebuilds_generation() {
     let (handle, ready, release, health) = gated_repair(&store, active.clone());
     await_condition(|| handle.status().state == ProjectionState::Running);
     let target = publish_repair_fixture(&store);
-    let journal = Connection::open(dir.path().join("local/journal.sqlite")).unwrap();
-    assert_eq!(journal.execute("DELETE FROM publications", []).unwrap(), 1);
-    drop(journal);
+    let lost = dir.path().join("lost-ledger");
+    std::fs::create_dir(&lost).unwrap();
+    for name in ["journal.sqlite-wal", "journal.sqlite-shm", "journal.sqlite"] {
+        let path = dir.path().join("local").join(name);
+        if path.exists() {
+            std::fs::rename(&path, lost.join(name)).unwrap();
+        }
+    }
+    assert!(lost.join("journal.sqlite").is_file());
+    let source = store.owned_published_reader();
+    let guard = source.read_snapshot().unwrap();
+    assert_eq!(guard.position(), &target);
+    let before = SourcePosition {
+        epoch: target.epoch.clone(),
+        sequence: target.sequence - 1,
+    };
+    assert!(matches!(
+        guard.read_published_paths(&before, 1),
+        Err(agentlaw_storage::Error::CoverageLost)
+    ));
+    drop(guard);
     handle.wake();
     let next = expect_repair_reason(&handle, &ready, &health, &active, "source_coverage_lost");
     assert_eq!(next.epoch, target.epoch);
@@ -927,6 +1112,12 @@ fn lost_unapplied_publication_ledger_rebuilds_generation() {
 
 #[test]
 fn restart_recovers_ordinary_generations_and_sidecars_after_interruption() {
+    const CHILD_FILE: &str = "AGENTLAW_TEST_INTERRUPTED_SIDECAR_FILE";
+    if let Some(path) = std::env::var_os(CHILD_FILE) {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; BEGIN IMMEDIATE; UPDATE exact_position SET sequence=sequence; COMMIT;").unwrap();
+        std::process::exit(74);
+    }
     for hold_reader in [true, false] {
         let (_dir, store, active) = fixture();
         let first_sink = Arc::new(Sink::default());
@@ -938,9 +1129,7 @@ fn restart_recovers_ordinary_generations_and_sidecars_after_interruption() {
         } else {
             None
         };
-        let db = Connection::open(&active.exact_file).unwrap();
-        db.execute_batch("DROP TABLE exact_heads").unwrap();
-        drop(db);
+        corrupt_page(&active.lexical_file, Some("metadata"));
         first.wake();
         await_condition(|| first_sink.pointers.lock().unwrap().len() == 1);
         await_condition(|| first.status().state == ProjectionState::Running);
@@ -955,17 +1144,18 @@ fn restart_recovers_ordinary_generations_and_sidecars_after_interruption() {
 
         let mut expected = vec![active.exact_file.clone(), active.lexical_file.clone()];
         if !hold_reader {
-            // Simulate sidecars left by an interrupted process after the databases close.
-            for base in [&active.exact_file, &active.lexical_file] {
-                for suffix in ["-wal", "-shm"] {
-                    let mut name = base.as_os_str().to_os_string();
-                    name.push(suffix);
-                    let sidecar = PathBuf::from(name);
-                    if !sidecar.exists() {
-                        std::fs::write(&sidecar, b"interrupted sidecar").unwrap();
-                    }
-                    expected.push(sidecar);
-                }
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "projection::tests::restart_recovers_ordinary_generations_and_sidecars_after_interruption"])
+                .env(CHILD_FILE, &active.exact_file)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(74));
+            for suffix in ["-wal", "-shm"] {
+                let mut name = active.exact_file.as_os_str().to_os_string();
+                name.push(suffix);
+                let sidecar = PathBuf::from(name);
+                assert!(sidecar.is_file());
+                expected.push(sidecar);
             }
         }
         let second_sink = Arc::new(Sink::default());

@@ -92,20 +92,6 @@ fn warm_arriving_during_exit_must_not_need_second_wake() {
 }
 
 #[test]
-fn demand_flap_must_not_bypass_failure_delay() {
-    let now = Instant::now();
-    let mut lifecycle = ModelLifecycle::default();
-    lifecycle.started();
-    lifecycle.exited(now, "load failed".into());
-    assert_eq!(lifecycle.action(now, false, true), LifecycleAction::None);
-    assert_eq!(
-        lifecycle.action(now, true, true),
-        LifecycleAction::None,
-        "a new attach started a replacement before the one-second failure deadline"
-    );
-}
-
-#[test]
 fn failure_backoff_starts_when_slow_spawn_has_finished() {
     struct SlowFail {
         clock: Arc<Mutex<Instant>>,

@@ -214,37 +214,7 @@ pub fn coordination_root(state: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod layout_tests {
-    use super::*;
-
-    #[test]
-    fn managed_layout_requires_its_exact_marker_and_state_child() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let state = root.join("state");
-        assert_eq!(managed_install_root(&state).unwrap(), None);
-        assert_eq!(
-            model_artifact_root(&state).unwrap(),
-            state.join("artifacts")
-        );
-        fs::write(root.join(MANAGED_LAYOUT_MARKER), "unknown-layout\n").unwrap();
-        assert!(managed_install_root(&state).is_err());
-        fs::write(
-            root.join(MANAGED_LAYOUT_MARKER),
-            format!("{MANAGED_LAYOUT_VERSION}\n"),
-        )
-        .unwrap();
-        assert_eq!(
-            managed_install_root(&state).unwrap(),
-            Some(root.to_path_buf())
-        );
-        fs::write(&state, "not a directory").unwrap();
-        assert!(managed_install_root(&state).is_err());
-        fs::remove_file(&state).unwrap();
-        assert_eq!(model_artifact_root(&state).unwrap(), root.join("models"));
-        assert_eq!(managed_install_root(&root.join("other")).unwrap(), None);
-    }
-}
+mod tests;
 
 pub fn load(root: &Path) -> Result<Option<Config>> {
     match fs::read(root.join("config.json")) {
@@ -304,13 +274,69 @@ pub fn replace_selection(root: &Path, expected: &Config, next: &Config) -> Resul
     temp.flush()
         .and_then(|_| temp.as_file().sync_all())
         .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
-    temp.persist(root.join("config.json")).map_err(|_| {
-        DomainError::new(
-            "configuration_io",
-            "Cannot install the next selection. The previous configuration remains selected.",
-        )
-    })?;
-    Ok(())
+    let destination = root.join("config.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    // Keep the same complete, synced temporary file across transient failures.
+    for attempt in 0..5 {
+        match temp.persist(&destination) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let transient = retryable_selection_replace(&error.error);
+                if transient && attempt < 4 && std::time::Instant::now() < deadline {
+                    #[cfg(test)]
+                    observe_selection_retry(&destination);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+                    }
+                    if std::time::Instant::now() < deadline {
+                        temp = error.file;
+                        continue;
+                    }
+                }
+                let kind = format!("{:?}", error.error.kind());
+                let raw = error.error.raw_os_error();
+                let mut result = DomainError::new(
+                    "configuration_io",
+                    format!("Cannot install the next selection. The previous configuration remains selected. OS error: {} (kind: {kind}, raw code: {raw:?}).", error.error),
+                ).with_details(serde_json::json!({"os_error_kind":kind,"raw_os_error":raw,"os_error":error.error.to_string()}));
+                result.retryable = transient;
+                return Err(result);
+            }
+        }
+    }
+    unreachable!("selection replacement attempts always return")
+}
+
+#[cfg(test)]
+type SelectionRetryHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+static SELECTION_RETRY_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SelectionRetryHook>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+fn selection_retry_hook(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, SelectionRetryHook>> {
+    SELECTION_RETRY_HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+#[cfg(test)]
+fn observe_selection_retry(path: &Path) {
+    let hook = selection_retry_hook().lock().unwrap().get(path).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn retryable_selection_replace(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 pub fn binding_root(root: &Path, source: &Path) -> Result<PathBuf> {
@@ -450,36 +476,4 @@ pub fn set_limit(root: &Path, key: &str, value: &str) -> Result<serde_json::Valu
     Ok(
         serde_json::json!({"key":key,"value":number,"applies":"next_request","config_path":root.join("config.json")}),
     )
-}
-
-#[cfg(test)]
-mod limit_validation_tests {
-    use super::*;
-
-    #[test]
-    fn delivery_ranges_are_checked_before_opening_setup_coordination() {
-        assert_eq!(
-            validate_limit("history.response_limit_bytes", "1").unwrap(),
-            1
-        );
-        assert_eq!(
-            validate_limit("response_limit_bytes", "4096").unwrap(),
-            4096
-        );
-        let directory = tempfile::tempdir().unwrap();
-        let absent_state = directory.path().join("absent-state");
-        for (key, value) in [
-            ("history.response_limit_bytes", "0"),
-            ("response_limit_bytes", "4095"),
-            ("response_limit_bytes", "not-a-number"),
-            ("unknown", "8192"),
-        ] {
-            assert_eq!(
-                set_limit(&absent_state, key, value).unwrap_err().code,
-                "invalid_configuration"
-            );
-        }
-        assert!(!absent_state.exists());
-        assert!(!directory.path().join("setup.lock").exists());
-    }
 }

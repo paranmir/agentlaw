@@ -9,6 +9,41 @@ fn doc(id: &str, body: &str, scope: &str) -> SearchDocument {
         scope: scope.into(),
     }
 }
+
+#[test]
+fn temporary_memory_index_supports_search_through_a_separate_view() {
+    let uri = format!(
+        "file:search-test-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let mut index = SearchIndex::open_temporary(uri).unwrap();
+    assert_eq!(
+        index
+            .connection
+            .query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    index
+        .commit(1, &[doc("one", "cancellation exception", "history")], &[])
+        .unwrap();
+    let hits = index
+        .read_view()
+        .unwrap()
+        .search(
+            "cancellation",
+            &ScopeFilter {
+                allowed_scopes: vec!["history".into()],
+            },
+            5,
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].memory_id, "one");
+}
 #[test]
 fn rrf_dedups_sections_and_ties() {
     let h = |id: &str, score| Hit {

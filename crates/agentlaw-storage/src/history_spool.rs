@@ -355,6 +355,44 @@ impl HistorySpool {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    /// Size of the acquired SQLite database, regardless of its backing store.
+    pub fn size_bytes(&self) -> Result<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        pages.checked_mul(page_size).ok_or(Error::Capacity)
+    }
+    /// Move an acquired in-memory spool into its private unsynchronized file.
+    /// Existing component handles keep their previous backing alive until dropped.
+    pub fn spill_to_file(&mut self) -> Result<()> {
+        if !self.path.to_string_lossy().starts_with("file:") {
+            return Ok(());
+        }
+        let directory = match &self.scratch_policy {
+            delta_stream::ScratchPolicy::Bounded { directory, .. } => directory.clone(),
+            delta_stream::ScratchPolicy::Legacy(directory) => directory.clone(),
+        };
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+        let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
+        self.conn
+            .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE;",
+        )?;
+        self.conn = connection;
+        self.path = path;
+        self.lease = lease;
+        self.scratch_policy = delta_stream::ScratchPolicy::Bounded {
+            memory: 0,
+            directory,
+        };
+        Ok(())
+    }
     /// An exact retained historical input for the import-only resolution writer.
     pub fn exact_change(&self, change_id: &str) -> Result<SpoolChange> {
         validate_id(change_id)?;

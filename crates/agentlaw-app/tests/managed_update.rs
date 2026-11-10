@@ -234,7 +234,7 @@ impl Drop for McpClient {
 // The broker outlives its clients by design. Own every process launched from
 // this fixture's private installation, even if fixture setup or a test panics.
 struct ManagedTemp {
-    _temp: tempfile::TempDir,
+    _temp: Option<tempfile::TempDir>,
     root: PathBuf,
 }
 
@@ -261,7 +261,7 @@ impl Drop for ManagedTemp {
                 })
                 .collect();
             if owned.is_empty() {
-                return;
+                break;
             }
             if Instant::now() >= deadline {
                 let pids: Vec<_> = owned.iter().map(|process| process.pid()).collect();
@@ -276,8 +276,22 @@ impl Drop for ManagedTemp {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        if let Some(temp) = self._temp.take() {
+            let path = temp.path().to_path_buf();
+            let result = temp.close();
+            if !std::thread::panicking() {
+                result.expect("fixture temporary installation was not removed");
+                assert!(
+                    !path.exists(),
+                    "fixture temporary installation remains: {}",
+                    path.display()
+                );
+            }
+        }
     }
 }
+
+static FIXTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
     _temp: ManagedTemp,
@@ -286,6 +300,7 @@ struct Fixture {
     host: PathBuf,
     helper: PathBuf,
     id: String,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -293,6 +308,9 @@ impl Fixture {
     }
 
     fn with_old_binary(old_binary: Option<&Path>) -> Self {
+        let serial = FIXTURE_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("managed");
         let state = root.join("state");
@@ -308,7 +326,7 @@ impl Fixture {
         .unwrap();
         let root = fs::canonicalize(root).unwrap();
         let temp = ManagedTemp {
-            _temp: temp,
+            _temp: Some(temp),
             root: root.clone(),
         };
         let state = root.join("state");
@@ -358,7 +376,7 @@ impl Fixture {
         fs::write(unpacked.join("LICENSE.agentlaw"), b"new-license").unwrap();
         let receipt_value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         let helper = PathBuf::from(receipt_value["executable"].as_str().unwrap());
-        let memory = temp._temp.path().join("memory");
+        let memory = temp._temp.as_ref().unwrap().path().join("memory");
         assert_eq!(
             run(
                 &old,
@@ -424,6 +442,7 @@ impl Fixture {
             host,
             helper,
             id,
+            _serial: serial,
         }
     }
     fn apply(&self) -> Value {
@@ -444,6 +463,20 @@ impl Fixture {
 #[test]
 fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
     let fixture = Fixture::new();
+    let old_install = fixture
+        .state
+        .join(format!("install-completed-{}.json", uuid::Uuid::new_v4()));
+    fs::write(&old_install, br#"{"targets":[]}"#).unwrap();
+    let current_install = fixture
+        .state
+        .join(format!("install-completed-{}.json", uuid::Uuid::new_v4()));
+    fs::write(
+        &current_install,
+        serde_json::to_vec(&json!({"targets":[],"update_plan_id":fixture.id})).unwrap(),
+    )
+    .unwrap();
+    let legacy = fixture.state.join("update-check.json");
+    fs::write(&legacy, b"legacy fixture").unwrap();
     let memory_format = fixture.root.parent().unwrap().join("memory/format.md");
     let original_memory = fs::read(&memory_format).unwrap();
     let previous = fixture.root.join(format!(".bin-previous-{}", fixture.id));
@@ -456,6 +489,23 @@ fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
     assert_eq!(complete["recovery_obligations_closed"], true);
     assert!(!previous.exists());
     assert!(!stage.exists());
+    assert!(!old_install.exists());
+    assert!(current_install.exists());
+    assert!(
+        fs::read_dir(&fixture.state)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("install-completed-")
+                    && fs::read(entry.path())
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|value| value["update_plan_id"] == fixture.id)
+            }),
+        "the current update's installation record was not retained"
+    );
+    assert_eq!(fs::read(legacy).unwrap(), b"legacy fixture");
     assert!(!fixture.state.join("update-maintenance.json").exists());
     assert_eq!(fs::read(memory_format).unwrap(), original_memory);
     assert!(complete["activation"] == "verified");

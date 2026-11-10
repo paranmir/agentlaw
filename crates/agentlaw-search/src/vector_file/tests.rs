@@ -544,10 +544,20 @@ fn busy_checkpoint_preserves_wal_without_error() {
 
 #[test]
 fn query_errors_and_corrupt_stored_vectors_are_distinct() {
-    let busy =
-        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None);
-    assert!(matches!(stored_value_error(busy), VectorFileError::Sql(_)));
     let d = tempdir().unwrap();
+    let locked = d.path().join("locked.sqlite");
+    let owner = Connection::open(&locked).unwrap();
+    owner
+        .execute_batch("CREATE TABLE example(x); BEGIN EXCLUSIVE;")
+        .unwrap();
+    let competitor = Connection::open(&locked).unwrap();
+    competitor.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let busy = competitor
+        .execute("INSERT INTO example VALUES(1)", [])
+        .unwrap_err();
+    assert!(matches!(stored_value_error(busy), VectorFileError::Sql(_)));
+    drop(competitor);
+    owner.execute_batch("ROLLBACK").unwrap();
     let path = d.path().join("vector.sqlite");
     let id = identity(VectorFileKind::Current);
     let mut writer = VectorFileWriter::open(&path, &id).unwrap();
@@ -571,13 +581,50 @@ fn query_errors_and_corrupt_stored_vectors_are_distinct() {
             Err(VectorFileError::Invalid(_))
         ));
     }
-    for vector in [vec![0., 0.], vec![f32::NAN, 0.]] {
-        let bytes: Vec<u8> = vector.into_iter().flat_map(f32::to_le_bytes).collect();
+    for (i, vector) in [[0., 0.], [f32::NAN, 0.]].into_iter().enumerate() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let copy = d.path().join(format!("damaged-{i}.sqlite"));
         writer
             .connection
-            .execute("UPDATE vectors SET vector=?1", [&bytes])
+            .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
             .unwrap();
-        let view = VectorFileReadView::open(&path, &id).unwrap();
+        let db = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let page: u64 = db
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name='vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let size: usize = db.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        drop(db);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&copy)
+            .unwrap();
+        let offset = (page - 1) * size as u64;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut bytes = vec![0; size];
+        file.read_exact(&mut bytes).unwrap();
+        let original: Vec<u8> = [1.0_f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let positions: Vec<_> = bytes
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(i, b)| (b == original).then_some(i))
+            .collect();
+        assert_eq!(positions.len(), 1);
+        file.seek(SeekFrom::Start(offset + positions[0] as u64))
+            .unwrap();
+        for value in vector {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let view = VectorFileReadView::open(&copy, &id).unwrap();
         assert!(matches!(
             view.search_ann(&[1., 0.], &scope, 10),
             Err(VectorFileError::Corrupt(_))
@@ -587,25 +634,21 @@ fn query_errors_and_corrupt_stored_vectors_are_distinct() {
             Err(VectorFileError::Corrupt(_))
         ));
     }
-    writer
-        .connection
-        .execute("UPDATE vectors SET vector='not a blob'", [])
+    let other = d.path().join("other-format.sqlite");
+    let db = Connection::open(&other).unwrap();
+    db.execute("ATTACH DATABASE ?1 AS original", [path.to_str().unwrap()])
         .unwrap();
-    let view = VectorFileReadView::open(&path, &id).unwrap();
-    assert!(matches!(
-        view.search_ann(&[1., 0.], &scope, 10),
-        Err(VectorFileError::Corrupt(_))
-    ));
-    assert!(matches!(
-        view.search(&[1., 0.], &scope, 10),
-        Err(VectorFileError::Corrupt(_))
-    ));
-    drop(view);
-    writer
-        .connection
-        .execute("UPDATE ann_profile SET version=999", [])
-        .unwrap();
-    let view = VectorFileReadView::open(&path, &id).unwrap();
+    db.execute_batch(
+        "CREATE TABLE binding_vector_meta AS SELECT * FROM original.binding_vector_meta;
+        CREATE TABLE vectors AS SELECT * FROM original.vectors;
+        CREATE TABLE vector_buckets AS SELECT * FROM original.vector_buckets;
+        CREATE TABLE completed_changes AS SELECT * FROM original.completed_changes;
+        CREATE TABLE ann_profile(singleton INTEGER PRIMARY KEY, version INTEGER);
+        INSERT INTO ann_profile VALUES(1,999);",
+    )
+    .unwrap();
+    drop(db);
+    let view = VectorFileReadView::open(&other, &id).unwrap();
     assert!(matches!(
         view.search_ann(&[1., 0.], &scope, 10),
         Err(VectorFileError::Corrupt(_))
