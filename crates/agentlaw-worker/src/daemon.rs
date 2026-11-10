@@ -971,10 +971,13 @@ fn handle_request(
             page_number,
             final_page,
             page,
-        ),
-        Operation::RepairIndex { context } => handle_repair_index(broker, signal, state, context),
+        )
+        .map(Response::Position),
+        Operation::RepairIndex { context } => {
+            handle_repair_index(broker, signal, state, context).map(Response::RepairIndex)
+        }
         Operation::DerivedSpool { context, page } => {
-            handle_derived_spool(broker, signal, state, context, page)
+            handle_derived_spool(broker, signal, state, context, page).map(Response::Position)
         }
         Operation::ExecutionDiagnostics => {
             let json = broker
@@ -1031,7 +1034,7 @@ fn handle_request(
             Ok(Response::Position(coordinator.position(&context)?))
         }
         Operation::DerivedSubmit { context, page } => {
-            handle_derived_submit(broker, signal, state, context, page)
+            handle_derived_submit(broker, signal, state, context, page).map(Response::Position)
         }
         Operation::IndexBatch {
             context,
@@ -1055,7 +1058,12 @@ fn handle_request(
             required,
         } => handle_search(
             broker, state, signal, context, query, scopes, limit, vector, required,
-        ),
+        )
+        .map(|outcome| match outcome {
+            crate::semantic_store::SearchOutcome::Found(packet) => Response::Search(packet),
+            crate::semantic_store::SearchOutcome::Pending => Response::Pending,
+            crate::semantic_store::SearchOutcome::Unavailable(error) => Response::Error(error),
+        }),
         Operation::Attach | Operation::Heartbeat => {
             broker.renew_lease(&req.lease, false, now(), 60000)?;
             signal.notify();

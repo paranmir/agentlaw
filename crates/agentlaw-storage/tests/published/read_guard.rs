@@ -2,7 +2,7 @@ use agentlaw_storage::{CurrentUnit, Error, FaultPoint, Head, Mutation, Store, Un
 use serde_json::json;
 use std::{sync::mpsc, time::Duration};
 
-const ID: &str = "11111111-1111-4111-8111-111111111111";
+use super::ID;
 
 fn mutation(body: &str, versions: Vec<String>) -> Mutation {
     Mutation {

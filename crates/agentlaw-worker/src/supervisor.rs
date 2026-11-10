@@ -365,10 +365,19 @@ struct SupervisorState {
 }
 struct SupervisorShared {
     state: std::sync::Mutex<SupervisorState>,
-    signal: Arc<Signal>,
+    signal: Arc<RamSignal>,
     changed: std::sync::Condvar,
     events: mpsc::Sender<Event>,
     wake_pending: AtomicBool,
+}
+// Wakeups are sent through the RAM supervisor's event channel.
+struct RamSignal {
+    events: mpsc::Sender<Event>,
+}
+impl RamSignal {
+    fn notify(&self) {
+        let _ = self.events.send(Event::Wake);
+    }
 }
 
 /// Owns one model-child process. The host supplies the shared request ID source.
@@ -399,7 +408,9 @@ impl ModelSupervisor {
                 queries: QueryQueue::default(),
                 terminated: None,
             }),
-            signal: Arc::new(Signal::default()),
+            signal: Arc::new(RamSignal {
+                events: events.clone(),
+            }),
             changed: std::sync::Condvar::new(),
             events,
             wake_pending: AtomicBool::new(false),
@@ -487,13 +498,41 @@ impl ModelSupervisor {
             .warm = warm;
         self.wake();
     }
+    /// Test-only observation of the currently applied host lease demand.
+    #[doc(hidden)]
+    pub fn is_warm(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .warm
+    }
+    /// Returns query loading demand retained by this supervisor.
+    pub fn has_query_demand(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .loading_demand
+    }
+    /// Retains query demand when the caller could not submit to a supervisor.
+    pub fn request_load(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.snapshot.state == WorkerState::Ready {
+            return;
+        }
+        state.loading_demand = true;
+        drop(state);
+        self.wake();
+    }
     pub fn wake(&self) {
         self.shared.signal.notify();
         if !self.shared.wake_pending.swap(true, Ordering::AcqRel) {
-            let _ = self
-                .shared
-                .events
-                .send(Event::ControlLost(String::new(), String::new()));
+            let _ = self.shared.events.send(Event::Wake);
         }
     }
     /// Waits for the supervisor thread to stop, returning its reason when it has terminated.
@@ -510,16 +549,20 @@ impl ModelSupervisor {
             .unwrap_or_else(|poison| poison.into_inner());
         state.terminated.clone()
     }
-    pub fn stop(&mut self) -> std::result::Result<(), String> {
-        if let Some(result) = &self.stop_result {
-            return result.clone();
-        }
+    /// Signals shutdown without waiting for the supervisor thread.
+    pub fn request_stop(&self) {
         self.shared
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .stop = true;
         self.wake();
+    }
+    pub fn stop(&mut self) -> std::result::Result<(), String> {
+        if let Some(result) = &self.stop_result {
+            return result.clone();
+        }
+        self.request_stop();
         let result = match self.thread.take() {
             Some(thread) => thread
                 .join()
@@ -582,21 +625,53 @@ fn start_ram_child(
     port: &impl WorkerProcessPort,
     config: &RuntimeConfig,
     events: &mpsc::Sender<Event>,
-    signal: &Arc<Signal>,
+    signal: &Arc<RamSignal>,
     now: Instant,
     cached: Option<(String, crate::execution::Selection)>,
 ) -> std::result::Result<RamChild, RamStartError> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.state_dir.join("model.lock"))
+        .map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?;
+    lock.try_lock_exclusive().map_err(|error| RamStartError {
+        cause: if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            "previous model child still running".into()
+        } else {
+            error.to_string()
+        },
+        owned: None,
+    })?;
+    FileExt::unlock(&lock).map_err(|error| RamStartError {
+        cause: error.to_string(),
+        owned: None,
+    })?;
     let incarnation = uuid::Uuid::new_v4().to_string();
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let mut child = OwnedChild(port.spawn(config).map_err(|error| RamStartError {
-        cause: error.to_string(),
-        owned: None,
-    })?);
-    if let Err(error) = port.observe(&child, incarnation.clone(), events.clone(), signal.clone()) {
+    let mut child = OwnedChild(
+        port.spawn(config).map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?,
+        None,
+    );
+    #[cfg(windows)]
+    {
+        child.1 = Some(kill_on_close_job(&child).map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?);
+    }
+    if let Err(error) = port.observe(&child, incarnation.clone(), events.clone(), Arc::new(|| {})) {
         return Err(failed_ram_start(
             port,
             child,
@@ -628,6 +703,7 @@ fn start_ram_child(
     };
     let launch = Launch {
         incarnation: incarnation.clone(),
+        parent_pid: std::process::id(),
         secret: secret.clone(),
         state: config.state_dir.clone(),
         assets: config.model.clone(),
@@ -763,12 +839,9 @@ fn return_stale_held(
     index: &dyn IndexWorkPort,
     owned: &std::sync::Mutex<std::collections::HashSet<ModelRequestId>>,
 ) {
-    let stale = held.as_ref().is_some_and(|held| {
-        child.is_none_or(|child| {
-            child.incarnation != held.origin.incarnation
-                || child.model_digest.as_deref() != Some(held.origin.model_digest.as_str())
-        })
-    });
+    let stale = held
+        .as_ref()
+        .is_some_and(|held| child.is_none_or(|child| child.incarnation != held.origin.incarnation));
     if stale {
         let held = held.take().unwrap();
         finish_owned_index(
@@ -798,6 +871,8 @@ fn model_supervision_run(
     let mut cleanup_at: Option<Instant> = None;
     let mut cache: Option<SelectionCache> = None;
     let mut pending_event = None;
+    // Only the most recently retired incarnation can still refine its failure.
+    let mut retired_incarnation: Option<String> = None;
     loop {
         let stopping = {
             let state = shared
@@ -851,11 +926,23 @@ fn model_supervision_run(
             return Ok(());
         }
         while let Some(event) = pending_event.take().or_else(|| incoming.try_recv().ok()) {
-            if matches!(&event, Event::ControlLost(inc, _) if inc.is_empty()) {
+            if matches!(&event, Event::Wake) {
                 shared.wake_pending.store(false, Ordering::Release);
                 continue;
             }
             let Some(active) = child.as_mut() else {
+                if let Event::Output(incarnation, Output::Unavailable { cause }) = event {
+                    if retired_incarnation.as_deref() == Some(incarnation.as_str()) {
+                        lifecycle.cause = Some(cause.clone());
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.snapshot.cause = Some(cause);
+                        shared.changed.notify_all();
+                        retired_incarnation = None;
+                    }
+                }
                 continue;
             };
             let event_inc = match &event {
@@ -863,11 +950,13 @@ fn model_supervision_run(
                 | Event::Exit(i)
                 | Event::Pipe(i, _)
                 | Event::ControlLost(i, _) => i,
+                Event::Wake => unreachable!(),
             };
             if event_inc != &active.incarnation {
                 continue;
             }
             match event {
+                Event::Wake => unreachable!(),
                 Event::Output(
                     _,
                     Output::Hello {
@@ -917,9 +1006,7 @@ fn model_supervision_run(
                     let digest = state.snapshot.model_digest.clone().unwrap_or_default();
                     if let RamWork::Index { origin, .. } = work {
                         drop(state);
-                        let result = if origin.incarnation != active.incarnation
-                            || active.model_digest.as_deref() != Some(origin.model_digest.as_str())
-                        {
+                        let result = if origin.incarnation != active.incarnation {
                             Err(EmbeddingError::Unavailable(
                                 "index work model changed before completion".into(),
                             ))
@@ -964,6 +1051,7 @@ fn model_supervision_run(
                     let stopped = port.stop(&mut old.child).is_ok();
                     let stop_finished_at = clock();
                     if stopped {
+                        retired_incarnation = Some(old.incarnation.clone());
                         cleanup_at = None;
                         if let Some(RamWork::Index { id, .. }) = old.running.take() {
                             finish_owned_index(
@@ -1011,6 +1099,7 @@ fn model_supervision_run(
                     let observed_at = clock();
                     let exited = old.child.wait().is_ok();
                     if exited {
+                        retired_incarnation = Some(old.incarnation.clone());
                         cleanup_at = None;
                         let cause = "model child exited".to_string();
                         if let Some(RamWork::Index { id, .. }) = old.running.take() {
@@ -1116,6 +1205,7 @@ fn model_supervision_run(
                 });
                 match start_ram_child(&port, &config, &events, &shared.signal, now, cache.get()) {
                     Ok(mut active) => {
+                        retired_incarnation = None;
                         active.last_control = clock();
                         lifecycle.started();
                         let mut state = shared
@@ -1142,7 +1232,6 @@ fn model_supervision_run(
                             .unwrap_or_else(|poison| poison.into_inner());
                         state.snapshot.state = WorkerState::Failed;
                         state.snapshot.cause = Some(cause);
-                        state.loading_demand = false;
                     }
                 }
             }
@@ -1253,6 +1342,7 @@ fn model_supervision_run(
     }
 }
 enum Event {
+    Wake,
     Output(String, Output),
     Exit(String),
     Pipe(String, String),
@@ -1266,7 +1356,7 @@ trait WorkerProcessPort {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()>;
     fn stop(&self, child: &mut Child) -> Result<()>;
     fn control(&self, address: &str, inc: &str, secret: &str, stop: bool) -> Result<Option<u64>>;
@@ -1291,11 +1381,11 @@ impl WorkerProcessPort for NativeProcess {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         observe_exit(child, move || {
             let _ = events.send(Event::Exit(inc));
-            signal.notify();
+            signal();
         })
     }
     fn stop(&self, child: &mut Child) -> Result<()> {
@@ -1398,7 +1488,40 @@ struct Active {
     unavailable: bool,
     exited: bool,
 }
-struct OwnedChild(Child);
+#[cfg(windows)]
+type ChildJob = std::os::windows::io::OwnedHandle;
+#[cfg(not(windows))]
+type ChildJob = ();
+struct OwnedChild(Child, Option<ChildJob>);
+#[cfg(windows)]
+fn kill_on_close_job(child: &Child) -> Result<ChildJob> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let job = unsafe { ChildJob::from_raw_handle(raw) };
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            std::mem::size_of_val(&limits) as u32,
+        )
+    } == 0
+        || unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(job)
+}
 impl std::ops::Deref for OwnedChild {
     type Target = Child;
     fn deref(&self) -> &Child {
@@ -1593,14 +1716,21 @@ fn start(
         )
         .optional()?
         .and_then(|(f, j)| serde_json::from_str(&j).ok().map(|v| (f, v)));
-    let mut child = OwnedChild(port.spawn(c)?);
+    let mut child = OwnedChild(port.spawn(c)?, None);
     b.connection.execute("INSERT INTO diagnostics VALUES('worker_process',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[serde_json::json!({"pid":child.id(),"incarnation":inc}).to_string()])?;
-    if let Err(e) = port.observe(&child, inc.clone(), events.clone(), signal.clone()) {
+    let observer_signal = signal.clone();
+    if let Err(e) = port.observe(
+        &child,
+        inc.clone(),
+        events.clone(),
+        Arc::new(move || observer_signal.notify()),
+    ) {
         let _ = port.stop(&mut child);
         return Err(e);
     }
     let launch = Launch {
         incarnation: inc.clone(),
+        parent_pid: std::process::id(),
         secret: secret.clone(),
         state: c.state_dir.clone(),
         assets: c.model.clone(),
@@ -1756,11 +1886,13 @@ fn run_with_port(
                 | Event::Exit(i)
                 | Event::Pipe(i, _)
                 | Event::ControlLost(i, _) => i,
+                Event::Wake => continue,
             };
             if inc != &active.inc {
                 continue;
             }
             match event {
+                Event::Wake => unreachable!(),
                 Event::Output(
                     _,
                     Output::Hello {
@@ -2084,68 +2216,10 @@ fn run_with_port(
 #[path = "supervisor_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "supervisor/tests/mod.rs"]
+mod ram_tests;
+
 #[cfg(all(test, windows))]
 #[path = "supervisor_native_tests.rs"]
 mod native_tests;
-
-#[cfg(test)]
-mod index_work_port_tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    struct TestPort {
-        work: Mutex<Option<IndexWork>>,
-        finished: Mutex<
-            Option<(
-                ModelRequestId,
-                std::result::Result<Vec<f32>, EmbeddingError>,
-            )>,
-        >,
-    }
-
-    impl IndexWorkPort for TestPort {
-        fn model_ready(&self, _: &str) {}
-
-        fn next_work(&self, _: &str) -> Option<IndexWork> {
-            self.work.lock().unwrap().take()
-        }
-
-        fn finish(
-            &self,
-            id: ModelRequestId,
-            outcome: std::result::Result<Vec<f32>, EmbeddingError>,
-        ) {
-            *self.finished.lock().unwrap() = Some((id, outcome));
-        }
-
-        fn status(&self) -> IndexWorkStatus {
-            IndexWorkStatus {
-                runnable: false,
-                next_retry_at: None,
-                awaiting_model: false,
-            }
-        }
-    }
-
-    #[test]
-    fn index_work_port_crosses_threads_and_records_outcome() {
-        let concrete = Arc::new(TestPort {
-            work: Mutex::new(Some(IndexWork {
-                id: ModelRequestId(42),
-                text: Arc::from("queued text"),
-            })),
-            finished: Mutex::new(None),
-        });
-        let port: Arc<dyn IndexWorkPort> = concrete.clone();
-        std::thread::spawn(move || {
-            let work = port.next_work("model").unwrap();
-            assert_eq!(&*work.text, "queued text");
-            port.finish(work.id, Ok(vec![1.0, 2.0]));
-        })
-        .join()
-        .unwrap();
-        let finished = concrete.finished.lock().unwrap().take().unwrap();
-        assert_eq!(finished.0, ModelRequestId(42));
-        assert_eq!(finished.1.unwrap(), vec![1.0, 2.0]);
-    }
-}

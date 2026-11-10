@@ -227,7 +227,7 @@ fn idle_supervisor_does_not_create_files_or_start_unconfigured_model() {
             _: &Child,
             _: String,
             _: mpsc::Sender<Event>,
-            _: Arc<Signal>,
+            _: Arc<dyn Fn() + Send + Sync>,
         ) -> Result<()> {
             unreachable!()
         }
@@ -279,7 +279,9 @@ fn idle_supervisor_does_not_create_files_or_start_unconfigured_model() {
             queries: QueryQueue::default(),
             terminated: None,
         }),
-        signal: Arc::new(Signal::default()),
+        signal: Arc::new(RamSignal {
+            events: events.clone(),
+        }),
         changed: std::sync::Condvar::new(),
         events,
         wake_pending: AtomicBool::new(false),

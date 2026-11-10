@@ -1,5 +1,5 @@
 //! Semantic index backend: search, vector flushing and index source handling.
-use crate::daemon::{Response, Result, Signal};
+use crate::daemon::{Result, Signal};
 use crate::derived::{
     DerivedContext, DerivedWorkCoordinator, PublishedPage, PublishedSourcePort, SourcePosition,
 };
@@ -19,6 +19,11 @@ pub struct SearchPacket {
     pub semantic_complete: bool,
     pub source_position: SourcePosition,
 }
+pub(crate) enum SearchOutcome {
+    Found(SearchPacket),
+    Pending,
+    Unavailable(EmbeddingError),
+}
 pub(crate) fn handle_bootstrap_spool(
     broker: &mut Broker,
     signal: &Signal,
@@ -27,7 +32,7 @@ pub(crate) fn handle_bootstrap_spool(
     page_number: u64,
     final_page: bool,
     page: crate::spool::PublishedSpoolPage,
-) -> Result<Response> {
+) -> Result<SourcePosition> {
     let _ = DerivedWorkCoordinator::new(broker, &MaterializedSource(None))?;
     if crate::derived::bootstrap_receipt(
         broker,
@@ -38,7 +43,7 @@ pub(crate) fn handle_bootstrap_spool(
         &page.bodies,
     )? {
         signal.notify();
-        return Ok(Response::Position(context.initial_basis.clone()));
+        return Ok(context.initial_basis.clone());
     }
     let source = MaterializedSource(Some(page.page));
     let position = DerivedWorkCoordinator::new(broker, &source)?.bootstrap_with_spools(
@@ -59,17 +64,17 @@ pub(crate) fn handle_bootstrap_spool(
         crate::indexing::Channel::Lexical,
     )? {}
     signal.notify();
-    Ok(Response::Position(position))
+    Ok(position)
 }
 pub(crate) fn handle_repair_index(
     broker: &mut Broker,
     signal: &Signal,
     state: &std::path::Path,
     context: DerivedContext,
-) -> Result<Response> {
+) -> Result<crate::indexing::RepairReceipt> {
     let receipt = crate::indexing::repair_index(broker, &context, state)?;
     signal.notify();
-    Ok(Response::RepairIndex(receipt))
+    Ok(receipt)
 }
 pub(crate) fn handle_derived_spool(
     broker: &mut Broker,
@@ -77,12 +82,12 @@ pub(crate) fn handle_derived_spool(
     state: &std::path::Path,
     context: DerivedContext,
     page: crate::spool::PublishedSpoolPage,
-) -> Result<Response> {
+) -> Result<SourcePosition> {
     if let Some(position) =
         crate::derived::accepted_receipt(broker, &context, &page.page, &page.bodies)?
     {
         signal.notify();
-        return Ok(Response::Position(position));
+        return Ok(position);
     }
     let limit = (page.page.batches.len() as u32).max(1);
     let source = MaterializedSource(Some(page.page));
@@ -101,7 +106,7 @@ pub(crate) fn handle_derived_spool(
         crate::indexing::Channel::Lexical,
     )? {}
     signal.notify();
-    Ok(Response::Position(position))
+    Ok(position)
 }
 pub(crate) fn handle_derived_submit(
     broker: &mut Broker,
@@ -109,10 +114,10 @@ pub(crate) fn handle_derived_submit(
     state: &std::path::Path,
     context: DerivedContext,
     page: PublishedPage,
-) -> Result<Response> {
+) -> Result<SourcePosition> {
     if let Some(position) = crate::derived::accepted_receipt(broker, &context, &page, &[])? {
         signal.notify();
-        return Ok(Response::Position(position));
+        return Ok(position);
     }
     let limit = (page.batches.len() as u32).max(1);
     let source = MaterializedSource(Some(page));
@@ -126,7 +131,7 @@ pub(crate) fn handle_derived_submit(
         crate::indexing::Channel::Lexical,
     )? {}
     signal.notify();
-    Ok(Response::Position(position))
+    Ok(position)
 }
 pub(crate) fn handle_search(
     broker: &mut Broker,
@@ -138,7 +143,7 @@ pub(crate) fn handle_search(
     limit: usize,
     vector: Option<Vec<f32>>,
     required: SourcePosition,
-) -> Result<Response> {
+) -> Result<SearchOutcome> {
     search(
         broker,
         state,
@@ -253,7 +258,7 @@ fn search(
     limit: usize,
     vector: Option<&[f32]>,
     required: SourcePosition,
-) -> Result<Response> {
+) -> Result<SearchOutcome> {
     use crate::indexing::{channel_position, flush_channel, Channel};
     use agentlaw_search::{ExactVectorIndex, ScopeFilter, SearchIndex};
     let deadline = std::time::Instant::now() + Duration::from_secs(25);
@@ -277,12 +282,12 @@ fn search(
             break;
         }
         if vector.is_some() && b.availability()? != SemanticAvailability::Ready {
-            return Ok(Response::Error(EmbeddingError::Unavailable(
+            return Ok(SearchOutcome::Unavailable(EmbeddingError::Unavailable(
                 "model not ready for requested vector fence".into(),
             )));
         }
         let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return Ok(Response::Pending);
+            return Ok(SearchOutcome::Pending);
         };
         signal.wait(observed, wait);
     }
@@ -325,7 +330,7 @@ fn search(
     } else {
         (Vec::new(), None, 0)
     };
-    Ok(Response::Search(SearchPacket {
+    Ok(SearchOutcome::Found(SearchPacket {
         lexical_matched,
         vector_candidates,
         lexical,

@@ -13,6 +13,7 @@ pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + S
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Launch {
     pub incarnation: String,
+    pub parent_pid: u32,
     pub secret: String,
     pub state: PathBuf,
     pub assets: Option<ModelAssets>,
@@ -96,7 +97,7 @@ pub fn run_model_child() -> Result<()> {
         .create(true)
         .truncate(false)
         .open(launch.state.join("model.lock"))?;
-    lock.try_lock_exclusive()?; // A surviving incumbent, including orphan grace, prevents double loading.
+    lock.try_lock_exclusive()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let output = Arc::new(Mutex::new(std::io::stdout()));
     write(
@@ -108,15 +109,24 @@ pub fn run_model_child() -> Result<()> {
     )?;
     let heartbeat = Arc::new((Mutex::new(Instant::now()), Condvar::new()));
     let clock = heartbeat.clone();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let parent = launch.parent_pid;
     std::thread::spawn(move || {
         let (time, wake) = &*clock;
         let mut last = time.lock().unwrap();
         loop {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if unsafe { libc::getppid() } as u32 != parent {
+                std::process::exit(0);
+            }
             let remaining = Duration::from_secs(60).saturating_sub(last.elapsed());
             if remaining.is_zero() {
                 std::process::exit(0);
             }
-            last = wake.wait_timeout(last, remaining).unwrap().0;
+            last = wake
+                .wait_timeout(last, remaining.min(Duration::from_millis(100)))
+                .unwrap()
+                .0;
         }
     });
     let incarnation = launch.incarnation.clone();
@@ -203,10 +213,7 @@ pub fn run_model_child() -> Result<()> {
                 )?;
             }
             Ok(Input::Stop) => break,
-            Err(_) => {
-                // Lost broker pipe: retain model only for the bounded orphan grace.
-                std::thread::park();
-            }
+            Err(_) => break,
         }
     }
     Ok(())

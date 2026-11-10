@@ -59,6 +59,12 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
+    pub fn acquire_history(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::history_spool::AcquiredHistory> {
+        self.read_snapshot()?.acquire_history(cancel)
+    }
     pub fn read_snapshot(&self) -> Result<SourceReadGuard<'_>> {
         let gate = self.store.lock_shared()?;
         let sequence = self.store.ensure_clean()?;
@@ -177,6 +183,29 @@ impl SourceReadGuard<'_> {
     pub fn read_procedure(&self, id: &str) -> Result<CurrentUnit> {
         self.store.read_kind(id, "procedure")
     }
+    /// Read an owned current unit without duplicating its bodies during decoding.
+    /// Reject before allocating a body when their cumulative size exceeds the budget.
+    pub fn read_current_compact(
+        &self,
+        id: &str,
+        procedure: bool,
+        body_budget: u64,
+    ) -> Result<CurrentUnit> {
+        crate::validate_id(id)?;
+        let kind = if procedure { "procedure" } else { "memory" };
+        let path = self
+            .store
+            .safe_path(&format!("current/{kind}/{}/{}.md", &id[..2], id))?;
+        if !path.exists() {
+            return Err(Error::NotFound(id.into()));
+        }
+        let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+        let unit = crate::codec::read_current_owned(&mut reader, body_budget)?;
+        if unit.entity_id != id {
+            return Err(Error::Corrupt("filename identity".into()));
+        }
+        Ok(unit)
+    }
     pub fn read_catalog(&self, id: &str) -> Result<serde_json::Value> {
         self.store.read_catalog_locked(id)
     }
@@ -187,69 +216,7 @@ impl SourceReadGuard<'_> {
         &self,
         ids: &[String],
     ) -> Result<(SourcePosition, Vec<crate::ResolvedCurrent>, Vec<String>)> {
-        let mut queue = std::collections::VecDeque::from(ids.to_vec());
-        let mut visited = std::collections::BTreeSet::new();
-        let mut resolved_ids = std::collections::BTreeSet::new();
-        let mut result = Vec::new();
-        let mut missing = Vec::new();
-        let mut bytes = 0u64;
-        while let Some(requested_id) = queue.pop_front() {
-            if !visited.insert(requested_id.clone()) {
-                continue;
-            }
-            crate::validate_id(&requested_id)?;
-            let mut next = requested_id.clone();
-            let mut redirect_path = Vec::new();
-            let mut chain = std::collections::BTreeSet::new();
-            loop {
-                if !chain.insert(next.clone()) {
-                    return Err(Error::Corrupt("redirect cycle".into()));
-                }
-                let current = match self.store.read_kind(&next, "memory") {
-                    Ok(unit) => unit,
-                    Err(Error::NotFound(_)) => {
-                        missing.push(next);
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if let crate::UnitState::Redirect { redirect_to, .. } = &current.state {
-                    redirect_path.push(next);
-                    next = redirect_to.clone();
-                    continue;
-                }
-                if resolved_ids.insert(current.entity_id.clone()) {
-                    for head in current.heads() {
-                        bytes = bytes
-                            .checked_add(head.body.len() as u64)
-                            .ok_or(Error::Capacity)?;
-                        if bytes > crate::codec::MAX_FRAME_BYTES {
-                            return Err(Error::Capacity);
-                        }
-                        for relation in head.metadata["relations"].as_array().into_iter().flatten()
-                        {
-                            if relation["kind"] == "required" {
-                                queue.push_back(
-                                    relation["target_memory_id"]
-                                        .as_str()
-                                        .ok_or_else(|| Error::Corrupt("required target".into()))?
-                                        .to_owned(),
-                                );
-                            }
-                        }
-                    }
-                    result.push(crate::ResolvedCurrent {
-                        requested_id,
-                        redirect_path,
-                        current,
-                    });
-                }
-                break;
-            }
-        }
-        missing.sort();
-        missing.dedup();
-        Ok((self.position.clone(), result, missing))
+        self.store.read_closure_locked(ids, self.position.clone())
     }
 }
 impl OwnedPublishedReader {

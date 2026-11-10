@@ -67,7 +67,16 @@ pub struct FrameInfo {
 pub fn scan(
     kind: &str,
     r: &mut impl BufRead,
+    consume: impl FnMut(&FrameInfo, &mut dyn Read) -> Result<()>,
+) -> Result<u64> {
+    scan_inner(kind, r, consume, true)
+}
+
+fn scan_inner(
+    kind: &str,
+    r: &mut impl BufRead,
     mut consume: impl FnMut(&FrameInfo, &mut dyn Read) -> Result<()>,
+    defer_utf8_errors: bool,
 ) -> Result<u64> {
     let first = line(r)?;
     if first != format!("<!-- agentlaw-file-v1 kind={kind} -->\n") {
@@ -148,10 +157,18 @@ pub fn scan(
             hash: Sha256::new(),
             count: 0,
             tail: Vec::new(),
+            invalid_utf8: false,
+            defer_utf8_errors,
+            expected: bytes,
+            early_eof: false,
         };
         consume(&info, &mut payload)?;
+        if payload.early_eof {
+            return Err(Error::Corrupt("payload length/UTF8/digest".into()));
+        }
         std::io::copy(&mut payload, &mut std::io::sink())?;
         if payload.count != bytes
+            || payload.invalid_utf8
             || !payload.tail.is_empty()
             || format!("{:x}", payload.hash.finalize()) != sha
         {
@@ -171,11 +188,18 @@ struct CheckedPayload<R> {
     hash: Sha256,
     count: u64,
     tail: Vec<u8>,
+    invalid_utf8: bool,
+    defer_utf8_errors: bool,
+    expected: u64,
+    early_eof: bool,
 }
 impl<R: Read> Read for CheckedPayload<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(out)?;
         if n == 0 {
+            if !out.is_empty() && self.count < self.expected {
+                self.early_eof = true;
+            }
             return Ok(0);
         }
         self.hash.update(&out[..n]);
@@ -183,12 +207,19 @@ impl<R: Read> Read for CheckedPayload<R> {
             .count
             .checked_add(n as u64)
             .ok_or_else(|| std::io::Error::other("byte count overflow"))?;
+        if self.invalid_utf8 {
+            return Ok(n);
+        }
         let mut bytes = std::mem::take(&mut self.tail);
         bytes.extend_from_slice(&out[..n]);
         match std::str::from_utf8(&bytes) {
             Ok(_) => {}
             Err(e) => {
                 if e.error_len().is_some() {
+                    if self.defer_utf8_errors {
+                        self.invalid_utf8 = true;
+                        return Ok(n);
+                    }
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid UTF8 payload",
@@ -346,6 +377,164 @@ pub fn read(kind: &str, r: &mut impl BufRead) -> Result<Vec<Frame>> {
         });
     }
 }
+
+/// Read a current unit while transferring frame payloads into their final owners.
+/// The metadata-only validation copy avoids cloning potentially large bodies.
+pub(crate) fn read_current_owned(
+    r: &mut impl BufRead,
+    body_budget: u64,
+) -> Result<crate::CurrentUnit> {
+    let mut frames = Vec::new();
+    let mut total = 0u64;
+    let mut body_total = 0u64;
+    scan_inner(
+        "current",
+        r,
+        |info, payload| {
+            total = total.checked_add(info.bytes).ok_or(Error::Capacity)?;
+            if info.bytes > MAX_FRAME_BYTES || total > MAX_FRAME_BYTES {
+                return Err(Error::Capacity);
+            }
+            if matches!(info.kind.as_str(), "body" | "instructions") {
+                body_total = body_total.checked_add(info.bytes).ok_or(Error::Capacity)?;
+                if body_total > body_budget {
+                    return Err(Error::Capacity);
+                }
+            }
+            let mut bytes = vec![0u8; usize::try_from(info.bytes).map_err(|_| Error::Capacity)?];
+            for chunk in bytes.chunks_mut(64 * 1024) {
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let count = match payload.read(&mut chunk[offset..]) {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => result?,
+                    };
+                    if count == 0 {
+                        return Err(Error::Corrupt("payload length/digest/UTF-8".into()));
+                    }
+                    offset += count;
+                }
+            }
+            frames.push(Frame {
+                kind: info.kind.clone(),
+                key: info.key.clone(),
+                payload: bytes,
+            });
+            Ok(())
+        },
+        true,
+    )?;
+    assemble_current(frames)
+}
+
+pub(crate) fn assemble_current(mut frames: Vec<Frame>) -> Result<crate::CurrentUnit> {
+    let state_index = frames
+        .iter()
+        .position(|f| f.kind == "state")
+        .ok_or_else(|| Error::Corrupt("state cardinality".into()))?;
+    if frames.iter().filter(|f| f.kind == "state").count() != 1 {
+        return Err(Error::Corrupt("state cardinality".into()));
+    }
+    let state_frame = frames.remove(state_index);
+    let value = parse_json(&state_frame.payload)?;
+    let entity_type = value["entity_type"]
+        .as_str()
+        .ok_or_else(|| Error::Corrupt("entity type".into()))?
+        .to_owned();
+    let entity_id = value[if entity_type == "memory" {
+        "memory_id"
+    } else {
+        "procedure_id"
+    }]
+    .as_str()
+    .ok_or_else(|| Error::Corrupt("entity id".into()))?
+    .to_owned();
+    if state_frame.key != entity_id {
+        return Err(Error::Corrupt("state key".into()));
+    }
+    let state = match value["state"].as_str() {
+        Some("live") => {
+            if value.get("redirect_to").is_some() || value.get("consolidation_change_id").is_some()
+            {
+                return Err(Error::Corrupt("live/redirect declarations mixed".into()));
+            }
+            let metadata = value["current_heads"]
+                .as_array()
+                .ok_or_else(|| Error::Corrupt("heads".into()))?;
+            if frames.len() != metadata.len() {
+                return Err(Error::Corrupt("body cardinality".into()));
+            }
+            let mut heads = Vec::with_capacity(metadata.len());
+            for item in metadata {
+                let id = item["change_id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Corrupt("change id".into()))?;
+                let kind = if entity_type == "memory" {
+                    "body"
+                } else {
+                    "instructions"
+                };
+                let index = frames
+                    .iter()
+                    .position(|f| f.key == id && f.kind == kind)
+                    .ok_or_else(|| Error::Corrupt("missing body".into()))?;
+                let frame = frames.swap_remove(index);
+                heads.push(crate::Head {
+                    metadata: item.clone(),
+                    body: String::from_utf8(frame.payload)
+                        .map_err(|_| Error::Corrupt("body UTF8".into()))?,
+                });
+            }
+            crate::UnitState::Live { heads }
+        }
+        Some("redirect") => {
+            if value.get("current_heads").is_some() || !frames.is_empty() {
+                return Err(Error::Corrupt("redirect body".into()));
+            }
+            crate::UnitState::Redirect {
+                redirect_to: value["redirect_to"].as_str().unwrap_or("").into(),
+                consolidation_change_id: value["consolidation_change_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into(),
+            }
+        }
+        _ => return Err(Error::Corrupt("state discriminator".into())),
+    };
+    let unit = crate::CurrentUnit {
+        entity_id,
+        entity_type,
+        state,
+    };
+    let validation_state = match &unit.state {
+        crate::UnitState::Live { heads } => crate::UnitState::Live {
+            heads: heads
+                .iter()
+                .map(|head| crate::Head {
+                    metadata: head.metadata.clone(),
+                    body: String::new(),
+                })
+                .collect(),
+        },
+        crate::UnitState::Redirect {
+            redirect_to,
+            consolidation_change_id,
+        } => crate::UnitState::Redirect {
+            redirect_to: redirect_to.clone(),
+            consolidation_change_id: consolidation_change_id.clone(),
+        },
+    };
+    crate::CurrentUnit {
+        entity_id: unit.entity_id.clone(),
+        entity_type: unit.entity_type.clone(),
+        state: validation_state,
+    }
+    .validate()?;
+    Ok(unit)
+}
+
+#[cfg(test)]
+mod tests;
 
 /// Canonical JSON uses explicit control-character escapes, unlike serde's short escapes.
 pub fn canonical_json(v: &serde_json::Value) -> Result<Vec<u8>> {

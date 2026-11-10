@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 mod ann;
 pub mod generations;
+pub mod vector_file;
 pub use ann::AnnMetrics;
 
 #[derive(Debug, Error)]
@@ -18,6 +19,7 @@ pub enum Error {
     CoverageUnknown,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+pub type SearchResult<T> = Result<T>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchDocument {
     pub memory_id: String,
@@ -48,6 +50,16 @@ pub struct SearchIndex {
 pub struct ReadView {
     connection: Connection,
     pub stamp: ViewStamp,
+}
+pub struct LexicalDelta<'a> {
+    pub pending: &'a [SearchDocument],
+    pub removed: &'a [String],
+    pub complete: bool,
+}
+pub struct EffectiveCorpus<'v> {
+    view: &'v mut ReadView,
+    n: f64,
+    avg: f64,
 }
 
 fn configure(c: &Connection) -> Result<()> {
@@ -89,6 +101,90 @@ impl StreamTokenizer {
     }
 }
 impl SearchIndex {
+    /// Open an existing lexical projection without creating or repairing schema.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        if connection.is_readonly(rusqlite::DatabaseName::Main)? {
+            return Err(Error::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+                None,
+            )));
+        }
+        configure(&connection)?;
+        let index = Self {
+            connection,
+            path: path.as_ref().to_path_buf(),
+        };
+        index.validate_existing()?;
+        Ok(index)
+    }
+
+    /// Validate an existing projection without creating, repairing, or writing it.
+    pub fn validate_existing(&self) -> Result<()> {
+        let connection = &self.connection;
+        let invalid =
+            || Error::Invalid("lexical projection is incomplete; rebuild required".into());
+        let classify = |error: rusqlite::Error| match &error {
+            rusqlite::Error::SqliteFailure(code, message)
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) || message.as_deref().is_some_and(|s| {
+                    s.contains("no such table") || s.contains("no such column")
+                }) =>
+            {
+                invalid()
+            }
+            rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::InvalidColumnType(..) => {
+                invalid()
+            }
+            _ => Error::Sql(error),
+        };
+        for query in [
+            "SELECT singleton,generation,commit_id,ack FROM metadata LIMIT 0",
+            "SELECT id,memory,change_id,scope,len FROM docs LIMIT 0",
+            "SELECT id,digest FROM lexicon LIMIT 0",
+            "SELECT term,doc,tf FROM postings LIMIT 0",
+            "SELECT singleton,version FROM analyzer LIMIT 0",
+            "SELECT filter,n,total_len,heads FROM query_stats LIMIT 0",
+            "SELECT filter,scope FROM query_stat_scopes LIMIT 0",
+        ] {
+            connection.prepare(query).map_err(&classify)?;
+        }
+        for name in ["postings_doc", "docs_scope"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(&classify)?;
+            if count != 1 {
+                return Err(invalid());
+            }
+        }
+        let (singleton, generation, commit, ack): (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT singleton,generation,commit_id,ack FROM metadata",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(&classify)?;
+        let analyzer: i64 = connection
+            .query_row(
+                "SELECT version FROM analyzer WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(&classify)?;
+        if singleton != 1 || generation < 0 || commit < 0 || ack < 0 || analyzer != 3 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path.as_ref())?;
         configure(&connection)?;
@@ -362,9 +458,54 @@ fn adjust_stats(c: &Connection, direction: i64) -> Result<()> {
     Ok(())
 }
 impl ReadView {
+    /// Opens an existing generation without modifying the main database.
+    pub fn open(path: &Path) -> SearchResult<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection
+            .execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY; BEGIN DEFERRED;")?;
+        let stamp =
+            connection.query_row("SELECT generation,commit_id,ack FROM metadata", [], |r| {
+                Ok(ViewStamp {
+                    generation: r.get(0)?,
+                    commit: r.get(1)?,
+                    ack: r.get(2)?,
+                })
+            })?;
+        Ok(Self { connection, stamp })
+    }
+    pub fn effective<'v>(
+        &'v mut self,
+        scope: &ScopeFilter,
+        delta: LexicalDelta<'_>,
+    ) -> SearchResult<EffectiveCorpus<'v>> {
+        if !delta.complete {
+            return Err(Error::CoverageUnknown);
+        }
+        let result = self.prepare_effective(scope, delta.pending, delta.removed);
+        match result {
+            Ok((n, avg)) => Ok(EffectiveCorpus { view: self, n, avg }),
+            Err(e) => {
+                let _ = self.clear_effective();
+                Err(e)
+            }
+        }
+    }
     pub fn lexical_matched(&mut self, query: &str, scope: &ScopeFilter) -> Result<u64> {
-        self.search(query, scope, 0, &[], &[], true)?;
-        let n:i64=self.connection.query_row("SELECT COUNT(DISTINCT p.memory) FROM effective_postings p JOIN effective d USING(memory,change_id) WHERE d.scope IN(SELECT scope FROM scopes)",[],|r|r.get(0))?;
+        self.effective(
+            scope,
+            LexicalDelta {
+                pending: &[],
+                removed: &[],
+                complete: true,
+            },
+        )?
+        .matched(query)
+    }
+    fn matched_prepared(&mut self, query: &str) -> Result<u64> {
+        self.prepare_query(query)?;
+        let n:i64=self.connection.query_row("SELECT COUNT(DISTINCT p.memory) FROM effective_postings p JOIN effective d USING(memory,change_id) WHERE p.term IN(SELECT term FROM query) AND d.scope IN(SELECT scope FROM scopes)",[],|r|r.get(0))?;
         Ok(n as u64)
     }
     /// IDF-weighted query-term coverage, independently normalized from BM25 ranking.
@@ -375,20 +516,18 @@ impl ReadView {
         scope: &ScopeFilter,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        self.search(query, scope, 0, &[], &[], true)?;
-        let cached: Option<f64> = self
-            .connection
-            .query_row(
-                "SELECT n FROM query_stats WHERE filter=?1",
-                [scope_key(scope)?],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let n: f64 = match cached {Some(n)=>n,None=>self.connection.query_row(
-            "SELECT COUNT(DISTINCT memory) FROM effective WHERE scope IN(SELECT scope FROM scopes)",
-            [],
-            |r| r.get(0),
-        )?};
+        self.effective(
+            scope,
+            LexicalDelta {
+                pending: &[],
+                removed: &[],
+                complete: true,
+            },
+        )?
+        .strength(query, limit)
+    }
+    fn strength_prepared(&mut self, query: &str, limit: usize, n: f64) -> Result<Vec<Hit>> {
+        self.prepare_query(query)?;
         self.connection.execute("DELETE FROM idfs", [])?;
         let mut total = 0.0;
         for term in tokens(query).keys() {
@@ -426,6 +565,26 @@ impl ReadView {
         if limit > 10000 {
             return Err(Error::Invalid("query/limit exceeds bounded profile".into()));
         }
+        self.effective(
+            scope,
+            LexicalDelta {
+                pending,
+                removed,
+                complete: true,
+            },
+        )?
+        .search(query, limit)
+    }
+    fn clear_effective(&self) -> Result<()> {
+        self.connection.execute_batch("DROP VIEW IF EXISTS temp.effective_postings; DROP VIEW IF EXISTS temp.effective; DROP TABLE IF EXISTS temp.op; DROP TABLE IF EXISTS temp.overlay; DROP TABLE IF EXISTS temp.invalid; DROP TABLE IF EXISTS temp.scopes; DROP TABLE IF EXISTS temp.query; DROP TABLE IF EXISTS temp.idfs; DROP TABLE IF EXISTS temp.term_lookup;")?;
+        Ok(())
+    }
+    fn prepare_effective(
+        &mut self,
+        scope: &ScopeFilter,
+        pending: &[SearchDocument],
+        removed: &[String],
+    ) -> Result<(f64, f64)> {
         let c = &self.connection;
         c.execute_batch("DROP VIEW IF EXISTS temp.effective; DROP VIEW IF EXISTS temp.effective_postings;
           DROP TABLE IF EXISTS temp.overlay; DROP TABLE IF EXISTS temp.op; DROP TABLE IF EXISTS temp.invalid; DROP TABLE IF EXISTS temp.scopes; DROP TABLE IF EXISTS temp.query;
@@ -433,7 +592,7 @@ impl ReadView {
           DROP TABLE IF EXISTS temp.term_lookup;CREATE TEMP TABLE term_lookup(digest BLOB PRIMARY KEY,term INTEGER UNIQUE);
           CREATE TEMP TABLE op(term INTEGER,memory TEXT,change_id TEXT,tf INTEGER,PRIMARY KEY(term,memory,change_id)) WITHOUT ROWID;
           CREATE TEMP TABLE invalid(memory TEXT PRIMARY KEY); CREATE TEMP TABLE scopes(scope TEXT PRIMARY KEY);
-          CREATE TEMP TABLE query(term INTEGER PRIMARY KEY);
+          CREATE TEMP TABLE query(term INTEGER PRIMARY KEY); DROP TABLE IF EXISTS temp.idfs; CREATE TEMP TABLE idfs(term INTEGER PRIMARY KEY,idf REAL);
           CREATE TEMP VIEW effective AS SELECT memory,change_id,scope,len FROM main.docs WHERE memory NOT IN(SELECT memory FROM invalid) UNION ALL SELECT * FROM overlay;
           CREATE TEMP VIEW effective_postings AS SELECT p.term,d.memory,d.change_id,p.tf FROM main.postings p JOIN main.docs d ON d.id=p.doc WHERE d.memory NOT IN(SELECT memory FROM invalid) UNION ALL SELECT * FROM op;")?;
         if pending.is_empty() && removed.is_empty() {
@@ -464,19 +623,30 @@ impl ReadView {
                 )?;
             }
         }
-        for term in tokens(query).keys() {
-            let term = lookup_term(c, term)?;
-            c.execute("INSERT INTO query VALUES(?1)", [term])?;
-        }
-        // SQLite does the corpus aggregation and external sort; no corpus-sized Rust collection.
-        // ln is evaluated in Rust per query term, not through an optional SQLite math extension.
         let cached: Option<(f64, f64)> = if pending.is_empty() && removed.is_empty() {
             c.query_row("SELECT n,CASE WHEN heads>0 THEN CAST(total_len AS REAL)/heads ELSE 1 END FROM query_stats WHERE filter=?1",[scope_key(scope)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
         } else {
             None
         };
         let (n,avg):(f64,f64)=match cached{Some(v)=>v,None=>c.query_row("SELECT COUNT(DISTINCT memory),COALESCE(AVG(len),1) FROM effective WHERE scope IN(SELECT scope FROM scopes)",[],|r|Ok((r.get(0)?,r.get(1)?)))?};
-        c.execute_batch("DROP TABLE IF EXISTS temp.idfs; CREATE TEMP TABLE idfs(term INTEGER PRIMARY KEY,idf REAL);")?;
+        Ok((n, avg))
+    }
+    fn prepare_query(&self, query: &str) -> Result<()> {
+        let c = &self.connection;
+        c.execute("DELETE FROM query", [])?;
+        for term in tokens(query).keys() {
+            let term = lookup_term(c, term)?;
+            c.execute("INSERT INTO query VALUES(?1)", [term])?;
+        }
+        Ok(())
+    }
+    fn search_prepared(&mut self, query: &str, limit: usize, n: f64, avg: f64) -> Result<Vec<Hit>> {
+        if limit > 10000 {
+            return Err(Error::Invalid("query/limit exceeds bounded profile".into()));
+        }
+        self.prepare_query(query)?;
+        let c = &self.connection;
+        c.execute("DELETE FROM idfs", [])?;
         {
             let mut st=c.prepare("SELECT p.term,COUNT(DISTINCT p.memory) FROM effective_postings p JOIN effective d USING(memory,change_id) WHERE p.term IN(SELECT term FROM query) AND d.scope IN(SELECT scope FROM scopes) GROUP BY p.term")?;
             let mut rows = st.query([])?;
@@ -496,6 +666,23 @@ impl ReadView {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+impl EffectiveCorpus<'_> {
+    pub fn search(&mut self, query: &str, limit: usize) -> SearchResult<Vec<Hit>> {
+        self.view.search_prepared(query, limit, self.n, self.avg)
+    }
+    pub fn strength(&mut self, query: &str, limit: usize) -> SearchResult<Vec<Hit>> {
+        self.view.strength_prepared(query, limit, self.n)
+    }
+    pub fn matched(&mut self, query: &str) -> SearchResult<u64> {
+        self.view.matched_prepared(query)
+    }
+}
+impl Drop for EffectiveCorpus<'_> {
+    fn drop(&mut self) {
+        let _ = self.view.clear_effective();
     }
 }
 
@@ -809,295 +996,4 @@ impl VectorBackend for VectorReadView {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn doc(id: &str, body: &str, scope: &str) -> SearchDocument {
-        SearchDocument {
-            memory_id: id.into(),
-            change_id: "v1".into(),
-            body: body.into(),
-            scope: scope.into(),
-        }
-    }
-    #[test]
-    fn rrf_dedups_sections_and_ties() {
-        let h = |id: &str, score| Hit {
-            memory_id: id.into(),
-            change_id: "v".into(),
-            score,
-        };
-        let assert_scores = |actual: &[Hit], expected: &[(&str, f64)]| {
-            assert_eq!(actual.len(), expected.len(), "unexpected fused identities");
-            for (hit, (id, score)) in actual.iter().zip(expected) {
-                assert_eq!(&hit.memory_id, id);
-                assert!(hit.score.is_finite(), "{id} has a non-finite fused score");
-                assert!(
-                    (hit.score - score).abs() < 1e-14,
-                    "{id}: expected {score:.17}, got {:.17}",
-                    hit.score
-                );
-            }
-        };
-
-        // Unsorted section hits. After per-memory max/dedup, the ranks are:
-        // lexical: a, b, c, d; vector: b, a, e, d.
-        // Duplicate a/b sections must neither vote again nor consume ranks.
-        // Raw lexical magnitudes dwarf cosine scores but must not dominate fusion.
-        let lexical = vec![
-            h("d", 0.0),
-            h("a", 0.5),
-            h("b", 1e6),
-            h("invalid-positive-infinity", f64::INFINITY),
-            h("c", f64::NAN),
-            h("a", 1e12),
-            h("c", 1.0),
-            h("a", 9e11),
-        ];
-        let vector = vec![
-            h("e", 0.7),
-            h("b", 0.1),
-            h("d", -0.2),
-            h("invalid-nan", f64::NAN),
-            h("a", 0.8),
-            h("b", 0.99),
-            h("invalid-negative-infinity", f64::NEG_INFINITY),
-            h("b", 0.98),
-        ];
-        let fused = reciprocal_rank_fusion(&[lexical.clone(), vector.clone()]);
-        // Hand calculation for k=60, ranks starting at 1:
-        // a,b = 1/61 + 1/62; d = 1/64 + 1/64; c,e = 1/63.
-        // Thus two fourth places outrank either single third place; equal totals
-        // are ordered by memory ID, not insertion order or raw score magnitude.
-        assert_scores(
-            &fused,
-            &[
-                ("a", 1.0 / 61.0 + 1.0 / 62.0),
-                ("b", 1.0 / 61.0 + 1.0 / 62.0),
-                ("d", 2.0 / 64.0),
-                ("c", 1.0 / 63.0),
-                ("e", 1.0 / 63.0),
-            ],
-        );
-
-        let rescaled = reciprocal_rank_fusion(&[
-            lexical
-                .iter()
-                .map(|hit| h(&hit.memory_id, hit.score * 1e-15))
-                .collect(),
-            vector
-                .iter()
-                .map(|hit| h(&hit.memory_id, hit.score * 1e9))
-                .collect(),
-        ]);
-        assert_eq!(rescaled, fused, "fusion must depend on ranks, not units");
-        let mut reversed_lexical = lexical.clone();
-        let mut reversed_vector = vector.clone();
-        reversed_lexical.reverse();
-        reversed_vector.reverse();
-        assert_eq!(
-            reciprocal_rank_fusion(&[reversed_vector, reversed_lexical]),
-            fused,
-            "channel/section arrival order must not change tied fused results"
-        );
-
-        // An absent channel contributes nothing: no invented vote or averaging.
-        let lexical_only = reciprocal_rank_fusion(&[lexical.clone(), vec![]]);
-        assert_scores(
-            &lexical_only,
-            &[
-                ("a", 1.0 / 61.0),
-                ("b", 1.0 / 62.0),
-                ("c", 1.0 / 63.0),
-                ("d", 1.0 / 64.0),
-            ],
-        );
-        assert_eq!(reciprocal_rank_fusion(&[vec![], lexical]), lexical_only);
-        assert_scores(
-            &reciprocal_rank_fusion(&[vec![], vector]),
-            &[
-                ("b", 1.0 / 61.0),
-                ("a", 1.0 / 62.0),
-                ("e", 1.0 / 63.0),
-                ("d", 1.0 / 64.0),
-            ],
-        );
-        assert!(reciprocal_rank_fusion(&[vec![], vec![]]).is_empty());
-        assert!(reciprocal_rank_fusion(&[
-            vec![h("nan", f64::NAN), h("infinity", f64::INFINITY)],
-            vec![h("negative-infinity", f64::NEG_INFINITY)],
-        ])
-        .is_empty());
-
-        // Equal raw scores are resolved before rank assignment, by stable ID.
-        let tied = reciprocal_rank_fusion(&[
-            vec![h("b", 1000.0), h("a", 1000.0)],
-            vec![h("b", 0.5), h("a", 0.5)],
-        ]);
-        assert_scores(&tied, &[("a", 2.0 / 61.0), ("b", 2.0 / 62.0)]);
-        assert_eq!(
-            reciprocal_rank_fusion(&[
-                vec![h("a", 1000.0), h("b", 1000.0)],
-                vec![h("a", 0.5), h("b", 0.5)],
-            ]),
-            tied
-        );
-    }
-    #[test]
-    fn snapshot_overlay_scope() {
-        let p = std::env::temp_dir().join(format!(
-            "agentlaw-search-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut index = SearchIndex::open(&p).unwrap();
-        index
-            .commit(
-                1,
-                &[
-                    doc("a", "old needle", "user"),
-                    doc("b", "needle", "private"),
-                ],
-                &[],
-            )
-            .unwrap();
-        let mut old = index.read_view().unwrap();
-        index
-            .commit(2, &[doc("a", "replacement", "user")], &[])
-            .unwrap();
-        let scope = ScopeFilter {
-            allowed_scopes: vec!["user".into()],
-        };
-        assert_eq!(old.stamp.ack, 1);
-        assert_eq!(
-            old.search("needle", &scope, 10, &[], &[], true)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(old
-            .search(
-                "needle",
-                &scope,
-                10,
-                &[doc("a", "replacement", "user")],
-                &[],
-                true
-            )
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            old.search("fresh", &scope, 10, &[doc("c", "fresh", "user")], &[], true)
-                .unwrap()[0]
-                .memory_id,
-            "c"
-        );
-        assert!(old.search("x", &scope, 10, &[], &[], false).is_err());
-        drop(old);
-        drop(index);
-        let _ = std::fs::remove_file(p);
-    }
-    #[test]
-    fn vector_validation() {
-        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0]).unwrap(), 1.0);
-        assert!(cosine(&[0.0], &[0.0]).is_err());
-    }
-    #[test]
-    fn multihead_scope_does_not_leak_or_duplicate_identity() {
-        let p = std::env::temp_dir().join(format!(
-            "agentlaw-heads-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut index = SearchIndex::open(&p).unwrap();
-        let first = doc("a", "public needle", "user");
-        let mut second = doc("a", "private secret needle", "private");
-        second.change_id = "v2".into();
-        index.commit(1, &[first, second], &[]).unwrap();
-        let mut view = index.read_view().unwrap();
-        let user = ScopeFilter {
-            allowed_scopes: vec!["user".into()],
-        };
-        assert!(view
-            .search("secret", &user, 10, &[], &[], true)
-            .unwrap()
-            .is_empty());
-        let both = ScopeFilter {
-            allowed_scopes: vec!["user".into(), "private".into()],
-        };
-        assert_eq!(
-            view.search("needle", &both, 10, &[], &[], true)
-                .unwrap()
-                .len(),
-            1
-        );
-        drop(view);
-        drop(index);
-        let _ = std::fs::remove_file(p);
-    }
-    #[test]
-    fn vector_disk_max_sections_overlay_and_snapshot() {
-        let p = std::env::temp_dir().join(format!(
-            "agentlaw-vector-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let rec = |id: &str, section: &str, vector| VectorRecord {
-            memory_id: id.into(),
-            change_id: "v1".into(),
-            section: section.into(),
-            scope: "user".into(),
-            vector,
-        };
-        let mut index = ExactVectorIndex::open(&p, "model", "config", 2).unwrap();
-        index
-            .commit(
-                1,
-                &[
-                    rec("a", "one", vec![1.0, 0.0]),
-                    rec("a", "two", vec![0.0, 1.0]),
-                    rec("b", "one", vec![0.8, 0.2]),
-                ],
-                &[],
-            )
-            .unwrap();
-        let old = index.read_view().unwrap();
-        let scope = ScopeFilter {
-            allowed_scopes: vec!["user".into()],
-        };
-        let hits = old.search(&[1.0, 0.0], &scope, 2).unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].memory_id, "a");
-        assert_eq!(hits[0].score, 1.0);
-        index.commit(2, &[], &["a".into()]).unwrap();
-        assert_eq!(old.stamp.ack, 1);
-        assert_eq!(
-            old.search(&[1.0, 0.0], &scope, 2).unwrap()[0].memory_id,
-            "a"
-        );
-        let hits = old
-            .search_with_overlay(
-                &[1.0, 0.0],
-                &scope,
-                2,
-                &[rec("c", "no lexical match required", vec![1.0, 0.0])],
-                &["a".into()],
-                true,
-            )
-            .unwrap();
-        assert_eq!(hits[0].memory_id, "c");
-        assert!(!hits.iter().any(|h| h.memory_id == "a"));
-        assert!(ExactVectorIndex::open(&p, "different model", "config", 2).is_err());
-        drop(old);
-        drop(index);
-        let _ = std::fs::remove_file(p);
-    }
-}
+mod tests;

@@ -231,8 +231,56 @@ impl Drop for McpClient {
     }
 }
 
-struct Fixture {
+// The broker outlives its clients by design. Own every process launched from
+// this fixture's private installation, even if fixture setup or a test panics.
+struct ManagedTemp {
     _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Drop for ManagedTemp {
+    fn drop(&mut self) {
+        use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut system = System::new();
+            system.refresh_processes(ProcessesToUpdate::All, true);
+            let owned: Vec<_> = system
+                .processes()
+                .values()
+                .filter(|process| {
+                    !matches!(
+                        process.status(),
+                        ProcessStatus::Zombie | ProcessStatus::Dead
+                    ) && process.exe().is_some_and(|exe| {
+                        fs::canonicalize(exe)
+                            .unwrap_or_else(|_| exe.to_path_buf())
+                            .starts_with(&self.root)
+                    })
+                })
+                .collect();
+            if owned.is_empty() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let pids: Vec<_> = owned.iter().map(|process| process.pid()).collect();
+                if !std::thread::panicking() {
+                    panic!("fixture processes did not exit: {pids:?}");
+                }
+                eprintln!("fixture processes did not exit: {pids:?}");
+                return;
+            }
+            for process in owned {
+                process.kill();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+struct Fixture {
+    _temp: ManagedTemp,
     root: PathBuf,
     state: PathBuf,
     host: PathBuf,
@@ -259,6 +307,10 @@ impl Fixture {
         )
         .unwrap();
         let root = fs::canonicalize(root).unwrap();
+        let temp = ManagedTemp {
+            _temp: temp,
+            root: root.clone(),
+        };
         let state = root.join("state");
         let bin = root.join("bin");
         let source = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
@@ -306,7 +358,7 @@ impl Fixture {
         fs::write(unpacked.join("LICENSE.agentlaw"), b"new-license").unwrap();
         let receipt_value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         let helper = PathBuf::from(receipt_value["executable"].as_str().unwrap());
-        let memory = temp.path().join("memory");
+        let memory = temp._temp.path().join("memory");
         assert_eq!(
             run(
                 &old,

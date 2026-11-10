@@ -54,6 +54,7 @@ impl ControlWriter {
     }
 }
 /// A request-scoped read-only control snapshot.
+/// Keep the writer connection open; otherwise SQLite creates `-wal` and `-shm` files.
 pub struct ControlReader {
     connection: Connection,
 }
@@ -580,17 +581,49 @@ mod control_reader_tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(ControlReader::open(dir.path()).is_err());
         assert!(!dir.path().join("control.sqlite").exists());
-        drop(ControlWriter::open(dir.path()).unwrap());
-        let path = dir.path().join("control.sqlite");
-        let before = std::fs::read(&path).unwrap();
+        let writer = ControlWriter::open(dir.path()).unwrap();
+        writer
+            .connection
+            .execute(
+                "INSERT INTO associations VALUES('binding','path','project')",
+                [],
+            )
+            .unwrap();
+        let files = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let names_before = files();
+        let db_path = dir.path().join("control.sqlite");
+        let wal_path = dir.path().join("control.sqlite-wal");
+        let db_before = std::fs::read(&db_path).unwrap();
+        let wal_before = std::fs::read(&wal_path).unwrap();
         {
             let reader = ControlReader::open(dir.path()).unwrap();
+            assert_eq!(
+                reader
+                    .exact_association("binding", "path")
+                    .unwrap()
+                    .unwrap()
+                    .project_id,
+                "project"
+            );
             assert!(reader
                 .connection
                 .execute("INSERT INTO settings VALUES('test','value')", [])
                 .is_err());
+            assert_eq!(names_before, files());
+            assert_eq!(db_before, std::fs::read(&db_path).unwrap());
+            assert_eq!(wal_before, std::fs::read(&wal_path).unwrap());
+            // ADR-0158 excludes SQLite's read marks in -shm from the write test.
         }
-        assert_eq!(before, std::fs::read(path).unwrap());
+        assert_eq!(names_before, files());
+        assert_eq!(db_before, std::fs::read(db_path).unwrap());
+        assert_eq!(wal_before, std::fs::read(wal_path).unwrap());
     }
 
     #[test]

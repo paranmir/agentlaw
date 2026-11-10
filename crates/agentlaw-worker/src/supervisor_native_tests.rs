@@ -23,6 +23,83 @@ unsafe extern "system" {
 }
 struct OwnedHandle(usize);
 
+struct LifetimeProcess(std::path::PathBuf);
+impl WorkerProcessPort for LifetimeProcess {
+    fn spawn(&self, _: &RuntimeConfig) -> Result<Child> {
+        Ok(Command::new(std::env::current_exe()?)
+            .args([
+                "--ignored",
+                "--exact",
+                "supervisor::native_tests::job_lifetime_helper",
+            ])
+            .env("AGENTLAW_JOB_ROLE", "child")
+            .env("AGENTLAW_JOB_DIR", &self.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+    fn observe(
+        &self,
+        child: &Child,
+        inc: String,
+        events: mpsc::Sender<Event>,
+        signal: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
+        NativeProcess.observe(child, inc, events, signal)
+    }
+    fn stop(&self, child: &mut Child) -> Result<()> {
+        NativeProcess.stop(child)
+    }
+    fn control(&self, _: &str, _: &str, _: &str, _: bool) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
+#[test]
+#[ignore = "helper process for parent lifetime test"]
+fn job_lifetime_helper() {
+    let dir = std::path::PathBuf::from(std::env::var_os("AGENTLAW_JOB_DIR").unwrap());
+    match std::env::var("AGENTLAW_JOB_ROLE").unwrap().as_str() {
+        "child" => {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("model.lock"))
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            std::fs::write(dir.join("child-ready"), std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        "parent" => {
+            let config = RuntimeConfig {
+                state_dir: dir.clone(),
+                executable: "unused".into(),
+                model: None,
+            };
+            let (events, _) = mpsc::channel();
+            let signal = Arc::new(RamSignal {
+                events: events.clone(),
+            });
+            let _child = start_ram_child(
+                &LifetimeProcess(dir.clone()),
+                &config,
+                &events,
+                &signal,
+                Instant::now(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{}", e.cause));
+            until(|| dir.join("child-ready").exists());
+            std::fs::write(dir.join("parent-ready"), "ready").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        _ => panic!("unexpected helper role"),
+    }
+}
+
 // Invoked only by the parent test below. The grandchild inherits stdout and
 // keeps the pipe open after its parent exits, then exits on its own.
 #[test]
@@ -45,38 +122,6 @@ fn exit_observation_helper() {
     }
 }
 
-#[test]
-fn observes_child_exit_while_descendant_keeps_stdout_open() {
-    use std::io::Read;
-
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "supervisor::native_tests::exit_observation_helper",
-        ])
-        .env("AGENTLAW_EXIT_TEST_ROLE", "child")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let (exit_tx, exit_rx) = mpsc::channel();
-    observe_exit(&child, move || exit_tx.send(()).unwrap()).unwrap();
-    let (eof_tx, eof_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).unwrap();
-        eof_tx.send(()).unwrap();
-    });
-    exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(
-        eof_rx.try_recv().is_err(),
-        "stdout reached EOF before child exit was observed"
-    );
-    child.wait().unwrap();
-    eof_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    reader.join().unwrap();
-}
 impl OwnedHandle {
     fn pin(child: &Child) -> Self {
         let mut handle = std::ptr::null_mut();
@@ -130,7 +175,13 @@ impl WorkerProcessPort for RefuseObserveAndStop {
         }
         .spawn(config)
     }
-    fn observe(&self, _: &Child, _: String, _: mpsc::Sender<Event>, _: Arc<Signal>) -> Result<()> {
+    fn observe(
+        &self,
+        _: &Child,
+        _: String,
+        _: mpsc::Sender<Event>,
+        _: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
         Err("observer failure".into())
     }
     fn stop(&self, _: &mut Child) -> Result<()> {
@@ -144,105 +195,6 @@ impl WorkerProcessPort for RefuseObserveAndStop {
     }
 }
 
-#[test]
-fn failed_start_with_unconfirmed_stop_keeps_owned_child() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = RuntimeConfig {
-        state_dir: dir.path().into(),
-        executable: "unused".into(),
-        model: None,
-    };
-    let (children, received) = mpsc::channel();
-    let (events, _) = mpsc::channel();
-    let error = match start_ram_child(
-        &RefuseObserveAndStop {
-            children,
-            stops: None,
-        },
-        &config,
-        &events,
-        &Arc::new(Signal::default()),
-        Instant::now(),
-        None,
-    ) {
-        Ok(_) => panic!("observer must fail"),
-        Err(error) => error,
-    };
-    let _handle = received.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(
-        error.owned.is_some(),
-        "the unconfirmed process handle must remain owned"
-    );
-}
-
-#[test]
-fn unconfirmed_child_never_allows_another_spawn() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = RuntimeConfig {
-        state_dir: dir.path().into(),
-        executable: "unused".into(),
-        model: Some(crate::ModelAssets {
-            onnx_model: "unused".into(),
-            tokenizer_json: "unused".into(),
-            runtime_library: "unused".into(),
-        }),
-    };
-    let (events, incoming) = mpsc::channel();
-    let shared = Arc::new(SupervisorShared {
-        state: std::sync::Mutex::new(SupervisorState {
-            snapshot: ModelSnapshot {
-                state: WorkerState::Stopped,
-                incarnation: None,
-                model_digest: None,
-                cause: None,
-            },
-            warm: false,
-            stop: false,
-            loading_demand: false,
-            queries: QueryQueue::default(),
-            terminated: None,
-        }),
-        signal: Arc::new(Signal::default()),
-        changed: std::sync::Condvar::new(),
-        events,
-        wake_pending: AtomicBool::new(false),
-    });
-    let (children, received) = mpsc::channel();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let port = RefuseObserveAndStop {
-        children,
-        stops: Some(stop_tx),
-    };
-    let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let clock_worker = clock.clone();
-    let worker_shared = shared.clone();
-    let thread = std::thread::spawn(move || {
-        model_supervision_loop(
-            config,
-            Arc::new(EmptyRamIndex),
-            worker_shared,
-            port,
-            move || *clock_worker.lock().unwrap(),
-            incoming,
-        )
-    });
-    let mut supervisor = ModelSupervisor {
-        shared,
-        thread: Some(thread),
-        ids: ModelRequestIds::new(),
-        stop_result: None,
-    };
-    supervisor.set_warm(true);
-    let _first = received.recv_timeout(Duration::from_secs(5)).unwrap();
-    wait_for(|| supervisor.snapshot().state == WorkerState::Failed);
-    stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    *clock.lock().unwrap() += Duration::from_secs(30);
-    supervisor.wake();
-    stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(supervisor.stop().is_err());
-    assert!(supervisor.stop().is_err());
-    assert!(received.try_recv().is_err());
-}
 impl WorkerProcessPort for FakeRamProcess {
     fn spawn(&self, _: &RuntimeConfig) -> Result<Child> {
         let child = Command::new("powershell.exe")
@@ -264,7 +216,7 @@ impl WorkerProcessPort for FakeRamProcess {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         self.observed.send((inc.clone(), events.clone()))?;
         NativeProcess.observe(child, inc, events, signal)
@@ -321,99 +273,6 @@ impl IndexWorkPort for OneRamIndex {
     }
 }
 
-#[test]
-fn ram_supervisor_returns_running_index_work_on_child_exit() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = RuntimeConfig {
-        state_dir: dir.path().into(),
-        executable: "unused".into(),
-        model: Some(crate::ModelAssets {
-            onnx_model: "unused".into(),
-            tokenizer_json: "unused".into(),
-            runtime_library: "unused".into(),
-        }),
-    };
-    let (events, incoming) = mpsc::channel();
-    let shared = Arc::new(SupervisorShared {
-        state: std::sync::Mutex::new(SupervisorState {
-            snapshot: ModelSnapshot {
-                state: WorkerState::Stopped,
-                incarnation: None,
-                model_digest: None,
-                cause: None,
-            },
-            warm: false,
-            stop: false,
-            loading_demand: false,
-            queries: QueryQueue::default(),
-            terminated: None,
-        }),
-        signal: Arc::new(Signal::default()),
-        changed: std::sync::Condvar::new(),
-        events,
-        wake_pending: AtomicBool::new(false),
-    });
-    let (children_tx, children_rx) = mpsc::channel();
-    let (observed_tx, observed_rx) = mpsc::channel();
-    let (taken_tx, taken_rx) = mpsc::channel();
-    let (completed_tx, completed_rx) = mpsc::channel();
-    let ids = ModelRequestIds::new();
-    let id = ids.next().unwrap();
-    let index = Arc::new(OneRamIndex {
-        work: std::sync::Mutex::new(Some(IndexWork {
-            id,
-            text: Arc::from("index"),
-        })),
-        taken: taken_tx,
-        completed: completed_tx,
-    });
-    let port = FakeRamProcess {
-        children: children_tx,
-        observed: observed_tx,
-    };
-    let worker_shared = shared.clone();
-    let thread = std::thread::spawn(move || {
-        model_supervision_loop(config, index, worker_shared, port, Instant::now, incoming)
-    });
-    let supervisor = ModelSupervisor {
-        shared,
-        thread: Some(thread),
-        ids,
-        stop_result: None,
-    };
-    supervisor.set_warm(true);
-    let child = children_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (inc, tx) = observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    tx.send(Event::Output(
-        inc.clone(),
-        Output::Ready {
-            model: "digest".into(),
-        },
-    ))
-    .unwrap();
-    assert_eq!(taken_rx.recv_timeout(Duration::from_secs(5)).unwrap(), id);
-    child.terminate();
-    assert_eq!(
-        completed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        (id, true)
-    );
-    let mut stale = vec![0.0; crate::DIMENSIONS];
-    stale[0] = 1.0;
-    tx.send(Event::Output(
-        inc,
-        Output::Result {
-            id: id.0,
-            attempt: 1,
-            result: Ok(stale),
-        },
-    ))
-    .unwrap();
-    assert!(completed_rx
-        .recv_timeout(Duration::from_millis(100))
-        .is_err());
-    drop(supervisor);
-}
-
 fn wait_for(predicate: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !predicate() {
@@ -425,197 +284,6 @@ fn wait_for(predicate: impl Fn() -> bool) {
     }
 }
 
-#[test]
-fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = RuntimeConfig {
-        state_dir: dir.path().into(),
-        executable: "unused".into(),
-        model: Some(crate::ModelAssets {
-            onnx_model: "unused".into(),
-            tokenizer_json: "unused".into(),
-            runtime_library: "unused".into(),
-        }),
-    };
-    let (events, incoming) = mpsc::channel();
-    let shared = Arc::new(SupervisorShared {
-        state: std::sync::Mutex::new(SupervisorState {
-            snapshot: ModelSnapshot {
-                state: WorkerState::Stopped,
-                incarnation: None,
-                model_digest: None,
-                cause: None,
-            },
-            warm: false,
-            stop: false,
-            loading_demand: false,
-            queries: QueryQueue::default(),
-            terminated: None,
-        }),
-        signal: Arc::new(Signal::default()),
-        changed: std::sync::Condvar::new(),
-        events,
-        wake_pending: AtomicBool::new(false),
-    });
-    let (children_tx, children_rx) = mpsc::channel();
-    let (observed_tx, observed_rx) = mpsc::channel();
-    let port = FakeRamProcess {
-        children: children_tx,
-        observed: observed_tx,
-    };
-    let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let clock_worker = clock.clone();
-    let worker_shared = shared.clone();
-    let thread = std::thread::spawn(move || {
-        model_supervision_loop(
-            config,
-            Arc::new(EmptyRamIndex),
-            worker_shared,
-            port,
-            move || *clock_worker.lock().unwrap(),
-            incoming,
-        )
-    });
-    let supervisor = Arc::new(ModelSupervisor {
-        shared,
-        thread: Some(thread),
-        ids: ModelRequestIds::new(),
-        stop_result: None,
-    });
-    supervisor.set_warm(true);
-    let first = children_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (old, tx) = observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    tx.send(Event::Output(
-        old.clone(),
-        Output::Ready {
-            model: "digest-a".into(),
-        },
-    ))
-    .unwrap();
-    wait_for(|| supervisor.snapshot().state == WorkerState::Ready);
-    let first_waiter_supervisor = supervisor.clone();
-    let second_waiter_supervisor = supervisor.clone();
-    let cancelled_waiter_supervisor = supervisor.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_waiter = cancel.clone();
-    let cancelled_waiter = std::thread::spawn(move || {
-        cancelled_waiter_supervisor.embed_query("shared", &cancel_waiter)
-    });
-    let first_waiter = std::thread::spawn(move || {
-        first_waiter_supervisor.embed_query("shared", &AtomicBool::new(false))
-    });
-    let second_waiter = std::thread::spawn(move || {
-        second_waiter_supervisor.embed_query("shared", &AtomicBool::new(false))
-    });
-    wait_for(|| {
-        supervisor
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .get(&ModelRequestId(1))
-            .is_some_and(|f| f.running && f.waiters == 3)
-    });
-    cancel.store(true, Ordering::Release);
-    assert_eq!(cancelled_waiter.join().unwrap(), Err(QueryError::Cancelled));
-    first.terminate();
-    assert!(matches!(
-        first_waiter.join().unwrap(),
-        Err(QueryError::Unavailable(_))
-    ));
-    assert!(matches!(
-        second_waiter.join().unwrap(),
-        Err(QueryError::Unavailable(_))
-    ));
-    wait_for(|| supervisor.snapshot().state == WorkerState::Failed);
-    *clock.lock().unwrap() += Duration::from_secs(1);
-    let _second = children_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (new, tx) = observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_ne!(old, new);
-    tx.send(Event::Output(
-        new.clone(),
-        Output::Ready {
-            model: "digest-b".into(),
-        },
-    ))
-    .unwrap();
-    wait_for(|| supervisor.snapshot().model_digest.as_deref() == Some("digest-b"));
-    let query_supervisor = supervisor.clone();
-    let query =
-        std::thread::spawn(move || query_supervisor.embed_query("hello", &AtomicBool::new(false)));
-    wait_for(|| {
-        supervisor
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .get(&ModelRequestId(2))
-            .is_some_and(|f| f.running)
-    });
-    let mut old_vector = vec![0.; crate::DIMENSIONS];
-    old_vector[0] = 1.;
-    let mut new_vector = vec![0.; crate::DIMENSIONS];
-    new_vector[1] = 1.;
-    tx.send(Event::Output(
-        old,
-        Output::Result {
-            id: 2,
-            attempt: 1,
-            result: Ok(old_vector),
-        },
-    ))
-    .unwrap();
-    tx.send(Event::Output(
-        new,
-        Output::Result {
-            id: 2,
-            attempt: 1,
-            result: Ok(new_vector.clone()),
-        },
-    ))
-    .unwrap();
-    let answer = query.join().unwrap().unwrap();
-    assert_eq!(answer.model_digest, "digest-b");
-    assert_eq!(answer.vector, new_vector);
-    let query_supervisor = supervisor.clone();
-    let invalid = std::thread::spawn(move || {
-        query_supervisor.embed_query("bad input", &AtomicBool::new(false))
-    });
-    wait_for(|| {
-        supervisor
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .get(&ModelRequestId(3))
-            .is_some_and(|f| f.running)
-    });
-    let current = supervisor.snapshot().incarnation.unwrap();
-    tx.send(Event::Output(
-        current.clone(),
-        Output::Result {
-            id: 3,
-            attempt: 1,
-            result: Err(EmbeddingError::Failed("bad input".into())),
-        },
-    ))
-    .unwrap();
-    assert!(matches!(
-        invalid.join().unwrap(),
-        Err(QueryError::Failed(_))
-    ));
-    assert_eq!(
-        supervisor.snapshot().incarnation.as_deref(),
-        Some(current.as_str())
-    );
-    drop(supervisor);
-}
 struct ObservedNative(mpsc::Sender<OwnedHandle>);
 impl WorkerProcessPort for ObservedNative {
     fn spawn(&self, c: &RuntimeConfig) -> Result<Child> {
@@ -628,7 +296,7 @@ impl WorkerProcessPort for ObservedNative {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         NativeProcess.observe(child, inc, events, signal)
     }
@@ -671,6 +339,7 @@ fn await_ready(path: &std::path::Path, old: Option<&str>) -> String {
 
 #[test]
 #[ignore = "requires provisioned real ONNX assets and AGENTLAW_SMOKE_WORKER executable"]
+// This exercises the legacy SQLite supervisor via run_with_port, not the RAM supervisor.
 fn native_worker_death_recovers_without_another_frontend_request() {
     let dir = tempfile::tempdir().unwrap();
     let asset =
@@ -846,42 +515,6 @@ impl IndexWorkPort for ReviewIndex {
         }
     }
 }
-struct ReviewProcess {
-    observed: mpsc::Sender<String>,
-}
-impl WorkerProcessPort for ReviewProcess {
-    fn spawn(&self, _: &RuntimeConfig) -> Result<Child> {
-        use std::os::windows::process::CommandExt;
-        Ok(Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?)
-    }
-    fn observe(
-        &self,
-        child: &Child,
-        inc: String,
-        events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
-    ) -> Result<()> {
-        self.observed.send(inc.clone())?;
-        NativeProcess.observe(child, inc, events, signal)
-    }
-    fn stop(&self, child: &mut Child) -> Result<()> {
-        NativeProcess.stop(child)
-    }
-    fn control(&self, _: &str, _: &str, _: &str, _: bool) -> Result<Option<u64>> {
-        Ok(None)
-    }
-}
 struct ReviewFixture {
     owner: Arc<ModelSupervisor>,
     index: Arc<ReviewIndex>,
@@ -897,25 +530,7 @@ impl ReviewFixture {
     fn new(warm: bool, work: bool, probe: bool, release: Option<mpsc::Receiver<()>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (events, incoming) = mpsc::channel();
-        let shared = Arc::new(SupervisorShared {
-            state: Mutex::new(SupervisorState {
-                snapshot: ModelSnapshot {
-                    state: WorkerState::Stopped,
-                    incarnation: None,
-                    model_digest: None,
-                    cause: None,
-                },
-                warm,
-                stop: false,
-                loading_demand: false,
-                queries: QueryQueue::default(),
-                terminated: None,
-            }),
-            signal: Arc::new(Signal::default()),
-            changed: std::sync::Condvar::new(),
-            events: events.clone(),
-            wake_pending: AtomicBool::new(false),
-        });
+        let shared = super::ram_tests::fixture_shared(warm, &events);
         let ids = ModelRequestIds::new();
         let (taken_tx, taken) = mpsc::channel();
         let (finished_tx, finished) = mpsc::channel();
@@ -937,8 +552,11 @@ impl ReviewFixture {
             statuses: status_tx,
         });
         let (observed_tx, observed) = mpsc::channel();
-        let port = ReviewProcess {
+        let port = RecheckProcess {
             observed: observed_tx,
+            stop_calls: Arc::new(AtomicUsize::new(0)),
+            refuse_first_stop: false,
+            handles: Arc::new(Mutex::new(Vec::new())),
         };
         let worker_shared = shared.clone();
         let worker_index = index.clone();
@@ -1002,213 +620,6 @@ fn review_until(predicate: impl Fn() -> bool) {
         assert!(Instant::now() < end, "review fixture did not advance");
         std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-#[test]
-fn review_next_work_must_not_hold_supervisor_state_lock() {
-    let f = ReviewFixture::new(true, false, true, None);
-    f.ready();
-    let was_unlocked = f.lock_result.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.close().unwrap();
-    assert!(
-        was_unlocked,
-        "IndexWorkPort::next_work was called with SupervisorShared.state locked"
-    );
-}
-
-#[test]
-fn review_thread_panic_must_fail_waiters_and_clear_ready() {
-    let f = ReviewFixture::new(true, false, false, None);
-    f.ready();
-    let owner = f.owner.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancelled = cancel.clone();
-    let (done_tx, done_rx) = mpsc::channel();
-    let query = std::thread::spawn(move || {
-        let outcome = owner.embed_query("pending", &cancelled);
-        done_tx.send(outcome).unwrap();
-    });
-    review_until(|| {
-        f.owner
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .values()
-            .any(|q| q.running)
-    });
-    f.index.panic_status.store(true, Ordering::SeqCst);
-    f.owner.wake();
-    review_until(|| f.owner.thread.as_ref().unwrap().is_finished());
-    let snapshot = f.owner.snapshot();
-    let completion = done_rx.recv_timeout(Duration::from_secs(5));
-    cancel.store(true, Ordering::SeqCst);
-    query.join().unwrap();
-    assert!(f.close().is_err());
-    assert!(
-        completion.is_ok(),
-        "supervisor thread ended but query remained pending; snapshot={snapshot:?}"
-    );
-    assert_ne!(snapshot.state, WorkerState::Ready);
-}
-
-#[test]
-fn review_warm_arriving_during_exit_must_not_need_second_wake() {
-    let (release_tx, release_rx) = mpsc::channel();
-    let f = ReviewFixture::new(false, true, false, Some(release_rx));
-    let inc = f.ready();
-    f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.events
-        .send(Event::Pipe(inc, "injected execution failure".into()))
-        .unwrap();
-    f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.owner.set_warm(true);
-    release_tx.send(()).unwrap();
-    let recovered_without_new_call = f.observed.recv_timeout(Duration::from_secs(5)).is_ok();
-    f.close().unwrap();
-    assert!(
-        recovered_without_new_call,
-        "live demand was retained in RAM but its wake was consumed using the old warm snapshot"
-    );
-}
-
-#[test]
-fn review_demand_flap_must_not_bypass_failure_delay() {
-    let now = Instant::now();
-    let mut lifecycle = ModelLifecycle::default();
-    lifecycle.started();
-    lifecycle.exited(now, "load failed".into());
-    assert_eq!(lifecycle.action(now, false, true), LifecycleAction::None);
-    assert_eq!(
-        lifecycle.action(now, true, true),
-        LifecycleAction::None,
-        "a new attach started a replacement before the one-second failure deadline"
-    );
-}
-
-#[test]
-fn review_query_arriving_during_index_handoff_runs_first() {
-    let (release, held) = mpsc::channel();
-    let f = ReviewFixture::new(true, true, false, None);
-    *f.index.release_next.lock().unwrap() = Some(held);
-    let inc = f.ready();
-    f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
-    let owner = f.owner.clone();
-    let query = std::thread::spawn(move || owner.embed_query("priority", &AtomicBool::new(false)));
-    review_until(|| {
-        !f.owner
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .pending
-            .is_empty()
-    });
-    release.send(()).unwrap();
-    review_until(|| {
-        f.owner
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .get(&ModelRequestId(2))
-            .is_some_and(|flight| flight.running)
-    });
-    let mut vector = vec![0.; crate::DIMENSIONS];
-    vector[0] = 1.;
-    f.events
-        .send(Event::Output(
-            inc.clone(),
-            Output::Result {
-                id: 2,
-                attempt: 1,
-                result: Ok(vector.clone()),
-            },
-        ))
-        .unwrap();
-    assert!(query.join().unwrap().is_ok());
-    for _ in 0..2 {
-        while f.statuses.try_recv().is_ok() {}
-        f.owner.wake();
-        f.statuses.recv_timeout(Duration::from_secs(5)).unwrap();
-    }
-    f.events
-        .send(Event::Output(
-            inc,
-            Output::Result {
-                id: 1,
-                attempt: 1,
-                result: Ok(vector),
-            },
-        ))
-        .unwrap();
-    f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.close().unwrap();
-}
-
-#[test]
-fn review_supervisor_panic_completes_owned_index_and_is_observable() {
-    let f = ReviewFixture::new(true, true, false, None);
-    f.ready();
-    f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.index.panic_status.store(true, Ordering::SeqCst);
-    f.owner.wake();
-    assert!(f.owner.wait_terminated(Duration::from_secs(5)).is_some());
-    f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(f.owner.snapshot().state, WorkerState::Failed);
-    f.owner.set_warm(true);
-    assert!(matches!(
-        f.owner.embed_query("after", &AtomicBool::new(false)),
-        Err(QueryError::Unavailable(_))
-    ));
-    assert!(f.close().is_err());
-}
-
-#[test]
-fn review_supervisor_panic_completes_held_index() {
-    let (release, held) = mpsc::channel();
-    let f = ReviewFixture::new(true, true, false, None);
-    *f.index.release_next.lock().unwrap() = Some(held);
-    f.ready();
-    f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
-    let owner = f.owner.clone();
-    let query = std::thread::spawn(move || owner.embed_query("priority", &AtomicBool::new(false)));
-    review_until(|| {
-        !f.owner
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .pending
-            .is_empty()
-    });
-    release.send(()).unwrap();
-    review_until(|| {
-        f.owner
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .get(&ModelRequestId(2))
-            .is_some_and(|flight| flight.running)
-    });
-    f.index.panic_status.store(true, Ordering::SeqCst);
-    f.owner.wake();
-    assert!(f.owner.wait_terminated(Duration::from_secs(5)).is_some());
-    f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(
-        query.join().unwrap(),
-        Err(QueryError::Unavailable(_))
-    ));
-    assert!(f.close().is_err());
 }
 
 struct RecheckIndex {
@@ -1287,7 +698,7 @@ impl WorkerProcessPort for RecheckProcess {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         use std::os::windows::io::AsHandle;
         self.handles
@@ -1326,25 +737,7 @@ impl Recheck {
     fn new(warm: bool, work: bool, refuse_first_stop: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (events, incoming) = mpsc::channel();
-        let shared = Arc::new(SupervisorShared {
-            state: Mutex::new(SupervisorState {
-                snapshot: ModelSnapshot {
-                    state: WorkerState::Stopped,
-                    incarnation: None,
-                    model_digest: None,
-                    cause: None,
-                },
-                warm,
-                stop: false,
-                loading_demand: false,
-                queries: QueryQueue::default(),
-                terminated: None,
-            }),
-            signal: Arc::new(Signal::default()),
-            changed: std::sync::Condvar::new(),
-            events: events.clone(),
-            wake_pending: AtomicBool::new(false),
-        });
+        let shared = super::ram_tests::fixture_shared(warm, &events);
         let ids = ModelRequestIds::new();
         let (next_tx, next_entered) = mpsc::channel();
         let (status_tx, status_entered) = mpsc::channel();
@@ -1463,406 +856,23 @@ fn vector() -> Vec<f32> {
     v
 }
 
-#[test]
-fn recheck_poisoned_shared_lock_preserves_query_completion_and_stop() {
-    let mut f = Recheck::new(true, false, false);
-    let inc = f.ready("a");
-    let query = f.running_query("survive poison");
-    until(|| {
-        f.shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .values()
-            .any(|q| q.running)
-    });
-    let shared = f.shared.clone();
-    assert!(std::thread::spawn(move || {
-        let _guard = shared.state.lock().unwrap();
-        panic!("injected poison without changing invariants");
-    })
-    .join()
-    .is_err());
-    f.events
-        .send(Event::Output(
-            inc,
-            Output::Result {
-                id: 1,
-                attempt: 1,
-                result: Ok(vector()),
-            },
-        ))
-        .unwrap();
-    let result = query.join().unwrap().unwrap();
-    assert_eq!(result.model_digest, "a");
-    assert_eq!(f.owner().snapshot().state, WorkerState::Ready);
-    let shared = f.shared.clone();
-    f.shutdown().unwrap();
-    let state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
-    assert_eq!(state.snapshot.state, WorkerState::Stopped);
-    assert!(state.terminated.is_some());
-    assert!(state.queries.flights.is_empty());
-}
-
-#[test]
-fn recheck_native_exit_during_next_work_returns_the_owned_item_once() {
-    use std::os::windows::io::AsRawHandle;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn TerminateProcess(process: *mut std::ffi::c_void, code: u32) -> i32;
-    }
-    let mut f = Recheck::new(true, true, false);
-    let (release, gate) = mpsc::channel();
-    *f.index.next_gate.lock().unwrap() = Some(gate);
-    f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let handle = f.handles.lock().unwrap().pop().unwrap();
-    assert_ne!(unsafe { TerminateProcess(handle.as_raw_handle(), 27) }, 0);
-    f.owner().set_warm(false);
-    f.owner().set_warm(true);
-    release.send(()).unwrap();
-    let outcome = f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.shutdown().unwrap();
-    assert_eq!(outcome.0, ModelRequestId(1));
-    assert!(outcome.1);
-    assert_eq!(f.index.finish_calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn recheck_failure_backoff_starts_when_slow_spawn_has_finished() {
-    struct SlowFail {
-        clock: Arc<Mutex<Instant>>,
-        attempts: mpsc::Sender<Instant>,
-    }
-    impl WorkerProcessPort for SlowFail {
-        fn spawn(&self, _: &RuntimeConfig) -> Result<Child> {
-            let mut now = self.clock.lock().unwrap();
-            self.attempts.send(*now).unwrap();
-            *now += Duration::from_secs(5);
-            Err("slow spawn failure".into())
-        }
-        fn observe(
-            &self,
-            _: &Child,
-            _: String,
-            _: mpsc::Sender<Event>,
-            _: Arc<Signal>,
-        ) -> Result<()> {
-            unreachable!()
-        }
-        fn stop(&self, _: &mut Child) -> Result<()> {
-            unreachable!()
-        }
-        fn control(&self, _: &str, _: &str, _: &str, _: bool) -> Result<Option<u64>> {
-            unreachable!()
-        }
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (events, incoming) = mpsc::channel();
-    let shared = Arc::new(SupervisorShared {
-        state: Mutex::new(SupervisorState {
-            snapshot: ModelSnapshot {
-                state: WorkerState::Stopped,
-                incarnation: None,
-                model_digest: None,
-                cause: None,
-            },
-            warm: true,
-            stop: false,
-            loading_demand: false,
-            queries: QueryQueue::default(),
-            terminated: None,
-        }),
-        signal: Arc::new(Signal::default()),
-        changed: std::sync::Condvar::new(),
-        events,
-        wake_pending: AtomicBool::new(false),
-    });
-    struct Idle;
-    impl IndexWorkPort for Idle {
-        fn model_ready(&self, _: &str) {}
-        fn next_work(&self, _: &str) -> Option<IndexWork> {
-            None
-        }
-        fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {}
-        fn status(&self) -> IndexWorkStatus {
-            IndexWorkStatus {
-                runnable: false,
-                next_retry_at: None,
-                awaiting_model: false,
-            }
-        }
-    }
-    let origin = Instant::now();
-    let clock = Arc::new(Mutex::new(origin));
-    let (tx, rx) = mpsc::channel();
-    let port = SlowFail {
-        clock: clock.clone(),
-        attempts: tx,
+fn missing_model_cause(directory: &std::path::Path) -> String {
+    let assets = crate::ModelAssets {
+        onnx_model: directory.join("missing.onnx"),
+        tokenizer_json: directory.join("missing.json"),
+        runtime_library: directory.join("missing.dll"),
     };
-    let worker_clock = clock.clone();
-    let worker_shared = shared.clone();
-    let config = RuntimeConfig {
-        state_dir: dir.path().into(),
-        executable: "unused".into(),
-        model: Some(crate::ModelAssets {
-            onnx_model: "unused".into(),
-            tokenizer_json: "unused".into(),
-            runtime_library: "unused".into(),
-        }),
-    };
-    let thread = std::thread::spawn(move || {
-        model_supervision_loop(
-            config,
-            Arc::new(Idle),
-            worker_shared,
-            port,
-            move || *worker_clock.lock().unwrap(),
-            incoming,
-        )
-    });
-    let mut owner = ModelSupervisor {
-        shared,
-        thread: Some(thread),
-        ids: ModelRequestIds::new(),
-        stop_result: None,
-    };
-    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let premature = rx.recv_timeout(Duration::from_millis(150)).ok();
-    let mut early = None;
-    let mut retried = None;
-    if premature.is_none() {
-        *clock.lock().unwrap() += Duration::from_millis(999);
-        owner.wake();
-        early = rx.recv_timeout(Duration::from_millis(50)).ok();
-        if early.is_none() {
-            *clock.lock().unwrap() += Duration::from_millis(1);
-            owner.wake();
-            retried = Some(rx.recv_timeout(Duration::from_secs(5)).unwrap());
-        }
-    }
-    owner.stop().unwrap();
-    assert!(
-        premature.is_none(),
-        "next spawn started at {:?}; previous failure completed at {:?}, no one-second delay",
-        premature.map(|x| x.duration_since(origin)),
-        first.duration_since(origin) + Duration::from_secs(5)
-    );
-    assert!(early.is_none(), "retried before the failure deadline");
-    assert_eq!(retried, Some(first + Duration::from_secs(6)));
-}
-
-#[test]
-fn recheck_stop_during_next_work_returns_the_owned_item_once() {
-    let mut f = Recheck::new(true, true, false);
-    let (release, gate) = mpsc::channel();
-    *f.index.next_gate.lock().unwrap() = Some(gate);
-    f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut owner = Arc::try_unwrap(f.owner.take().unwrap()).ok().unwrap();
-    let (done_tx, done_rx) = mpsc::channel();
-    let stop = std::thread::spawn(move || {
-        done_tx.send(owner.stop()).unwrap();
-    });
-    until(|| f.shared.state.lock().unwrap().stop);
-    release.send(()).unwrap();
-    assert!(done_rx
-        .recv_timeout(Duration::from_secs(5))
+    crate::OnnxProvider::load(&assets)
+        .err()
         .unwrap()
-        .is_ok());
-    stop.join().unwrap();
-    let outcome = f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(outcome.0, ModelRequestId(1));
-    assert!(outcome.1);
-    assert_eq!(f.index.finish_calls.load(Ordering::SeqCst), 1);
+        .to_string()
 }
 
-#[test]
-fn recheck_child_failure_during_next_work_returns_the_owned_item_once() {
-    let mut f = Recheck::new(true, true, false);
-    let (release, gate) = mpsc::channel();
-    *f.index.next_gate.lock().unwrap() = Some(gate);
-    let inc = f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.events
-        .send(Event::Pipe(inc, "failure during handoff".into()))
-        .unwrap();
-    release.send(()).unwrap();
-    let outcome = f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(outcome.1);
-    f.shutdown().unwrap();
-    assert_eq!(f.index.finish_calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn recheck_held_work_must_not_cross_replacement_after_stop_retry() {
-    let mut f = Recheck::new(true, true, true);
-    let (release, gate) = mpsc::channel();
-    *f.index.next_gate.lock().unwrap() = Some(gate);
-    let old = f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let query = f.running_query("priority");
-    until(|| !f.shared.state.lock().unwrap().queries.pending.is_empty());
-    release.send(()).unwrap();
-    until(|| {
-        f.shared
-            .state
-            .lock()
-            .unwrap()
-            .queries
-            .flights
-            .values()
-            .any(|q| q.running)
-    });
-    f.events
-        .send(Event::Pipe(old, "control failure".into()))
-        .unwrap();
-    assert!(matches!(
-        query.join().unwrap(),
-        Err(QueryError::Unavailable(_))
-    ));
-    until(|| f.stop_calls.load(Ordering::SeqCst) == 1);
-    *f.clock.lock().unwrap() += Duration::from_secs(2);
-    f.owner().wake();
-    let new = f.ready("b");
-    let before_replacement = f.finished.try_recv().ok();
-    let mut observed = before_replacement.clone();
-    if observed.is_none() {
-        for _ in 0..10 {
-            f.events
-                .send(Event::Output(
-                    new.clone(),
-                    Output::Result {
-                        id: 1,
-                        attempt: 1,
-                        result: Ok(vector()),
-                    },
-                ))
-                .unwrap();
-            if let Ok(outcome) = f.finished.recv_timeout(Duration::from_millis(50)) {
-                observed = Some(outcome);
-                break;
-            }
-        }
-    }
-    f.shutdown().unwrap();
-    assert!(before_replacement.as_ref().is_some_and(|x| x.1),
-        "held job from model a was not returned on confirmed exit; completion after model b READY: {observed:?}");
-}
-
-#[test]
-fn recheck_warm_arriving_after_event_drain_survives_until_next_iteration() {
-    let mut f = Recheck::new(false, true, false);
-    let inc = f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (release, gate) = mpsc::channel();
-    *f.index.status_gate.lock().unwrap() = Some(gate);
-    f.events
-        .send(Event::Pipe(inc, "failure before status".into()))
-        .unwrap();
-    f.status_entered
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-    f.owner().set_warm(true);
-    *f.clock.lock().unwrap() += Duration::from_secs(2);
-    release.send(()).unwrap();
-    let replacement = f.observed.recv_timeout(Duration::from_secs(5));
-    f.shutdown().unwrap();
-    assert!(
-        replacement.is_ok(),
-        "warm event arriving after re-read was lost"
-    );
-}
-
-#[test]
-fn recheck_stop_arriving_after_event_drain_does_not_wait_for_heartbeat() {
-    let mut f = Recheck::new(true, false, false);
-    f.ready("a");
-    let (release, gate) = mpsc::channel();
-    *f.index.status_gate.lock().unwrap() = Some(gate);
-    f.owner().wake();
-    f.status_entered
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
-    let mut owner = Arc::try_unwrap(f.owner.take().unwrap()).ok().unwrap();
-    let (done_tx, done_rx) = mpsc::channel();
-    let stop = std::thread::spawn(move || {
-        done_tx.send(owner.stop()).unwrap();
-    });
-    until(|| f.shared.state.lock().unwrap().stop);
-    release.send(()).unwrap();
-    assert!(done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .is_ok());
-    stop.join().unwrap();
-}
-
-#[test]
-fn recheck_finish_panic_must_not_deliver_a_second_conflicting_completion() {
-    let mut f = Recheck::new(true, true, false);
-    let inc = f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.index.panic_finish_once.store(true, Ordering::SeqCst);
-    for _ in 0..10 {
-        f.events
-            .send(Event::Output(
-                inc.clone(),
-                Output::Result {
-                    id: 1,
-                    attempt: 1,
-                    result: Ok(vector()),
-                },
-            ))
-            .unwrap();
-        if f.owner()
-            .wait_terminated(Duration::from_millis(100))
-            .is_some()
-        {
-            break;
-        }
-    }
-    let terminated = f.owner().wait_terminated(Duration::from_secs(5));
-    let calls = f.index.finish_calls.load(Ordering::SeqCst);
-    let completions: Vec<_> = f.finished.try_iter().collect();
-    let result = f.shutdown();
-    assert!(terminated.is_some());
-    assert!(result.is_err());
-    assert_eq!(
-        calls, 1,
-        "finish received conflicting duplicate completions: {completions:?}"
-    );
-}
-
-#[test]
-fn recheck_index_result_rejects_changed_digest_in_same_incarnation() {
-    let mut f = Recheck::new(true, true, false);
-    let inc = f.ready("a");
-    f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.events
-        .send(Event::Output(
-            inc.clone(),
-            Output::Ready { model: "b".into() },
-        ))
-        .unwrap();
-    until(|| f.owner().snapshot().model_digest.as_deref() == Some("b"));
-    f.events
-        .send(Event::Output(
-            inc,
-            Output::Result {
-                id: 1,
-                attempt: 1,
-                result: Ok(vector()),
-            },
-        ))
-        .unwrap();
-    let outcome = f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    f.shutdown().unwrap();
-    assert!(
-        outcome.1,
-        "an index result for a different model digest was accepted"
-    );
-    assert_eq!(f.index.finish_calls.load(Ordering::SeqCst), 1);
-}
+#[path = "supervisor/tests/lifecycle.rs"]
+mod lifecycle;
+#[path = "supervisor/tests/native_index_handoff.rs"]
+mod native_index_handoff;
+#[path = "supervisor/tests/native_windows.rs"]
+mod native_windows;
+#[path = "supervisor/tests/query.rs"]
+mod query;

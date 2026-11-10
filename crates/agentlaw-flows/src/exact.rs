@@ -11,14 +11,1260 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak},
 };
-fn db<T>(r: std::result::Result<T, rusqlite::Error>) -> Result<T> {
-    r.map_err(|_| {
-        DomainError::new(
-            "exact_index_failed",
-            "The rebuildable exact-membership index is unavailable.",
+#[cfg(test)]
+mod tests;
+
+/// A validated pair of derived files. Readers hold its Arc while using either file.
+pub struct ProjectionGeneration {
+    id: String,
+    epoch: String,
+    exact_file: PathBuf,
+    lexical_file: PathBuf,
+}
+
+pub struct PinnedProjection {
+    exact: ExactIndex,
+    lexical: agentlaw_search::ReadView,
+    minimum_ack: SourcePosition,
+    maximum_ack: u64,
+    // Drop the read handles before releasing the file-retention reference.
+    generation: Arc<ProjectionGeneration>,
+}
+
+pub struct ShadowGeneration {
+    generation: ProjectionGeneration,
+}
+
+pub struct StagedActivation {
+    registry_id: uuid::Uuid,
+    generation: Arc<ProjectionGeneration>,
+}
+impl StagedActivation {
+    pub fn generation_id(&self) -> &str {
+        &self.generation.id
+    }
+    pub fn exact_file(&self) -> &Path {
+        &self.generation.exact_file
+    }
+    pub fn epoch(&self) -> &str {
+        &self.generation.epoch
+    }
+    pub fn lexical_file(&self) -> &Path {
+        &self.generation.lexical_file
+    }
+    pub fn into_files(self) -> (PathBuf, PathBuf) {
+        (
+            self.generation.exact_file.clone(),
+            self.generation.lexical_file.clone(),
         )
-    })
+    }
+}
+
+// Weak references allow a restarted maintainer in this process to avoid reclaiming
+// files still held by a registry, a staged activation, or a pinned reader.
+static KNOWN_GENERATIONS: std::sync::OnceLock<
+    Mutex<Vec<(Weak<ProjectionGeneration>, PathBuf, PathBuf)>>,
+> = std::sync::OnceLock::new();
+/// Obtain a common filesystem identity for path comparisons without changing files.
+pub fn projection_path_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| -> std::io::Result<PathBuf> {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "missing parent")
+            })?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing name"))?;
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+fn register_generation(generation: &Arc<ProjectionGeneration>) {
+    let exact = projection_path_key(&generation.exact_file);
+    let lexical = projection_path_key(&generation.lexical_file);
+    let mut known = KNOWN_GENERATIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    known.retain(|(item, _, _)| item.strong_count() != 0);
+    known.push((Arc::downgrade(generation), exact, lexical));
+}
+/// True only if no generation in this process still references the file.
+pub fn projection_file_unreferenced(path: &Path) -> bool {
+    let key = projection_path_key(path);
+    let mut known = KNOWN_GENERATIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    known.retain(|(item, _, _)| item.strong_count() != 0);
+    !known
+        .iter()
+        .any(|(_, exact, lexical)| *exact == key || *lexical == key)
+}
+struct RetiredGeneration {
+    generation: Weak<ProjectionGeneration>,
+    exact: PathBuf,
+    lexical: PathBuf,
+}
+struct GenerationState {
+    current: Arc<ProjectionGeneration>,
+    retired: Vec<RetiredGeneration>,
+    untrusted: bool,
+}
+pub struct ProjectionGenerations {
+    id: uuid::Uuid,
+    state: Mutex<GenerationState>,
+}
+fn not_ready() -> DomainError {
+    DomainError::new("exact_not_ready", "The exact projection is not ready.")
+}
+fn projection_corrupt() -> DomainError {
+    DomainError::new(
+        "exact_index_corrupt",
+        "Projection schema or metadata is incomplete; rebuild required.",
+    )
+}
+impl ProjectionGenerations {
+    pub fn open(
+        id: impl Into<String>,
+        epoch: impl Into<String>,
+        exact_file: impl Into<PathBuf>,
+        lexical_file: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let registry = Self::from_generation(ProjectionGeneration {
+            id: id.into(),
+            epoch: epoch.into(),
+            exact_file: exact_file.into(),
+            lexical_file: lexical_file.into(),
+        })?;
+        {
+            let state = registry.state.lock().map_err(|_| not_ready())?;
+            if state.current.exact_file.parent() != state.current.lexical_file.parent() {
+                return Err(not_ready());
+            }
+            if !state.current.exact_file.is_file() || !state.current.lexical_file.is_file() {
+                return Err(not_ready());
+            }
+            let filename = state
+                .current
+                .exact_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(not_ready)?;
+            if filename != format!("exact-{}.sqlite", state.current.id)
+                && filename != format!("exact-repair-{}.sqlite", state.current.id)
+            {
+                return Err(not_ready());
+            }
+        }
+        drop(registry.pin()?);
+        Ok(registry)
+    }
+    /// Construct a registry for an untrusted active generation without opening it.
+    pub fn open_for_recovery(
+        id: impl Into<String>,
+        epoch: impl Into<String>,
+        exact_file: impl Into<PathBuf>,
+        lexical_file: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let generation = ProjectionGeneration {
+            id: id.into(),
+            epoch: epoch.into(),
+            exact_file: exact_file.into(),
+            lexical_file: lexical_file.into(),
+        };
+        if generation.exact_file.parent() != generation.lexical_file.parent() {
+            return Err(not_ready());
+        }
+        let name = generation
+            .exact_file
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or_else(not_ready)?;
+        if name != format!("exact-{}.sqlite", generation.id)
+            && name != format!("exact-repair-{}.sqlite", generation.id)
+        {
+            return Err(not_ready());
+        }
+        let registry = Self::from_generation(generation)?;
+        registry.state.lock().map_err(|_| not_ready())?.untrusted = true;
+        Ok(registry)
+    }
+    /// Retain an active descriptor while its files are temporarily inaccessible.
+    pub fn open_unavailable(
+        id: impl Into<String>,
+        epoch: impl Into<String>,
+        exact_file: impl Into<PathBuf>,
+        lexical_file: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let registry = Self::open_for_recovery(id, epoch, exact_file, lexical_file)?;
+        registry.state.lock().map_err(|_| not_ready())?.untrusted = false;
+        Ok(registry)
+    }
+    fn from_generation(generation: ProjectionGeneration) -> Result<Self> {
+        let generation = Arc::new(generation);
+        register_generation(&generation);
+        Ok(Self {
+            id: uuid::Uuid::new_v4(),
+            state: Mutex::new(GenerationState {
+                current: generation,
+                retired: Vec::new(),
+                untrusted: false,
+            }),
+        })
+    }
+    pub fn pin(&self) -> Result<PinnedProjection> {
+        for _ in 0..2 {
+            let generation = {
+                let state = self.state.lock().map_err(|_| not_ready())?;
+                if state.untrusted {
+                    return Err(not_ready());
+                }
+                state.current.clone()
+            };
+            let exact = db(Connection::open_with_flags(
+                &generation.exact_file,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ))?;
+            db(exact.execute_batch("PRAGMA temp_store=MEMORY; BEGIN DEFERRED"))?;
+            let (epoch, sequence, pointer): (String, String, String) = db(exact.query_row("SELECT p.epoch,p.sequence,l.filename FROM exact_position p JOIN exact_lexical l ON l.singleton=p.singleton WHERE p.singleton=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
+            if generation.lexical_file.file_name().and_then(|v| v.to_str())
+                != Some(pointer.as_str())
+            {
+                #[cfg(test)]
+                tests::oracle::on_pointer_mismatch(self);
+                continue;
+            }
+            if epoch != generation.epoch {
+                return Err(not_ready());
+            }
+            let sequence: u64 = sequence.parse().map_err(|_| not_ready())?;
+            i64::try_from(sequence).map_err(|_| not_ready())?;
+            let lexical =
+                agentlaw_search::ReadView::open(&generation.lexical_file).map_err(lexical_error)?;
+            let lexical_ack = u64::try_from(lexical.stamp.ack).map_err(|_| not_ready())?;
+            let minimum_ack = SourcePosition {
+                epoch,
+                sequence: sequence.min(lexical_ack),
+            };
+            let directory = generation
+                .exact_file
+                .parent()
+                .ok_or_else(not_ready)?
+                .to_path_buf();
+            return Ok(PinnedProjection {
+                generation,
+                exact: ExactIndex {
+                    connection: exact,
+                    directory,
+                },
+                lexical,
+                minimum_ack,
+                maximum_ack: sequence.max(lexical_ack),
+            });
+        }
+        Err(not_ready())
+    }
+    /// Reject new pins until a validated shadow replaces the damaged generation.
+    pub fn mark_untrusted(&self) -> Result<()> {
+        self.state.lock().map_err(|_| not_ready())?.untrusted = true;
+        Ok(())
+    }
+    pub fn stage(&self, shadow: ShadowGeneration) -> Result<StagedActivation> {
+        let generation = Arc::new(shadow.generation);
+        register_generation(&generation);
+        Ok(StagedActivation {
+            registry_id: self.id,
+            generation,
+        })
+    }
+    pub fn commit(&self, staged: StagedActivation) -> Result<()> {
+        if staged.registry_id != self.id {
+            return Err(not_ready());
+        }
+        let mut state = self.state.lock().map_err(|_| not_ready())?;
+        state.untrusted = false;
+        let old = std::mem::replace(&mut state.current, staged.generation);
+        state.retired.push(RetiredGeneration {
+            generation: Arc::downgrade(&old),
+            exact: old.exact_file.clone(),
+            lexical: old.lexical_file.clone(),
+        });
+        Ok(())
+    }
+    /// Returns file pairs only after no pinned reader can still use them.
+    pub fn take_retired(&self) -> Vec<(PathBuf, PathBuf)> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut ready = Vec::new();
+        state.retired.retain(|item| {
+            if item.generation.strong_count() == 0 {
+                ready.push((item.exact.clone(), item.lexical.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaBudget {
+    pub max_identities: u32,
+    pub max_resident_bytes: u64,
+}
+impl Default for DeltaBudget {
+    fn default() -> Self {
+        Self {
+            max_identities: 1024,
+            max_resident_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+pub struct ExactSnapshot {
+    pinned: PinnedProjection,
+    position: SourcePosition,
+    removed: Vec<String>,
+    units: Vec<CurrentUnit>,
+    documents: Vec<agentlaw_search::SearchDocument>,
+}
+impl ExactSnapshot {
+    fn shadows_id(&self, id: &str) -> bool {
+        self.removed
+            .iter()
+            .any(|entry| entry == id || entry.strip_prefix("procedure/") == Some(id))
+    }
+    pub fn position(&self) -> &SourcePosition {
+        &self.position
+    }
+    pub fn owned_body(&self, id: &str, version: &str) -> Option<&str> {
+        let unit = self.units.iter().find(|unit| unit.entity_id == id)?;
+        let key = index_id(unit);
+        let index = self
+            .documents
+            .iter()
+            .filter(|doc| doc.memory_id == key)
+            .position(|doc| doc.change_id == version)?;
+        if unit.entity_type == "memory" {
+            self.documents
+                .iter()
+                .filter(|doc| doc.memory_id == key)
+                .nth(index)
+                .map(|doc| doc.body.as_str())
+        } else {
+            unit.heads().get(index).map(|head| head.body.as_str())
+        }
+    }
+
+    pub fn identical_bodies(&self, body: &str) -> Result<Vec<String>> {
+        let mut result: BTreeSet<_> = self
+            .pinned
+            .exact
+            .identical_bodies(body)?
+            .into_iter()
+            .filter(|id| !self.shadows_id(id))
+            .collect();
+        for unit in &self.units {
+            let matches = if unit.entity_type == "memory" {
+                self.documents
+                    .iter()
+                    .any(|doc| doc.memory_id == unit.entity_id && doc.body == body)
+            } else {
+                unit.heads().iter().any(|head| head.body == body)
+            };
+            if matches {
+                result.insert(unit.entity_id.clone());
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+
+    pub fn procedure_ids(&self, context: &RequestContext) -> Result<Vec<String>> {
+        let scopes = allowed_scopes(context);
+        let mut result: BTreeSet<_> = self
+            .pinned
+            .exact
+            .procedure_ids(context)?
+            .into_iter()
+            .filter(|id| !self.removed.contains(&format!("procedure/{id}")))
+            .collect();
+        for unit in &self.units {
+            if unit.entity_type != "learned_procedure" {
+                continue;
+            }
+            for head in unit.heads() {
+                let scope = crate::runtime::scope_token(&crate::runtime::scope_value(
+                    &head.metadata["applicability"],
+                )?);
+                if scopes.contains(&scope) {
+                    result.insert(unit.entity_id.clone());
+                }
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+
+    pub fn work_targets(
+        &self,
+        project: &str,
+        requested: &[WorkTarget],
+    ) -> Result<Vec<(String, Reading)>> {
+        let encode = |reading: &Reading| match reading {
+            Reading::Required => "required",
+            Reading::Related => "related",
+        };
+        let mut result = BTreeSet::new();
+        for (id, reading) in self.pinned.exact.work_targets(project, requested)? {
+            if !self.removed.contains(&id) {
+                result.insert((id, encode(&reading).to_owned()));
+            }
+        }
+        let requests = requested
+            .iter()
+            .map(|target| Ok((relative_path(&target.path)?, &target.kind)))
+            .collect::<Result<Vec<_>>>()?;
+        for unit in &self.units {
+            for head in unit.heads() {
+                for target in head.metadata["work_targets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    let target: StoredTarget =
+                        serde_json::from_value(target.clone()).map_err(|_| {
+                            DomainError::new("source_corrupt", "Published work target is invalid.")
+                        })?;
+                    if target.project_id != project {
+                        continue;
+                    }
+                    let path = relative_path(&target.path)?;
+                    if requests
+                        .iter()
+                        .any(|(requested, kind)| target_path_matches(requested, kind, &path))
+                    {
+                        result.insert((unit.entity_id.clone(), encode(&target.reading).to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(result
+            .into_iter()
+            .map(|(id, reading)| {
+                (
+                    id,
+                    if reading == "required" {
+                        Reading::Required
+                    } else {
+                        Reading::Related
+                    },
+                )
+            })
+            .collect())
+    }
+
+    pub fn reverse_required(&self, targets: &[String]) -> Result<Vec<String>> {
+        let mut result: BTreeSet<_> = self
+            .pinned
+            .exact
+            .reverse_required(targets)?
+            .into_iter()
+            .filter(|id| !self.removed.contains(id))
+            .collect();
+        for unit in &self.units {
+            for head in unit.heads() {
+                for relation in head.metadata["relations"].as_array().into_iter().flatten() {
+                    if relation["kind"] == "required"
+                        && relation["target_memory_id"]
+                            .as_str()
+                            .is_some_and(|id| targets.iter().any(|v| v == id))
+                    {
+                        result.insert(unit.entity_id.clone());
+                    }
+                }
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+    pub fn related(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut result: BTreeSet<_> = self
+            .pinned
+            .exact
+            .related(ids)?
+            .into_iter()
+            .filter(|(id, _)| !self.removed.contains(id))
+            .collect();
+        for unit in &self.units {
+            if !ids.contains(&unit.entity_id) {
+                continue;
+            }
+            for head in unit.heads() {
+                for relation in head.metadata["relations"].as_array().into_iter().flatten() {
+                    if relation["kind"] == "related" {
+                        let target = relation["target_memory_id"].as_str().ok_or_else(|| {
+                            DomainError::new("source_corrupt", "Relation target is missing.")
+                        })?;
+                        result.insert((unit.entity_id.clone(), target.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+    pub fn heads(&self, ids: &[String]) -> Result<Vec<HeadRecord>> {
+        let mut result = self.pinned.exact.heads(ids)?;
+        result.retain(|head| !self.shadows_id(&head.entity_id));
+        for unit in &self.units {
+            if !ids.contains(&unit.entity_id) {
+                continue;
+            }
+            let key = index_id(unit);
+            for (head, document) in unit.heads().iter().zip(
+                self.documents
+                    .iter()
+                    .filter(|document| document.memory_id == key),
+            ) {
+                result.push(HeadRecord {
+                    entity_id: unit.entity_id.clone(),
+                    entity_type: unit.entity_type.clone(),
+                    observed_version: document.change_id.clone(),
+                    metadata: head.metadata.clone(),
+                    excerpt: if unit.entity_type == "memory" {
+                        document.body.chars().take(400).collect()
+                    } else {
+                        head.body.chars().take(400).collect()
+                    },
+                });
+            }
+        }
+        result.sort_by(|a, b| {
+            (&a.entity_id, &a.observed_version).cmp(&(&b.entity_id, &b.observed_version))
+        });
+        Ok(result)
+    }
+    pub fn ids_matching(
+        &self,
+        context: &RequestContext,
+        rules: bool,
+        tasks: bool,
+    ) -> Result<Vec<String>> {
+        let scopes = allowed_scopes(context);
+        let mut result: BTreeSet<_> = self
+            .pinned
+            .exact
+            .ids_matching(context, rules, tasks)?
+            .into_iter()
+            .filter(|id| !self.removed.contains(id))
+            .collect();
+        for unit in &self.units {
+            if unit.entity_type != "memory" {
+                continue;
+            }
+            for head in unit.heads() {
+                if !scopes.contains(&index_scope(unit, head)?) {
+                    continue;
+                }
+                if (rules && head.metadata["is_rule"].as_bool() == Some(true))
+                    || (tasks && head.metadata["in_working_set"].as_bool() == Some(true))
+                {
+                    result.insert(unit.entity_id.clone());
+                }
+            }
+        }
+        Ok(result.into_iter().collect())
+    }
+    pub fn build(
+        pinned: PinnedProjection,
+        source: &agentlaw_storage::published::SourceReadGuard<'_>,
+        budget: DeltaBudget,
+    ) -> Result<Self> {
+        let mut snapshot = Self {
+            position: pinned.minimum_ack.clone(),
+            pinned,
+            removed: Vec::new(),
+            units: Vec::new(),
+            documents: Vec::new(),
+        };
+        snapshot.advance(source, budget)?;
+        Ok(snapshot)
+    }
+    pub fn advance(
+        &mut self,
+        source: &agentlaw_storage::published::SourceReadGuard<'_>,
+        budget: DeltaBudget,
+    ) -> Result<()> {
+        let end = source.position();
+        if end.epoch != self.pinned.minimum_ack.epoch {
+            return Err(DomainError::new(
+                "source_epoch_changed",
+                "Source epoch changed.",
+            ));
+        }
+        u64_to_i64(end.sequence)?;
+        if end.sequence < self.pinned.maximum_ack || end.sequence < self.position.sequence {
+            return Err(not_ready());
+        }
+        let mut cursor = self.pinned.minimum_ack.clone();
+        let mut identities = std::collections::BTreeSet::new();
+        while cursor.sequence < end.sequence {
+            let page = source
+                .read_published_paths(&cursor, 1024)
+                .map_err(source_error)?;
+            for path in page.canonical_paths {
+                let kind = if path.starts_with("current/memory/") {
+                    "memory"
+                } else if path.starts_with("current/procedure/") {
+                    "procedure"
+                } else {
+                    continue;
+                };
+                let id = Path::new(&path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| {
+                        DomainError::new("source_corrupt", "Invalid publication path.")
+                    })?;
+                identities.insert((kind.to_owned(), id.to_owned()));
+                if identities.len() > budget.max_identities as usize {
+                    return Err(DomainError::new(
+                        "capacity",
+                        "Projection delta identity budget exceeded.",
+                    ));
+                }
+            }
+            cursor = page.covered_through;
+        }
+        let mut removed = Vec::new();
+        let mut units = Vec::new();
+        let mut documents = Vec::new();
+        let mut bytes = 0u64;
+        for (kind, id) in identities {
+            removed.push(if kind == "procedure" {
+                format!("procedure/{id}")
+            } else {
+                id.clone()
+            });
+            let remaining = budget
+                .max_resident_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| {
+                    DomainError::new("capacity", "Projection delta body budget exceeded.")
+                })?;
+            let mut unit = match source.read_current_compact(&id, kind == "procedure", remaining) {
+                Ok(unit) => unit,
+                Err(agentlaw_storage::Error::NotFound(_)) => continue,
+                Err(error) => return Err(source_error(error)),
+            };
+            let refs = unit.references().map_err(source_error)?;
+            let key = index_id(&unit);
+            let specs = unit
+                .heads()
+                .iter()
+                .zip(refs)
+                .map(|(head, reference)| {
+                    Ok((
+                        reference.observed_version,
+                        index_scope(&unit, head)?,
+                        if kind == "procedure" {
+                            Some(index_body(&unit, head))
+                        } else {
+                            None
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let UnitState::Live { heads } = &mut unit.state {
+                for (head, (version, scope, procedure_body)) in heads.iter_mut().zip(specs) {
+                    let body = if kind == "memory" {
+                        std::mem::take(&mut head.body)
+                    } else {
+                        procedure_body.unwrap_or_default()
+                    };
+                    bytes = bytes
+                        .checked_add(if kind == "memory" {
+                            body.len() as u64
+                        } else {
+                            head.body.len() as u64
+                        })
+                        .ok_or_else(|| {
+                            DomainError::new("capacity", "Projection delta body budget exceeded.")
+                        })?;
+                    if bytes > budget.max_resident_bytes {
+                        return Err(DomainError::new(
+                            "capacity",
+                            "Projection delta body budget exceeded.",
+                        ));
+                    }
+                    documents.push(agentlaw_search::SearchDocument {
+                        memory_id: key.clone(),
+                        change_id: version,
+                        body,
+                        scope,
+                    });
+                }
+            }
+            units.push(unit);
+        }
+        self.position = end.clone();
+        self.removed = removed;
+        self.units = units;
+        self.documents = documents;
+        Ok(())
+    }
+    pub fn lexical(
+        &mut self,
+        scope: &agentlaw_search::ScopeFilter,
+    ) -> Result<agentlaw_search::EffectiveCorpus<'_>> {
+        self.pinned
+            .lexical
+            .effective(
+                scope,
+                agentlaw_search::LexicalDelta {
+                    pending: &self.documents,
+                    removed: &self.removed,
+                    complete: true,
+                },
+            )
+            .map_err(lexical_error)
+    }
+}
+
+/// Single-owner writer; the store service is responsible for writer exclusivity.
+pub struct ExactIndexWriter {
+    exact: ExactIndex,
+    lexical: agentlaw_search::SearchIndex,
+}
+
+fn source_error(error: agentlaw_storage::Error) -> DomainError {
+    match error {
+        agentlaw_storage::Error::Capacity => {
+            DomainError::new("capacity", "Source acquisition exceeded its capacity.")
+        }
+        agentlaw_storage::Error::CoverageLost => DomainError::new(
+            "source_coverage_lost",
+            "Source publication coverage is incomplete.",
+        ),
+        _ => DomainError::new(
+            "source_unavailable",
+            format!("Cannot read published source: {error}"),
+        ),
+    }
+}
+
+fn sqlite_unavailable(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code,
+        rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::PermissionDenied))
+}
+fn exact_unavailable() -> DomainError {
+    DomainError::new(
+        "exact_index_unavailable",
+        "The projection is temporarily unavailable.",
+    )
+}
+fn exact_schema_error(error: rusqlite::Error) -> DomainError {
+    if sqlite_unavailable(&error) {
+        return exact_unavailable();
+    }
+    let corrupt = match &error {
+        rusqlite::Error::SqliteFailure(code, message) => {
+            matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) || message
+                .as_deref()
+                .is_some_and(|s| s.contains("no such table") || s.contains("no such column"))
+        }
+        rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::InvalidColumnType(..) => true,
+        _ => false,
+    };
+    if corrupt {
+        projection_corrupt()
+    } else {
+        DomainError::new("exact_index_failed", "Cannot access exact projection.")
+    }
+}
+fn lexical_error(error: agentlaw_search::Error) -> DomainError {
+    if matches!(&error, agentlaw_search::Error::Sql(err) if sqlite_unavailable(err)) {
+        return exact_unavailable();
+    }
+    let corrupt = match &error {
+        agentlaw_search::Error::Invalid(message) => {
+            message == "lexical projection is incomplete; rebuild required"
+        }
+        agentlaw_search::Error::Sql(rusqlite::Error::SqliteFailure(code, message)) => {
+            matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) || message
+                .as_deref()
+                .is_some_and(|s| s.contains("no such table") || s.contains("no such column"))
+        }
+        agentlaw_search::Error::Sql(
+            rusqlite::Error::QueryReturnedNoRows | rusqlite::Error::InvalidColumnType(..),
+        ) => true,
+        _ => false,
+    };
+    if corrupt {
+        projection_corrupt()
+    } else {
+        DomainError::new("lexical_index_failed", "Cannot access lexical projection.")
+    }
+}
+impl ExactIndexWriter {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(projection_corrupt())
+            }
+            _ => return Err(exact_unavailable()),
+        }
+        let check = db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ))?;
+        validate_exact_schema(&check)?;
+        let filename: String = check
+            .query_row(
+                "SELECT filename FROM exact_lexical WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(exact_schema_error)?;
+        if Path::new(&filename).components().count() != 1
+            || Path::new(&filename)
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some(filename.as_str())
+        {
+            return Err(projection_corrupt());
+        }
+        let lexical_path = path.parent().ok_or_else(not_ready)?.join(&filename);
+        match std::fs::metadata(&lexical_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(projection_corrupt())
+            }
+            _ => return Err(exact_unavailable()),
+        }
+        let sequence: String = check
+            .query_row(
+                "SELECT sequence FROM exact_position WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(exact_schema_error)?;
+        let sequence = sequence.parse::<u64>().map_err(|_| projection_corrupt())?;
+        i64::try_from(sequence).map_err(|_| projection_corrupt())?;
+        let lexical =
+            agentlaw_search::SearchIndex::open_existing(&lexical_path).map_err(lexical_error)?;
+        drop(check);
+        let connection = db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ))?;
+        if connection
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .map_err(exact_schema_error)?
+        {
+            return Err(exact_unavailable());
+        }
+        db(connection.busy_timeout(std::time::Duration::from_secs(5)))?;
+        let exact = ExactIndex {
+            connection,
+            directory: path.parent().ok_or_else(not_ready)?.to_path_buf(),
+        };
+        exact.position()?.ok_or_else(not_ready)?;
+        Ok(Self { exact, lexical })
+    }
+
+    /// Validate both projection schemas without writing.
+    pub fn validate_active(&self) -> Result<()> {
+        validate_exact_schema(&self.exact.connection)?;
+        let (epoch, sequence, filename): (String, String, String) = self.exact.connection.query_row(
+            "SELECT p.epoch,p.sequence,l.filename FROM exact_position p JOIN exact_lexical l ON l.singleton=p.singleton WHERE p.singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(exact_schema_error)?;
+        if epoch.is_empty()
+            || sequence
+                .parse::<u64>()
+                .ok()
+                .and_then(|value| i64::try_from(value).ok())
+                .is_none()
+            || filename.is_empty()
+            || Path::new(&filename).components().count() != 1
+        {
+            return Err(projection_corrupt());
+        }
+        self.lexical.validate_existing().map_err(lexical_error)
+    }
+    pub fn synchronize(
+        &mut self,
+        source: &agentlaw_storage::published::OwnedPublishedReader,
+        control: &RequestControl,
+    ) -> Result<SourcePosition> {
+        control.check()?;
+        let guard = source.read_snapshot().map_err(source_error)?;
+        let end = guard.position().clone();
+        u64_to_i64(end.sequence)?;
+        let exact_ack = self.exact.position()?.ok_or_else(not_ready)?;
+        let lexical_ack = self.lexical.read_view().map_err(lexical_error)?.stamp.ack;
+        let lexical_ack = u64::try_from(lexical_ack).map_err(|_| not_ready())?;
+        if exact_ack.epoch != end.epoch {
+            return Err(DomainError::new(
+                "source_epoch_changed",
+                "Source epoch changed.",
+            ));
+        }
+        if exact_ack.sequence > end.sequence || lexical_ack > end.sequence {
+            return Err(not_ready());
+        }
+        if exact_ack.sequence == end.sequence && lexical_ack == end.sequence {
+            return Ok(end);
+        }
+        let mut cursor = SourcePosition {
+            epoch: end.epoch.clone(),
+            sequence: exact_ack.sequence.min(lexical_ack),
+        };
+        drop(guard);
+        while cursor.sequence < end.sequence {
+            control.check()?;
+            let guard = source.read_snapshot().map_err(source_error)?;
+            if guard.position().epoch != end.epoch {
+                return Err(DomainError::new(
+                    "source_epoch_changed",
+                    "Source epoch changed.",
+                ));
+            }
+            let page = guard
+                .read_published_paths(&cursor, 1)
+                .map_err(source_error)?;
+            drop(guard);
+            // The source page already deduplicates canonical paths. Keep only one
+            // bounded batch of parsed identities in addition to that source page.
+            let mut paths = page
+                .canonical_paths
+                .into_iter()
+                .filter_map(|path| {
+                    let kind = if path.starts_with("current/memory/") {
+                        "memory"
+                    } else if path.starts_with("current/procedure/") {
+                        "procedure"
+                    } else {
+                        return None;
+                    };
+                    Some(
+                        Path::new(&path)
+                            .file_stem()
+                            .and_then(|v| v.to_str())
+                            .map(|id| (kind.to_owned(), id.to_owned()))
+                            .ok_or_else(|| {
+                                DomainError::new("source_corrupt", "Invalid canonical path.")
+                            }),
+                    )
+                })
+                .peekable();
+            loop {
+                control.check()?;
+                let guard = source.read_snapshot().map_err(source_error)?;
+                if guard.position().epoch != end.epoch {
+                    return Err(DomainError::new(
+                        "source_epoch_changed",
+                        "Source epoch changed.",
+                    ));
+                }
+                let mut acquired = Vec::new();
+                let mut changed = Vec::new();
+                let mut bytes = 0u64;
+                while changed.len() < 1024 {
+                    if bytes > DeltaBudget::default().max_resident_bytes {
+                        break;
+                    }
+                    let (kind, id) = match paths.peek() {
+                        None => break,
+                        Some(Ok(pair)) => pair,
+                        Some(Err(_)) => {
+                            return Err(DomainError::new(
+                                "source_corrupt",
+                                "Invalid canonical path.",
+                            ))
+                        }
+                    };
+                    let value = if kind == "memory" {
+                        guard.acquire_current(id)
+                    } else {
+                        guard.acquire_procedure(id)
+                    };
+                    match value {
+                        Ok(value) => {
+                            let size = value
+                                .bodies
+                                .values()
+                                .try_fold(0u64, |sum, body| sum.checked_add(body.bytes))
+                                .ok_or_else(|| {
+                                    DomainError::new("capacity", "Writer batch is too large.")
+                                })?;
+                            if !changed.is_empty()
+                                && (bytes > DeltaBudget::default().max_resident_bytes
+                                    || size
+                                        > DeltaBudget::default()
+                                            .max_resident_bytes
+                                            .saturating_sub(bytes))
+                            {
+                                break;
+                            }
+                            bytes = bytes.checked_add(size).ok_or_else(|| {
+                                DomainError::new("capacity", "Writer batch is too large.")
+                            })?;
+                            acquired.push(value);
+                        }
+                        Err(agentlaw_storage::Error::NotFound(_)) => {}
+                        Err(error) => return Err(source_error(error)),
+                    }
+                    changed.push(paths.next().expect("peeked source path")?);
+                }
+                drop(guard);
+                let complete = paths.peek().is_none();
+                let through = if complete {
+                    &page.covered_through
+                } else {
+                    &cursor
+                };
+                let units = acquired
+                    .iter()
+                    .map(acquired_unit)
+                    .collect::<Result<Vec<_>>>()?;
+                let removed = changed.iter().map(|(kind, id)| {
+                    if kind == "procedure" {
+                        format!("procedure/{id}")
+                    } else {
+                        id.clone()
+                    }
+                });
+                control.check()?;
+                let current_lexical =
+                    u64::try_from(self.lexical.read_view().map_err(lexical_error)?.stamp.ack)
+                        .map_err(|_| not_ready())?;
+                self.lexical
+                    .commit_stream(
+                        u64_to_i64(through.sequence.max(current_lexical))?,
+                        removed.map(Ok),
+                        lazy_head_streams(&units, &acquired),
+                    )
+                    .map_err(lexical_error)?;
+                let tx = db(self.exact.connection.transaction())?;
+                for (_, id) in &changed {
+                    delete_unit(&tx, id)?;
+                }
+                for (unit, body) in units.iter().zip(&acquired) {
+                    apply_unit(&tx, unit, body)?;
+                }
+                let exact_sequence = exact_ack.sequence.max(through.sequence);
+                db(tx.execute(
+                    "UPDATE exact_position SET epoch=?1,sequence=?2 WHERE singleton=1",
+                    params![end.epoch, exact_sequence.to_string()],
+                ))?;
+                db(tx.commit())?;
+                control.phase("exact_batch_committed");
+                if complete {
+                    break;
+                }
+            }
+            cursor = page.covered_through;
+        }
+        Ok(end)
+    }
+
+    pub fn rebuild_shadow(
+        &mut self,
+        source: &agentlaw_storage::published::OwnedPublishedReader,
+        control: &RequestControl,
+    ) -> Result<ShadowGeneration> {
+        Self::rebuild_shadow_in(&self.exact.directory, source, control)
+    }
+
+    pub fn rebuild_shadow_in(
+        directory: &Path,
+        source: &agentlaw_storage::published::OwnedPublishedReader,
+        control: &RequestControl,
+    ) -> Result<ShadowGeneration> {
+        control.check()?;
+        std::fs::create_dir_all(directory).map_err(|_| {
+            DomainError::new("exact_index_failed", "Cannot create projection directory.")
+        })?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let exact_file = directory.join(format!("exact-repair-{id}.sqlite"));
+        let lexical_file = directory.join(format!("lexical-rebuild-{id}.sqlite"));
+        let result = (|| {
+            let before = source
+                .read_snapshot()
+                .map_err(source_error)?
+                .position()
+                .clone();
+            let mut exact = ExactIndex::open(&exact_file)?;
+            let mut lexical =
+                agentlaw_search::SearchIndex::open(&lexical_file).map_err(lexical_error)?;
+            control.phase("rebuilding_shadow");
+            let mut cursor = None;
+            loop {
+                control.check()?;
+                let (_, ids, more) = source
+                    .inventory_page(cursor.as_deref(), 128)
+                    .map_err(source_error)?;
+                for (kind, id) in ids {
+                    control.check()?;
+                    let acquired = if kind == "memory" {
+                        source.acquire_current(&id)
+                    } else {
+                        source.acquire_procedure(&id)
+                    };
+                    match acquired {
+                        Ok(acquired) => {
+                            let unit = acquired_unit(&acquired)?;
+                            let tx = db(exact.connection.transaction())?;
+                            apply_unit(&tx, &unit, &acquired)?;
+                            db(tx.commit())?;
+                            lexical
+                                .commit_stream(
+                                    0,
+                                    std::iter::once(Ok(index_id(&unit))),
+                                    head_streams(&unit, &acquired)?.into_iter().flatten(),
+                                )
+                                .map_err(lexical_error)?;
+                        }
+                        Err(agentlaw_storage::Error::NotFound(_)) => {}
+                        Err(error) => return Err(source_error(error)),
+                    }
+                    cursor = Some(format!("{kind}/{id}"));
+                }
+                if !more {
+                    break;
+                }
+            }
+            lexical
+                .commit(u64_to_i64(before.sequence)?, &[], &[])
+                .map_err(lexical_error)?;
+            db(exact.connection.execute(
+                "INSERT INTO exact_lexical VALUES(1,?1)",
+                [lexical_file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(not_ready)?],
+            ))?;
+            db(exact.connection.execute(
+                "INSERT INTO exact_position VALUES(1,?1,?2)",
+                params![before.epoch, before.sequence.to_string()],
+            ))?;
+            let mut writer = Self { exact, lexical };
+            let through = writer.synchronize(source, control)?;
+            control.check()?;
+            if writer.exact.position()?.as_ref() != Some(&through) {
+                return Err(not_ready());
+            }
+            let view = agentlaw_search::ReadView::open(&lexical_file).map_err(lexical_error)?;
+            if view.stamp.ack != u64_to_i64(through.sequence)? {
+                return Err(not_ready());
+            }
+            drop(view);
+            for path in [&exact_file, &lexical_file] {
+                let connection =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .map_err(exact_schema_error)?;
+                let status: String = connection
+                    .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                    .map_err(exact_schema_error)?;
+                if status != "ok" {
+                    return Err(projection_corrupt());
+                }
+            }
+            let generation = ProjectionGeneration {
+                id,
+                epoch: before.epoch,
+                exact_file: exact_file.clone(),
+                lexical_file: lexical_file.clone(),
+            };
+            let registry = ProjectionGenerations::from_generation(generation)?;
+            drop(registry.pin()?);
+            let generation = Arc::try_unwrap(
+                registry
+                    .state
+                    .into_inner()
+                    .map_err(|_| not_ready())?
+                    .current,
+            )
+            .map_err(|_| not_ready())?;
+            Ok(ShadowGeneration { generation })
+        })();
+        if result.is_err() {
+            for path in [&exact_file, &lexical_file] {
+                for suffix in ["", "-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                }
+            }
+        }
+        result
+    }
+}
+
+fn validate_exact_schema(connection: &Connection) -> Result<()> {
+    let queries: &[&str] = &[
+        "SELECT singleton,epoch,sequence FROM exact_position LIMIT 0",
+        "SELECT singleton,filename FROM exact_lexical LIMIT 0",
+        "SELECT id,kind,redirect FROM exact_units LIMIT 0",
+        "SELECT id,version,kind,scope,is_rule,task,metadata FROM exact_heads LIMIT 0",
+        "SELECT id,version,digest FROM exact_bodies LIMIT 0",
+        "SELECT id,version,excerpt FROM exact_previews LIMIT 0",
+        "SELECT source,version,target,kind FROM exact_edges LIMIT 0",
+        "SELECT source,version,project,path,kind,reading FROM exact_targets LIMIT 0",
+    ];
+    for query in queries {
+        connection.prepare(query).map_err(exact_schema_error)?;
+    }
+    let indexes: &[&str] = &[
+        "exact_scope",
+        "exact_body_digest",
+        "reverse_required",
+        "target_project",
+    ];
+    for name in indexes {
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(exact_schema_error)?;
+        if count != 1 {
+            return Err(DomainError::new(
+                "exact_index_corrupt",
+                "Projection index is missing; rebuild required.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn delete_unit(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
+    for (table, key) in [
+        ("exact_units", "id"),
+        ("exact_heads", "id"),
+        ("exact_bodies", "id"),
+        ("exact_previews", "id"),
+        ("exact_edges", "source"),
+        ("exact_targets", "source"),
+    ] {
+        db(tx.execute(&format!("DELETE FROM {table} WHERE {key}=?1"), [id]))?;
+    }
+    Ok(())
+}
+fn db<T>(r: std::result::Result<T, rusqlite::Error>) -> Result<T> {
+    r.map_err(exact_schema_error)
 }
 fn u64_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
@@ -396,21 +1642,23 @@ impl ExactIndex {
         let mut result = BTreeSet::new();
         for target in requested {
             let path = relative_path(&target.path)?;
-            let escaped = path
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            let mut st=db(self.connection.prepare("SELECT DISTINCT source,reading FROM exact_targets WHERE project=?1 AND (path=?2 OR (?3=1 AND path LIKE ?4 ESCAPE '\\')) ORDER BY source"))?;
+            let mut st=db(self.connection.prepare("SELECT DISTINCT source,reading,path FROM exact_targets WHERE project=?1 AND (path=?2 COLLATE BINARY OR (?3=1 AND substr(path,1,length(?2)+1)=?2 || '/' COLLATE BINARY)) ORDER BY source"))?;
             let rows = db(st.query_map(
-                params![
-                    project,
-                    path,
-                    target.kind == TargetKind::Directory,
-                    format!("{escaped}/%")
-                ],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                params![project, path, target.kind == TargetKind::Directory],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             ))?;
-            result.extend(db(rows.collect::<std::result::Result<Vec<_>, _>>())?);
+            for row in rows {
+                let (id, reading, stored) = db(row)?;
+                if target_path_matches(&path, &target.kind, &stored) {
+                    result.insert((id, reading));
+                }
+            }
         }
         result
             .into_iter()
@@ -473,6 +1721,15 @@ impl ExactIndex {
         }
         Ok(result.into_iter().collect())
     }
+}
+// Paths are case-sensitive and directory matches end at a component boundary;
+// the SQL prefix condition above implements the same predicate.
+fn target_path_matches(requested: &str, kind: &TargetKind, stored: &str) -> bool {
+    stored == requested
+        || (*kind == TargetKind::Directory
+            && stored
+                .strip_prefix(requested)
+                .is_some_and(|tail| tail.starts_with('/')))
 }
 pub fn allowed_scopes(context: &RequestContext) -> Vec<String> {
     let mut scopes = vec!["user".into(), format!("machine:{}", context.machine_id)];
@@ -594,41 +1851,79 @@ fn head_streams(
     unit: &CurrentUnit,
     acquired: &agentlaw_storage::acquire::AcquiredCurrent,
 ) -> Result<Vec<HeadStream>> {
-    let mut streams = Vec::new();
-    for (index, head) in unit.heads().iter().enumerate() {
-        let change = &acquired
-            .references
-            .get(index)
-            .ok_or_else(|| DomainError::new("source_corrupt", "Missing acquired version."))?
-            .observed_version;
-        let reader = if unit.entity_type == "memory" {
-            Some(
-                acquired
-                    .bodies
-                    .get(head.metadata["change_id"].as_str().unwrap_or(""))
-                    .ok_or_else(|| DomainError::new("source_corrupt", "Missing acquired body."))?
-                    .open()
-                    .map_err(|_| {
-                        DomainError::new("source_unavailable", "Cannot open acquired body.")
-                    })?,
-            )
-        } else {
-            None
-        };
-        streams.push(HeadStream {
-            template: agentlaw_search::SearchDocument {
-                memory_id: index_id(unit),
-                change_id: change.clone(),
-                body: index_body(unit, head),
-                scope: index_scope(unit, head)?,
-            },
-            reader,
-            pending: Vec::with_capacity(65540),
-            done: false,
-            emitted: false,
-        });
-    }
-    Ok(streams)
+    unit.heads()
+        .iter()
+        .enumerate()
+        .map(|(index, head)| head_stream(unit, acquired, index, head))
+        .collect()
+}
+fn head_stream(
+    unit: &CurrentUnit,
+    acquired: &agentlaw_storage::acquire::AcquiredCurrent,
+    index: usize,
+    head: &agentlaw_storage::Head,
+) -> Result<HeadStream> {
+    let change = &acquired
+        .references
+        .get(index)
+        .ok_or_else(|| DomainError::new("source_corrupt", "Missing acquired version."))?
+        .observed_version;
+    let reader = if unit.entity_type == "memory" {
+        Some(
+            acquired
+                .bodies
+                .get(head.metadata["change_id"].as_str().unwrap_or(""))
+                .ok_or_else(|| DomainError::new("source_corrupt", "Missing acquired body."))?
+                .open()
+                .map_err(|_| {
+                    DomainError::new("source_unavailable", "Cannot open acquired body.")
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(HeadStream {
+        template: agentlaw_search::SearchDocument {
+            memory_id: index_id(unit),
+            change_id: change.clone(),
+            body: index_body(unit, head),
+            scope: index_scope(unit, head)?,
+        },
+        reader,
+        pending: Vec::new(),
+        done: false,
+        emitted: false,
+    })
+}
+fn lazy_head_streams<'a>(
+    units: &'a [CurrentUnit],
+    acquired: &'a [agentlaw_storage::acquire::AcquiredCurrent],
+) -> impl Iterator<Item = agentlaw_search::Result<agentlaw_search::SearchDocument>> + 'a {
+    let mut index = 0;
+    let mut head_index = 0;
+    let mut current: Option<HeadStream> = None;
+    std::iter::from_fn(move || loop {
+        if let Some(stream) = &mut current {
+            if let Some(item) = stream.next() {
+                return Some(item);
+            }
+            current = None;
+        }
+        let unit = units.get(index)?;
+        let body = acquired.get(index)?;
+        if head_index == unit.heads().len() {
+            index += 1;
+            head_index = 0;
+            continue;
+        }
+        let head = &unit.heads()[head_index];
+        let selected = head_index;
+        head_index += 1;
+        match head_stream(unit, body, selected, head) {
+            Ok(next) => current = Some(next),
+            Err(error) => return Some(Err(agentlaw_search::Error::Invalid(error.to_string()))),
+        }
+    })
 }
 fn index_body(unit: &CurrentUnit, head: &agentlaw_storage::Head) -> String {
     if unit.entity_type == "learned_procedure" {
