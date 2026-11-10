@@ -97,9 +97,8 @@ cargo build --locked --workspace
 
 Run `./target/debug/agentlaw --help` on Unix-like systems, or
 `.\target\debug\agentlaw.exe --help` in PowerShell. `schema` prints the actual MCP
-tool definition and input schema. Platform-specific verification is listed in
-[Verification](verification.md); these commands are not a claim of tested
-support on every platform.
+tool definition and input schema. These source-build commands do not establish
+tested support on every platform or live-harness compatibility.
 
 To build optimized executables, add `--release`; outputs are under `target/release/`.
 Alternatively, install the CLI with Cargo from the cloned repository:
@@ -157,8 +156,7 @@ harnesses can install the same folder using their documented skill location;
 this does not imply tested compatibility with every harness.
 
 The skill is plain Markdown: no extra runtime or model is installed, no memory is
-created, and MCP registration is unchanged. Install only the skill folder, not
-the repository's contributor `AGENTS.md` as global instructions.
+created, and MCP registration is unchanged.
 
 ### Complete Codex setup
 

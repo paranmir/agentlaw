@@ -20,8 +20,7 @@
 
 This patch improves CLI usability without changing the memory tool contract.
 Publishing does not update an active installation or establish semantic-model
-readiness. See [usage](usage.md), [release operation](releasing.md) and
-[verification](verification.md) for supported commands and verification limits.
+readiness. See [usage](usage.md) for supported commands and operating limits.
 
 ## Previous release: 0.4.1
 
@@ -40,8 +39,7 @@ readiness. See [usage](usage.md), [release operation](releasing.md) and
 
 Publishing does not update an active installation or repair semantic retrieval.
 Real-model quality and downstream LLM notification behavior are separate from
-the regression and release-pipeline checks. See [release operation](releasing.md)
-and [verification](verification.md).
+the regression and release-pipeline checks.
 
 ## Previous release: 0.4.0
 
@@ -76,8 +74,8 @@ must accept the added `sync` branch. Releases through 0.3.6 do not expose it.
 No active installation, policy or live memory store is changed by publishing
 this release.
 
-See [usage](usage.md#git-and-management) for activation and the operation flow,
-and [verification](verification.md) for actual checks and resource bounds.
+See [usage](usage.md#git-and-management) for activation, the operation flow and
+resource bounds.
 No measured speedup for the original 20-minute case is claimed. The six-pattern
 scanner is not complete secret/PII classification; receipt reuse is not full
 fsck or exactly-once scanning of an interrupted attempt. Real-model resolution

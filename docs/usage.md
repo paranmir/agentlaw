@@ -6,24 +6,6 @@ the same input contract. Runtime does not replace the agent's semantic judgment
 or the user's decisions.
 
 For installation and harness setup, see the [installation guide](installation.md).
-For tested behavior and current gaps, see [verification](verification.md).
-
-## Modules and source of truth
-
-| Crate | Responsibility |
-|---|---|
-| agentlaw-contracts | Shared types, schema, validation and LLM-facing guidance |
-| agentlaw-flows | Project context, recall, write/review, procedures and history |
-| agentlaw-storage | Complete current Markdown, lossless history, publication/recovery |
-| agentlaw-search | BM25, vector candidates, RRF, scope filters and generations |
-| agentlaw-worker | Shared broker, model lifecycle, durable jobs and index acknowledgment |
-| agentlaw-app | MCP/CLI, explicit installation, configuration and Git operations |
-
-The [README](../README.md#how-the-pieces-fit) introduces the user-facing pieces.
-Current memory is directly readable Markdown: reading it does not replay every
-past change. History retains causal changes separately. Indexes and embeddings
-are rebuildable; unpublished proposals and recovery decisions are not disposable
-caches. Git synchronization is explicit, not a condition of memory-write success.
 
 ## CLI help and input
 
@@ -66,24 +48,6 @@ before application resources open. Installation model manifests/assets and
 export files keep their existing limits. CLI syntax checks do not replace domain
 validation. Existing result/error streams remain intact; procedure inventory/search
 still stream JSONL or tables and diagnostics.
-
-## Build
-
-```powershell
-cargo check --workspace
-cargo build --workspace
-.\target\debug\agentlaw.exe --help
-.\target\debug\agentlaw.exe schema
-```
-
-The development Windows machine uses Rust/Cargo 1.98.1 and LLVM-MinGW on the user
-PATH, target `stable-x86_64-pc-windows-gnullvm`. Ignored `.tools/` files are local
-build/download assets, not a distributable installer. Installed Rust execution
-does not need a project Python environment.
-
-The default regression command is
-`cargo test --workspace --no-fail-fast`. Real-model tests require explicit assets;
-see [model artifacts](../crates/agentlaw-worker/ARTIFACTS.md).
 
 ## Isolated setup and installation
 
@@ -146,7 +110,7 @@ versioned executable and verified assets, updates owned MCP/bootstrap entries,
 preserves unrelated settings and records recoverable progress. Codex Desktop/CLI
 share the Codex adapter. `--harness oh-my-pi` has a configuration adapter; live
 harness verification is deferred. Omit `--harness-dir` only when deliberately
-targeting the active user profile. This task has not changed that profile.
+targeting the active user profile.
 
 The model manifest contains three **absolute local paths** and SHA-256 digests:
 
@@ -348,8 +312,12 @@ exclusion or history rewrite needs a separate scoped decision, not a bypass.
 Scanning materializes a self-contained raw Git transfer store. Retries validate
 its integrity and reuse pattern findings; new candidates are scanned again.
 Replace refs, grafts, shallow/partial/promisor stores, alternates and gitlinks are
-unsupported, without silently reconfiguring Git. Default capture/read-set bounds
-and unmeasured performance are documented in [verification](verification.md).
+unsupported, without silently reconfiguring Git. Capture/projection is limited
+to 100,000 canonical files and 512 MiB, with a cooperative 5-second capture
+budget. Final guarded context is limited to 256 nodes/paths and 16 MiB; large
+connected graphs may be refused. Convenience snapshots and requests retain
+64 MiB and 16 MiB limits respectively. The capture budget is not a hard OS I/O
+deadline, and these bounds are not a measured large-corpus performance guarantee.
 
 ### Existing separate continuity/import/share commands
 
@@ -381,14 +349,3 @@ Management uses `learned-procedure list` and `learned-procedure search --query
 <text>`; `--help` lists filters and output formats. `history export --memory-id
 <id> --output <new-file>` writes complete versioned JSONL through a temporary
 file, without overwriting existing output.
-
-## Verification boundary
-
-The implementation record distinguishes code, historical evidence and untested
-changes. The regression suite and separate real-model tests cover local Windows
-CPU inference, installation, worker recovery and nonempty Git-clone reconstruction.
-Actual GPU execution, macOS/Linux/Arm, physical power loss and
-million-record user-corpus latency/quality remain unverified.
-
-Building the product does not reconfigure an active harness.
-Installation and Git sharing remain explicit operations.
