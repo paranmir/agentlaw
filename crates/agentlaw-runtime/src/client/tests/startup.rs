@@ -361,3 +361,88 @@ fn unresponsive_owner_remains_alive_and_candidate_loses_lock() {
     assert!(owner.lock().unwrap().try_wait().unwrap().is_none());
     assert!(launcher.already_owned.load(Ordering::SeqCst) > 0);
 }
+
+#[cfg(windows)]
+#[test]
+fn switched_store_closes_and_pinned_request_reopens_it() {
+    use crate::test_support::installation::TestInstallation;
+
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    let a_db = installation
+        .config()
+        .unwrap()
+        .unwrap()
+        .runtime_root(installation.state())
+        .join("control.sqlite");
+    installation.select_store("b").unwrap();
+    let b_db = installation
+        .config()
+        .unwrap()
+        .unwrap()
+        .runtime_root(installation.state())
+        .join("control.sqlite");
+    installation.select_store("a").unwrap();
+    let project = installation.state().parent().unwrap().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let launcher = TestLauncher::new(installation.state());
+    let _host = start_host(&launcher);
+    let client = attached(installation.state(), &launcher);
+    let request = |input: Value| ValidatedRequest::parse_public(&input.to_string()).unwrap();
+    let control = RequestControl::default();
+    let a_binding = client.resolve_binding().unwrap();
+    let saved = client.call(CallTarget::Store(a_binding), request(json!({
+        "action":"remember_this", "remember_this":{"memories":[{
+            "operation":"create", "what_to_remember":"A retained marker for reopening the selected store",
+            "evidence":"Store switch fixture", "applies_to":["user"]
+        }]}
+    })), &control).unwrap();
+    let id = saved["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .expect("saved memory id")
+        .to_owned();
+    client
+        .call(
+            CallTarget::Setup,
+            request(json!({
+                "action":"connect_project_memory", "connect_project_memory":{
+                    "project_path":project, "memory_store_path":installation.store_path("b")
+                }
+            })),
+            &control,
+        )
+        .unwrap();
+    let b_binding = client.resolve_binding().unwrap();
+    assert_ne!(a_binding, b_binding);
+    let recall = || request(json!({"action":"recall", "recall":{"memory_ids":[id]}}));
+    let b_result = client
+        .call(CallTarget::Store(b_binding), recall(), &control)
+        .unwrap();
+    assert_eq!(b_result["missing_ids"]["memory_ids"][0], id);
+
+    let a_renamed = a_db.with_file_name("control-test-moved.sqlite");
+    wait_for(|| match std::fs::rename(&a_db, &a_renamed) {
+        Ok(()) => true,
+        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => false,
+        Err(error) => panic!("renaming A control database: {error}"),
+    });
+    std::fs::rename(&a_renamed, &a_db).unwrap();
+    let b_renamed = b_db.with_file_name("control-test-moved.sqlite");
+    match std::fs::rename(&b_db, &b_renamed) {
+        Err(error) => assert!(
+            matches!(error.raw_os_error(), Some(32 | 33)),
+            "unexpected B rename error: {error}"
+        ),
+        Ok(()) => {
+            std::fs::rename(&b_renamed, &b_db).unwrap();
+            panic!("selected store B control database was not held open");
+        }
+    }
+    let restored = client
+        .call(CallTarget::Store(a_binding), recall(), &control)
+        .unwrap();
+    assert_eq!(
+        restored["memories"][0]["current_heads"][0]["what_to_remember"],
+        "A retained marker for reopening the selected store"
+    );
+}
