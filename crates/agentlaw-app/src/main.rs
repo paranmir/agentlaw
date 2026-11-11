@@ -15,11 +15,16 @@ fn main() {
             Err(_) => std::process::exit(1),
         };
         let gate_state = state.clone();
+        let assets = agentlaw_app::install::installed_assets(&state).unwrap_or(None);
+        let installation_build = match agentlaw_runtime::installation::build_identity(&executable) {
+            Ok(build) => build,
+            Err(_) => std::process::exit(1),
+        };
         let deps = agentlaw_runtime::ports::HostDeps {
             state,
             executable,
-            assets: None,
-            installation_build: env!("CARGO_PKG_VERSION").into(),
+            assets,
+            installation_build,
             start_gate: std::sync::Arc::new(move || {
                 agentlaw_app::update::managed::check_frontend_start(&gate_state)
             }),
@@ -27,10 +32,7 @@ fn main() {
         let code = match agentlaw_runtime::host::run(deps) {
             Ok(agentlaw_runtime::host::RunExit::Stopped) => 0,
             Ok(agentlaw_runtime::host::RunExit::AlreadyOwned) => 3,
-            Ok(agentlaw_runtime::host::RunExit::StartBlocked(error)) => {
-                eprintln!("{}", agentlaw_app::error_payload(&error));
-                4
-            }
+            Ok(agentlaw_runtime::host::RunExit::StartBlocked(_)) => 4,
             Err(_) => 1,
         };
         std::process::exit(code);

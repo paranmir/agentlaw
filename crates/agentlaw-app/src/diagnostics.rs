@@ -57,15 +57,26 @@ pub enum DoctorMode {
     Audit,
 }
 
-fn runtime_probe_to_worker(_probe: agentlaw_runtime::client::Probe) -> Value {
-    unimplemented!("runtime probe to worker diagnosis")
+fn runtime_probe_to_worker(probe: agentlaw_runtime::client::Probe) -> Value {
+    use agentlaw_runtime::client::Probe;
+    match probe {
+        Probe::NotRunning { stale_endpoint: false } => json!({"status":"not_running"}),
+        Probe::NotRunning { stale_endpoint: true } => json!({"status":"not_running", "stale_endpoint":true}),
+        Probe::Unresponsive => json!({"code":"worker_diagnosis_incomplete", "message":"runtime_unresponsive: runtime did not respond."}),
+        Probe::Mismatch(reply) => json!({"code":"worker_diagnosis_incomplete", "message":format!("runtime mismatch: {reply:?}")}),
+        Probe::Running(snapshot) => serde_json::to_value(snapshot).unwrap_or_else(|_| json!({"code":"worker_diagnosis_incomplete", "message":"Cannot serialize runtime health."})),
+    }
 }
 
 pub fn doctor(state: &Path, mode: DoctorMode) -> Result<Value> {
     doctor_with_health(state, mode, &|| {
+        let executable = std::env::current_exe()
+            .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
+        let build = agentlaw_runtime::installation::build_identity(&executable)
+            .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
         Ok(runtime_probe_to_worker(agentlaw_runtime::client::probe(
             state,
-            env!("CARGO_PKG_VERSION"),
+            &build,
             std::time::Duration::from_secs(5),
         )))
     })

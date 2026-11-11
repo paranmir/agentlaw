@@ -38,7 +38,7 @@ pub fn receive<T: DeserializeOwned>(stream: &mut TcpStream, max: u32) -> io::Res
     serde_json::from_slice(&read_frame(stream, max)?).map_err(io::Error::other)
 }
 pub fn connect(endpoint: &Endpoint, address: SocketAddr, build: &str) -> io::Result<TcpStream> {
-    if !address.ip().is_loopback() || endpoint.protocol != PROTOCOL_VERSION {
+    if !address.ip().is_loopback() {
         return Err(io::Error::other("invalid endpoint"));
     }
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;

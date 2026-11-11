@@ -11,11 +11,11 @@ use agentlaw_contracts::{
 use serde_json::Value;
 use std::{
     io::{self, Write},
-    net::Shutdown,
+    net::{Shutdown, TcpStream},
     path::{Path, PathBuf},
     sync::{atomic::Ordering, mpsc, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug)]
@@ -73,18 +73,145 @@ pub enum Probe {
     Mismatch(HelloReply),
 }
 
-pub fn probe(_state: &Path, _installation_build: &str, _hello_timeout: Duration) -> Probe {
-    unimplemented!("probe")
+fn hello(
+    endpoint: &Endpoint,
+    build: &str,
+    timeout: Duration,
+    connect_timeout: Duration,
+) -> io::Result<(TcpStream, HelloReply)> {
+    if !endpoint.control.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-loopback endpoint",
+        ));
+    }
+    let mut stream = TcpStream::connect_timeout(
+        &endpoint.control,
+        connect_timeout.max(Duration::from_millis(1)),
+    )?;
+    let timeout = timeout.max(Duration::from_millis(1));
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    transport::send(
+        &mut stream,
+        &Hello {
+            protocol: PROTOCOL_VERSION,
+            installation_build: build.to_owned(),
+            secret: endpoint.secret.clone(),
+        },
+        MAX_CONTROL_FRAME_BYTES,
+    )?;
+    let reply = transport::receive(&mut stream, MAX_CONTROL_REPLY_BYTES)?;
+    Ok((stream, reply))
+}
+
+pub fn probe(state: &Path, installation_build: &str, hello_timeout: Duration) -> Probe {
+    let endpoint = match transport::read_endpoint(state) {
+        Ok(endpoint) => endpoint,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Probe::NotRunning {
+                stale_endpoint: false,
+            }
+        }
+        Err(_) => return Probe::Unresponsive,
+    };
+    match hello(
+        &endpoint,
+        installation_build,
+        hello_timeout,
+        Duration::from_secs(3),
+    ) {
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Probe::NotRunning {
+            stale_endpoint: true,
+        },
+        Err(_) => Probe::Unresponsive,
+        Ok((mut stream, HelloReply::Accepted)) => {
+            if transport::send(
+                &mut stream,
+                &ControlRequest::Health,
+                MAX_CONTROL_FRAME_BYTES,
+            )
+            .is_err()
+            {
+                return Probe::Unresponsive;
+            }
+            match transport::receive(&mut stream, MAX_CONTROL_REPLY_BYTES) {
+                Ok(ControlReply::Health(snapshot)) => Probe::Running(snapshot),
+                _ => Probe::Unresponsive,
+            }
+        }
+        Ok((_, reply @ (HelloReply::ProtocolMismatch | HelloReply::BuildMismatch))) => {
+            Probe::Mismatch(reply)
+        }
+        Ok(_) => Probe::Unresponsive,
+    }
 }
 
 impl Client {
     pub fn attach(
-        _state: &Path,
-        _installation_build: &str,
-        _launcher: &dyn RuntimeLauncher,
-        _limits: AttachLimits,
+        state: &Path,
+        installation_build: &str,
+        launcher: &dyn RuntimeLauncher,
+        limits: AttachLimits,
     ) -> Result<Client, ClientError> {
-        Err(unavailable("attach is not implemented"))
+        let deadline = Instant::now() + limits.start_wait;
+        let mut candidate: Option<Box<dyn RuntimeCandidate>> = None;
+        let mut failed_endpoint: Option<(u32, std::net::SocketAddr, String)> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ClientError::Runtime(RuntimeError::Unresponsive));
+            }
+            if let Ok(endpoint) = transport::read_endpoint(state) {
+                let identity = (endpoint.pid, endpoint.control, endpoint.secret.clone());
+                if failed_endpoint.as_ref() != Some(&identity) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match hello(
+                        &endpoint,
+                        installation_build,
+                        limits.hello_timeout.min(remaining),
+                        Duration::from_secs(3).min(remaining),
+                    ) {
+                        Ok((_, HelloReply::Accepted)) => {
+                            if let Ok(client) = Self::connect(state, installation_build) {
+                                return Ok(client);
+                            }
+                        }
+                        Ok((
+                            _,
+                            reply @ (HelloReply::BuildMismatch | HelloReply::ProtocolMismatch),
+                        )) => {
+                            return Err(ClientError::Runtime(RuntimeError::Protocol(format!(
+                                "hello: {reply:?}"
+                            ))));
+                        }
+                        Err(ref error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::ConnectionRefused
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            failed_endpoint = Some(identity);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(active) = candidate.as_mut() {
+                match active.try_exit().map_err(unavailable)? {
+                    Some(CandidateExit::AlreadyOwned) => candidate = None,
+                    Some(CandidateExit::StartBlocked(error)) => {
+                        return Err(ClientError::Domain(error))
+                    }
+                    Some(CandidateExit::Failed(reason)) => return Err(unavailable(reason)),
+                    None => {}
+                }
+            } else {
+                candidate = Some(launcher.launch().map_err(unavailable)?);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
     pub fn connect(state: &Path, installation_build: &str) -> Result<Self, ClientError> {
         let mut endpoint = transport::read_endpoint(state).map_err(unavailable)?;

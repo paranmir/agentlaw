@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 pub use search::SemanticSearch;
 
+pub const INDEX_CONFIG_VERSION: &str = "v1";
+
 /// Configuration shared by the current and future history index lanes.
 #[derive(Clone, Debug)]
 pub struct SemanticConfig {
