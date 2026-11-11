@@ -65,6 +65,8 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
                 path.strip_prefix(root).unwrap().to_owned(),
                 if kind.is_dir() {
                     None
+                } else if path.strip_prefix(root).unwrap() == Path::new("service/owner.lock") {
+                    Some(fs::metadata(&path).unwrap().len().to_le_bytes().to_vec())
                 } else {
                     Some(fs::read(&path).unwrap())
                 },
@@ -103,6 +105,119 @@ fn assert_health(value: &Value) {
 
 fn assert_no_audit(value: &Value) {
     assert!(value.get("audit").is_none(), "{value}");
+}
+
+#[test]
+fn doctor_without_endpoint_reports_not_running_without_modifying_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let before = files(&state);
+    let output = run(&state, &["doctor", "--health"]);
+    assert!(output.status.success());
+    let result = json_output(&output);
+    assert_eq!(
+        result["worker_runtime"],
+        serde_json::json!({"status":"not_running"})
+    );
+    assert_eq!(files(&state), before);
+}
+
+struct OwnedFixture(std::process::Child);
+
+impl Drop for OwnedFixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn doctor_runtime_fixture() {
+    let Some(state) = std::env::var_os("AGENTLAW_DOCTOR_FIXTURE") else {
+        return;
+    };
+    use fs2::FileExt;
+    let state = PathBuf::from(state);
+    fs::create_dir_all(state.join("service")).unwrap();
+    let lock = fs::File::create(state.join("service/owner.lock")).unwrap();
+    lock.try_lock_exclusive().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = agentlaw_runtime::transport::Endpoint {
+        protocol: agentlaw_runtime::protocol::PROTOCOL_VERSION,
+        installation_build: env!("CARGO_PKG_VERSION").into(),
+        control: address,
+        data: address,
+        secret: "a".repeat(64),
+        pid: std::process::id(),
+    };
+    agentlaw_runtime::transport::write_endpoint(&state, &endpoint).unwrap();
+    for stream in listener.incoming() {
+        if let Ok(stream) = stream {
+            std::mem::forget(stream);
+        }
+    }
+}
+
+fn start_doctor_fixture(state: &Path) -> OwnedFixture {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cases::doctor_runtime_fixture", "--nocapture"])
+        .env("AGENTLAW_DOCTOR_FIXTURE", state)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut fixture = OwnedFixture(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !state.join("service/endpoint.json").exists() {
+        assert!(
+            fixture.0.try_wait().unwrap().is_none(),
+            "fixture exited early"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not publish endpoint"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    fixture
+}
+
+#[test]
+fn doctor_reports_stale_endpoint_after_owner_is_killed() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut fixture = start_doctor_fixture(&state);
+    fixture.0.kill().unwrap();
+    fixture.0.wait().unwrap();
+    let before = files(&state);
+    let output = run(&state, &["doctor", "--health"]);
+    assert!(output.status.success());
+    let result = json_output(&output);
+    assert_eq!(result["worker_runtime"]["status"], "not_running");
+    assert_eq!(result["worker_runtime"]["stale_endpoint"], true);
+    assert_eq!(files(&state), before);
+}
+
+#[test]
+fn doctor_reports_unresponsive_owner_without_modifying_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut fixture = start_doctor_fixture(&state);
+    let before = files(&state);
+    let output = run(&state, &["doctor", "--health"]);
+    assert!(output.status.success());
+    let result = json_output(&output);
+    assert_eq!(
+        result["worker_runtime"]["code"],
+        "worker_diagnosis_incomplete"
+    );
+    assert!(result["worker_runtime"]
+        .to_string()
+        .contains("runtime_unresponsive"));
+    assert!(fixture.0.try_wait().unwrap().is_none());
+    assert_eq!(files(&state), before);
 }
 
 #[test]

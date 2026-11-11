@@ -5,6 +5,36 @@ use std::ffi::{OsStr, OsString};
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == OsStr::new("runtime-host") {
+        let state = match std::env::var_os("AGENTLAW_HOME") {
+            Some(state) => std::path::PathBuf::from(state),
+            None => std::process::exit(1),
+        };
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => std::process::exit(1),
+        };
+        let gate_state = state.clone();
+        let deps = agentlaw_runtime::ports::HostDeps {
+            state,
+            executable,
+            assets: None,
+            installation_build: env!("CARGO_PKG_VERSION").into(),
+            start_gate: std::sync::Arc::new(move || {
+                agentlaw_app::update::managed::check_frontend_start(&gate_state)
+            }),
+        };
+        let code = match agentlaw_runtime::host::run(deps) {
+            Ok(agentlaw_runtime::host::RunExit::Stopped) => 0,
+            Ok(agentlaw_runtime::host::RunExit::AlreadyOwned) => 3,
+            Ok(agentlaw_runtime::host::RunExit::StartBlocked(error)) => {
+                eprintln!("{}", agentlaw_app::error_payload(&error));
+                4
+            }
+            Err(_) => 1,
+        };
+        std::process::exit(code);
+    }
     let errors = ErrorPolicy::for_args(&args);
     let parsed = match cli::parse(args) {
         Ok(parsed) => parsed,

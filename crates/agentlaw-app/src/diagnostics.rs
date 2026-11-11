@@ -57,10 +57,17 @@ pub enum DoctorMode {
     Audit,
 }
 
+fn runtime_probe_to_worker(_probe: agentlaw_runtime::client::Probe) -> Value {
+    unimplemented!("runtime probe to worker diagnosis")
+}
+
 pub fn doctor(state: &Path, mode: DoctorMode) -> Result<Value> {
     doctor_with_health(state, mode, &|| {
-        agentlaw_worker::inspect_runtime(&state.join("worker"))
-            .map_err(|error| DomainError::new("worker_diagnosis_incomplete", error.to_string()))
+        Ok(runtime_probe_to_worker(agentlaw_runtime::client::probe(
+            state,
+            env!("CARGO_PKG_VERSION"),
+            std::time::Duration::from_secs(5),
+        )))
     })
 }
 

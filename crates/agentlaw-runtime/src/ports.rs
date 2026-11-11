@@ -12,6 +12,7 @@ pub struct HostDeps {
     pub executable: PathBuf,
     pub assets: Option<agentlaw_worker::ModelAssets>,
     pub installation_build: String,
+    pub start_gate: Arc<dyn Fn() -> Result<(), agentlaw_contracts::DomainError> + Send + Sync>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -174,6 +175,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub enum RuntimeError {
     #[error("runtime unavailable: {0}")]
     Unavailable(String),
+    #[error("runtime unresponsive")]
+    Unresponsive,
     #[error("capacity exceeded: {0}")]
     Capacity(String),
     #[error("protocol violation: {0}")]

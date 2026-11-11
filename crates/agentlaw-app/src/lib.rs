@@ -11,6 +11,7 @@ pub mod install;
 pub mod installed;
 pub mod inventory;
 use agentlaw_flows::history_diff as stream_diff;
+pub mod runtime_launcher;
 pub mod transport;
 pub mod update;
 

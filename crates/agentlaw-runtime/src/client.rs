@@ -37,7 +37,55 @@ struct Inner {
 pub struct Client {
     inner: Arc<Inner>,
 }
+
+pub struct AttachLimits {
+    pub start_wait: Duration,
+    pub hello_timeout: Duration,
+}
+
+impl Default for AttachLimits {
+    fn default() -> Self {
+        Self {
+            start_wait: Duration::from_secs(30),
+            hello_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+pub enum CandidateExit {
+    AlreadyOwned,
+    StartBlocked(DomainError),
+    Failed(String),
+}
+
+pub trait RuntimeLauncher: Send + Sync {
+    fn launch(&self) -> io::Result<Box<dyn RuntimeCandidate>>;
+}
+
+pub trait RuntimeCandidate: Send {
+    fn try_exit(&mut self) -> io::Result<Option<CandidateExit>>;
+}
+
+pub enum Probe {
+    NotRunning { stale_endpoint: bool },
+    Running(HealthSnapshot),
+    Unresponsive,
+    Mismatch(HelloReply),
+}
+
+pub fn probe(_state: &Path, _installation_build: &str, _hello_timeout: Duration) -> Probe {
+    unimplemented!("probe")
+}
+
 impl Client {
+    pub fn attach(
+        _state: &Path,
+        _installation_build: &str,
+        _launcher: &dyn RuntimeLauncher,
+        _limits: AttachLimits,
+    ) -> Result<Client, ClientError> {
+        Err(unavailable("attach is not implemented"))
+    }
     pub fn connect(state: &Path, installation_build: &str) -> Result<Self, ClientError> {
         let mut endpoint = transport::read_endpoint(state).map_err(unavailable)?;
         let client = uuid::Uuid::new_v4().to_string();

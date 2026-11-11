@@ -14,6 +14,41 @@ use std::{
 };
 
 const WAIT: Duration = Duration::from_secs(3);
+
+mod startup;
+
+#[test]
+fn attach_returns_candidate_maintenance_error() {
+    struct BlockedLauncher;
+    struct BlockedCandidate;
+    impl RuntimeLauncher for BlockedLauncher {
+        fn launch(&self) -> io::Result<Box<dyn RuntimeCandidate>> {
+            Ok(Box::new(BlockedCandidate))
+        }
+    }
+    impl RuntimeCandidate for BlockedCandidate {
+        fn try_exit(&mut self) -> io::Result<Option<CandidateExit>> {
+            Ok(Some(CandidateExit::StartBlocked(DomainError::new(
+                "update_maintenance",
+                "updating",
+            ))))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let result = Client::attach(
+        dir.path(),
+        "test-build",
+        &BlockedLauncher,
+        AttachLimits {
+            start_wait: Duration::from_millis(300),
+            hello_timeout: Duration::from_millis(100),
+        },
+    );
+    assert!(
+        matches!(result, Err(ClientError::Domain(ref error)) if error.code == "update_maintenance")
+    );
+    assert!(!dir.path().join("service/endpoint.json").exists());
+}
 fn send<T: Serialize>(stream: &mut TcpStream, value: &T) {
     write_frame(
         stream,
