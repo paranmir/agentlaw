@@ -15,7 +15,11 @@ fn main() {
             Err(_) => std::process::exit(1),
         };
         let gate_state = state.clone();
-        let assets = agentlaw_app::install::installed_assets(&state).unwrap_or(None);
+        let assets_state = state.clone();
+        let assets = std::sync::Arc::new(move || {
+            agentlaw_app::install::installed_assets(&assets_state)
+                .map_err(|error| error.to_string())
+        });
         let installation_build = match agentlaw_runtime::installation::build_identity(&executable) {
             Ok(build) => build,
             Err(_) => std::process::exit(1),

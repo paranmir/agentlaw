@@ -145,8 +145,22 @@ pub enum CommandRequest {
 #[derive(Debug, Clone)]
 pub enum SetupRequest {
     ConnectStore(ConnectRequest),
+    Command(SetupCommand),
+}
+
+#[derive(Debug, Clone)]
+pub enum SetupCommand {
     StoreConnect { path: PathBuf, create: bool },
     ConfigSet { key: String, value: String },
+    MachineName { value: String },
+}
+
+pub fn encode_setup(_command: &SetupCommand) -> Vec<u8> {
+    unimplemented!()
+}
+
+pub fn decode_body(_kind: RequestKind, _body: &[u8]) -> Result<Classified, RejectReason> {
+    Err(RejectReason::KindMismatch)
 }
 
 pub fn request_kind(request: &ValidatedRequest) -> RequestKind {
@@ -284,6 +298,7 @@ pub enum ControlRequest {
     Lease { client: String },
     ResolveBinding,
     Shutdown { reason: String },
+    ConfigGet { key: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +310,8 @@ pub enum ControlReply {
     Binding(BindingRef),
     BindingError(BindingError),
     ShutdownAccepted,
+    Config(serde_json::Value),
+    ConfigError(agentlaw_contracts::DomainError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

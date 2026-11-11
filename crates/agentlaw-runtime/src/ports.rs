@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct HostDeps {
     pub state: PathBuf,
     pub executable: PathBuf,
-    pub assets: Option<agentlaw_worker::ModelAssets>,
+    pub assets: Arc<dyn Fn() -> Result<Option<agentlaw_worker::ModelAssets>, String> + Send + Sync>,
     pub installation_build: String,
     pub start_gate: Arc<dyn Fn() -> Result<(), agentlaw_contracts::DomainError> + Send + Sync>,
 }

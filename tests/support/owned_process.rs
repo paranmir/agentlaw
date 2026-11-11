@@ -8,6 +8,23 @@ pub struct OwnedProcess {
     job: windows_sys::Win32::Foundation::HANDLE,
 }
 impl OwnedProcess {
+    #[allow(dead_code)]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+    #[allow(dead_code)]
+    pub fn stop(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+    #[allow(dead_code)]
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+    #[allow(dead_code)]
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
     pub fn new(mut child: Child) -> Self {
         #[cfg(windows)]
         unsafe {

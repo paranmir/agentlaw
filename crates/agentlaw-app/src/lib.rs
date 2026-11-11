@@ -5,6 +5,7 @@ use std::io::{BufRead, Write};
 
 pub use agentlaw_runtime::installation::{config, delivery, machine, setup};
 pub mod diagnostics;
+pub mod frontend;
 pub use agentlaw_runtime::git::{git_ops, git_scan, sync};
 pub mod history_export;
 pub mod install;

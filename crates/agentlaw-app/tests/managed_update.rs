@@ -53,16 +53,28 @@ fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
             Err(error) => panic!("Could not start {}: {error}", binary.display()),
         }
     }
-    let mut child = child.expect("bounded executable-busy retry");
-    let stdout = child.stdout.take().unwrap();
+    let mut child = OwnedStaticChild(child.expect("bounded executable-busy retry"));
+    let stdout = child.0.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = Vec::new();
         let _ = BufReader::new(stdout).read_until(b'\n', &mut line);
         let _ = send.send(line);
     });
-    let status = child.wait().unwrap();
-    let line = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed update command timed out: {args:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let line = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("managed update stdout did not close");
     let value: Value =
         serde_json::from_slice(&line).unwrap_or_else(|_| panic!("Invalid CLI output: {line:?}"));
     assert!(status.success(), "{value}");
@@ -524,6 +536,264 @@ fn maintenance_drains_an_open_mcp_before_replacing_bundle() {
         active.child.try_wait().unwrap().is_some(),
         "old MCP stayed alive after the update"
     );
+}
+
+#[test]
+fn update_stops_running_runtime_before_replacement() {
+    let fixture = Fixture::new();
+    let mut host = OwnedStaticChild(
+        Command::new(&fixture.helper)
+            .arg("runtime-host")
+            .env("AGENTLAW_HOME", &fixture.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.state.join("service/endpoint.json").exists() {
+        assert!(
+            host.0.try_wait().unwrap().is_none(),
+            "runtime exited before startup"
+        );
+        assert!(Instant::now() < deadline, "runtime did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let start = Instant::now();
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(start.elapsed() < Duration::from_secs(60));
+    assert!(
+        host.0.try_wait().unwrap().is_some(),
+        "runtime survived replacement"
+    );
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn runtime_shutdown_fixture() {
+    let Some(role) = std::env::var_os("AGENTLAW_UPDATE_RUNTIME_FIXTURE") else {
+        return;
+    };
+    use agentlaw_runtime::{installation::owner::OwnerLock, protocol::*, transport};
+    let state = PathBuf::from(std::env::var_os("AGENTLAW_UPDATE_RUNTIME_STATE").unwrap());
+    let _lock = OwnerLock::try_acquire(&state).unwrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    fs::write(state.join("fixture-owner-ready"), b"ready").unwrap();
+    let until = Instant::now() + Duration::from_secs(120);
+    let wait_file = |name: &str| {
+        while !state.join(name).exists() {
+            assert!(Instant::now() < until, "fixture signal deadline: {name}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    if role == "late" {
+        wait_file("fixture-publish");
+    }
+    transport::write_endpoint(
+        &state,
+        &transport::Endpoint {
+            protocol: PROTOCOL_VERSION,
+            installation_build: "fixture-other-build".into(),
+            control: address,
+            data: address,
+            secret: "a".repeat(64),
+            pid: std::process::id(),
+        },
+    )
+    .unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    let _: Hello = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();
+    fs::write(state.join("fixture-hello"), b"received").unwrap();
+    if role == "silent" {
+        wait_file("fixture-release");
+        return;
+    }
+    if role == "stopping" {
+        transport::send(&mut stream, &HelloReply::Stopping, MAX_CONTROL_REPLY_BYTES).unwrap();
+        wait_file("fixture-release");
+        return;
+    }
+    transport::send(&mut stream, &HelloReply::Accepted, MAX_CONTROL_REPLY_BYTES).unwrap();
+    let request: ControlRequest = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();
+    assert!(matches!(request, ControlRequest::Shutdown { .. }));
+    fs::write(state.join("fixture-shutdown"), b"received").unwrap();
+    transport::send(
+        &mut stream,
+        &ControlReply::ShutdownAccepted,
+        MAX_CONTROL_REPLY_BYTES,
+    )
+    .unwrap();
+}
+
+fn start_shutdown_fixture(fixture: &Fixture, role: &str) -> OwnedStaticChild {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "runtime_shutdown_fixture", "--nocapture"])
+        .env("AGENTLAW_UPDATE_RUNTIME_FIXTURE", role)
+        .env("AGENTLAW_UPDATE_RUNTIME_STATE", &fixture.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut helper = OwnedStaticChild(child);
+    wait_for_update_fixture(
+        &mut helper,
+        || fixture.state.join("fixture-owner-ready").exists(),
+        Duration::from_secs(10),
+    );
+    helper
+}
+
+fn wait_for_update_fixture(
+    child: &mut OwnedStaticChild,
+    mut predicate: impl FnMut() -> bool,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "fixture process exited prematurely"
+        );
+        assert!(Instant::now() < deadline, "fixture deadline elapsed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn start_fixture_update(fixture: &Fixture) -> OwnedStaticChild {
+    OwnedStaticChild(
+        Command::new(&fixture.helper)
+            .args([
+                "update",
+                "apply",
+                &fixture.id,
+                "--root",
+                fixture.root.to_str().unwrap(),
+            ])
+            .env("AGENTLAW_HOME", &fixture.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn finish_fixture_update(
+    child: &mut OwnedStaticChild,
+    timeout: Duration,
+) -> (std::process::ExitStatus, Value) {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "updater did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = send.send(bytes);
+    });
+    let bytes = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("updater stdout did not close");
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[test]
+fn update_waits_for_runtime_already_stopping() {
+    let fixture = Fixture::new();
+    let mut owner = start_shutdown_fixture(&fixture, "stopping");
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("service/endpoint.json").exists(),
+        Duration::from_secs(10),
+    );
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("fixture-hello").exists(),
+        Duration::from_secs(20),
+    );
+    assert!(
+        update.0.try_wait().unwrap().is_none(),
+        "update did not wait for owner"
+    );
+    assert!(agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+    fs::write(fixture.state.join("fixture-release"), b"release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while owner.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(60));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn update_waits_for_owner_to_publish_then_requests_shutdown() {
+    let fixture = Fixture::new();
+    let mut owner = start_shutdown_fixture(&fixture, "late");
+    assert!(!fixture.state.join("service/endpoint.json").exists());
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut update,
+        || fixture.state.join("update-maintenance.json").exists(),
+        Duration::from_secs(20),
+    );
+    assert!(owner.0.try_wait().unwrap().is_none());
+    assert!(update.0.try_wait().unwrap().is_none());
+    fs::write(fixture.state.join("fixture-publish"), b"publish").unwrap();
+    wait_for_update_fixture(
+        &mut update,
+        || fixture.state.join("fixture-shutdown").exists(),
+        Duration::from_secs(20),
+    );
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(60));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(owner.0.try_wait().unwrap().is_some());
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn unresponsive_runtime_prevents_update_replacement() {
+    let fixture = Fixture::new();
+    let binary = fixture.root.join("bin").join(binary_name());
+    let before = hash(&binary);
+    let mut owner = start_shutdown_fixture(&fixture, "silent");
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("service/endpoint.json").exists(),
+        Duration::from_secs(10),
+    );
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("fixture-hello").exists(),
+        Duration::from_secs(20),
+    );
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(110));
+    assert!(!status.success(), "{result}");
+    let details = result.to_string().to_lowercase();
+    assert!(
+        details.contains("unresponsive")
+            || details.contains("timeout")
+            || details.contains("timed out"),
+        "{result}"
+    );
+    assert_eq!(hash(&binary), before);
+    assert!(owner.0.try_wait().unwrap().is_none());
+    fs::write(fixture.state.join("fixture-release"), b"release").unwrap();
 }
 
 #[test]

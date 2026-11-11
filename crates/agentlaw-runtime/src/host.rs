@@ -73,13 +73,14 @@ pub fn run(deps: crate::ports::HostDeps) -> crate::ports::RuntimeResult<RunExit>
     let wake_model = model.clone();
     indexer.set_model_waker(Arc::new(move || wake_model.wake()));
     let semantic = Arc::new(SemanticSearch::new(indexer.clone(), model.clone()));
+    let assets = (deps.assets)().unwrap_or(None);
     let worker = agentlaw_worker::RuntimeConfig {
         state_dir: deps.state.join("worker"),
         executable: deps.executable.clone(),
-        model: deps.assets.clone(),
+        model: assets.clone(),
     };
     let supervisor = supervision::Supervisor::new(health.clone());
-    if deps.assets.is_some() {
+    if assets.is_some() {
         let worker_config = worker.clone();
         let worker_indexer = indexer.clone();
         let worker_ids = ids.clone();

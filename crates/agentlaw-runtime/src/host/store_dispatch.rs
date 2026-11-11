@@ -11,7 +11,7 @@ use crate::{
     },
     protocol::{
         BindingError, BindingRef, CallTarget, Classified, CommandRequest, QueryRequest,
-        RejectReason, SetupRequest,
+        RejectReason, SetupCommand, SetupRequest,
     },
 };
 use agentlaw_contracts::{ConnectIntent, DomainError, RequestControl};
@@ -93,7 +93,7 @@ impl StoreDispatch {
                 follow_up = Some(request);
                 result
             }
-            SetupRequest::StoreConnect { path, create } => {
+            SetupRequest::Command(SetupCommand::StoreConnect { path, create }) => {
                 let worker = self.worker.clone();
                 setup::connect_selection_with_control(
                     &self.state,
@@ -104,7 +104,10 @@ impl StoreDispatch {
                 )?
                 .0
             }
-            SetupRequest::ConfigSet { key, value } => config::set_limit(&self.state, &key, &value)?,
+            SetupRequest::Command(SetupCommand::ConfigSet { key, value }) => {
+                config::set_limit(&self.state, &key, &value)?
+            }
+            SetupRequest::Command(SetupCommand::MachineName { .. }) => unimplemented!(),
         };
         let selected = read_config(&self.state);
         self.registry.publish(selected.clone());

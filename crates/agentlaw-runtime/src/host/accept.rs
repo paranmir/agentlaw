@@ -275,6 +275,12 @@ fn serve_control<D: Dispatcher>(mut stream: TcpStream, ctx: Arc<Context<D>>) {
                 ctx.lifecycle.stop();
                 ControlReply::ShutdownAccepted
             }
+            ControlRequest::ConfigGet { .. } => {
+                ControlReply::ConfigError(agentlaw_contracts::DomainError::new(
+                    "unimplemented",
+                    "ConfigGet is not implemented.",
+                ))
+            }
         };
         if transport::send(&mut stream, &reply, MAX_CONTROL_REPLY_BYTES).is_err() {
             break;

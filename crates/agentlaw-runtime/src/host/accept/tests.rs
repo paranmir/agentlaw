@@ -257,6 +257,42 @@ fn header(id: RequestId, kind: RequestKind, len: u32) -> CallHeader {
 }
 
 #[test]
+fn shutdown_rejects_body_that_arrives_after_proceed() {
+    let fixture = Fixture::new(Fake::default());
+    let mut data = fixture.data();
+    let bytes = body();
+    let id = RequestId::new();
+    send(
+        &mut data,
+        &header(id, RequestKind::Query, bytes.len() as u32),
+    );
+    assert_eq!(receive::<DataFrame>(&mut data), DataFrame::Proceed { id });
+    let mut control = fixture.connect(fixture.host.control);
+    send(&mut control, &hello());
+    assert_eq!(receive::<HelloReply>(&mut control), HelloReply::Accepted);
+    send(
+        &mut control,
+        &ControlRequest::Shutdown {
+            reason: "test".into(),
+        },
+    );
+    assert_eq!(
+        receive::<ControlReply>(&mut control),
+        ControlReply::ShutdownAccepted
+    );
+    data.write_all(&bytes).unwrap();
+    assert_eq!(
+        receive::<DataFrame>(&mut data),
+        DataFrame::Rejected {
+            id,
+            reason: RejectReason::Stopping
+        }
+    );
+    assert_eq!(fixture.fake.admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.fake.runs.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn endpoint_file_contains_exact_documented_fields() {
     let fixture = Fixture::new(Fake::default());
     let bytes = std::fs::read(fixture._dir.path().join("service/endpoint.json")).unwrap();

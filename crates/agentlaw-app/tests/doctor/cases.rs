@@ -123,6 +123,82 @@ fn doctor_without_endpoint_reports_not_running_without_modifying_state() {
     assert_eq!(files(&state), before);
 }
 
+#[test]
+fn doctor_reports_running_runtime_without_changing_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_agentlaw"))
+        .arg("runtime-host")
+        .env("AGENTLAW_HOME", &state)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut host = OwnedFixture(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.join("service/endpoint.json").exists() {
+        assert!(host.0.try_wait().unwrap().is_none(), "host exited");
+        assert!(Instant::now() < deadline, "host did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let before = files(&state);
+    let output = run(&state, &["doctor", "--health"]);
+    assert!(output.status.success());
+    let result = json_output(&output);
+    assert_eq!(result["worker_runtime"]["status"], "running", "{result}");
+    assert!(
+        result["worker_runtime"]["components"].is_array(),
+        "{result}"
+    );
+    assert!(result["worker_runtime"]["activity"].is_object(), "{result}");
+    assert!(result["worker_runtime"].get("resolved_history").is_none());
+    assert_eq!(files(&state), before);
+    assert!(host.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn doctor_reports_missing_installed_model_while_runtime_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let asset =
+        serde_json::json!({"path":temp.path().join("missing-model"),"sha256":"0".repeat(64)});
+    fs::write(state.join("model-assets.json"), serde_json::to_vec(&serde_json::json!({
+        "model_build_id":"fixture", "onnx_model":asset, "tokenizer_json":asset, "runtime_library":asset
+    })).unwrap()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_agentlaw"))
+        .arg("runtime-host")
+        .env("AGENTLAW_HOME", &state)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut host = OwnedFixture(child);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(host.0.try_wait().unwrap().is_none(), "runtime exited");
+        let output = run(&state, &["doctor", "--health"]);
+        if output.status.success() {
+            let result = json_output(&output);
+            if result["worker_runtime"]["status"] == "running"
+                && !result["worker_runtime"]["diagnostics"]["model_load"].is_null()
+            {
+                let diagnostic = result["worker_runtime"]["diagnostics"]["model_load"]
+                    .to_string()
+                    .to_lowercase();
+                assert!(diagnostic.contains("missing"), "{result}");
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing model diagnostic not reported"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 struct OwnedFixture(std::process::Child);
 
 impl Drop for OwnedFixture {

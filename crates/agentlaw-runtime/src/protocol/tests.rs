@@ -2,6 +2,26 @@ use super::*;
 use serde_json::{json, Value};
 use std::io::Cursor;
 
+#[test]
+fn setup_body_rejects_incorrect_kind_and_invalid_fields() {
+    let valid = br#"{"setup_command":{"config_set":{"key":"x","value":"y"}}}"#;
+    for kind in [RequestKind::Query, RequestKind::Command] {
+        assert!(matches!(
+            decode_body(kind, valid),
+            Err(RejectReason::KindMismatch)
+        ));
+    }
+    for body in [
+        &br#"{"setup_command":{"config_set":{"key":"x","value":"y","extra":1}}}"#[..],
+        &br#"{"setup_command":{"config_set":{"key":"x","key":"z","value":"y"}}}"#[..],
+    ] {
+        assert!(matches!(
+            decode_body(RequestKind::Setup, body),
+            Err(RejectReason::InvalidBody(_))
+        ));
+    }
+}
+
 struct CountingReader<R> {
     inner: R,
     consumed: usize,

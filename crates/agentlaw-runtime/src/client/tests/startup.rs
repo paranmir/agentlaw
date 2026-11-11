@@ -53,7 +53,7 @@ fn fixture() {
         let deps = crate::ports::HostDeps {
             state,
             executable: std::env::current_exe().unwrap(),
-            assets: None,
+            assets: Arc::new(|| Ok(None)),
             installation_build: BUILD.into(),
             start_gate: Arc::new(|| Ok(())),
         };
@@ -64,6 +64,40 @@ fn fixture() {
             Err(_) => 1,
         };
         std::process::exit(code);
+    }
+    if role == "delayed-owner" {
+        let _lock = OwnerLock::try_acquire(&state).unwrap().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        crate::transport::write_endpoint(
+            &state,
+            &crate::transport::Endpoint {
+                protocol: PROTOCOL_VERSION,
+                installation_build: BUILD.into(),
+                control: address,
+                data: address,
+                secret: "a".repeat(64),
+                pid: std::process::id(),
+            },
+        )
+        .unwrap();
+        std::fs::write(state.join("fixture-ready"), b"ready").unwrap();
+        let (mut first, _) = listener.accept().unwrap();
+        let _: Hello = recv(&mut first);
+        std::fs::write(state.join("hello-received"), b"ready").unwrap();
+        wait_for(|| state.join("release-hello").exists());
+        let _ = transport::send(&mut first, &HelloReply::Accepted, MAX_CONTROL_REPLY_BYTES);
+        for connection in listener.incoming() {
+            let mut stream = connection.unwrap();
+            let _: Hello = recv(&mut stream);
+            send(&mut stream, &HelloReply::Accepted);
+            if let Ok(ControlRequest::Lease { .. }) =
+                transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES)
+            {
+                send(&mut stream, &ControlReply::LeaseRenewed);
+            }
+        }
+        return;
     }
     let _lock = if role == "silent-owner" {
         Some(
@@ -360,6 +394,251 @@ fn unresponsive_owner_remains_alive_and_candidate_loses_lock() {
     ));
     assert!(owner.lock().unwrap().try_wait().unwrap().is_none());
     assert!(launcher.already_owned.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn delayed_hello_is_retried_against_original_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = Arc::new(TestLauncher::new(dir.path()));
+    let owner = launcher.spawn("delayed-owner", None);
+    wait_for(|| dir.path().join("fixture-ready").exists());
+    let worker = launcher.clone();
+    let attach =
+        thread::spawn(move || Client::attach(&worker.state, BUILD, worker.as_ref(), limits()));
+    wait_for(|| dir.path().join("hello-received").exists());
+    let deadline = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < deadline {
+        thread::park_timeout(Duration::from_millis(5));
+    }
+    std::fs::write(dir.path().join("release-hello"), b"go").unwrap();
+    let client = attach
+        .join()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("attach: {e:?}"));
+    assert_eq!(client.inner.endpoint.pid, owner.lock().unwrap().id());
+    assert!(owner.lock().unwrap().try_wait().unwrap().is_none());
+    assert!(OwnerLock::try_acquire(dir.path()).unwrap().is_none());
+    let children = launcher.children.lock().unwrap().clone();
+    for child in children.iter().filter(|child| !Arc::ptr_eq(child, &owner)) {
+        wait_for(|| child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+}
+
+#[test]
+fn config_get_uses_runtime_snapshot_and_reports_invalid_keys() {
+    use crate::test_support::installation::TestInstallation;
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    crate::installation::config::set_limit(installation.state(), "response_limit_bytes", "8192")
+        .unwrap();
+    let launcher = TestLauncher::new(installation.state());
+    let client = attached(installation.state(), &launcher);
+    assert_eq!(
+        client.config_get("response_limit_bytes").unwrap()["value"],
+        8192
+    );
+    crate::installation::config::set_limit(installation.state(), "response_limit_bytes", "16384")
+        .unwrap();
+    assert_eq!(
+        client.config_get("response_limit_bytes").unwrap()["value"],
+        8192
+    );
+    assert!(matches!(
+        client.config_get("unknown"),
+        Err(ClientError::Domain(_))
+    ));
+}
+
+#[test]
+fn config_get_handles_missing_and_corrupt_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = TestLauncher::new(dir.path());
+    let client = attached(dir.path(), &launcher);
+    assert_eq!(
+        client.config_get("response_limit_bytes").unwrap()["value"],
+        crate::installation::config::default_response_limit()
+    );
+    client.shutdown("test").unwrap();
+    wait_for(|| matches!(owner_alive(dir.path()), Ok(false)));
+    std::fs::write(dir.path().join("config.json"), b"{").unwrap();
+    let client = attached(dir.path(), &launcher);
+    assert!(matches!(
+        client.config_get("response_limit_bytes"),
+        Err(ClientError::Domain(_))
+    ));
+}
+
+#[test]
+fn setup_store_connect_switches_binding_without_worker_daemon() {
+    use crate::test_support::installation::TestInstallation;
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    installation.select_store("b").unwrap();
+    installation.select_store("a").unwrap();
+    let launcher = TestLauncher::new(installation.state());
+    let client = attached(installation.state(), &launcher);
+    let before = client.resolve_binding().unwrap();
+    let result = client
+        .setup(
+            SetupCommand::StoreConnect {
+                path: installation.store_path("b"),
+                create: false,
+            },
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert!(result.is_object());
+    let after = client.resolve_binding().unwrap();
+    assert_ne!(before, after);
+    let request = ValidatedRequest::parse_public(
+        &json!({"action":"recall","recall":{"recall_for":"store selection marker"}}).to_string(),
+    )
+    .unwrap();
+    assert!(client
+        .call(
+            CallTarget::Store(after),
+            request,
+            &RequestControl::default()
+        )
+        .is_ok());
+    assert!(!installation.state().join("worker/endpoint.json").exists());
+}
+
+#[test]
+fn public_setup_connect_switches_store_without_worker_endpoint() {
+    use crate::test_support::installation::TestInstallation;
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    installation.select_store("b").unwrap();
+    installation.select_store("a").unwrap();
+    let project = installation.state().parent().unwrap().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let launcher = TestLauncher::new(installation.state());
+    let client = attached(installation.state(), &launcher);
+    let original = client.resolve_binding().unwrap();
+    let input = json!({"action":"connect_project_memory", "connect_project_memory": {
+        "project_path": project, "memory_store_path": installation.store_path("b")
+    }});
+    let request = ValidatedRequest::parse_public(&input.to_string()).unwrap();
+    let result = client
+        .call(CallTarget::Setup, request, &RequestControl::default())
+        .unwrap();
+    assert!(result.is_object());
+    let selected = client.resolve_binding().unwrap();
+    assert_ne!(original, selected);
+    let recall = ValidatedRequest::parse_public(
+        &json!({"action":"recall", "recall":{"recall_for":"selection marker"}}).to_string(),
+    )
+    .unwrap();
+    assert!(client
+        .call(
+            CallTarget::Store(selected),
+            recall,
+            &RequestControl::default()
+        )
+        .is_ok());
+    assert!(!installation.state().join("worker/endpoint.json").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn shutdown_during_upload_does_not_reopen_store_and_releases_owner() {
+    use crate::test_support::installation::TestInstallation;
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    let db = installation
+        .config()
+        .unwrap()
+        .unwrap()
+        .runtime_root(installation.state())
+        .join("control.sqlite");
+    let launcher = TestLauncher::new(installation.state());
+    let host = start_host(&launcher);
+    let client = attached(installation.state(), &launcher);
+    let binding = client.resolve_binding().unwrap();
+    let endpoint = crate::transport::read_endpoint(installation.state()).unwrap();
+    let mut data = TcpStream::connect(endpoint.data).unwrap();
+    data.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send(
+        &mut data,
+        &Hello {
+            protocol: PROTOCOL_VERSION,
+            installation_build: BUILD.into(),
+            secret: endpoint.secret,
+        },
+    );
+    assert_eq!(recv::<HelloReply>(&mut data), HelloReply::Accepted);
+    let request = ValidatedRequest::parse_public(
+        &json!({"action":"recall","recall":{"recall_for":"shutdown marker"}}).to_string(),
+    )
+    .unwrap();
+    let body = wire::encode_wire(request.request()).unwrap();
+    let id = RequestId::new();
+    send(
+        &mut data,
+        &CallHeader {
+            id,
+            target: CallTarget::Store(binding),
+            kind: RequestKind::Query,
+            body_len: body.len() as u32,
+        },
+    );
+    assert_eq!(recv::<DataFrame>(&mut data), DataFrame::Proceed { id });
+    client.shutdown("test").unwrap();
+    data.write_all(&body).unwrap();
+    assert_eq!(
+        recv::<DataFrame>(&mut data),
+        DataFrame::Rejected {
+            id,
+            reason: RejectReason::Stopping
+        }
+    );
+    let moved = db.with_file_name("control-moved.sqlite");
+    wait_for(|| match std::fs::rename(&db, &moved) {
+        Ok(()) => true,
+        Err(e) if matches!(e.raw_os_error(), Some(32 | 33)) => false,
+        Err(e) => panic!("rename: {e}"),
+    });
+    std::fs::rename(&moved, &db).unwrap();
+    wait_for(|| host.lock().unwrap().try_wait().unwrap().is_some());
+    assert_eq!(
+        host.lock().unwrap().try_wait().unwrap().unwrap().code(),
+        Some(0)
+    );
+    assert!(!installation.state().join("service/endpoint.json").exists());
+    assert!(OwnerLock::try_acquire(installation.state())
+        .unwrap()
+        .is_some());
+}
+
+#[cfg(windows)]
+#[test]
+fn shutdown_immediately_after_attach_finishes_and_releases_store() {
+    use crate::test_support::installation::TestInstallation;
+    let installation = TestInstallation::new();
+    installation.select_store("a").unwrap();
+    let db = installation
+        .config()
+        .unwrap()
+        .unwrap()
+        .runtime_root(installation.state())
+        .join("control.sqlite");
+    let launcher = TestLauncher::new(installation.state());
+    let host = start_host(&launcher);
+    let client = attached(installation.state(), &launcher);
+    client.shutdown("test").unwrap();
+    wait_for(|| host.lock().unwrap().try_wait().unwrap().is_some());
+    assert_eq!(
+        host.lock().unwrap().try_wait().unwrap().unwrap().code(),
+        Some(0)
+    );
+    assert!(!installation.state().join("service/endpoint.json").exists());
+    assert!(OwnerLock::try_acquire(installation.state())
+        .unwrap()
+        .is_some());
+    let moved = db.with_file_name("control-moved.sqlite");
+    std::fs::rename(&db, &moved).unwrap();
+    std::fs::rename(&moved, &db).unwrap();
 }
 
 #[cfg(windows)]

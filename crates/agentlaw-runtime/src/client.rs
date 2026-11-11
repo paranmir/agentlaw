@@ -38,6 +38,15 @@ pub struct Client {
     inner: Arc<Inner>,
 }
 
+pub enum ShutdownState {
+    NotRunning,
+    Stopping,
+}
+
+pub fn shutdown_installed(_state: &Path, _reason: &str) -> Result<ShutdownState, ClientError> {
+    Err(unavailable("shutdown_installed is not implemented"))
+}
+
 pub struct AttachLimits {
     pub start_wait: Duration,
     pub hello_timeout: Duration,
@@ -148,6 +157,17 @@ pub fn probe(state: &Path, installation_build: &str, hello_timeout: Duration) ->
 }
 
 impl Client {
+    pub fn setup(
+        &self,
+        _command: SetupCommand,
+        _control: &RequestControl,
+    ) -> Result<Value, ClientError> {
+        Err(unavailable("setup is not implemented"))
+    }
+
+    pub fn config_get(&self, _key: &str) -> Result<Value, ClientError> {
+        Err(unavailable("config_get is not implemented"))
+    }
     pub fn attach(
         state: &Path,
         installation_build: &str,
