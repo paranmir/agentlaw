@@ -280,6 +280,12 @@ Cancellation was requested. The operation's final result determines whether publ
 
 A completed pre-decision cancellation returns the existing retained-work reference after its state is persisted.
 
+For `runtime_unresponsive`:
+
+```text
+The Agentlaw runtime process is running but not responding, so this operation was not executed. You must tell the user in their language that Agentlaw memory is unavailable because its runtime is unresponsive, and that ending the Agentlaw runtime process lets the next call start a new one. Do not retry automatically and do not end the process yourself.
+```
+
 ### Incomplete semantic recall
 
 A recall with `recall_for` and an actual `semantic_channel_incomplete`
