@@ -30,3 +30,8 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The installation build identity hashes the whole executable; keep hashing
+# fast in debug builds, whose executables are large and unoptimized.
+[profile.dev.package.sha2]
+opt-level = 3
