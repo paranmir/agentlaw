@@ -1,5 +1,8 @@
 //! Black-box help and argv validation. Every subprocess keeps stdin open until
 //! it exits, and hostile installation fixtures detect accidental state access.
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -100,6 +103,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 }
 
 struct HostileHome {
+    _runtime_cleanup: RuntimeCleanup,
     temp: tempfile::TempDir,
     state: PathBuf,
     original: BTreeMap<PathBuf, Option<Vec<u8>>>,
@@ -116,6 +120,7 @@ impl HostileHome {
         }
         let original = snapshot(temp.path());
         Self {
+            _runtime_cleanup: RuntimeCleanup(state.clone()),
             temp,
             state,
             original,
@@ -546,6 +551,7 @@ fn procedure_argument_errors_keep_stderr_and_stdout_separate() {
 fn equals_value_is_literal_and_end_of_options_does_not_trigger_help() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let named = successful_json(&run(
         &state,
         temp.path(),

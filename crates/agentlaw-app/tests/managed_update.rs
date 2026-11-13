@@ -1,5 +1,8 @@
 //! Managed update subprocess tests use only temporary roots and owned processes.
 use fs2::FileExt;
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -306,6 +309,7 @@ impl Drop for ManagedTemp {
 static FIXTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
+    _runtime_cleanup: RuntimeCleanup,
     _temp: ManagedTemp,
     root: PathBuf,
     state: PathBuf,
@@ -343,6 +347,7 @@ impl Fixture {
         };
         let state = root.join("state");
         let bin = root.join("bin");
+        let runtime_cleanup = RuntimeCleanup(state.clone());
         let source = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
         let old = bin.join(binary_name());
         fs::copy(old_binary.unwrap_or(source), &old).unwrap();
@@ -403,6 +408,7 @@ impl Fixture {
             )["created"],
             true
         );
+        runtime_cleanup.shutdown();
         fs::write(staged.join("launcher.asset"), b"pinned launcher asset").unwrap();
         let archive_name = if cfg!(windows) {
             "agentlaw-x86_64-pc-windows-msvc.zip"
@@ -448,6 +454,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            _runtime_cleanup: runtime_cleanup,
             _temp: temp,
             root,
             state,

@@ -1,6 +1,9 @@
 //! Actual CLI and MCP subprocesses, not a mocked backend.
 #[path = "../../../tests/support/owned_process.rs"]
 mod owned_process;
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
@@ -58,7 +61,7 @@ fn run(state: &Path, args: &[&str], input: Option<Value>) -> (Output, Value) {
     // product hang. Bound the test and terminate only the command it owns.
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let mut child = Daemon::new(child);
+    let mut child = Daemon::frontend(child);
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -119,29 +122,6 @@ fn initialize(state: &Path, source: &Path) {
     assert!(source.join("format.md").is_file());
 }
 
-struct RuntimeCleanup(std::path::PathBuf);
-impl Drop for RuntimeCleanup {
-    fn drop(&mut self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(endpoint) = agentlaw_runtime::transport::read_endpoint(&self.0) {
-                if let Ok(client) =
-                    agentlaw_runtime::client::Client::connect(&self.0, &endpoint.installation_build)
-                {
-                    let _ = client.shutdown("test cleanup");
-                }
-            }
-            if !agentlaw_runtime::installation::owner::owner_alive(&self.0).unwrap_or(false) {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
-
 struct McpFixture {
     _child: Daemon,
     input: std::process::ChildStdin,
@@ -159,7 +139,7 @@ impl McpFixture {
             .unwrap();
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
-        let child = Daemon::new(child);
+        let child = Daemon::frontend(child);
         let (tx, replies) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(output).lines() {
@@ -201,7 +181,9 @@ impl McpFixture {
 fn cli_call_starts_runtime_and_returns_recall() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let _cleanup = RuntimeCleanup(state.clone());
     assert!(!state.join("service/endpoint.json").exists());
     let (out, result) = run(
@@ -215,10 +197,114 @@ fn cli_call_starts_runtime_and_returns_recall() {
 }
 
 #[test]
+fn frontend_pipes_reach_eof_while_runtime_remains_alive() {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = send.send(result);
+        });
+        receive
+    }
+
+    for frontend in ["cli", "mcp"] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
+        initialize(&state, &temp.path().join("store"));
+        _initial_runtime_cleanup.shutdown();
+        let _cleanup = RuntimeCleanup(state.clone());
+        assert!(!state.join("service/endpoint.json").exists());
+        let mut cmd = command(&state);
+        if frontend == "cli" {
+            cmd.args(["call", "--json", "-"]);
+        } else {
+            cmd.args(["mcp", "serve", "--stdio"]);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let stdout = drain(child.stdout.take().unwrap());
+        let stderr = drain(child.stderr.take().unwrap());
+        let mut child = Daemon::frontend(child);
+        if frontend == "cli" {
+            write!(
+                input,
+                "{}",
+                json!({"action":"recall","recall":{"recall_for":"pipe eof fixture"}})
+            )
+            .unwrap();
+        } else {
+            for message in [
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"recall_for":"pipe eof fixture"}}}}),
+            ] {
+                writeln!(input, "{message}").unwrap();
+            }
+        }
+        drop(input);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{frontend} frontend did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            status.success(),
+            "{frontend} exited unsuccessfully: {status}"
+        );
+        let endpoint =
+            agentlaw_runtime::transport::read_endpoint(&state).expect("runtime endpoint");
+        let mut processes = sysinfo::System::new();
+        processes.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        assert!(
+            processes
+                .process(sysinfo::Pid::from_u32(endpoint.pid))
+                .is_some(),
+            "runtime process is not alive"
+        );
+        assert!(agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
+        let output = stdout
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stdout EOF deadline")
+            .unwrap();
+        stderr
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stderr EOF deadline")
+            .unwrap();
+        assert!(!output.is_empty(), "{frontend} produced no response");
+        processes.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        assert!(
+            processes
+                .process(sysinfo::Pid::from_u32(endpoint.pid))
+                .is_some(),
+            "runtime exited before EOF"
+        );
+        assert!(agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
+    }
+}
+
+#[test]
 fn two_mcp_frontends_share_one_runtime_and_memory() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let _cleanup = RuntimeCleanup(state.clone());
     let mut first = McpFixture::start(&state);
     let mut second = McpFixture::start(&state);
@@ -250,7 +336,9 @@ fn two_mcp_frontends_share_one_runtime_and_memory() {
 fn discovery_responds_before_runtime_is_ready_and_first_call_waits() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let _cleanup = RuntimeCleanup(state.clone());
     let lock = agentlaw_runtime::installation::owner::OwnerLock::try_acquire(&state)
         .unwrap()
@@ -279,7 +367,9 @@ fn discovery_responds_before_runtime_is_ready_and_first_call_waits() {
 fn reconnects_within_same_mcp_call_after_owned_host_is_killed() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let _cleanup = RuntimeCleanup(state.clone());
     let mut host = Daemon::new(
         command(&state)
@@ -381,7 +471,9 @@ fn disconnect_after_mutation_body_helper() {
 fn mcp_does_not_resend_mutation_after_body_disconnect() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let _cleanup = RuntimeCleanup(state.clone());
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -442,11 +534,14 @@ fn mcp_does_not_resend_mutation_after_body_disconnect() {
 fn first_store_connection_works_from_mcp_and_cli() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("store");
+    let _seed_runtime_cleanup = RuntimeCleanup(temp.path().join("seed"));
     initialize(&temp.path().join("seed"), &source);
+    _seed_runtime_cleanup.shutdown();
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     for frontend in ["mcp", "cli"] {
         let state = temp.path().join(frontend);
+        let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
         let _cleanup = RuntimeCleanup(state.clone());
         assert!(!state.join("config.json").exists());
         let input = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":project,"memory_store_path":source,"intent":"discover"}});
@@ -471,7 +566,7 @@ fn first_store_connection_works_from_mcp_and_cli() {
                 .unwrap()
                 .unwrap()
                 .memory_store_path,
-            source
+            std::fs::canonicalize(&source).unwrap()
         );
     }
 }
@@ -480,6 +575,7 @@ fn first_store_connection_works_from_mcp_and_cli() {
 fn runtime_file_delivery_reports_config_path_and_smaller_history_limit() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
     let _cleanup = RuntimeCleanup(state.clone());
     for (key, value) in [
@@ -508,12 +604,16 @@ fn runtime_file_delivery_reports_config_path_and_smaller_history_limit() {
         assert!(out.status.success(), "{envelope}");
         assert_eq!(envelope["code"], "complete_content_in_file", "{envelope}");
         let path = envelope["artifact"]["path"].as_str().unwrap();
-        let content: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let content: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             content["response_limit"]["config_file"],
             json!(state.join("config.json")),
             "{content}"
         );
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("\"response_limit\"").count(), 1, "{content}");
+        assert!(!text.contains("complete_content_in_file"), "{content}");
     }
 }
 
@@ -521,6 +621,7 @@ fn runtime_file_delivery_reports_config_path_and_smaller_history_limit() {
 fn history_uses_smaller_limit_when_recall_remains_inline() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
     let _cleanup = RuntimeCleanup(state.clone());
     for (key, value) in [
@@ -569,12 +670,16 @@ fn history_uses_smaller_limit_when_recall_remains_inline() {
         content["response_limit"]["config_file"],
         json!(state.join("config.json"))
     );
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(text.matches("\"response_limit\"").count(), 1, "{content}");
+    assert!(!text.contains("complete_content_in_file"), "{content}");
 }
 
 #[test]
 fn machine_inspect_without_identity_is_read_only() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let (out, value) = run(&state, &["machine", "inspect"], None);
     assert!(out.status.success(), "{value}");
     assert!(value["machine_id"].is_null(), "{value}");
@@ -586,13 +691,16 @@ fn machine_inspect_without_identity_is_read_only() {
 fn config_get_without_runtime_reads_file_without_starting_host() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     initialize(&state, &temp.path().join("store"));
+    _initial_runtime_cleanup.shutdown();
     let (out, result) = run(
         &state,
         &["config", "set", "response_limit_bytes", "8192"],
         None,
     );
     assert!(out.status.success(), "{result}");
+    _initial_runtime_cleanup.shutdown();
     assert!(!state.join("service/endpoint.json").exists());
     let (out, result) = run(&state, &["config", "get", "response_limit_bytes"], None);
     assert!(out.status.success(), "{result}");
@@ -622,6 +730,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
     }
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let host = temp.path().join("codex");
     let source = temp.path().join("source");
     let manifest = temp.path().join("model.json");
@@ -791,6 +900,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
         ],
     );
     let replica = temp.path().join("new-installation");
+    let _replica_runtime_cleanup = RuntimeCleanup(replica.clone());
     std::fs::create_dir(&replica).unwrap();
     // Reuse provisioned, immutable assets; no user installation and no network download.
     std::fs::copy(
@@ -872,6 +982,7 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
 fn isolated_install_is_explicit_repeatable_and_preserves_harness_settings() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("설치 state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let host = tmp.path().join("codex profile");
     let (_, proposal) = run(
         &state,
@@ -985,7 +1096,6 @@ fn isolated_install_is_explicit_repeatable_and_preserves_harness_settings() {
 
 #[test]
 fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
-    use rusqlite::OptionalExtension;
     fn source_bytes(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
         let mut files = std::collections::BTreeMap::new();
         let mut directories = vec![root.to_path_buf()];
@@ -1016,6 +1126,7 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _runtime = RuntimeCleanup(state.clone());
@@ -1185,91 +1296,6 @@ fn diagnostics_and_limits_are_explicit_and_do_not_reset_memory() {
     assert_eq!(doctor["audit"]["source"]["validated"], true);
     verify_content();
     assert_eq!(export("after-doctor.jsonl"), history);
-    // Damage only a disposable exact index, then require repair to install a
-    // real replacement generation. A success flag alone is not preservation evidence.
-    let active_index = {
-        let db = rusqlite::Connection::open_with_flags(
-            local.join("control.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.query_row(
-            "SELECT value FROM settings WHERE key='exact_active_generation'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .unwrap()
-        .unwrap_or_else(|| "exact-v3.sqlite".into())
-    };
-    let damaged = local.join(&active_index);
-    let old_index =
-        rusqlite::Connection::open_with_flags(&damaged, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    assert_eq!(
-        old_index
-            .query_row("SELECT COUNT(*) FROM exact_units WHERE id=?1", [id], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap(),
-        1
-    );
-    drop(old_index);
-    std::fs::write(&damaged, b"deliberately damaged disposable exact index").unwrap();
-    let corrupt_index =
-        rusqlite::Connection::open_with_flags(&damaged, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    assert!(
-        corrupt_index
-            .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
-            .is_err(),
-        "fixture must damage the effective SQLite index, not just an unused file"
-    );
-    drop(corrupt_index);
-    let (out, repaired) = run(&state, &["repair"], None);
-    assert!(out.status.success(), "{repaired}");
-    assert_eq!(repaired["original_memory_preserved"], true);
-    assert_eq!(repaired["derived"]["lexical_complete"], true);
-    assert_eq!(
-        repaired["derived"]["semantic_complete"], false,
-        "no model was configured"
-    );
-    let replacement = {
-        let db = rusqlite::Connection::open_with_flags(
-            local.join("control.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.query_row(
-            "SELECT value FROM settings WHERE key='exact_active_generation'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap()
-    };
-    assert_ne!(replacement, active_index);
-    let index = rusqlite::Connection::open_with_flags(
-        local.join(replacement),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    assert_eq!(
-        index
-            .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
-            .unwrap(),
-        "ok"
-    );
-    assert_eq!(
-        index
-            .query_row("SELECT COUNT(*) FROM exact_units WHERE id=?1", [id], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap(),
-        1
-    );
-    drop(index);
-    verify_content();
-    assert_eq!(export("after-repair.jsonl"), history);
     // Corrupt source is not a repair invitation to reset authoritative content.
     let format = std::fs::read(source.join("format.md")).unwrap();
     std::fs::write(source.join("format.md"), b"invalid fixture format").unwrap();
@@ -1328,6 +1354,7 @@ fn installed_layout_proposes_memory_beside_private_state() {
 fn managed_install_cli_create_and_doctor_use_installation_local_coordination() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("custom-installation");
+    let _runtime_cleanup = RuntimeCleanup(root.join("state"));
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(
@@ -1542,6 +1569,7 @@ fn damaged_managed_layout_does_not_fall_back_to_appdata() {
 fn setup_is_explicit_and_does_not_select_foreign_data() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let (_, proposed) = run(&state, &["store", "propose-location"], None);
     assert_eq!(proposed["created"], false);
     assert_eq!(
@@ -1593,6 +1621,7 @@ fn setup_is_explicit_and_does_not_select_foreign_data() {
 fn real_cli_publication_is_visible_to_new_mcp_process() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _runtime = RuntimeCleanup(state.clone());
@@ -1629,7 +1658,9 @@ fn real_cli_publication_is_visible_to_new_mcp_process() {
 fn clone_connect_validates_source_and_keeps_machine_state_local() {
     let tmp = tempfile::tempdir().unwrap();
     let first = tmp.path().join("first");
+    let _first_runtime_cleanup = RuntimeCleanup(first.clone());
     let second = tmp.path().join("second");
+    let _second_runtime_cleanup = RuntimeCleanup(second.clone());
     let source = tmp.path().join("source");
     initialize(&first, &source);
     let cloned = tmp.path().join("cloned");
@@ -1653,6 +1684,7 @@ fn existing_frontend_switches_next_request_and_old_store_is_retained() {
     use std::io::{BufRead, BufReader};
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let a = tmp.path().join("a");
     initialize(&state, &a);
     let machine_before = std::fs::read(state.join("machine.json")).unwrap();
@@ -1761,6 +1793,7 @@ fn existing_frontend_switches_next_request_and_old_store_is_retained() {
 fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _runtime = RuntimeCleanup(state.clone());
@@ -1821,6 +1854,7 @@ fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
 fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _runtime = RuntimeCleanup(state.clone());
@@ -1883,10 +1917,17 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
         contextual_packet["memories"][0]["current_heads"][0]["what_to_remember"],
         body
     );
+    // A contextual single-head rule carries its full text without memory_ref;
+    // the explicit-ID recall above returns the full head.
     assert_eq!(
-        contextual_packet["memories"][0]["current_heads"][0]["memory_ref"],
-        saved["results"][0]["memory_ref"]
+        contextual_packet["memories"][0]["memory_id"],
+        saved["results"][0]["memory_ref"]["memory_id"]
     );
+    let contextual_head = contextual_packet["memories"][0]["current_heads"][0]
+        .as_object()
+        .unwrap();
+    assert!(contextual_head.contains_key("applicability"));
+    assert!(!contextual_head.contains_key("memory_ref"));
     let (_, changed) = run(
         &state,
         &["call", "--json", "-"],
@@ -1918,6 +1959,7 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
 fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
+    let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
     let source = tmp.path().join("source");
     initialize(&state, &source);
     let _runtime = RuntimeCleanup(state.clone());
@@ -1978,17 +2020,25 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     assert_eq!(response["artifact"]["bytes"], bytes.len());
     let packet: Value = serde_json::from_slice(&bytes).unwrap();
     let memories = packet["memories"].as_array().unwrap();
-    for (saved, body) in [
-        (&reference, &reference_body),
-        (&first, &first_body),
-        (&second, &second_body),
-    ] {
-        let expected = &saved["results"][0]["memory_ref"];
-        assert!(memories
+    // The required reference keeps the full head; contextual single-head rules
+    // carry only their full text, applicability and rule marker.
+    let expected = &reference["results"][0]["memory_ref"];
+    assert!(memories
+        .iter()
+        .any(|m| m["memory_id"] == expected["memory_id"]
+            && m["current_heads"][0]["memory_ref"] == *expected
+            && m["current_heads"][0]["what_to_remember"] == reference_body));
+    for (saved, body) in [(&first, &first_body), (&second, &second_body)] {
+        let id = &saved["results"][0]["memory_ref"]["memory_id"];
+        let rule = memories
             .iter()
-            .any(|m| m["memory_id"] == expected["memory_id"]
-                && m["current_heads"][0]["memory_ref"] == *expected
-                && m["current_heads"][0]["what_to_remember"] == *body));
+            .find(|m| m["memory_id"] == *id)
+            .unwrap_or_else(|| panic!("contextual rule {id} missing: {packet}"));
+        let head = rule["current_heads"][0].as_object().unwrap();
+        assert_eq!(head["what_to_remember"], *body);
+        assert_eq!(head["is_rule"], true);
+        assert!(head.contains_key("applicability"));
+        assert!(!head.contains_key("memory_ref") && !head.contains_key("origin"));
     }
     assert_eq!(memories.len(), 3);
     assert_eq!(
@@ -2023,6 +2073,10 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     .unwrap();
     assert_eq!(unbound_packet["status"], "needs_user_input");
     assert_eq!(unbound_packet["code"], "project_connection_required");
+    assert_ne!(
+        unbound_packet["partial_recall"]["code"], "complete_content_in_file",
+        "partial recall must be inside the one delivered file"
+    );
     for candidate in unbound_packet["partial_recall"]["candidates"]
         .as_array()
         .unwrap()

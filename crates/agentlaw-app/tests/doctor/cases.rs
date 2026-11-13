@@ -1,3 +1,6 @@
+#[path = "../../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -111,6 +114,7 @@ fn assert_no_audit(value: &Value) {
 fn doctor_without_endpoint_reports_not_running_without_modifying_state() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     fs::create_dir_all(&state).unwrap();
     let before = files(&state);
     let output = run(&state, &["doctor", "--health"]);
@@ -127,6 +131,7 @@ fn doctor_without_endpoint_reports_not_running_without_modifying_state() {
 fn doctor_reports_running_runtime_without_changing_state() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     fs::create_dir_all(&state).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_agentlaw"))
         .arg("runtime-host")
@@ -161,6 +166,7 @@ fn doctor_reports_running_runtime_without_changing_state() {
 fn doctor_reports_missing_installed_model_while_runtime_runs() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     fs::create_dir_all(&state).unwrap();
     let asset =
         serde_json::json!({"path":temp.path().join("missing-model"),"sha256":"0".repeat(64)});
@@ -264,6 +270,7 @@ fn start_doctor_fixture(state: &Path) -> OwnedFixture {
 fn doctor_reports_stale_endpoint_after_owner_is_killed() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let mut fixture = start_doctor_fixture(&state);
     fixture.0.kill().unwrap();
     fixture.0.wait().unwrap();
@@ -280,6 +287,7 @@ fn doctor_reports_stale_endpoint_after_owner_is_killed() {
 fn doctor_reports_unresponsive_owner_without_modifying_state() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let mut fixture = start_doctor_fixture(&state);
     let before = files(&state);
     let output = run(&state, &["doctor", "--health"]);
@@ -300,6 +308,7 @@ fn doctor_reports_unresponsive_owner_without_modifying_state() {
 fn doctor_flags_are_in_generated_help_and_unknown_flag_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let help = run(&state, &["doctor", "--help"]);
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
@@ -315,6 +324,7 @@ fn doctor_flags_are_in_generated_help_and_unknown_flag_is_rejected() {
 fn doctor_modes_report_setup_without_creating_installation() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("absent");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     for args in [
         &["doctor"][..],
         &["doctor", "--health"][..],
@@ -334,6 +344,7 @@ fn doctor_modes_report_setup_without_creating_installation() {
 fn doctor_corrupted_source_is_not_examined_by_default_health() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     let create = run(
         &state,
@@ -367,6 +378,7 @@ fn doctor_corrupted_source_is_not_examined_by_default_health() {
 fn doctor_health_does_not_change_any_state_files() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     create(&state, &source);
     let before = files(&state);
@@ -384,6 +396,7 @@ fn doctor_health_does_not_change_any_state_files() {
 fn doctor_health_finishes_while_storage_exclusive_gate_is_held() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     create(&state, &source);
     let store = store(&state, &source);
@@ -427,6 +440,7 @@ fn doctor_health_finishes_while_storage_exclusive_gate_is_held() {
 fn doctor_health_finishes_during_real_publications() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     create(&state, &source);
     let store = store(&state, &source);
@@ -468,6 +482,7 @@ fn doctor_health_finishes_during_real_publications() {
 fn doctor_audit_includes_health_and_successful_source_result() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     create(&state, &source);
     let health = json_output(&run(&state, &["doctor"]));
@@ -484,6 +499,7 @@ fn doctor_audit_includes_health_and_successful_source_result() {
 fn doctor_audit_failure_preserves_health_and_corrupt_source_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let source = temp.path().join("source");
     create(&state, &source);
     let format = source.join("format.md");

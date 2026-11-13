@@ -2,6 +2,9 @@
 //! and unchanged hostile fixtures establish rejection before visible state
 //! effects; these tests do not trace every read, process launch, or network call.
 
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -50,6 +53,7 @@ fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
 }
 
 struct HostileHome {
+    _runtime_cleanup: RuntimeCleanup,
     temp: tempfile::TempDir,
     state: PathBuf,
 }
@@ -59,7 +63,12 @@ impl HostileHome {
         let state = temp.path().join("state");
         fs::create_dir(&state).unwrap();
         fs::write(state.join("config.json"), b"{ invalid configuration\n").unwrap();
-        Self { temp, state }
+        let runtime_cleanup = RuntimeCleanup(state.clone());
+        Self {
+            _runtime_cleanup: runtime_cleanup,
+            temp,
+            state,
+        }
     }
 
     /// `None` leaves stdin open without sending bytes; an argv/file rejection

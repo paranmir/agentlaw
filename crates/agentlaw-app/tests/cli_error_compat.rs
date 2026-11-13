@@ -1,6 +1,9 @@
 //! Frozen error/exit compatibility through the real CLI. Hostile isolated state
 //! snapshots check visible effects; they do not trace every filesystem read.
 
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -37,6 +40,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 }
 
 struct HostileHome {
+    _runtime_cleanup: RuntimeCleanup,
     temp: tempfile::TempDir,
     state: PathBuf,
 }
@@ -51,7 +55,12 @@ impl HostileHome {
             fs::write(state.join("config.json"), b"invalid configuration").unwrap();
             fs::write(state.join("machine.json"), b"invalid identity").unwrap();
         }
-        Self { temp, state }
+        let runtime_cleanup = RuntimeCleanup(state.clone());
+        Self {
+            _runtime_cleanup: runtime_cleanup,
+            temp,
+            state,
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
