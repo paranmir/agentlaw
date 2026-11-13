@@ -249,12 +249,20 @@ impl MutationLane {
             .unwrap_or_else(|e| e.into_inner()) = Some(wake);
     }
     pub fn close(&self) {
+        let _ = self.close_checked();
+    }
+    pub fn close_checked(&self) -> crate::ports::RuntimeResult<()> {
         if !self.sender.shared.closed.swap(true, Ordering::AcqRel) {
             let _ = self.sender.shared.sender.send(Message::Stop);
         }
         if let Some(thread) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = thread.join();
+            thread.join().map_err(|_| {
+                crate::ports::RuntimeError::Unavailable(
+                    "Mutation lane terminated unexpectedly.".into(),
+                )
+            })?;
         }
+        Ok(())
     }
 }
 impl Drop for MutationLane {

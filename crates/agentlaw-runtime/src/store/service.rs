@@ -86,6 +86,109 @@ impl ActivePointerSink for PointerSink {
 }
 
 impl StoreService {
+    pub fn repair_derived(&self, control: &RequestControl) -> Result<Value> {
+        control.phase("rebuilding_private_derived_generation");
+        control.check()?;
+        self.projection.rebuild(control).map_err(|e| {
+            control
+                .check()
+                .err()
+                .unwrap_or_else(|| DomainError::new("derived_repair_failed", e.to_string()))
+        })?;
+        control.check()?;
+        let target = self
+            .source
+            .read_snapshot()
+            .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?
+            .position()
+            .clone();
+        let (semantic_complete, diagnostic) =
+            match self.indexer.start_repair(&self.identity.binding_id) {
+                Err(error) => (
+                    false,
+                    Some(DomainError::new(
+                        "semantic_repair_incomplete",
+                        error.to_string(),
+                    )),
+                ),
+                Ok(()) => match self.indexer.repair_progress(&self.identity.binding_id) {
+                    Some(progress)
+                        if progress.state == crate::semantic::SemanticRepairState::Complete
+                            && progress.ack.as_ref().is_some_and(|ack| {
+                                ack.epoch == target.epoch
+                                    && u64::try_from(ack.sequence)
+                                        .is_ok_and(|sequence| sequence >= target.sequence)
+                            }) =>
+                    {
+                        (true, None)
+                    }
+                    Some(progress) => (
+                        false,
+                        Some(DomainError::new(
+                            "semantic_repair_incomplete",
+                            progress
+                                .reason
+                                .unwrap_or_else(|| "Semantic repair is still in progress.".into()),
+                        )),
+                    ),
+                    None => (
+                        false,
+                        Some(DomainError::new(
+                            "semantic_repair_incomplete",
+                            "Semantic repair progress is unavailable.",
+                        )),
+                    ),
+                },
+            };
+        control.check()?;
+        Ok(
+            json!({"lexical_complete":true,"semantic_complete":semantic_complete,"diagnostics":diagnostic.into_iter().collect::<Vec<_>>()}),
+        )
+    }
+    pub fn continuity_save(&self, control: &RequestControl) -> Result<Value> {
+        control.check()?;
+        agentlaw_contracts::to_value(crate::git::git_ops::continuity_save_from_handle(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            "Agentlaw continuity snapshot\n",
+        )?)
+    }
+    pub fn export_history(
+        &self,
+        memory_id: String,
+        output: PathBuf,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        crate::store::export::history_export(&self.source, &memory_id, &output, control)
+    }
+    pub fn procedure_list(
+        &self,
+        filter: crate::protocol::InventoryFilter,
+        output: PathBuf,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        crate::store::export::procedure_list(
+            &self.source,
+            &self.identity.local.join("exports"),
+            &filter,
+            &output,
+            control,
+        )
+    }
+    pub fn procedure_search(
+        &self,
+        query: String,
+        limit: Option<usize>,
+        filter: crate::protocol::InventoryFilter,
+        output: PathBuf,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        let result = self.with_read_ctx(&self.identity, control, |ctx| {
+            self.reads
+                .search_procedures(ctx, &query, &filter, limit.unwrap_or(5))
+        })?;
+        crate::store::export::write_search(&self.source, &filter, &output, result, control)
+    }
     pub fn command(&self, request: CommandRequest, control: &RequestControl) -> Result<Value> {
         self.command_identity(request, control, &self.identity)
     }
@@ -495,16 +598,29 @@ impl StoreService {
             root: self.identity.root.clone(),
             local: self.identity.local.clone(),
             coordination: self.coordination.clone(),
+            source: self.source.clone(),
             lane: self.lane.sender(),
         }
     }
     pub fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
+        while self.close_for_maintenance().is_err() {
+            std::thread::sleep(Duration::from_millis(50));
         }
-        self.projection.shutdown(Duration::from_secs(30));
-        self.indexer.close_binding(&self.identity.binding_id);
-        self.lane.close();
+    }
+    pub fn close_for_maintenance(&self) -> RuntimeResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.projection.shutdown(Duration::from_secs(30)) {
+            return Err(RuntimeError::Unavailable(
+                "Projection shutdown did not finish.".into(),
+            ));
+        }
+        self.indexer
+            .close_binding_checked(&self.identity.binding_id)?;
+        self.lane.close_checked()?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
     }
 }
 fn restore_request(recall_for: Option<String>) -> RecallRequest {

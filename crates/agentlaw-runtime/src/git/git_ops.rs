@@ -995,6 +995,43 @@ pub(crate) fn valid_oid(s: &str) -> bool {
 /// Capture under C6's source read gate, then create a commit and CAS the expected ref.
 /// No fetch, merge, push, user-index write, author invention or force-update occurs.
 pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<SaveReceipt> {
+    continuity_save_source(store, local, message)
+}
+
+trait CooperativeSource {
+    fn with_source_read<T>(
+        &self,
+        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
+    ) -> agentlaw_storage::Result<T>;
+}
+impl CooperativeSource for Store {
+    fn with_source_read<T>(
+        &self,
+        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
+    ) -> agentlaw_storage::Result<T> {
+        Store::with_source_read(self, read)
+    }
+}
+impl CooperativeSource for super::handle::GitStoreHandle {
+    fn with_source_read<T>(
+        &self,
+        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
+    ) -> agentlaw_storage::Result<T> {
+        self.source.with_source_read(read)
+    }
+}
+pub(crate) fn continuity_save_from_handle(
+    handle: &super::handle::GitStoreHandle,
+    local: &Path,
+    message: &str,
+) -> Result<SaveReceipt> {
+    continuity_save_source(handle, local, message)
+}
+fn continuity_save_source(
+    store: &impl CooperativeSource,
+    local: &Path,
+    message: &str,
+) -> Result<SaveReceipt> {
     let _lane = lane(local)?;
     super::sync::require_git_slot_clear(local)?;
     let handoff_path = local.join("save-handoff.json");

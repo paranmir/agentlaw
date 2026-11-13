@@ -22,6 +22,23 @@ pub struct RuntimeBackend {
 }
 
 impl RuntimeBackend {
+    pub fn admin(
+        &mut self,
+        command: &protocol::AdminCommand,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        crate::update::managed::check_frontend_start(&self.state)?;
+        let client = self.client().map_err(|e| error(e, false))?;
+        let binding = client.resolve_binding().map_err(|e| error(e, false))?;
+        client
+            .admin(binding, command, control)
+            .map_err(|e| error(e, false))
+    }
+    pub fn health(&mut self) -> Result<agentlaw_runtime::ports::HealthSnapshot> {
+        self.client()
+            .and_then(|client| client.health())
+            .map_err(|e| error(e, false))
+    }
     pub fn new(state: PathBuf, background: bool) -> Result<Self> {
         let executable = std::env::current_exe()
             .map_err(|e| DomainError::new("invalid_installation", e.to_string()))?;

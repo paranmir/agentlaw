@@ -185,6 +185,8 @@ fn disconnect_after_admin_body_helper() {
             }
             Err(e) => panic!("accept: {e}"),
         };
+        // Accepted sockets inherit the listener's non-blocking mode on Windows.
+        stream.set_nonblocking(false).unwrap();
         let _: Hello = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();
         transport::send(&mut stream, &HelloReply::Accepted, MAX_CONTROL_REPLY_BYTES).unwrap();
         let header: CallHeader = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();

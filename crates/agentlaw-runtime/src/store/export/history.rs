@@ -1,43 +1,30 @@
 //! Explicit lossless audit artifact. Never sent as ordinary recall content.
-use agentlaw_contracts::{DomainError, Result};
+use agentlaw_contracts::{DomainError, RequestControl, Result};
 use agentlaw_storage::history_spool::Component;
-use agentlaw_storage::Store;
+use agentlaw_storage::published::OwnedPublishedReader;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::{io::Write, path::Path};
+use std::{
+    io::{Read, Write},
+    path::Path,
+};
 
 fn error(message: &str) -> DomainError {
     DomainError::new("history_export_failed", message)
 }
-pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
+pub(super) fn export(
+    store: &OwnedPublishedReader,
+    memory_id: &str,
+    output: &Path,
+    control: &RequestControl,
+) -> Result<Value> {
+    control.phase("exporting_history");
+    control.check()?;
     agentlaw_storage::validate_id(memory_id)
         .map_err(|_| DomainError::new("invalid_memory_id", "Use a returned UUID memory ID."))?;
-    let absolute = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|_| error("Could not resolve the output path."))?
-            .join(output)
-    };
-    let directory = absolute
-        .parent()
-        .ok_or_else(|| error("Output must have a parent directory."))?;
-    let directory = std::fs::canonicalize(directory)
-        .map_err(|_| error("Output directory does not exist or cannot be inspected."))?;
-    let root = store
-        .with_source_read(|root, _| Ok(root.to_path_buf()))
-        .map_err(|_| error("Source view is unavailable; no audit was written."))?;
-    if directory.starts_with(&root) {
-        return Err(error(
-            "Write the derived audit outside the canonical memory store.",
-        ));
-    }
-    if absolute.exists() {
-        return Err(DomainError::new(
-            "output_exists",
-            "Audit export does not overwrite an existing file. Choose a new output path.",
-        ));
-    }
+    let target = super::validate_output(store, output)?;
+    let absolute = output.to_path_buf();
+    let directory = &target.parent;
     // All causal selection and descriptors remain on disk. Large evidence/body
     // frames are streamed; one long line does not force a correspondingly large allocation.
     let scratch = tempfile::tempdir_in(&directory)
@@ -51,6 +38,9 @@ pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
         .visit_history_closure(memory_id, |change| {
             let result =
                 (|| -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    if control.check().is_err() {
+                        return Err("cancelled".into());
+                    }
                     let id = change.metadata["change_id"]
                         .as_str()
                         .ok_or("missing change identity")?;
@@ -90,13 +80,16 @@ pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
                     write!(records, ",\"recorded_at\":")?;
                     serde_json::to_writer(&mut records, &recorded_at)?;
                     write!(records, ",\"evidence\":")?;
-                    crate::stream_diff::json_string(&mut change.evidence.open()?, &mut records)?;
+                    agentlaw_flows::history_diff::json_string(
+                        &mut change.evidence.open()?,
+                        &mut records,
+                    )?;
                     write!(records, ",\"markdown_diff\":\"")?;
-                    crate::stream_diff::write_diff(
+                    agentlaw_flows::history_diff::write_diff(
                         &before,
                         &after,
                         &files.path().join("lines.sqlite"),
-                        &mut crate::stream_diff::JsonEscape(&mut records),
+                        &mut agentlaw_flows::history_diff::JsonEscape(&mut records),
                     )?;
                     write!(records, "\"")?;
                     if parents.len() > 1 {
@@ -123,7 +116,11 @@ pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
             result.map_err(|e| agentlaw_storage::Error::Io(std::io::Error::other(e.to_string())))
         })
         .map_err(|_| {
-            error("History validation or audit streaming failed; no partial audit was installed.")
+            control.check().err().unwrap_or_else(|| {
+                error(
+                    "History validation or audit streaming failed; no partial audit was installed.",
+                )
+            })
         })?;
     if count == 0 {
         return Err(DomainError::new(
@@ -153,6 +150,9 @@ pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
             let mut rows = query.query([])?;
             let mut comma = false;
             while let Some(row) = rows.next()? {
+                if control.check().is_err() {
+                    return Err("cancelled".into());
+                }
                 if comma {
                     write!(temporary, ",")?;
                 }
@@ -164,16 +164,26 @@ pub fn export(store: &Store, memory_id: &str, output: &Path) -> Result<Value> {
         writeln!(temporary, ",\"change_count\":{count}}}")?;
         records.flush()?;
         let mut input = std::fs::File::open(records.path())?;
-        std::io::copy(&mut input, &mut temporary)?;
+        let mut buffer = [0u8; 32768];
+        loop {
+            if control.check().is_err() {
+                return Err("cancelled".into());
+            }
+            let n = input.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            temporary.write_all(&buffer[..n])?;
+        }
         Ok(())
     })();
-    assemble.map_err(|_| error("Cannot assemble the complete audit artifact."))?;
-    temporary
-        .flush()
-        .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|_| error("Could not persist the audit file."))?;
-    temporary
-        .persist_noclobber(&absolute)
-        .map_err(|_| error("Could not install completed output; existing files were preserved."))?;
+    assemble.map_err(|_| {
+        control
+            .check()
+            .err()
+            .unwrap_or_else(|| error("Cannot assemble the complete audit artifact."))
+    })?;
+    control.check()?;
+    super::install_output(temporary, &target, control)?;
     Ok(json!({"output":absolute,"change_count":count,"complete":true,"schema_version":1}))
 }

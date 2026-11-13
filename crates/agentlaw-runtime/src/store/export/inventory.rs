@@ -1,6 +1,6 @@
 //! Complete procedure inventory; disk-backed sorting keeps bodies out of the output.
-use agentlaw_contracts::{DomainError, Result};
-use agentlaw_storage::{Store, UnitState};
+use agentlaw_contracts::{DomainError, RequestControl, Result};
+use agentlaw_storage::{published::OwnedPublishedReader, UnitState};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
@@ -25,25 +25,19 @@ fn failure() -> DomainError {
     )
 }
 
-pub fn list(store: &Store, local: &Path, options: &Options) -> Result<Option<Value>> {
-    if let Some(output) = &options.output {
-        let absolute = if output.is_absolute() {
-            output.clone()
-        } else {
-            std::env::current_dir().map_err(|_| failure())?.join(output)
-        };
-        let parent = absolute.parent().ok_or_else(failure)?;
-        let parent = fs::canonicalize(parent).map_err(|_| failure())?;
-        let root = store
-            .with_source_read(|root, _| Ok(root.to_path_buf()))
-            .map_err(|_| failure())?;
-        if parent.starts_with(&root) {
-            return Err(DomainError::new(
-                "invalid_output_path",
-                "Write the derived inventory outside the canonical memory store.",
-            ));
-        }
-    }
+pub(super) fn list(
+    store: &OwnedPublishedReader,
+    local: &Path,
+    options: &Options,
+    control: &RequestControl,
+) -> Result<Value> {
+    control.phase("exporting_inventory");
+    control.check()?;
+    let output = options
+        .output
+        .as_ref()
+        .ok_or_else(|| DomainError::new("invalid_output_path", "Output path is required."))?;
+    let target = super::validate_output(store, output)?;
     fs::create_dir_all(local).map_err(|_| failure())?;
     let scratch = tempfile::tempdir_in(local).map_err(|_| failure())?;
     let db = Connection::open(scratch.path().join("inventory.sqlite")).map_err(|_| failure())?;
@@ -84,6 +78,7 @@ pub fn list(store: &Store, local: &Path, options: &Options) -> Result<Option<Val
         None
     };
     store.visit_current(|unit| {
+        if control.check().is_err() { return Err(agentlaw_storage::Error::Io(io::Error::other("cancelled"))); }
         if unit.entity_type != "learned_procedure" { return Ok(()); }
         if let UnitState::Live { heads } = &unit.state {
             for head in heads {
@@ -99,16 +94,13 @@ pub fn list(store: &Store, local: &Path, options: &Options) -> Result<Option<Val
             }
         }
         Ok(())
-    }).map_err(|_| failure())?;
+    }).map_err(|_| control.check().err().unwrap_or_else(failure))?;
     let count: i64 = db
         .query_row("SELECT count(DISTINCT id) FROM rows", [], |r| r.get(0))
         .map_err(|_| failure())?;
     let competing: i64 = db
         .query_row("SELECT count(*) FROM competing", [], |r| r.get(0))
         .map_err(|_| failure())?;
-    if competing > 0 {
-        eprintln!("{competing} procedure IDs have competing current heads. All distinct descriptors are included; recall their IDs before choosing instructions.");
-    }
     let write_rows = |out: &mut dyn Write| -> Result<()> {
         let mut statement = db
             .prepare(
@@ -122,6 +114,7 @@ pub fn list(store: &Store, local: &Path, options: &Options) -> Result<Option<Val
             writeln!(out, "PROCEDURE ID\tNAME\tUSE WHEN\tAPPLICABILITY").map_err(|_| failure())?;
         }
         for row in rows {
+            control.check()?;
             let row = row.map_err(|_| failure())?;
             if options.table {
                 let v: Value = serde_json::from_str(&row).map_err(|_| failure())?;
@@ -139,27 +132,18 @@ pub fn list(store: &Store, local: &Path, options: &Options) -> Result<Option<Val
         out.flush().map_err(|_| failure())
     };
     if let Some(output) = &options.output {
-        let output = if output.is_absolute() {
-            output.clone()
-        } else {
-            std::env::current_dir().map_err(|_| failure())?.join(output)
-        };
-        let parent = output.parent().ok_or_else(failure)?;
-        if output.exists() {
-            return Err(DomainError::new(
-                "output_exists",
-                "Choose a new inventory output path; existing files are not overwritten.",
-            ));
-        }
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|_| failure())?;
+        let output = output.clone();
+        let mut temp = tempfile::NamedTempFile::new_in(&target.parent).map_err(|_| failure())?;
         write_rows(temp.as_file_mut())?;
-        temp.as_file().sync_all().map_err(|_| failure())?;
-        temp.persist_noclobber(&output).map_err(|_| failure())?;
-        Ok(Some(
-            json!({"output":output,"procedure_count":count,"complete":true}),
-        ))
+        super::install_output(temp, &target, control)?;
+        let competing_notice = (competing > 0).then(|| format!("{competing} procedure IDs have competing current heads. All distinct descriptors are included; recall their IDs before choosing instructions."));
+        Ok(
+            json!({"output":output,"procedure_count":count,"complete":true,"competing_count":competing,"competing_notice":competing_notice}),
+        )
     } else {
-        write_rows(&mut io::stdout().lock())?;
-        Ok(None)
+        Err(DomainError::new(
+            "invalid_output_path",
+            "Output path is required.",
+        ))
     }
 }

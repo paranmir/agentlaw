@@ -85,6 +85,9 @@ struct State {
     wake: bool,
     stopping: bool,
     stopped: bool,
+    repair_requested: u64,
+    repair_completed: u64,
+    repair_error: Option<String>,
 }
 struct Inner {
     state: Mutex<State>,
@@ -187,6 +190,9 @@ impl ProjectionHandle {
                 wake: initial_error.is_none(),
                 stopping: false,
                 stopped: false,
+                repair_requested: 0,
+                repair_completed: 0,
+                repair_error: None,
             }),
             changed: Condvar::new(),
             generations: Arc::new(registry),
@@ -252,6 +258,41 @@ impl ProjectionHandle {
         let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         s.wake = true;
         self.inner.changed.notify_all();
+    }
+    pub fn rebuild(&self, control: &RequestControl) -> RuntimeResult<()> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopping || state.stopped {
+            return Err(RuntimeError::Unavailable("Projection is stopping.".into()));
+        }
+        state.repair_requested = state
+            .repair_requested
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Capacity("Projection repair counter exhausted.".into()))?;
+        let requested = state.repair_requested;
+        state.wake = true;
+        self.inner.changed.notify_all();
+        loop {
+            control
+                .check()
+                .map_err(|e| RuntimeError::Unavailable(e.to_string()))?;
+            if state.repair_completed >= requested {
+                return match &state.repair_error {
+                    Some(error) => Err(RuntimeError::Unavailable(error.clone())),
+                    None => Ok(()),
+                };
+            }
+            if state.stopping || state.stopped {
+                return Err(RuntimeError::Unavailable(
+                    "Projection stopped before repair completed.".into(),
+                ));
+            }
+            state = self
+                .inner
+                .changed
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
     pub fn status(&self) -> ProjectionStatus {
         self.inner
@@ -463,6 +504,17 @@ fn run(
         if state.stopping {
             break;
         }
+        let requested_repair = if state.repair_requested > state.repair_completed {
+            Some(state.repair_requested)
+        } else {
+            None
+        };
+        if requested_repair.is_some() {
+            recovery = true;
+            reopen = false;
+            recovery_reason = "projection repair requested".into();
+            writer.current = None;
+        }
         if needs_sync {
             sync_pending = false;
             retry_at = None;
@@ -570,6 +622,12 @@ fn run(
                     retry = config.retry_initial.max(Duration::from_millis(1));
                 }
                 Err(e) => {
+                    if let Some(requested) = requested_repair {
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.repair_completed = requested;
+                        state.repair_error = Some(e.to_string());
+                        inner.changed.notify_all();
+                    }
                     failures += 1;
                     let state = if failures >= 3 {
                         ProjectionState::Failed
@@ -596,6 +654,12 @@ fn run(
                 Ok(pos) => {
                     through = Some(pos);
                     inner.publish(ProjectionState::Running, through.clone(), None);
+                    if let Some(requested) = requested_repair {
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.repair_completed = requested;
+                        state.repair_error = None;
+                        inner.changed.notify_all();
+                    }
                     retry_at = None;
                     retry = config.retry_initial.max(Duration::from_millis(1));
                 }
@@ -605,6 +669,12 @@ fn run(
                         "exact_index_corrupt" | "source_epoch_changed" | "source_coverage_lost"
                     ) =>
                 {
+                    if let Some(requested) = requested_repair {
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.repair_completed = requested;
+                        state.repair_error = Some(e.to_string());
+                        inner.changed.notify_all();
+                    }
                     let _ = inner.generations.mark_untrusted();
                     writer.current = None;
                     recovery = true;
@@ -617,6 +687,12 @@ fn run(
                     sync_pending = true;
                 }
                 Err(e) => {
+                    if let Some(requested) = requested_repair {
+                        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.repair_completed = requested;
+                        state.repair_error = Some(e.to_string());
+                        inner.changed.notify_all();
+                    }
                     if e.code == "exact_index_unavailable" {
                         let _ = inner.generations.mark_untrusted();
                         writer.current = None;

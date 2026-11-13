@@ -4,13 +4,14 @@ use crate::store::lane::{
     ImportPublishInput, LaneCommand, LaneReply, LaneSender, SyncOverlayInput,
 };
 use agentlaw_flows::{DomainError, RequestControl, Result};
-use agentlaw_storage::PublishReceipt;
+use agentlaw_storage::{published::OwnedPublishedReader, PublishReceipt};
 use std::path::PathBuf;
 
 pub struct GitStoreHandle {
     pub(crate) root: PathBuf,
     pub(crate) local: PathBuf,
     pub(crate) coordination: PathBuf,
+    pub(crate) source: OwnedPublishedReader,
     pub(crate) lane: LaneSender,
 }
 

@@ -449,6 +449,17 @@ pub struct ExactSnapshot {
     documents: Vec<agentlaw_search::SearchDocument>,
 }
 impl ExactSnapshot {
+    pub fn all_scopes(&self) -> Result<Vec<String>> {
+        let mut scopes: BTreeSet<String> = self.pinned.exact.all_scopes()?.into_iter().collect();
+        for unit in &self.units {
+            for head in unit.heads() {
+                scopes.insert(crate::runtime::scope_token(&crate::runtime::scope_value(
+                    &head.metadata["applicability"],
+                )?));
+            }
+        }
+        Ok(scopes.into_iter().collect())
+    }
     fn shadows_id(&self, id: &str) -> bool {
         self.removed
             .iter()

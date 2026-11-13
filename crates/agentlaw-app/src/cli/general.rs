@@ -4,17 +4,21 @@ use super::{
     commands::{
         ConfigCommand, ContinuityCommand, HistoryCommand, InstallArgs, MachineCommand, StoreCommand,
     },
-    dispatch::{cli_control, selected_store},
+    dispatch::cli_control,
 };
 use agentlaw_app::config as configuration;
 use agentlaw_contracts::{DomainError, Result};
-use agentlaw_runtime::protocol::SetupCommand;
+use agentlaw_runtime::protocol::{AdminCommand, SetupCommand};
 use serde_json::{json, Value};
 
 fn runtime_setup(command: SetupCommand) -> Result<Value> {
     let state = configuration::state_root()?;
     agentlaw_app::update::managed::check_frontend_start(&state)?;
     agentlaw_app::frontend::RuntimeBackend::new(state, false)?.setup(command, &cli_control())
+}
+pub(super) fn runtime_admin(command: AdminCommand) -> Result<Value> {
+    let state = configuration::state_root()?;
+    agentlaw_app::frontend::RuntimeBackend::new(state, false)?.admin(&command, &cli_control())
 }
 
 pub(super) fn install(args: InstallArgs) -> Result<Value> {
@@ -93,21 +97,18 @@ pub(super) fn history(command: HistoryCommand) -> Result<Value> {
             agentlaw_storage::validate_id(&args.memory_id).map_err(|_| {
                 DomainError::new("invalid_memory_id", "Use a returned UUID memory ID.")
             })?;
-            let (store, _) = selected_store()?;
-            agentlaw_app::history_export::export(&store, &args.memory_id, &args.output)
+            let output = std::path::absolute(args.output)
+                .map_err(|e| DomainError::new("invalid_output_path", e.to_string()))?;
+            runtime_admin(AdminCommand::HistoryExport {
+                memory_id: args.memory_id,
+                output,
+            })
         }
     }
 }
 
 pub(super) fn continuity(command: ContinuityCommand) -> Result<Value> {
     match command {
-        ContinuityCommand::Save => {
-            let (store, local) = selected_store()?;
-            agentlaw_contracts::to_value(agentlaw_app::git_ops::continuity_save(
-                &store,
-                &local.join("git"),
-                "Agentlaw continuity snapshot\n",
-            )?)
-        }
+        ContinuityCommand::Save => runtime_admin(AdminCommand::ContinuitySave),
     }
 }

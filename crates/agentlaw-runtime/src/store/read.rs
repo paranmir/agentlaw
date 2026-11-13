@@ -17,6 +17,25 @@ pub struct ReadCoordinator {
     budget: DeltaBudget,
 }
 impl ReadCoordinator {
+    pub fn search_procedures(
+        &self,
+        ctx: &ReadCtx<'_>,
+        query: &str,
+        filter: &crate::protocol::InventoryFilter,
+        limit: usize,
+    ) -> FlowResult<Value> {
+        self.with_exact(ctx, |exact| {
+            agentlaw_flows::read::search_procedures_filtered(
+                ctx,
+                exact,
+                query,
+                filter.scope.as_deref(),
+                filter.project.as_deref(),
+                filter.machine.as_deref(),
+                limit,
+            )
+        })
+    }
     pub fn new(projection: ProjectionHandle, budget: DeltaBudget) -> Self {
         Self { projection, budget }
     }

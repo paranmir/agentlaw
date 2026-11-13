@@ -29,7 +29,7 @@ fn cancelled_exports_leave_no_output_or_scratch_entries() {
     let root = dir.path().join("source");
     let local = dir.path().join("local");
     fs::create_dir_all(&local).unwrap();
-    let _store = Store::open(&root, local.join("canonical")).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
     let parent = dir.path().join("output");
     fs::create_dir(&parent).unwrap();
     let parent_before = entries(&parent);
@@ -37,9 +37,14 @@ fn cancelled_exports_leave_no_output_or_scratch_entries() {
     let control = RequestControl::new(Arc::new(AtomicBool::new(true)), |_| {});
     let history = parent.join("history.jsonl");
     assert_eq!(
-        history_export(&root, "missing", &history, &control)
-            .unwrap_err()
-            .code,
+        history_export(
+            &store.owned_published_reader(),
+            "missing",
+            &history,
+            &control
+        )
+        .unwrap_err()
+        .code,
         "cancelled"
     );
     assert!(!history.exists());
@@ -47,9 +52,15 @@ fn cancelled_exports_leave_no_output_or_scratch_entries() {
     assert_eq!(entries(&local), local_before);
     let inventory = parent.join("inventory.jsonl");
     assert_eq!(
-        procedure_list(&root, &local, &filter(), &inventory, &control)
-            .unwrap_err()
-            .code,
+        procedure_list(
+            &store.owned_published_reader(),
+            &local,
+            &filter(),
+            &inventory,
+            &control
+        )
+        .unwrap_err()
+        .code,
         "cancelled"
     );
     assert!(!inventory.exists());
@@ -115,9 +126,15 @@ fn cancellation_from_export_progress_leaves_no_output_or_scratch() {
             "history.jsonl"
         });
         let result = if inventory {
-            procedure_list(&root, &local, &filter(), &path, &control)
+            procedure_list(
+                &store.owned_published_reader(),
+                &local,
+                &filter(),
+                &path,
+                &control,
+            )
         } else {
-            history_export(&root, &id, &path, &control)
+            history_export(&store.owned_published_reader(), &id, &path, &control)
         };
         assert!(
             cancel.load(Ordering::Acquire),
@@ -166,7 +183,8 @@ fn export_has_exact_manifest_and_lossless_changes_without_overwriting() {
     let output = dir.path().join("audit.jsonl");
     let control = RequestControl::default();
     assert_eq!(
-        history_export(&root, &id, &output, &control).unwrap()["change_count"],
+        history_export(&store.owned_published_reader(), &id, &output, &control).unwrap()
+            ["change_count"],
         2
     );
     let raw = fs::read_to_string(&output).unwrap();
@@ -184,7 +202,7 @@ fn export_has_exact_manifest_and_lossless_changes_without_overwriting() {
         .unwrap()
         .contains("고친 끝"));
     assert_eq!(
-        history_export(&root, &id, &output, &control)
+        history_export(&store.owned_published_reader(), &id, &output, &control)
             .unwrap_err()
             .code,
         "output_exists"
@@ -211,7 +229,14 @@ fn complete_inventory_is_sorted_compact_and_no_clobber() {
     let output = dir.path().join("inventory.jsonl");
     let control = RequestControl::default();
     assert_eq!(
-        procedure_list(&root, &local, &filter(), &output, &control).unwrap()["procedure_count"],
+        procedure_list(
+            &store.owned_published_reader(),
+            &local,
+            &filter(),
+            &output,
+            &control
+        )
+        .unwrap()["procedure_count"],
         2
     );
     let text = fs::read_to_string(&output).unwrap();
@@ -223,9 +248,15 @@ fn complete_inventory_is_sorted_compact_and_no_clobber() {
     assert_eq!(rows[0].as_object().unwrap().len(), 4);
     assert!(!text.contains("Instructions must"));
     assert_eq!(
-        procedure_list(&root, &local, &filter(), &output, &control)
-            .unwrap_err()
-            .code,
+        procedure_list(
+            &store.owned_published_reader(),
+            &local,
+            &filter(),
+            &output,
+            &control
+        )
+        .unwrap_err()
+        .code,
         "output_exists"
     );
     assert_eq!(fs::read_to_string(&output).unwrap(), text);
@@ -238,12 +269,20 @@ fn export_rejects_relative_and_source_tree_paths() {
     fs::create_dir(&root).unwrap();
     let local = dir.path().join("local");
     fs::create_dir(&local).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
     let control = RequestControl::default();
     for path in [
         std::path::PathBuf::from("relative.jsonl"),
         root.join("output.jsonl"),
     ] {
-        assert!(procedure_list(&root, &local, &filter(), &path, &control).is_err());
+        assert!(procedure_list(
+            &store.owned_published_reader(),
+            &local,
+            &filter(),
+            &path,
+            &control
+        )
+        .is_err());
         assert!(!path.exists());
     }
 }
@@ -255,10 +294,11 @@ fn export_does_not_clobber_existing_output() {
     fs::create_dir(&root).unwrap();
     let local = dir.path().join("local");
     fs::create_dir(&local).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
     let output = dir.path().join("existing.jsonl");
     fs::write(&output, b"keep").unwrap();
     assert!(procedure_list(
-        &root,
+        &store.owned_published_reader(),
         &local,
         &filter(),
         &output,
@@ -274,12 +314,12 @@ fn export_to_missing_parent_leaves_no_output_or_temporary_file() {
     let root = dir.path().join("source");
     let local = dir.path().join("local");
     fs::create_dir(&local).unwrap();
-    let _store = Store::open(&root, local.join("canonical")).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
     let local_before = entries(&local);
     let before = entries(dir.path());
     let output = dir.path().join("missing").join("output.jsonl");
     assert!(procedure_list(
-        &root,
+        &store.owned_published_reader(),
         &local,
         &filter(),
         &output,
@@ -308,6 +348,7 @@ fn export_rejects_alias_into_source_tree() {
     fs::create_dir(&root).unwrap();
     let local = dir.path().join("local");
     fs::create_dir(&local).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
     let alias = dir.path().join("alias");
     #[cfg(unix)]
     let linked = std::os::unix::fs::symlink(&root, &alias);
@@ -324,7 +365,7 @@ fn export_rejects_alias_into_source_tree() {
     }
     let output = alias.join("output.jsonl");
     assert!(procedure_list(
-        &root,
+        &store.owned_published_reader(),
         &local,
         &filter(),
         &output,

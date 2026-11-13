@@ -6,6 +6,112 @@ use agentlaw_search::{Hit, ScopeFilter};
 
 const SEARCH_LIMIT: usize = 10_000;
 
+pub fn search_procedures_filtered(
+    ctx: &ReadCtx<'_>,
+    exact: &mut ExactSnapshot,
+    query: &str,
+    scope: Option<&str>,
+    project: Option<&str>,
+    machine: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    ctx.request.check()?;
+    let project = if let Some(selector) = project {
+        let catalog = ctx
+            .source
+            .list_catalog()
+            .map_err(|_| DomainError::new("source_unavailable", "Cannot read project catalog."))?;
+        let matches: Vec<_> = catalog
+            .iter()
+            .filter(|p| {
+                p["project_id"].as_str() == Some(selector)
+                    || p["name"]
+                        .as_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(selector))
+                    || p["aliases"].as_array().is_some_and(|aliases| {
+                        aliases.iter().any(|alias| {
+                            alias
+                                .as_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(selector))
+                        })
+                    })
+            })
+            .filter_map(|p| p["project_id"].as_str())
+            .collect();
+        if matches.contains(&selector) {
+            Some(selector.to_owned())
+        } else {
+            match matches.as_slice() {
+                [id] => Some((*id).to_owned()),
+                _ => {
+                    return Err(DomainError::new(
+                        "project_selection_required",
+                        "Choose one explicit project ID for management search.",
+                    ))
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(machine) = machine {
+        validate_id(machine)?;
+    }
+    let scopes: Vec<_> = exact
+        .all_scopes()?
+        .into_iter()
+        .filter(|s| {
+            scope.is_none_or(|kind| match kind {
+                "user" => s == "user",
+                "project" => s.starts_with("project:") && !s.contains(":machine:"),
+                "machine" => s.starts_with("machine:"),
+                "project_machine" => s.starts_with("project:") && s.contains(":machine:"),
+                _ => false,
+            })
+        })
+        .filter(|s| {
+            project.as_ref().is_none_or(|id| {
+                s == &format!("project:{id}") || s.starts_with(&format!("project:{id}:machine:"))
+            })
+        })
+        .filter(|s| {
+            machine.is_none_or(|id| {
+                s == &format!("machine:{id}") || s.ends_with(&format!(":machine:{id}"))
+            })
+        })
+        .map(|s| format!("procedure:{s}"))
+        .collect();
+    let channels = preparation_channels(ctx, exact, query, &scopes)?;
+    let matched = channels.hits.len();
+    let mut results = Vec::new();
+    let mut shown = 0;
+    for hit in channels.hits.into_iter().take(limit) {
+        ctx.request.check()?;
+        let Some(id) = hit.memory_id.strip_prefix("procedure/") else {
+            continue;
+        };
+        let mut descriptors = Vec::new();
+        for h in exact.heads(&[id.to_owned()])? {
+            let applicability = scope_value(&h.metadata["applicability"])?;
+            if !scopes.contains(&format!("procedure:{}", scope_token(&applicability))) {
+                continue;
+            }
+            let value = json!({"procedure_id":id,"name":h.metadata["name"],"use_when":h.metadata["use_when"],"applicability":applicability});
+            if !descriptors.contains(&value) {
+                descriptors.push(value);
+            }
+        }
+        descriptors.sort_by_key(Value::to_string);
+        if !descriptors.is_empty() {
+            shown += 1;
+            results.extend(descriptors);
+        }
+    }
+    Ok(
+        json!({"procedures":results,"matched":matched,"shown":shown,"diagnostics":channels.diagnostics}),
+    )
+}
+
 enum AcquiredClosure {
     Owned(Vec<agentlaw_storage::ResolvedCurrent>),
     Spooled(Vec<agentlaw_storage::acquire::AcquiredResolvedCurrent>),

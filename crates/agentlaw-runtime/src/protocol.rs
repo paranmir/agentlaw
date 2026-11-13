@@ -159,8 +159,28 @@ pub enum AdminCommand {
     Repair,
 }
 
-pub fn encode_admin(_command: &AdminCommand) -> Vec<u8> {
-    unimplemented!()
+pub fn encode_admin(command: &AdminCommand) -> agentlaw_contracts::Result<Vec<u8>> {
+    let output = match command {
+        AdminCommand::HistoryExport { output, .. }
+        | AdminCommand::ProcedureList { output, .. }
+        | AdminCommand::ProcedureSearch { output, .. } => Some(output),
+        _ => None,
+    };
+    if output.is_some_and(|path| path.to_str().is_none()) {
+        return Err(agentlaw_contracts::DomainError::new(
+            "invalid_output_path",
+            "Output path must be valid UTF-8.",
+        ));
+    }
+    let value = match command {
+        AdminCommand::ContinuitySave => serde_json::json!({"continuity_save":{}}),
+        AdminCommand::Audit => serde_json::json!({"audit":{}}),
+        AdminCommand::Repair => serde_json::json!({"repair":{}}),
+        _ => serde_json::to_value(command)
+            .map_err(|e| agentlaw_contracts::DomainError::new("invalid_input", e.to_string()))?,
+    };
+    serde_json::to_vec(&serde_json::json!({"admin_command":value}))
+        .map_err(|e| agentlaw_contracts::DomainError::new("invalid_input", e.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +229,45 @@ pub fn decode_body(kind: RequestKind, body: &[u8]) -> Result<Classified, RejectR
         agentlaw_contracts::validation::decode_unique(text).map_err(RejectReason::InvalidBody)?;
     let classified = if let Some(object) = value
         .as_object()
+        .filter(|object| object.len() == 1 && object.contains_key("admin_command"))
+    {
+        if kind != RequestKind::Admin {
+            return Err(RejectReason::KindMismatch);
+        }
+        let mut command = object["admin_command"].clone();
+        if !command.is_object() {
+            return Err(RejectReason::InvalidBody(
+                agentlaw_contracts::DomainError::new(
+                    "invalid_input",
+                    "Admin command has invalid fields.",
+                ),
+            ));
+        }
+        if let Some(map) = command.as_object() {
+            if map.len() == 1 {
+                let (key, fields) = map.iter().next().unwrap();
+                if matches!(key.as_str(), "continuity_save" | "audit" | "repair") {
+                    if !fields.as_object().is_some_and(|fields| fields.is_empty()) {
+                        return Err(RejectReason::InvalidBody(
+                            agentlaw_contracts::DomainError::new(
+                                "invalid_input",
+                                "Admin command has invalid fields.",
+                            ),
+                        ));
+                    }
+                    command = serde_json::Value::String(key.clone());
+                }
+            }
+        }
+        let command = serde_json::from_value(command).map_err(|_| {
+            RejectReason::InvalidBody(agentlaw_contracts::DomainError::new(
+                "invalid_input",
+                "Admin command has invalid fields.",
+            ))
+        })?;
+        Classified::Admin(command)
+    } else if let Some(object) = value
+        .as_object()
         .filter(|object| object.len() == 1 && object.contains_key("setup_command"))
     {
         let command = serde_json::from_value(object["setup_command"].clone()).map_err(|_| {
@@ -218,6 +277,8 @@ pub fn decode_body(kind: RequestKind, body: &[u8]) -> Result<Classified, RejectR
             ))
         })?;
         Classified::Setup(SetupRequest::Command(command))
+    } else if kind == RequestKind::Admin {
+        return Err(RejectReason::KindMismatch);
     } else {
         classify(agentlaw_contracts::wire::decode_wire(body).map_err(RejectReason::InvalidBody)?)
     };

@@ -437,18 +437,6 @@ pub(crate) enum ProcedureFormat {
     Table,
 }
 
-impl From<InventoryArgs> for agentlaw_app::inventory::Options {
-    fn from(args: InventoryArgs) -> Self {
-        Self {
-            output: args.output,
-            scope: args.scope.map(|scope| scope.as_str().to_owned()),
-            project: args.project,
-            machine: args.machine,
-            table: args.format == ProcedureFormat::Table,
-        }
-    }
-}
-
 #[derive(Debug, Args)]
 pub(crate) struct ProcedureSearchArgs {
     #[arg(long, value_name = "TEXT")]

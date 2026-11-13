@@ -219,7 +219,10 @@ agentlaw repair
 History defaults to 8192 response bytes; general delivery defaults to 65536.
 These control delivery, not silent truncation. `doctor` diagnoses without source
 repair. `repair` completes recorded publication and rebuilds derived generations.
-`doctor` does not start the runtime: `worker_runtime` reports `not_running`, with
+`doctor --audit`, `repair`, `continuity save`, `history export`, and
+`learned-procedure list` and `search` run inside the installation runtime, starting
+it if needed. During repair, other requests to the selected store wait until it finishes.
+Default `doctor` does not start the runtime: `worker_runtime` reports `not_running`, with
 `stale_endpoint` when an old address remains. An unresponsive runtime reports
 `worker_diagnosis_incomplete` and `runtime_unresponsive`. A running runtime
 reports component states and unresolved reasons in `worker_runtime.diagnostics`,

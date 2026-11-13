@@ -4,7 +4,7 @@ use crate::{
         config,
         registry::{ConfigRegistry, ConfigSnapshot, ConfigState},
     },
-    ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus},
+    ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus, RuntimeError},
     projection::ProjectionConfig,
     protocol::{BindingRef, RejectReason},
     store::{
@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 enum Entry {
@@ -37,6 +37,8 @@ enum Entry {
 
 struct State {
     entries: HashMap<BindingRef, Entry>,
+    maintaining: HashMap<BindingRef, bool>,
+    audits: HashMap<BindingRef, usize>,
     stopping: bool,
 }
 
@@ -53,8 +55,15 @@ struct Inner {
 
 pub(super) struct Stores(Arc<Inner>);
 
-pub(super) struct MaintenanceGuard;
-pub(super) struct AuditGuard;
+pub(super) struct MaintenanceGuard {
+    inner: Arc<Inner>,
+    snapshot: Arc<ConfigSnapshot>,
+    reopened: Option<Arc<StoreService>>,
+}
+pub(super) struct AuditGuard {
+    inner: Arc<Inner>,
+    reference: BindingRef,
+}
 
 #[cfg(test)]
 impl Stores {
@@ -77,10 +86,58 @@ impl Stores {
 }
 
 impl MaintenanceGuard {
-    pub(super) fn reopen(&mut self, _control: &RequestControl) -> Result<(), RejectReason> {
-        Err(RejectReason::StoreUnavailable(
-            "maintenance unavailable".into(),
-        ))
+    pub(super) fn reopen(&mut self, control: &RequestControl) -> Result<(), RejectReason> {
+        if self.reopened.is_none() {
+            self.reopened = Some(Arc::new(
+                self.inner
+                    .open(&self.snapshot, control)
+                    .map_err(open_rejection)?,
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn service(&self) -> Option<&StoreService> {
+        self.reopened.as_deref()
+    }
+}
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(service) = self.reopened.take() {
+            if state.stopping {
+                state
+                    .entries
+                    .insert(self.snapshot.reference, Entry::Closing);
+                drop(state);
+                service.close();
+                drop(service);
+                state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.entries.remove(&self.snapshot.reference);
+            } else {
+                state.entries.insert(
+                    self.snapshot.reference,
+                    Entry::Open {
+                        key: self.snapshot.key.clone(),
+                        service,
+                        active: 0,
+                    },
+                );
+            }
+        }
+        state.maintaining.remove(&self.snapshot.reference);
+        self.inner.changed.notify_all();
+    }
+}
+impl Drop for AuditGuard {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = state.audits.get_mut(&self.reference) {
+            *count -= 1;
+            if *count == 0 {
+                state.audits.remove(&self.reference);
+            }
+        }
+        self.inner.changed.notify_all();
     }
 }
 
@@ -109,14 +166,12 @@ impl Inner {
         &self,
         snapshot: &ConfigSnapshot,
         control: &RequestControl,
-    ) -> Result<StoreService, String> {
+    ) -> Result<StoreService, RuntimeError> {
         if matches!(self.registry.current(), ConfigState::Ready(current) if current.key == snapshot.key)
         {
-            config::require_existing_binding(&self.installation, &snapshot.config)
-                .map_err(|e| e.to_string())?;
+            config::require_existing_binding(&self.installation, &snapshot.config)?;
         }
-        let identity =
-            identity::resolve(&self.installation, snapshot).map_err(|e| e.to_string())?;
+        let identity = identity::resolve(&self.installation, snapshot)?;
         let deps = StoreDeps {
             health: self.deps.health.clone(),
             semantic: self.deps.semantic.clone(),
@@ -129,36 +184,190 @@ impl Inner {
             coordination: self.deps.coordination.clone(),
             state: self.deps.state.clone(),
         };
-        StoreService::open(identity, deps, control).map_err(|e| e.to_string())
+        StoreService::open(identity, deps, control)
+    }
+}
+
+fn open_rejection(error: RuntimeError) -> RejectReason {
+    match error {
+        RuntimeError::Domain(error) => RejectReason::InvalidBody(error),
+        other => RejectReason::StoreUnavailable(other.to_string()),
     }
 }
 
 impl Stores {
-    fn acquire_for_execution(
+    pub(super) fn installation(&self) -> &std::path::Path {
+        &self.0.installation
+    }
+    pub(super) fn indexing_status(&self, snapshot: &ConfigSnapshot) -> serde_json::Value {
+        let marker = snapshot
+            .config
+            .runtime_root(&self.0.installation)
+            .join("control-initialized.json");
+        let binding = std::fs::read(marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value["binding_id"].as_str().map(str::to_owned));
+        let Some(binding) = binding else {
+            return serde_json::Value::Null;
+        };
+        let components: Vec<_> = self.0.deps.health.snapshot().into_iter()
+            .filter(|(id, _)| id.binding.as_deref() == Some(binding.as_str()) && matches!(id.kind, ComponentKind::Exact | ComponentKind::Semantic))
+            .map(|(id, status)| serde_json::json!({"kind":format!("{:?}", id.kind).to_ascii_lowercase(),"state":format!("{:?}", status.state).to_ascii_lowercase(),"reason":status.reason}))
+            .collect();
+        if components.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({"components":components})
+        }
+    }
+    pub(super) fn acquire_for_execution(
         &self,
-        _snapshot: &Arc<ConfigSnapshot>,
-        _control: &RequestControl,
+        snapshot: &Arc<ConfigSnapshot>,
+        control: &RequestControl,
     ) -> Result<StoreGuard, agentlaw_contracts::DomainError> {
-        Err(agentlaw_contracts::DomainError::new(
-            "unavailable",
-            "Execution acquire is not implemented.",
-        ))
+        self.acquire_with_control(snapshot, control).map_err(|e| {
+            if control.cancel.load(Ordering::Acquire) {
+                agentlaw_contracts::DomainError::new("cancelled", "The request was cancelled.")
+            } else if let RejectReason::InvalidBody(error) = e {
+                error
+            } else {
+                agentlaw_contracts::DomainError::new("store_unavailable", format!("{e:?}"))
+            }
+        })
     }
     pub(super) fn maintain(
         &self,
-        _snapshot: &Arc<ConfigSnapshot>,
-        _control: &RequestControl,
+        snapshot: &Arc<ConfigSnapshot>,
+        control: &RequestControl,
     ) -> Result<MaintenanceGuard, RejectReason> {
-        Err(RejectReason::StoreUnavailable(
-            "maintenance unavailable".into(),
-        ))
+        let reference = snapshot.reference;
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.maintaining.contains_key(&reference) {
+            if state.stopping {
+                return Err(RejectReason::Stopping);
+            }
+            if control.cancel.load(Ordering::Acquire) {
+                return Err(RejectReason::InvalidBody(
+                    agentlaw_contracts::DomainError::new("cancelled", "The request was cancelled."),
+                ));
+            }
+            self.notify_observer(reference, "maintain_waiting");
+            state = self
+                .0
+                .changed
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if state.stopping {
+            return Err(RejectReason::Stopping);
+        }
+        if control.cancel.load(Ordering::Acquire) {
+            return Err(RejectReason::InvalidBody(
+                agentlaw_contracts::DomainError::new("cancelled", "The request was cancelled."),
+            ));
+        }
+        state.maintaining.insert(reference, true);
+        self.notify_observer(reference, "maintain_reserved");
+        loop {
+            if state.stopping || control.cancel.load(Ordering::Acquire) {
+                state.maintaining.remove(&reference);
+                self.0.changed.notify_all();
+                return Err(if state.stopping {
+                    RejectReason::Stopping
+                } else {
+                    RejectReason::InvalidBody(agentlaw_contracts::DomainError::new(
+                        "cancelled",
+                        "The request was cancelled.",
+                    ))
+                });
+            }
+            if state.audits.contains_key(&reference) {
+                self.notify_observer(reference, "maintain_waiting");
+                state = self
+                    .0
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(50))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            match state.entries.get(&reference) {
+                None => break,
+                Some(Entry::Open {
+                    active: 0, service, ..
+                }) => {
+                    let service = service.clone();
+                    state.entries.insert(reference, Entry::Closing);
+                    drop(state);
+                    let result = service.close_for_maintenance();
+                    state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(error) = result {
+                        state.maintaining.remove(&reference);
+                        self.0.changed.notify_all();
+                        let inner = self.0.clone();
+                        std::thread::spawn(move || {
+                            while service.close_for_maintenance().is_err() {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            drop(service);
+                            let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                            state.entries.remove(&reference);
+                            inner.changed.notify_all();
+                        });
+                        return Err(RejectReason::StoreUnavailable(error.to_string()));
+                    }
+                    state.entries.remove(&reference);
+                    self.0.changed.notify_all();
+                    break;
+                }
+                _ => {
+                    state = self
+                        .0
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            }
+        }
+        Ok(MaintenanceGuard {
+            inner: self.0.clone(),
+            snapshot: snapshot.clone(),
+            reopened: None,
+        })
     }
     pub(super) fn audit_guard(
         &self,
-        _snapshot: &Arc<ConfigSnapshot>,
-        _control: &RequestControl,
+        snapshot: &Arc<ConfigSnapshot>,
+        control: &RequestControl,
     ) -> Result<AuditGuard, RejectReason> {
-        Err(RejectReason::StoreUnavailable("audit unavailable".into()))
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.maintaining.contains_key(&snapshot.reference) {
+            if state.stopping {
+                return Err(RejectReason::Stopping);
+            }
+            if control.cancel.load(Ordering::Acquire) {
+                return Err(RejectReason::InvalidBody(
+                    agentlaw_contracts::DomainError::new("cancelled", "The request was cancelled."),
+                ));
+            }
+            state = self
+                .0
+                .changed
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if state.stopping {
+            return Err(RejectReason::Stopping);
+        }
+        *state.audits.entry(snapshot.reference).or_default() += 1;
+        Ok(AuditGuard {
+            inner: self.0.clone(),
+            reference: snapshot.reference,
+        })
     }
     pub(super) fn new(
         installation: PathBuf,
@@ -168,6 +377,8 @@ impl Stores {
         Self(Arc::new(Inner {
             state: Mutex::new(State {
                 entries: HashMap::new(),
+                maintaining: HashMap::new(),
+                audits: HashMap::new(),
                 stopping: false,
             }),
             changed: Condvar::new(),
@@ -196,6 +407,21 @@ impl Stores {
             if state.stopping {
                 return Err(RejectReason::Stopping);
             }
+            if control.cancel.load(Ordering::Acquire) {
+                return Err(RejectReason::InvalidBody(
+                    agentlaw_contracts::DomainError::new("cancelled", "The request was cancelled."),
+                ));
+            }
+            if state.maintaining.contains_key(&reference) {
+                self.notify_observer(reference, "acquire_waiting");
+                state = self
+                    .0
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(50))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
             match state.entries.get_mut(&reference) {
                 Some(Entry::Open {
                     service, active, ..
@@ -211,8 +437,9 @@ impl Stores {
                     state = self
                         .0
                         .changed
-                        .wait(state)
+                        .wait_timeout(state, Duration::from_millis(50))
                         .unwrap_or_else(|e| e.into_inner())
+                        .0
                 }
                 None => {
                     state.entries.insert(reference, Entry::Opening);
@@ -240,7 +467,7 @@ impl Stores {
                         Err(error) => {
                             state.entries.remove(&reference);
                             self.0.changed.notify_all();
-                            return Err(RejectReason::StoreUnavailable(error));
+                            return Err(open_rejection(error));
                         }
                     }
                 }
@@ -279,7 +506,11 @@ impl Stores {
                     key,
                     service,
                     active: 0,
-                } if Some(key) != current.as_ref() => Some((*reference, service.clone())),
+                } if Some(key) != current.as_ref()
+                    && !state.maintaining.contains_key(reference) =>
+                {
+                    Some((*reference, service.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -295,8 +526,11 @@ impl Stores {
         self.stop_opening();
         loop {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.entries.is_empty() {
+            if state.entries.is_empty() && state.maintaining.is_empty() && state.audits.is_empty() {
                 return;
+            }
+            for reference in state.maintaining.keys().chain(state.audits.keys()) {
+                self.notify_observer(*reference, "shutdown_waiting");
             }
             let closing: Vec<_> = state
                 .entries
@@ -343,6 +577,7 @@ impl Drop for StoreGuard {
             ConfigState::Ready(snapshot) => Some(snapshot.key.clone()),
             _ => None,
         };
+        let maintaining = state.maintaining.contains_key(&self.reference);
         let close = match state.entries.get_mut(&self.reference) {
             Some(Entry::Open {
                 key,
@@ -350,7 +585,7 @@ impl Drop for StoreGuard {
                 active,
             }) => {
                 *active -= 1;
-                if *active == 0 && selected.as_ref() != Some(key) {
+                if *active == 0 && !maintaining && selected.as_ref() != Some(key) {
                     Some(service.clone())
                 } else {
                     None

@@ -1,8 +1,5 @@
 //! Dispatch installation setup and pinned store requests.
-use super::{
-    dispatch::Dispatcher,
-    stores::{StoreGuard, Stores},
-};
+use super::{dispatch::Dispatcher, stores::Stores};
 use crate::{
     installation::{
         config,
@@ -10,8 +7,8 @@ use crate::{
         setup,
     },
     protocol::{
-        BindingError, BindingRef, CallTarget, Classified, CommandRequest, QueryRequest,
-        RejectReason, SetupCommand, SetupRequest,
+        AdminCommand, BindingError, BindingRef, CallTarget, Classified, CommandRequest,
+        QueryRequest, RejectReason, SetupCommand, SetupRequest,
     },
 };
 use agentlaw_contracts::{ConnectIntent, DomainError, RequestControl};
@@ -53,8 +50,9 @@ pub(super) struct StoreDispatch {
 }
 
 pub(super) enum Admitted {
-    Query(StoreGuard, Arc<ConfigSnapshot>, QueryRequest),
-    Command(StoreGuard, Arc<ConfigSnapshot>, CommandRequest),
+    Query(Arc<ConfigSnapshot>, QueryRequest),
+    Command(Arc<ConfigSnapshot>, CommandRequest),
+    Admin(Arc<ConfigSnapshot>, AdminCommand),
     Setup(SetupRequest),
 }
 
@@ -172,12 +170,12 @@ impl Dispatcher for StoreDispatch {
     type Admitted = Admitted;
     fn response_limit(&self, admitted: &Admitted) -> Option<usize> {
         match admitted {
-            Admitted::Query(_, s, QueryRequest::History(_)) => Some(
+            Admitted::Query(s, QueryRequest::History(_)) => Some(
                 s.config
                     .response_limit_bytes
                     .min(s.config.history_response_limit_bytes),
             ),
-            Admitted::Query(_, s, _) | Admitted::Command(_, s, _) => {
+            Admitted::Query(s, _) | Admitted::Command(s, _) | Admitted::Admin(s, _) => {
                 Some(s.config.response_limit_bytes)
             }
             Admitted::Setup(_) => None,
@@ -186,9 +184,6 @@ impl Dispatcher for StoreDispatch {
     fn admit(&self, target: &CallTarget, request: Classified) -> Result<Admitted, RejectReason> {
         match target {
             CallTarget::Store(reference) => {
-                if matches!(request, Classified::Admin(_)) {
-                    return Err(RejectReason::StoreUnavailable("admin unavailable".into()));
-                }
                 let snapshot = self
                     .registry
                     .resolve(reference)
@@ -197,27 +192,57 @@ impl Dispatcher for StoreDispatch {
                         BindingError::ConnectionRequired => RejectReason::ConnectionRequired,
                         BindingError::ConfigInvalid(reason) => RejectReason::ConfigInvalid(reason),
                     })?;
-                let guard = self.stores.acquire(&snapshot)?;
                 match request {
-                    Classified::Query(request) => Ok(Admitted::Query(guard, snapshot, request)),
-                    Classified::Command(request) => Ok(Admitted::Command(guard, snapshot, request)),
-                    Classified::Setup(_) | Classified::Admin(_) => Err(RejectReason::KindMismatch),
+                    Classified::Query(request) => Ok(Admitted::Query(snapshot, request)),
+                    Classified::Command(request) => Ok(Admitted::Command(snapshot, request)),
+                    Classified::Admin(request) => Ok(Admitted::Admin(snapshot, request)),
+                    Classified::Setup(_) => Err(RejectReason::KindMismatch),
                 }
             }
             CallTarget::Setup => match request {
                 Classified::Setup(request) => Ok(Admitted::Setup(request)),
+                Classified::Admin(_) => Err(RejectReason::InvalidBody(DomainError::new(
+                    "invalid_input",
+                    "Admin commands require a store binding.",
+                ))),
                 _ => Err(RejectReason::KindMismatch),
             },
         }
     }
     fn run(&self, request: Admitted, control: &RequestControl) -> Result<Value, DomainError> {
         match request {
-            Admitted::Query(guard, snapshot, request) => {
+            Admitted::Query(snapshot, request) => {
+                let guard = self.stores.acquire_for_execution(&snapshot, control)?;
                 guard.query_with_snapshot(request, &snapshot, control)
             }
-            Admitted::Command(guard, snapshot, request) => {
+            Admitted::Command(snapshot, request) => {
+                let guard = self.stores.acquire_for_execution(&snapshot, control)?;
                 guard.command_with_snapshot(request, &snapshot, control)
             }
+            Admitted::Admin(snapshot, request) => match request {
+                AdminCommand::Audit | AdminCommand::Repair => {
+                    super::maintenance::run(&self.stores, &snapshot, request, control)
+                }
+                other => {
+                    let guard = self.stores.acquire_for_execution(&snapshot, control)?;
+                    match other {
+                        AdminCommand::ContinuitySave => guard.continuity_save(control),
+                        AdminCommand::HistoryExport { memory_id, output } => {
+                            guard.export_history(memory_id, output, control)
+                        }
+                        AdminCommand::ProcedureList { filter, output } => {
+                            guard.procedure_list(filter, output, control)
+                        }
+                        AdminCommand::ProcedureSearch {
+                            query,
+                            limit,
+                            filter,
+                            output,
+                        } => guard.procedure_search(query, limit, filter, output, control),
+                        _ => unreachable!(),
+                    }
+                }
+            },
             Admitted::Setup(request) => self.setup(request, control).map(|(value, _)| value),
         }
     }

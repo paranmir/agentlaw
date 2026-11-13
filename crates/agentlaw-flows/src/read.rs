@@ -17,7 +17,8 @@ mod owner;
 pub(crate) mod streaming;
 pub(crate) use owner::preparation_channels;
 pub use owner::{
-    discover, prepare_recall, recall, recall_for_project, recall_prepared, PreparedRecall,
+    discover, prepare_recall, recall, recall_for_project, recall_prepared,
+    search_procedures_filtered, PreparedRecall,
 };
 /// Inspect retained pending work without opening a writable control connection.
 pub fn pending_inspect(ctx: &ReadCtx<'_>, request: &RememberRequest) -> Result<Value> {

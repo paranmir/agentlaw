@@ -451,9 +451,20 @@ impl SemanticIndexer {
     }
 
     pub fn close_binding(&self, binding: &str) {
+        let _ = self.close_binding_checked(binding);
+    }
+
+    pub fn close_binding_checked(&self, binding: &str) -> RuntimeResult<()> {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(lane) = state.schedule.lanes.remove(&LaneKey::current(binding)) else {
-            return;
+            while state.closing.contains(binding) {
+                state = self
+                    .inner
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            return Ok(());
         };
         lane.cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -505,6 +516,7 @@ impl SemanticIndexer {
             }
         }
         let mut deferred = false;
+        let mut failed = false;
         for handle in handles {
             if handle.thread().id() == std::thread::current().id() {
                 deferred = true;
@@ -522,10 +534,14 @@ impl SemanticIndexer {
                 });
                 continue;
             }
-            let _ = handle.join();
+            if handle.join().is_err() {
+                failed = true;
+            }
         }
         if deferred {
-            return;
+            return Err(RuntimeError::Unavailable(
+                "Semantic shutdown is still in progress.".into(),
+            ));
         }
         self.inner
             .state
@@ -545,6 +561,13 @@ impl SemanticIndexer {
                 reason: None,
             },
         );
+        if failed {
+            Err(RuntimeError::Unavailable(
+                "Semantic worker terminated unexpectedly.".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn wake(&self, binding: &str) {

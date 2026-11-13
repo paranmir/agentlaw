@@ -216,13 +216,17 @@ pub fn probe(state: &Path, installation_build: &str, hello_timeout: Duration) ->
 impl Client {
     pub fn admin(
         &self,
-        _binding: crate::protocol::BindingRef,
-        _command: &crate::protocol::AdminCommand,
-        _control: &RequestControl,
+        binding: crate::protocol::BindingRef,
+        command: &crate::protocol::AdminCommand,
+        control: &RequestControl,
     ) -> Result<Value, ClientError> {
-        Err(ClientError::Rejected(RejectReason::StoreUnavailable(
-            "admin unavailable".into(),
-        )))
+        self.call_body(
+            CallTarget::Store(binding),
+            RequestKind::Admin,
+            crate::protocol::encode_admin(command).map_err(ClientError::Domain)?,
+            control,
+            2,
+        )
     }
     pub fn setup(
         &self,

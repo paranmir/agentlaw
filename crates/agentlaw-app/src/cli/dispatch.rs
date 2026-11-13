@@ -69,7 +69,7 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             agentlaw_app::diagnostics::doctor(&config::state_root()?, mode)?
         }
         Command::Repair => {
-            agentlaw_app::diagnostics::repair(&config::state_root()?, cli_control())?
+            general::runtime_admin(agentlaw_runtime::protocol::AdminCommand::Repair)?
         }
         Command::Config { command } => general::config(command)?,
         Command::Machine { command } => general::machine(command)?,

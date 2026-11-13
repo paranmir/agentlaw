@@ -59,6 +59,22 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
+    pub fn with_source_read<T>(
+        &self,
+        read: impl FnOnce(&std::path::Path, u64) -> Result<T>,
+    ) -> Result<T> {
+        self.store.with_source_read(read)
+    }
+    pub fn visit_history_closure(
+        &self,
+        entity_id: &str,
+        visit: impl FnMut(crate::history_spool::SpoolChange) -> Result<()>,
+    ) -> Result<u64> {
+        self.store.visit_history_closure(entity_id, visit)
+    }
+    pub fn visit_current(&self, visit: impl FnMut(CurrentUnit) -> Result<()>) -> Result<u64> {
+        self.store.visit_current(visit)
+    }
     pub fn acquire_history(
         &self,
         cancel: &std::sync::atomic::AtomicBool,

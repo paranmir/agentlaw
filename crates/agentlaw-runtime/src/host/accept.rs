@@ -333,6 +333,17 @@ fn admit_call<D: Dispatcher>(
     }
     if matches!(
         (header.kind, header.target),
+        (RequestKind::Admin, CallTarget::Setup)
+    ) {
+        return Err(RejectReason::InvalidBody(
+            agentlaw_contracts::DomainError::new(
+                "invalid_input",
+                "Admin commands require a store binding.",
+            ),
+        ));
+    }
+    if matches!(
+        (header.kind, header.target),
         (RequestKind::Setup, CallTarget::Store(_))
             | (RequestKind::Query | RequestKind::Command, CallTarget::Setup)
     ) {
@@ -363,6 +374,7 @@ fn admit_call<D: Dispatcher>(
         .begin(ActivityKind::Execution)
         .map_err(|e| e.stopping_reason().unwrap_or(RejectReason::Busy))?;
     let history = matches!(&classified, Classified::Query(QueryRequest::History(_)));
+    let admin = matches!(&classified, Classified::Admin(_));
     let fallback = match header.target {
         CallTarget::Store(reference) => ctx.registry.resolve(&reference).ok().map(|s| {
             if history {
@@ -386,6 +398,7 @@ fn admit_call<D: Dispatcher>(
             output,
             id,
             fallback,
+            admin,
             (guard, registration, slot, body_reservation),
         )
     });
@@ -399,6 +412,7 @@ fn run_execution<D: Dispatcher>(
     mailbox: Arc<Mailbox>,
     id: RequestId,
     fallback: Option<usize>,
+    admin: bool,
     resources: (
         super::lifecycle::LifecycleGuard,
         Registration,
@@ -412,6 +426,9 @@ fn run_execution<D: Dispatcher>(
         ctx.dispatcher
             .run_with_limit(admitted, &control)
             .and_then(|(value, selected)| {
+                if admin {
+                    return Ok(value);
+                }
                 delivery::adapt(
                     value,
                     &ctx.state,
