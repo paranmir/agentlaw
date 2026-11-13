@@ -132,6 +132,21 @@ impl StoreService {
         control: &RequestControl,
     ) -> RuntimeResult<Self> {
         control.check()?;
+        if identity.root.join("format.md").exists()
+            && ((!identity.local.join("canonical/source-fence").exists()
+                && !identity.local.join("control-initialized.json").exists())
+                || identity
+                    .local
+                    .join("canonical/validation-required")
+                    .exists())
+        {
+            Store::attach_existing_with_coordination(
+                &identity.root,
+                identity.local.join("canonical"),
+                &deps.coordination,
+            )
+            .map_err(|e| RuntimeError::StoreUnavailable(e.to_string()))?;
+        }
         if identity.local.join("control-initialized.json").exists()
             && !identity.local.join("canonical/source-fence").is_file()
         {
@@ -160,6 +175,7 @@ impl StoreService {
             binding_id: identity.binding_id.clone(),
             history_limit: identity.history_limit,
             response_limit: identity.response_limit,
+            config_file: identity.config_file.clone(),
         };
         let lane = MutationLane::start(lane_identity, store, writer)?;
         match lane.sender().call(LaneCommand::Recover, control)? {
@@ -272,6 +288,7 @@ impl StoreService {
             binding_id: self.identity.binding_id.clone(),
             history_limit: snapshot.config.history_response_limit_bytes,
             response_limit: snapshot.config.response_limit_bytes,
+            config_file: self.identity.config_file.clone(),
         })
     }
     fn query_identity(
@@ -425,6 +442,42 @@ impl StoreService {
         let semantic = self.preparation.wait_target(&target, control);
         TargetPreparation { exact, semantic }
     }
+    pub fn prepare_selection(
+        &self,
+        control: &RequestControl,
+        semantic_required: bool,
+    ) -> Result<Value> {
+        let target = self
+            .source
+            .read_snapshot()
+            .map_err(|e| DomainError::new("store_unavailable", e.to_string()))?
+            .position()
+            .clone();
+        if semantic_required {
+            let prepared = self.ensure_target(target, control);
+            if let ExactPreparation::Incomplete { reason, .. } = prepared.exact {
+                return Err(DomainError::new("exact_build_incomplete", reason));
+            }
+            match prepared.semantic {
+                Ok(SemanticCoverage::CompleteAt(_)) => {
+                    Ok(json!({"lexical_complete":true,"semantic_complete":true}))
+                }
+                other => Err(DomainError::new(
+                    "semantic_build_incomplete",
+                    format!("Semantic preparation failed: {other:?}"),
+                )),
+            }
+        } else {
+            if let ExactPreparation::Incomplete { reason, .. } =
+                self.ensure_exact_target(target, control)
+            {
+                return Err(DomainError::new("exact_build_incomplete", reason));
+            }
+            Ok(
+                json!({"lexical_complete":true,"semantic_complete":false,"diagnostics":[{"code":"semantic_unavailable","message":"No model is configured; vector build was not performed."}]}),
+            )
+        }
+    }
     pub fn recover(&self, control: &RequestControl) -> Result<()> {
         match self.lane.sender().call(LaneCommand::Recover, control)? {
             LaneReply::Done => Ok(()),
@@ -442,7 +495,6 @@ impl StoreService {
             root: self.identity.root.clone(),
             local: self.identity.local.clone(),
             coordination: self.coordination.clone(),
-            source: self.source.clone(),
             lane: self.lane.sender(),
         }
     }

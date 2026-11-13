@@ -130,7 +130,7 @@ impl StreamedSelection {
             crate::artifacts::ReadArtifactWriter::create(local.join("response-artifacts"))?;
         self.emit(&mut out, value, control)?;
         let artifact = out.finish()?;
-        let mut envelope = json!({"code":"complete_content_in_file", "content_read":false, "artifact":artifact, "next_action":"Read the complete result file on the Runtime host before relying on its contents. If it is inaccessible, request file transfer. The file is retained for at least seven days."});
+        let mut envelope = json!({"code":"complete_content_in_file", "content_read":false, "artifact":artifact, "next_action":"The complete result has NOT been read. Read the result file on the Runtime host before relying on its contents. If it is inaccessible, request file transfer. The file is retained for at least seven days."});
         if let Some(instruction) = value.get("turn_instruction") {
             envelope["turn_instruction"] = instruction.clone();
         }

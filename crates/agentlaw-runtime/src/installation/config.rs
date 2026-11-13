@@ -38,6 +38,28 @@ pub fn default_history_limit() -> usize {
     8192
 }
 
+pub fn get_value(root: &Path, selected: Option<&Config>, key: &str) -> Result<serde_json::Value> {
+    let (value, field) = match key {
+        "history.response_limit_bytes" => (
+            selected.map_or_else(default_history_limit, |c| c.history_response_limit_bytes),
+            "history_response_limit_bytes",
+        ),
+        "response_limit_bytes" => (
+            selected.map_or_else(default_response_limit, |c| c.response_limit_bytes),
+            "response_limit_bytes",
+        ),
+        _ => {
+            return Err(DomainError::new(
+                "invalid_configuration",
+                "Unknown configuration key.",
+            ))
+        }
+    };
+    Ok(
+        serde_json::json!({"key": key, "value": value, "config_path": root.join("config.json"), "configuration_field": field}),
+    )
+}
+
 /// A published selection names an existing authority, never permission to
 /// recreate missing source/proposal state. Fresh setup uses a separate path.
 pub fn require_existing_binding(installation: &Path, selected: &Config) -> Result<()> {
@@ -263,10 +285,14 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
 /// Caller holds setup.lock. The whole selection changes at one replace boundary;
 /// opened Runtime instances retain their old store until the next request.
 pub fn replace_selection(root: &Path, expected: &Config, next: &Config) -> Result<()> {
-    use std::io::Write;
     if load(root)?.as_ref() != Some(expected) {
         return Err(DomainError::new("configuration_changed", "Selection changed while the next store was being prepared. Retry without discarding either store."));
     }
+    write_selection(root, next)
+}
+
+pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
+    use std::io::Write;
     let mut temp = tempfile::NamedTempFile::new_in(root)
         .map_err(|_| DomainError::new("configuration_io", "Cannot prepare the next selection."))?;
     serde_json::to_writer_pretty(temp.as_file_mut(), next)

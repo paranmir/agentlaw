@@ -168,10 +168,49 @@ impl ProjectionWorkspace {
 fn failure() -> DomainError {
     DomainError::new("history_projection_failed", "History could not be acquired or projected completely. Original memory is unchanged; use doctor to investigate source integrity and retry. This is not an empty history result.")
 }
+struct NoticeContext<'a> {
+    config_file: Option<&'a Path>,
+    general: bool,
+}
+fn history_notice(limit: usize, context: Option<&NoticeContext<'_>>) -> Value {
+    let general = context.is_some_and(|context| context.general);
+    let key = if general {
+        "response_limit_bytes"
+    } else {
+        "history.response_limit_bytes"
+    };
+    let path = context
+        .and_then(|context| context.config_file)
+        .map(|path| json!(path))
+        .unwrap_or_else(|| {
+            json!("Use agentlaw config path to obtain the installation configuration file.")
+        });
+    json!({"applied_bytes":limit,"config_key":key,"config_file":path,"user_notice":format!("History details exceed the configured response size. Adjust {key} to change this limit.")})
+}
 fn history_artifact(local: &Path, input: &mut impl Read, notice: Value) -> Work<Value> {
-    let artifact = crate::artifacts::create_from_reader(local.join("response-artifacts"), input)?;
+    let mut out = crate::artifacts::ArtifactWriter::create(local.join("response-artifacts"))?;
+    let mut pending = None;
+    let mut buffer = [0u8; 32768];
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(byte) = pending {
+            out.write_all(&[byte])?;
+        }
+        out.write_all(&buffer[..n - 1])?;
+        pending = Some(buffer[n - 1]);
+    }
+    if pending != Some(b'}') {
+        return Err("invalid history result".into());
+    }
+    out.write_all(b",\"response_limit\":")?;
+    serde_json::to_writer(&mut out, &notice)?;
+    out.write_all(b"}")?;
+    let artifact = out.finish()?;
     Ok(
-        json!({"code":"complete_content_in_file","content_read":false,"complete":true,"artifact":artifact,"response_limit":notice,"next_action":"The complete version-frozen history response is in the artifact and has not been read. Use the harness file-reading tool or shell to read that path in bounded sections before relying on it. If that environment cannot access the path, tell the user what is unread and ask for file transfer or raise the configured history response limit; do not claim the history was restored. After the indicated retention period it may be cleaned automatically; a new history query reads the then-current source, not necessarily this version."}),
+        json!({"code":"complete_content_in_file","content_read":false,"complete":true,"artifact":artifact,"response_limit_bytes":notice["applied_bytes"],"response_limit":notice,"next_action":"The complete version-frozen history response is in the artifact and has not been read. Use the harness file-reading tool or shell to read that path in bounded sections before relying on it. If that environment cannot access the path, tell the user what is unread and ask for file transfer or adjust the indicated response limit; do not claim the history was restored. After the indicated retention period it may be cleaned automatically; a new history query reads the then-current source, not necessarily this version."}),
     )
 }
 
@@ -532,10 +571,11 @@ pub fn history(
         spool,
         &ctx.identity.local,
         request,
-        ctx.identity.history_limit,
+        ctx.identity.history_limit.min(ctx.identity.response_limit),
         ctx.request,
         &semantic,
         Some((ctx, &workspace)),
+        None,
     )
 }
 fn search_owned(
@@ -629,6 +669,7 @@ fn project_spool(
     control: &RequestControl,
     semantic: &dyn HistorySemanticChannel,
     owned: Option<(&crate::runtime::ReadCtx<'_>, &ProjectionWorkspace)>,
+    config_file: Option<&Path>,
 ) -> crate::Result<Value> {
     let identity = request
         .memory_id
@@ -659,6 +700,12 @@ fn project_spool(
         .or(legacy_workspace.as_ref())
         .expect("workspace");
     let ctx = owned.map(|(ctx, _)| ctx);
+    let notice_context = NoticeContext {
+        config_file: ctx
+            .and_then(|ctx| ctx.identity.config_file.as_deref())
+            .or(config_file),
+        general: ctx.is_some_and(|ctx| ctx.identity.response_limit <= ctx.identity.history_limit),
+    };
     let db = &workspace.db;
     let work = (|| -> Work<Value> {
         db.execute_batch("CREATE TABLE nodes(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,metadata TEXT,body TEXT,evidence TEXT,parents INTEGER,children INTEGER DEFAULT 0,keynode INTEGER DEFAULT 0); CREATE TABLE edges(child TEXT,parent TEXT,PRIMARY KEY(child,parent)); CREATE INDEX edge_parent ON edges(parent,child); CREATE TABLE selected(window INTEGER,id TEXT,matched INTEGER,PRIMARY KEY(window,id)); BEGIN;")?;
@@ -845,6 +892,7 @@ fn project_spool(
                 control,
                 diagnostic.as_ref(),
                 ctx.is_some(),
+                Some(&notice_context),
             );
         }
         let mut entries = Vec::new();
@@ -899,7 +947,7 @@ fn project_spool(
         if serde_json::to_vec(&complete)?.len() <= limit {
             return Ok(complete);
         }
-        let notice = json!({"applied_bytes":limit,"config_key":"history.response_limit_bytes","config_file":"Use agentlaw config path to obtain the installation configuration file.","user_notice":"History details exceed the configured response size. Whole changes are shown with a causal map; this setting can be changed with agentlaw config set history.response_limit_bytes <bytes>."});
+        let notice = history_notice(limit, Some(&notice_context));
         for delivered in (1..entries.len()).rev() {
             db.execute_batch(
                 "UPDATE nodes SET keynode=CASE WHEN parents<>1 OR children<>1 THEN 1 ELSE 0 END;",
@@ -911,7 +959,7 @@ fn project_spool(
             let mut partial = assemble(&entries[..delivered])?;
             partial["response_limit"] = notice.clone();
             partial["remaining_requested_changes"] = json!(entries.len() - delivered);
-            partial["next_action"] = json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Increase history.response_limit_bytes for a larger response.");
+            partial["next_action"] = json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Adjust the indicated limit for a larger response.");
             if serde_json::to_vec(&partial)?.len() <= limit {
                 return Ok(partial);
             }
@@ -940,6 +988,17 @@ pub fn project_with_worker(
     control: &RequestControl,
     worker: Option<(&agentlaw_worker::Client, &str)>,
 ) -> crate::Result<Value> {
+    project_with_worker_config(store, local, request, limit, control, worker, None)
+}
+pub(crate) fn project_with_worker_config(
+    store: &Store,
+    local: &Path,
+    request: &HistoryRequest,
+    limit: usize,
+    control: &RequestControl,
+    worker: Option<(&agentlaw_worker::Client, &str)>,
+    config_file: Option<&Path>,
+) -> crate::Result<Value> {
     let identity = request
         .memory_id
         .as_deref()
@@ -953,7 +1012,16 @@ pub fn project_with_worker(
     control.check()?;
     let spool = acquired.map_err(|_| failure())?;
     let semantic = WorkerHistorySemantic { worker };
-    project_spool(spool, local, request, limit, control, &semantic, None)
+    project_spool(
+        spool,
+        local,
+        request,
+        limit,
+        control,
+        &semantic,
+        None,
+        config_file,
+    )
 }
 
 trait HistorySemanticChannel {
@@ -1078,6 +1146,7 @@ fn render_disk(
     control: &RequestControl,
     diagnostic: Option<&Value>,
     owned: bool,
+    identity: Option<&NoticeContext<'_>>,
 ) -> Work<Value> {
     control.phase("projecting_history");
     let records = scratch.join("records.jsonl");
@@ -1130,7 +1199,7 @@ fn render_disk(
     if bytes <= limit as u64 && fits {
         return Ok(serde_json::from_reader(File::open(&all)?)?);
     }
-    let notice = json!({"applied_bytes":limit,"config_key":"history.response_limit_bytes","config_file":"Use agentlaw config path to obtain the installation configuration file.","user_notice":"History details exceed the configured response size. Whole changes are shown with a causal map; this setting can be changed with agentlaw config set history.response_limit_bytes <bytes>."});
+    let notice = history_notice(limit, identity);
     if owned && !fits {
         let mut notice = notice;
         if bytes <= limit as u64 {
@@ -1179,7 +1248,7 @@ fn render_disk(
             let mut value: Value = serde_json::from_reader(File::open(&partial)?)?;
             value["response_limit"] = notice.clone();
             value["remaining_requested_changes"] = json!(total - delivered);
-            value["next_action"]=json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Increase history.response_limit_bytes for a larger response.");
+            value["next_action"]=json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Adjust the indicated limit for a larger response.");
             if serde_json::to_vec(&value)?.len() <= limit {
                 return Ok(value);
             }

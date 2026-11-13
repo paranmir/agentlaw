@@ -54,7 +54,7 @@ impl StopToken {
             }
         }
     }
-    fn wait(&self, duration: Duration) {
+    pub fn wait(&self, duration: Duration) {
         let guard = self.0.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = self
             .0
@@ -154,7 +154,11 @@ impl Supervisor {
                 sink.publish(
                     component.clone(),
                     ComponentStatus {
-                        state: ComponentState::Recovering,
+                        state: if reason.starts_with("asset: ") {
+                            ComponentState::Degraded
+                        } else {
+                            ComponentState::Recovering
+                        },
                         observed_at: SystemTime::now(),
                         reason: Some(reason),
                     },

@@ -540,6 +540,7 @@ impl Runtime {
             pump_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             background_error: Default::default(),
             history_response_limit: 8192,
+            config_file: None,
             request_control: RequestControl::default(),
         };
         runtime.recover_authoring()?;

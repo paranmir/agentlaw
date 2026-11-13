@@ -15,6 +15,7 @@ fn bounded_queue_processes_one_stores_commands_in_order() {
         binding_id: uuid::Uuid::new_v4().to_string(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     writer.bind_identity(&identity).unwrap();
     let lane = MutationLane::start(identity, store, writer).unwrap();
@@ -95,6 +96,7 @@ fn cancellation_at_dequeue_never_runs_the_waiting_command() {
         binding_id: uuid::Uuid::new_v4().to_string(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     writer.bind_identity(&identity).unwrap();
     let lane = MutationLane::start(identity, store, writer).unwrap();
@@ -184,6 +186,7 @@ fn started_recovery_finishes_result_record_after_caller_cancels() {
         binding_id: uid(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     writer.bind_identity(&identity).unwrap();
     let mutation = Mutation {
@@ -294,6 +297,7 @@ fn stale_import_preserves_sync_inputs_changed_code() {
         binding_id: uid(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     writer.bind_identity(&identity).unwrap();
     let lane = MutationLane::start(identity, store, writer).unwrap();

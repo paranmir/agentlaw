@@ -148,19 +148,46 @@ pub enum SetupRequest {
     Command(SetupCommand),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SetupCommand {
     StoreConnect { path: PathBuf, create: bool },
     ConfigSet { key: String, value: String },
     MachineName { value: String },
 }
 
-pub fn encode_setup(_command: &SetupCommand) -> Vec<u8> {
-    unimplemented!()
+pub fn encode_setup(command: &SetupCommand) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"setup_command": command}))
+        .expect("setup command is serializable")
 }
 
-pub fn decode_body(_kind: RequestKind, _body: &[u8]) -> Result<Classified, RejectReason> {
-    Err(RejectReason::KindMismatch)
+pub fn decode_body(kind: RequestKind, body: &[u8]) -> Result<Classified, RejectReason> {
+    let text = std::str::from_utf8(body).map_err(|_| {
+        RejectReason::InvalidBody(agentlaw_contracts::DomainError::new(
+            "invalid_input",
+            "Invalid JSON, duplicate object key, or invalid Unicode.",
+        ))
+    })?;
+    let value =
+        agentlaw_contracts::validation::decode_unique(text).map_err(RejectReason::InvalidBody)?;
+    let classified = if let Some(object) = value
+        .as_object()
+        .filter(|object| object.len() == 1 && object.contains_key("setup_command"))
+    {
+        let command = serde_json::from_value(object["setup_command"].clone()).map_err(|_| {
+            RejectReason::InvalidBody(agentlaw_contracts::DomainError::new(
+                "invalid_input",
+                "Setup command has invalid fields.",
+            ))
+        })?;
+        Classified::Setup(SetupRequest::Command(command))
+    } else {
+        classify(agentlaw_contracts::wire::decode_wire(body).map_err(RejectReason::InvalidBody)?)
+    };
+    if classified.kind() != kind {
+        return Err(RejectReason::KindMismatch);
+    }
+    Ok(classified)
 }
 
 pub fn request_kind(request: &ValidatedRequest) -> RequestKind {

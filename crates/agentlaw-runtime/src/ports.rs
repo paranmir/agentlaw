@@ -61,6 +61,12 @@ pub struct HealthSink {
 }
 
 impl HealthSink {
+    pub fn remove(&self, component: &ComponentId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(component);
+    }
     pub fn publish(&self, component: ComponentId, mut status: ComponentStatus) {
         if let Some(reason) = &mut status.reason {
             if reason.len() > MAX_HEALTH_REASON_BYTES {

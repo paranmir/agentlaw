@@ -2,14 +2,20 @@
 
 use super::{
     commands::{
-        ConfigCommand, ConfigKey, ContinuityCommand, HistoryCommand, InstallArgs, MachineCommand,
-        StoreCommand,
+        ConfigCommand, ContinuityCommand, HistoryCommand, InstallArgs, MachineCommand, StoreCommand,
     },
     dispatch::{cli_control, selected_store},
 };
 use agentlaw_app::config as configuration;
 use agentlaw_contracts::{DomainError, Result};
+use agentlaw_runtime::protocol::SetupCommand;
 use serde_json::{json, Value};
+
+fn runtime_setup(command: SetupCommand) -> Result<Value> {
+    let state = configuration::state_root()?;
+    agentlaw_app::update::managed::check_frontend_start(&state)?;
+    agentlaw_app::frontend::RuntimeBackend::new(state, false)?.setup(command, &cli_control())
+}
 
 pub(super) fn install(args: InstallArgs) -> Result<Value> {
     let harness = agentlaw_app::install::Harness::parse(args.harness.as_str())?;
@@ -32,45 +38,36 @@ pub(super) fn config(command: ConfigCommand) -> Result<Value> {
         ConfigCommand::Path => Ok(json!({"path":configuration::state_root()?.join("config.json")})),
         ConfigCommand::Get(args) => {
             let state = configuration::state_root()?;
+            let backend = agentlaw_app::frontend::RuntimeBackend::new(state.clone(), false)?;
+            if let Some(value) = backend.config_get_if_running(args.key.as_str())? {
+                return Ok(value);
+            }
             let selected = configuration::load(&state)?;
-            let (value, field) = match args.key {
-                ConfigKey::HistoryResponseLimitBytes => (
-                    selected
-                        .map(|selected| selected.history_response_limit_bytes)
-                        .unwrap_or_else(configuration::default_history_limit),
-                    "history_response_limit_bytes",
-                ),
-                ConfigKey::ResponseLimitBytes => (
-                    selected
-                        .map(|selected| selected.response_limit_bytes)
-                        .unwrap_or_else(configuration::default_response_limit),
-                    "response_limit_bytes",
-                ),
-            };
-            Ok(
-                json!({"key":args.key.as_str(),"value":value,"config_path":state.join("config.json"),"configuration_field":field}),
-            )
+            configuration::get_value(&state, selected.as_ref(), args.key.as_str())
         }
         ConfigCommand::Set(args) => {
             let key = args.key.as_str();
             let value = args.value.to_string();
             configuration::validate_limit(key, &value)?;
-            configuration::set_limit(&configuration::state_root()?, key, &value)
+            runtime_setup(SetupCommand::ConfigSet {
+                key: key.into(),
+                value,
+            })
         }
     }
 }
 
 pub(super) fn machine(command: MachineCommand) -> Result<Value> {
     match command {
-        MachineCommand::Inspect => agentlaw_contracts::to_value(
-            agentlaw_app::machine::load_or_create(&configuration::state_root()?)?,
-        ),
+        MachineCommand::Inspect => {
+            match agentlaw_app::machine::inspect(&configuration::state_root()?)? {
+                Some(machine) => agentlaw_contracts::to_value(machine),
+                None => Ok(json!({"machine_id":null,"display_name":null})),
+            }
+        }
         MachineCommand::Name(args) => {
             agentlaw_app::machine::validate_name(&args.value)?;
-            agentlaw_contracts::to_value(agentlaw_app::machine::name(
-                &configuration::state_root()?,
-                &args.value,
-            )?)
+            runtime_setup(SetupCommand::MachineName { value: args.value })
         }
     }
 }
@@ -87,13 +84,7 @@ pub(super) fn store(command: StoreCommand) -> Result<Value> {
         StoreCommand::Connect(args) => (args.path, false),
     };
     agentlaw_app::setup::validate_path(&path)?;
-    agentlaw_app::setup::connect_with_control(
-        &configuration::state_root()?,
-        &path,
-        create,
-        cli_control(),
-        agentlaw_app::installed::worker_config,
-    )
+    runtime_setup(SetupCommand::StoreConnect { path, create })
 }
 
 pub(super) fn history(command: HistoryCommand) -> Result<Value> {

@@ -23,6 +23,8 @@ pub enum ClientError {
     Runtime(RuntimeError),
     Rejected(RejectReason),
     MutationOutcomeUnknown,
+    BeforeBody(String),
+    AfterBody(String),
     Domain(DomainError),
 }
 fn unavailable(error: impl std::fmt::Display) -> ClientError {
@@ -43,8 +45,63 @@ pub enum ShutdownState {
     Stopping,
 }
 
-pub fn shutdown_installed(_state: &Path, _reason: &str) -> Result<ShutdownState, ClientError> {
-    Err(unavailable("shutdown_installed is not implemented"))
+pub fn shutdown_installed(state: &Path, reason: &str) -> Result<ShutdownState, ClientError> {
+    let endpoint = match transport::read_endpoint(state) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ShutdownState::NotRunning)
+        }
+        Err(error) => return Err(unavailable(error)),
+    };
+    let (mut stream, reply) = match hello(
+        &endpoint,
+        &endpoint.installation_build,
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+    ) {
+        Ok(result) => result,
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            return Ok(ShutdownState::NotRunning)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Err(ClientError::Runtime(RuntimeError::Unresponsive))
+        }
+        Err(error) => return Err(unavailable(error)),
+    };
+    match reply {
+        HelloReply::Stopping => Ok(ShutdownState::Stopping),
+        HelloReply::Accepted => {
+            transport::send(
+                &mut stream,
+                &ControlRequest::Shutdown {
+                    reason: reason.into(),
+                },
+                MAX_CONTROL_FRAME_BYTES,
+            )
+            .map_err(unavailable)?;
+            match transport::receive(&mut stream, MAX_CONTROL_REPLY_BYTES) {
+                Ok(ControlReply::ShutdownAccepted) => Ok(ShutdownState::Stopping),
+                Ok(_) => Err(unavailable("invalid shutdown reply")),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    Err(ClientError::Runtime(RuntimeError::Unresponsive))
+                }
+                Err(error) => Err(unavailable(error)),
+            }
+        }
+        other => Err(ClientError::Runtime(RuntimeError::Protocol(format!(
+            "hello: {other:?}"
+        )))),
+    }
 }
 
 pub struct AttachLimits {
@@ -159,14 +216,37 @@ pub fn probe(state: &Path, installation_build: &str, hello_timeout: Duration) ->
 impl Client {
     pub fn setup(
         &self,
-        _command: SetupCommand,
-        _control: &RequestControl,
+        command: SetupCommand,
+        control: &RequestControl,
     ) -> Result<Value, ClientError> {
-        Err(unavailable("setup is not implemented"))
+        self.call_body(
+            CallTarget::Setup,
+            RequestKind::Setup,
+            encode_setup(&command),
+            control,
+            2,
+        )
+    }
+    pub fn setup_once(
+        &self,
+        command: SetupCommand,
+        control: &RequestControl,
+    ) -> Result<Value, ClientError> {
+        self.call_body(
+            CallTarget::Setup,
+            RequestKind::Setup,
+            encode_setup(&command),
+            control,
+            1,
+        )
     }
 
-    pub fn config_get(&self, _key: &str) -> Result<Value, ClientError> {
-        Err(unavailable("config_get is not implemented"))
+    pub fn config_get(&self, key: &str) -> Result<Value, ClientError> {
+        match self.control(ControlRequest::ConfigGet { key: key.into() })? {
+            ControlReply::Config(value) => Ok(value),
+            ControlReply::ConfigError(error) => Err(ClientError::Domain(error)),
+            _ => Err(unavailable("invalid config reply")),
+        }
     }
     pub fn attach(
         state: &Path,
@@ -176,14 +256,16 @@ impl Client {
     ) -> Result<Client, ClientError> {
         let deadline = Instant::now() + limits.start_wait;
         let mut candidate: Option<Box<dyn RuntimeCandidate>> = None;
-        let mut failed_endpoint: Option<(u32, std::net::SocketAddr, String)> = None;
+        let mut failed_endpoint: Option<((u32, std::net::SocketAddr, String), Instant)> = None;
         loop {
             if Instant::now() >= deadline {
                 return Err(ClientError::Runtime(RuntimeError::Unresponsive));
             }
             if let Ok(endpoint) = transport::read_endpoint(state) {
                 let identity = (endpoint.pid, endpoint.control, endpoint.secret.clone());
-                if failed_endpoint.as_ref() != Some(&identity) {
+                if failed_endpoint.as_ref().is_none_or(|(failed, at)| {
+                    failed != &identity || at.elapsed() >= Duration::from_secs(1)
+                }) {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     match hello(
                         &endpoint,
@@ -191,7 +273,8 @@ impl Client {
                         limits.hello_timeout.min(remaining),
                         Duration::from_secs(3).min(remaining),
                     ) {
-                        Ok((_, HelloReply::Accepted)) => {
+                        Ok((stream, HelloReply::Accepted)) => {
+                            drop(stream);
                             if let Ok(client) = Self::connect(state, installation_build) {
                                 return Ok(client);
                             }
@@ -212,7 +295,7 @@ impl Client {
                                     | io::ErrorKind::WouldBlock
                             ) =>
                         {
-                            failed_endpoint = Some(identity);
+                            failed_endpoint = Some((identity, Instant::now()));
                         }
                         _ => {}
                     }
@@ -310,10 +393,30 @@ impl Client {
     ) -> Result<Value, ClientError> {
         let kind = request_kind(&request);
         let body = wire::encode_wire(request.request()).map_err(ClientError::Domain)?;
+        self.call_body(target, kind, body, control, 2)
+    }
+    pub fn call_once(
+        &self,
+        target: CallTarget,
+        request: ValidatedRequest,
+        control: &RequestControl,
+    ) -> Result<Value, ClientError> {
+        let kind = request_kind(&request);
+        let body = wire::encode_wire(request.request()).map_err(ClientError::Domain)?;
+        self.call_body(target, kind, body, control, 1)
+    }
+    fn call_body(
+        &self,
+        target: CallTarget,
+        kind: RequestKind,
+        body: Vec<u8>,
+        control: &RequestControl,
+        attempts: usize,
+    ) -> Result<Value, ClientError> {
         if body.len() > MAX_WIRE_BODY_BYTES as usize {
             return Err(ClientError::Rejected(RejectReason::BodyTooLarge));
         }
-        for attempt in 0..2 {
+        for attempt in 0..attempts {
             if control.cancel.load(Ordering::Acquire) {
                 return Err(ClientError::Domain(DomainError::new(
                     "cancelled",
@@ -328,10 +431,10 @@ impl Client {
             let mut stream = match transport::connect(&endpoint, endpoint.data, &self.inner.build) {
                 Ok(s) => s,
                 Err(e) => {
-                    if attempt == 0 && e.kind() != io::ErrorKind::PermissionDenied {
+                    if attempt + 1 < attempts && e.kind() != io::ErrorKind::PermissionDenied {
                         continue;
                     }
-                    return Err(unavailable(e));
+                    return Err(ClientError::BeforeBody(e.to_string()));
                 }
             };
             let id = RequestId::new();
@@ -342,10 +445,10 @@ impl Client {
                 body_len: body.len() as u32,
             };
             if let Err(e) = transport::send(&mut stream, &header, MAX_CONTROL_FRAME_BYTES) {
-                if attempt == 0 {
+                if attempt + 1 < attempts {
                     continue;
                 }
-                return Err(unavailable(e));
+                return Err(ClientError::BeforeBody(e.to_string()));
             }
             let mut reader = stream.try_clone().map_err(unavailable)?;
             let (tx, rx) = mpsc::channel();
@@ -392,19 +495,27 @@ impl Client {
                         if proceeded && kind != RequestKind::Query {
                             return Err(ClientError::MutationOutcomeUnknown);
                         }
-                        if attempt == 0 {
+                        if attempt + 1 < attempts {
                             break;
                         }
-                        return Err(unavailable(e));
+                        return Err(if proceeded {
+                            ClientError::AfterBody(e.to_string())
+                        } else {
+                            ClientError::BeforeBody(e.to_string())
+                        });
                     }
                     Err(_) => {
                         if proceeded && kind != RequestKind::Query {
                             return Err(ClientError::MutationOutcomeUnknown);
                         }
-                        if attempt == 0 {
+                        if attempt + 1 < attempts {
                             break;
                         }
-                        return Err(unavailable("connection closed"));
+                        return Err(if proceeded {
+                            ClientError::AfterBody("connection closed".into())
+                        } else {
+                            ClientError::BeforeBody("connection closed".into())
+                        });
                     }
                 };
                 match frame {
@@ -422,20 +533,20 @@ impl Client {
                             if kind != RequestKind::Query {
                                 return Err(ClientError::MutationOutcomeUnknown);
                             }
-                            if attempt == 0 {
+                            if attempt + 1 < attempts {
                                 break;
                             }
-                            return Err(unavailable(e));
+                            return Err(ClientError::AfterBody(e.to_string()));
                         }
                     }
                     DataFrame::Rejected { id: got, reason } if got == id => {
-                        if reason.is_transient() && attempt == 0 {
+                        if reason.is_transient() && attempt + 1 < attempts {
                             break;
                         }
                         return Err(ClientError::Rejected(reason));
                     }
                     DataFrame::RejectedUnread { reason } => {
-                        if reason.is_transient() && attempt == 0 {
+                        if reason.is_transient() && attempt + 1 < attempts {
                             break;
                         }
                         return Err(ClientError::Rejected(reason));

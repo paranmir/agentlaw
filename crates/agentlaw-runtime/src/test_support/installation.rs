@@ -43,19 +43,7 @@ impl TestInstallation {
             ));
         }
         let path = self.store_path(name);
-        crate::installation::setup::connect(
-            self.state(),
-            &path,
-            !path.join("format.md").exists(),
-            |state| {
-                Ok(agentlaw_worker::RuntimeConfig {
-                    state_dir: state.into(),
-                    executable: std::env::current_exe()
-                        .map_err(|e| DomainError::new("configuration_io", e.to_string()))?,
-                    model: None,
-                })
-            },
-        )
+        crate::host::prepare_test_selection(self.state(), &path, !path.join("format.md").exists())
     }
     pub fn config(
         &self,

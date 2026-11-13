@@ -18,65 +18,23 @@ use sysinfo::{get_current_pid, ProcessStatus, ProcessesToUpdate, System};
 mod cleanup;
 
 const REPO_RELEASE: &str = "https://github.com/paranmir/agentlaw/releases/download";
-const MAINTENANCE_FILE: &str = "update-maintenance.json";
+use agentlaw_runtime::installation::gate::{self, MaintenanceGate};
 
 fn maintenance_path(state: &Path) -> PathBuf {
-    state.join(MAINTENANCE_FILE)
+    gate::path(state)
 }
 
-/// Normal frontends cannot start while a replacement is in progress. The
-/// candidate's private MCP probe is admitted only for the pinned plan.
 pub fn check_frontend_start(state: &Path) -> Result<()> {
-    let path = maintenance_path(state);
-    if !path.exists() {
+    gate::check_start(state)?;
+    if !maintenance_path(state).exists() {
         if let Ok(Some(root)) = config::managed_install_root(state) {
             if let Ok(root) = fs::canonicalize(root) {
                 cleanup::retry_pending(&root);
             }
         }
-        return Ok(());
     }
-    let raw = fs::read(&path).map_err(|_| {
-        error(
-            "update_maintenance",
-            "Cannot read the update maintenance gate.",
-        )
-    })?;
-    let marker: Value = serde_json::from_slice(&raw).map_err(|_| {
-        error(
-            "update_maintenance",
-            "The update maintenance gate is invalid.",
-        )
-    })?;
-    let Some(id) = marker["plan_id"].as_str() else {
-        return Err(error(
-            "update_maintenance",
-            "The update maintenance gate has no plan.",
-        ));
-    };
-    let probe = std::env::var("AGENTLAW_UPDATE_PROBE_PLAN").ok();
-    if probe.as_deref() == Some(id) {
-        let root = state
-            .parent()
-            .ok_or_else(|| error("update_maintenance", "Invalid managed state path."))?;
-        let plan = load(root, id)?;
-        let expected = candidate_executable(&plan)?;
-        let current = std::env::current_exe()
-            .map_err(|_| error("update_maintenance", "Cannot identify the MCP executable."))?;
-        if fs::canonicalize(current)
-            .ok()
-            .zip(fs::canonicalize(expected).ok())
-            .is_some_and(|(running, candidate)| running == candidate)
-        {
-            return Ok(());
-        }
-    }
-    Err(error(
-        "update_maintenance",
-        "Agentlaw is being replaced; restart the harness after the update command completes.",
-    ))
+    Ok(())
 }
-
 fn error(code: &str, message: &str) -> DomainError {
     DomainError::new(code, message)
 }
@@ -752,7 +710,7 @@ pub fn prepare(id: &str) -> Result<Value> {
     let stage = stage(&root, id);
     if plan.phase == "prepared" {
         verify_staged(&plan)?;
-        let mut gate = MaintenanceGate::open(&plan)?;
+        let mut gate = open_gate(&plan)?;
         gate.retain_for_recovery();
         return verified_handoff(&plan);
     }
@@ -918,7 +876,7 @@ pub fn prepare(id: &str) -> Result<Value> {
     publish_candidate(&plan, &candidate)?;
     plan.phase = "prepared".into();
     save(&plan)?;
-    let mut gate = MaintenanceGate::open(&plan)?;
+    let mut gate = open_gate(&plan)?;
     gate.retain_for_recovery();
     verified_handoff(&plan)
 }
@@ -1136,121 +1094,15 @@ fn previous_bundle(plan: &Plan) -> PathBuf {
     plan.root.join(format!(".bin-previous-{}", plan.id))
 }
 
-struct MaintenanceGate {
-    path: PathBuf,
-    id: String,
-    retain_on_drop: bool,
+fn open_gate(plan: &Plan) -> Result<MaintenanceGate> {
+    let candidate = candidate_executable(plan)?;
+    let hash = plan
+        .bundle_hashes
+        .as_ref()
+        .and_then(|hashes| hashes.get(binary_name()))
+        .ok_or_else(|| error("update_plan_invalid", "The candidate hash is missing."))?;
+    MaintenanceGate::open(&plan.root.join("state"), &plan.id, &candidate, hash)
 }
-
-impl MaintenanceGate {
-    fn open(plan: &Plan) -> Result<Self> {
-        let path = maintenance_path(&plan.root.join("state"));
-        let candidate = candidate_executable(plan)?;
-        let expected = plan
-            .bundle_hashes
-            .as_ref()
-            .and_then(|hashes| hashes.get(binary_name()))
-            .ok_or_else(|| error("update_plan_invalid", "The candidate hash is missing."))?;
-        let marker = json!({"plan_id":plan.id,"candidate":candidate,"candidate_sha256":expected,"drain":false});
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                serde_json::to_writer(&mut file, &marker).map_err(|_| {
-                    error("update_maintenance", "Cannot write the maintenance gate.")
-                })?;
-                file.sync_all().map_err(|_| {
-                    error("update_maintenance", "Cannot persist the maintenance gate.")
-                })?;
-            }
-            Err(reason) if reason.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing: Value = serde_json::from_slice(&fs::read(&path).map_err(|_| {
-                    error("update_maintenance", "Cannot inspect the maintenance gate.")
-                })?)
-                .map_err(|_| error("update_maintenance", "The maintenance gate is invalid."))?;
-                if existing["plan_id"] != marker["plan_id"]
-                    || existing["candidate"] != marker["candidate"]
-                    || existing["candidate_sha256"] != marker["candidate_sha256"]
-                {
-                    return Err(error(
-                        "update_busy",
-                        "A different update owns this managed root.",
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(error(
-                    "update_maintenance",
-                    "Cannot create the maintenance gate.",
-                ))
-            }
-        }
-        Ok(Self {
-            path,
-            id: plan.id.clone(),
-            retain_on_drop: false,
-        })
-    }
-
-    fn retain_for_recovery(&mut self) {
-        self.retain_on_drop = true;
-    }
-
-    fn set_drain(&self, drain: bool) -> Result<()> {
-        let mut marker: Value =
-            serde_json::from_slice(&fs::read(&self.path).map_err(|_| {
-                error("update_maintenance", "Cannot inspect the maintenance gate.")
-            })?)
-            .map_err(|_| error("update_maintenance", "The maintenance gate changed."))?;
-        if marker["plan_id"] != self.id {
-            return Err(error(
-                "update_maintenance",
-                "Another plan owns the maintenance gate.",
-            ));
-        }
-        marker["drain"] = json!(drain);
-        atomic_json(&self.path, &marker)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        let raw = fs::read(&self.path)
-            .map_err(|_| error("update_maintenance", "The maintenance gate disappeared."))?;
-        let marker: Value = serde_json::from_slice(&raw)
-            .map_err(|_| error("update_maintenance", "The maintenance gate changed."))?;
-        if marker["plan_id"] != self.id {
-            return Err(error(
-                "update_maintenance",
-                "Another plan owns the maintenance gate.",
-            ));
-        }
-        fs::remove_file(&self.path).map_err(|_| {
-            error(
-                "update_maintenance",
-                "Cannot reopen normal Agentlaw startup.",
-            )
-        })?;
-        self.retain_on_drop = true;
-        Ok(())
-    }
-}
-
-impl Drop for MaintenanceGate {
-    fn drop(&mut self) {
-        if !self.retain_on_drop {
-            if let Ok(raw) = fs::read(&self.path) {
-                if serde_json::from_slice::<Value>(&raw)
-                    .ok()
-                    .is_some_and(|marker| marker["plan_id"] == self.id)
-                {
-                    let _ = fs::remove_file(&self.path);
-                }
-            }
-        }
-    }
-}
-
 fn verified_broker_pid(plan: &Plan) -> Result<Option<sysinfo::Pid>> {
     let worker = plan.root.join("state/worker");
     let lock = match fs::OpenOptions::new()
@@ -1368,6 +1220,102 @@ fn wait_for_managed_processes(plan: &Plan, allow_workers: bool) -> Result<()> {
                 &format!(
                     "Agentlaw could not establish process exit before replacement: {}",
                     blockers.join(", ")
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn stop_runtime(plan: &Plan) -> Result<()> {
+    use agentlaw_runtime::{
+        client::{shutdown_installed, ClientError, ShutdownState},
+        installation::owner,
+        ports::RuntimeError,
+    };
+    let state = plan.root.join("state");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut retry = true;
+    let mut unresponsive = false;
+    let mut failure = None;
+    loop {
+        if retry {
+            match shutdown_installed(&state, "managed update") {
+                Ok(ShutdownState::NotRunning) => {}
+                Ok(ShutdownState::Stopping) => retry = false,
+                Err(ClientError::Runtime(RuntimeError::Unresponsive)) => {
+                    unresponsive = true;
+                    retry = false;
+                }
+                Err(e) => {
+                    failure = Some(format!("shutdown request failed: {e:?}"));
+                    retry = false;
+                }
+            }
+        }
+        let alive = owner::owner_alive(&state).map_err(|e| {
+            error(
+                "inspection_unknown",
+                &format!("Cannot inspect runtime owner: {e}"),
+            )
+        })?;
+        let broker = verified_broker_pid(plan)?;
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let blockers: Vec<String> = system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                if matches!(
+                    process.status(),
+                    ProcessStatus::Zombie | ProcessStatus::Dead
+                ) {
+                    return None;
+                }
+                if broker.is_some_and(|id| *pid == id || process.parent() == Some(id)) {
+                    return None;
+                }
+                let exe = process.exe()?;
+                let executable = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+                if !executable.starts_with(&plan.root) {
+                    return None;
+                }
+                if process
+                    .cmd()
+                    .iter()
+                    .any(|arg| arg == "runtime-host" || arg == "model-child")
+                {
+                    Some(format!("PID {}: {}", pid.as_u32(), executable.display()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !alive && blockers.is_empty() {
+            if unresponsive {
+                return Err(error("update_process_active", "The runtime did not respond to the shutdown request; inspect it before retrying replacement."));
+            }
+            if let Some(reason) = failure {
+                return Err(error("update_process_active", &reason));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let mut reasons = blockers;
+            if alive {
+                reasons.push("runtime owner lock is still held".into());
+            }
+            if unresponsive {
+                reasons.push("runtime shutdown was unresponsive".into());
+            }
+            if let Some(reason) = failure {
+                reasons.push(reason);
+            }
+            return Err(error(
+                "update_process_active",
+                &format!(
+                    "Agentlaw could not establish runtime exit before replacement: {}",
+                    reasons.join(", ")
                 ),
             ));
         }
@@ -1562,10 +1510,11 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
     } else {
         verify_staged(&plan)?;
     }
-    let mut gate = MaintenanceGate::open(&plan)?;
+    let mut gate = open_gate(&plan)?;
     if plan.phase != "prepared" {
         gate.retain_for_recovery();
     }
+    stop_runtime(&plan)?;
     wait_for_managed_processes(&plan, true)?;
     gate.set_drain(true)?;
     wait_for_managed_processes(&plan, false)?;
@@ -1728,7 +1677,9 @@ fn apply_live(id: &str, requested_root: &Path) -> Result<Value> {
         }
         if plan.phase == "verifying_candidate" {
             drop(install_lock.take());
-            probe_candidate_mcp(&plan)?;
+            let probe_result = probe_candidate_mcp(&plan);
+            stop_runtime(&plan)?;
+            probe_result?;
             wait_for_managed_processes(&plan, true)?;
             gate.set_drain(true)?;
             wait_for_managed_processes(&plan, false)?;

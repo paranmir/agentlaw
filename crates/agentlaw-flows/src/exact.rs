@@ -697,6 +697,9 @@ impl ExactSnapshot {
         source: &agentlaw_storage::published::SourceReadGuard<'_>,
         budget: DeltaBudget,
     ) -> Result<Self> {
+        if pinned.generation.epoch != pinned.minimum_ack.epoch {
+            return Err(not_ready());
+        }
         let mut snapshot = Self {
             position: pinned.minimum_ack.clone(),
             pinned,

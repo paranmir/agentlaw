@@ -60,11 +60,40 @@ pub enum DoctorMode {
 fn runtime_probe_to_worker(probe: agentlaw_runtime::client::Probe) -> Value {
     use agentlaw_runtime::client::Probe;
     match probe {
-        Probe::NotRunning { stale_endpoint: false } => json!({"status":"not_running"}),
-        Probe::NotRunning { stale_endpoint: true } => json!({"status":"not_running", "stale_endpoint":true}),
-        Probe::Unresponsive => json!({"code":"worker_diagnosis_incomplete", "message":"runtime_unresponsive: runtime did not respond."}),
-        Probe::Mismatch(reply) => json!({"code":"worker_diagnosis_incomplete", "message":format!("runtime mismatch: {reply:?}")}),
-        Probe::Running(snapshot) => serde_json::to_value(snapshot).unwrap_or_else(|_| json!({"code":"worker_diagnosis_incomplete", "message":"Cannot serialize runtime health."})),
+        Probe::NotRunning {
+            stale_endpoint: false,
+        } => json!({"status":"not_running"}),
+        Probe::NotRunning {
+            stale_endpoint: true,
+        } => json!({"status":"not_running", "stale_endpoint":true}),
+        Probe::Unresponsive => {
+            json!({"code":"worker_diagnosis_incomplete", "message":"runtime_unresponsive: runtime did not respond."})
+        }
+        Probe::Mismatch(reply) => {
+            json!({"code":"worker_diagnosis_incomplete", "message":format!("runtime mismatch: {reply:?}")})
+        }
+        Probe::Running(snapshot) => {
+            use agentlaw_runtime::ports::{ComponentKind, ComponentState};
+            let mut diagnostics = serde_json::Map::new();
+            let components: Vec<Value> = snapshot.components.into_iter().map(|(id, status)| {
+                let kind = format!("{:?}", id.kind).to_ascii_lowercase();
+                let state = format!("{:?}", status.state).to_ascii_lowercase();
+                if matches!(status.state, ComponentState::Failed | ComponentState::Degraded | ComponentState::Recovering) {
+                    if let Some(reason) = &status.reason {
+                        let key = match (id.kind, id.binding.as_deref()) {
+                            (ComponentKind::Model, _) => "model_load".to_owned(),
+                            (ComponentKind::Semantic, Some(binding)) => format!("vector_index:{binding}"),
+                            (_, Some(binding)) => format!("{kind}:{binding}"),
+                            _ => kind.clone(),
+                        };
+                        diagnostics.insert(key, json!(reason));
+                    }
+                }
+                let observed_at_ms = status.observed_at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                json!({"kind":kind,"binding":id.binding,"state":state,"reason":status.reason,"observed_at_ms":observed_at_ms})
+            }).collect();
+            json!({"status":"running","components":components,"activity":snapshot.activity,"diagnostics":diagnostics})
+        }
     }
 }
 
@@ -231,6 +260,10 @@ pub fn repair(state: &Path, control: agentlaw_flows::RequestControl) -> Result<V
         &selected.user_id,
         &identity.machine_id,
         config::coordination_root(state),
+    )?
+    .with_config_file(
+        std::path::absolute(state.join("config.json"))
+            .map_err(|e| DomainError::new("configuration_io", e.to_string()))?,
     )?;
     let worker_config = installed::worker_config(state)?;
     if worker_config.model.is_some() {

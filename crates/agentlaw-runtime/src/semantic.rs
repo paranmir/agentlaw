@@ -455,6 +455,8 @@ impl SemanticIndexer {
         let Some(lane) = state.schedule.lanes.remove(&LaneKey::current(binding)) else {
             return;
         };
+        lane.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
         let history_keys: Vec<_> = state
             .schedule
             .lanes

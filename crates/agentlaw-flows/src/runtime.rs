@@ -80,6 +80,7 @@ pub struct StoreIdentity {
     pub binding_id: String,
     pub history_limit: usize,
     pub response_limit: usize,
+    pub config_file: Option<PathBuf>,
 }
 pub struct ReadCtx<'a> {
     pub identity: &'a StoreIdentity,
@@ -109,6 +110,7 @@ pub struct Runtime {
     pub(crate) pump_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) background_error: std::sync::Arc<std::sync::Mutex<Option<DomainError>>>,
     pub(crate) history_response_limit: usize,
+    pub(crate) config_file: Option<PathBuf>,
     pub(crate) request_control: RequestControl,
 }
 #[derive(Clone)]
@@ -324,6 +326,16 @@ impl Runtime {
         self.history_response_limit = bytes;
         self
     }
+    pub fn with_config_file(mut self, path: PathBuf) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(DomainError::new(
+                "invalid_path",
+                "Configuration path must be absolute.",
+            ));
+        }
+        self.config_file = Some(path);
+        Ok(self)
+    }
     pub fn machine_id(&self) -> &str {
         &self.machine_id
     }
@@ -358,7 +370,7 @@ impl Runtime {
                         DomainError::new("invalid_input", "A history subject is required.")
                     })?;
                 validate_id(id)?;
-                crate::history_projection::project_with_worker(
+                crate::history_projection::project_with_worker_config(
                     &self.store,
                     &self.local,
                     &r,
@@ -367,6 +379,7 @@ impl Runtime {
                     self.worker
                         .as_deref()
                         .map(|client| (client, self.binding_id.as_str())),
+                    self.config_file.as_deref(),
                 )
             }
         }?;

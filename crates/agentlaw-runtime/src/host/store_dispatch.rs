@@ -49,7 +49,7 @@ pub(super) struct StoreDispatch {
     registry: Arc<ConfigRegistry>,
     stores: Arc<Stores>,
     setup: Mutex<()>,
-    worker: agentlaw_worker::RuntimeConfig,
+    assets: Arc<dyn Fn() -> Result<Option<agentlaw_worker::ModelAssets>, String> + Send + Sync>,
 }
 
 pub(super) enum Admitted {
@@ -63,17 +63,21 @@ impl StoreDispatch {
         state: PathBuf,
         registry: Arc<ConfigRegistry>,
         stores: Arc<Stores>,
-        worker: agentlaw_worker::RuntimeConfig,
+        assets: Arc<dyn Fn() -> Result<Option<agentlaw_worker::ModelAssets>, String> + Send + Sync>,
     ) -> Self {
         Self {
             state,
             registry,
             stores,
             setup: Mutex::new(()),
-            worker,
+            assets,
         }
     }
-    fn setup(&self, request: SetupRequest, control: &RequestControl) -> Result<Value, DomainError> {
+    fn setup(
+        &self,
+        request: SetupRequest,
+        control: &RequestControl,
+    ) -> Result<(Value, Option<usize>), DomainError> {
         let lane = self.setup.lock().unwrap_or_else(|e| e.into_inner());
         let mut follow_up = None;
         let result = match request {
@@ -82,35 +86,35 @@ impl StoreDispatch {
                     DomainError::new("invalid_path", "A memory store path is required.")
                 })?;
                 control.phase("preparing_memory_store");
-                let worker = self.worker.clone();
-                let (result, _) = setup::connect_selection_with_control(
+                let (result, _) = setup::connect_prepared(
                     &self.state,
                     Path::new(&path),
                     false,
-                    control.clone(),
-                    |_| Ok(worker),
+                    control,
+                    &self.registry,
+                    |snapshot, control| self.prepare(snapshot, control),
                 )?;
                 follow_up = Some(request);
                 result
             }
             SetupRequest::Command(SetupCommand::StoreConnect { path, create }) => {
-                let worker = self.worker.clone();
-                setup::connect_selection_with_control(
+                setup::connect_prepared(
                     &self.state,
                     &path,
                     create,
-                    control.clone(),
-                    |_| Ok(worker),
+                    control,
+                    &self.registry,
+                    |snapshot, control| self.prepare(snapshot, control),
                 )?
                 .0
             }
-            SetupRequest::Command(SetupCommand::ConfigSet { key, value }) => {
-                config::set_limit(&self.state, &key, &value)?
-            }
-            SetupRequest::Command(SetupCommand::MachineName { .. }) => unimplemented!(),
+            SetupRequest::Command(command) => setup::command(&self.state, &self.registry, command)?,
         };
-        let selected = read_config(&self.state);
-        self.registry.publish(selected.clone());
+        let selected = self.registry.current();
+        let limit = match &selected {
+            ConfigState::Ready(snapshot) => Some(snapshot.config.response_limit_bytes),
+            _ => None,
+        };
         self.stores.selection_changed();
         if let ConfigState::Ready(snapshot) = &selected {
             self.stores.prewarm(snapshot);
@@ -134,7 +138,7 @@ impl StoreDispatch {
             None
         };
         drop(lane);
-        if let (Some(request), Some((guard, snapshot))) = (follow_up, pinned) {
+        let value = if let (Some(request), Some((guard, snapshot))) = (follow_up, pinned) {
             if matches!(request.intent, None | Some(ConnectIntent::Discover))
                 && request.restore_context != Some(true)
             {
@@ -144,12 +148,41 @@ impl StoreDispatch {
             }
         } else {
             Ok(result)
-        }
+        }?;
+        Ok((value, limit))
+    }
+
+    fn prepare(
+        &self,
+        snapshot: &Arc<ConfigSnapshot>,
+        control: &RequestControl,
+    ) -> Result<Value, DomainError> {
+        let guard = self
+            .stores
+            .acquire(snapshot)
+            .map_err(|e| DomainError::new("store_unavailable", format!("{e:?}")))?;
+        let configured = (self.assets)()
+            .map_err(|e| DomainError::new("semantic_build_failed", e))?
+            .is_some();
+        guard.prepare_selection(control, configured)
     }
 }
 
 impl Dispatcher for StoreDispatch {
     type Admitted = Admitted;
+    fn response_limit(&self, admitted: &Admitted) -> Option<usize> {
+        match admitted {
+            Admitted::Query(_, s, QueryRequest::History(_)) => Some(
+                s.config
+                    .response_limit_bytes
+                    .min(s.config.history_response_limit_bytes),
+            ),
+            Admitted::Query(_, s, _) | Admitted::Command(_, s, _) => {
+                Some(s.config.response_limit_bytes)
+            }
+            Admitted::Setup(_) => None,
+        }
+    }
     fn admit(&self, target: &CallTarget, request: Classified) -> Result<Admitted, RejectReason> {
         match target {
             CallTarget::Store(reference) => {
@@ -182,7 +215,20 @@ impl Dispatcher for StoreDispatch {
             Admitted::Command(guard, snapshot, request) => {
                 guard.command_with_snapshot(request, &snapshot, control)
             }
+            Admitted::Setup(request) => self.setup(request, control).map(|(value, _)| value),
+        }
+    }
+    fn run_with_limit(
+        &self,
+        admitted: Admitted,
+        control: &RequestControl,
+    ) -> Result<(Value, Option<usize>), DomainError> {
+        match admitted {
             Admitted::Setup(request) => self.setup(request, control),
+            other => {
+                let limit = self.response_limit(&other);
+                self.run(other, control).map(|value| (value, limit))
+            }
         }
     }
 }

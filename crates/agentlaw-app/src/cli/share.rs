@@ -87,6 +87,10 @@ fn import(command: ImportCommand) -> Result<Value> {
                 &selected.user_id,
                 &identity.machine_id,
                 config::coordination_root(&state),
+            )?
+            .with_config_file(
+                std::path::absolute(state.join("config.json"))
+                    .map_err(|e| DomainError::new("configuration_io", e.to_string()))?,
             )?;
             let configuration = agentlaw_app::installed::worker_config(&state)?;
             if configuration.model.is_some() {

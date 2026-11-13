@@ -529,7 +529,10 @@ impl Store {
         }
     }
     fn validate_format(&self) -> Result<()> {
-        let file = File::open(self.root.join("format.md"))
+        Self::validate_existing_format(&self.root)
+    }
+    pub fn validate_existing_format(root: &Path) -> Result<()> {
+        let file = File::open(root.join("format.md"))
             .map_err(|_| Error::Corrupt("not an Agentlaw source: format.md required".into()))?;
         let frames = codec::read("format", &mut BufReader::new(file))?;
         if frames.len() != 1

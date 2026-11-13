@@ -549,6 +549,7 @@ fn interrupted_initialization_can_retry_before_marker_is_written() {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let invalid = dir.path().join("not-a-directory");
     std::fs::write(&invalid, b"file").unwrap();
@@ -562,6 +563,7 @@ fn interrupted_initialization_can_retry_before_marker_is_written() {
         binding_id: identity.binding_id.clone(),
         history_limit: identity.history_limit,
         response_limit: identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     assert!(StoreService::open(identity, invalid_deps, &RequestControl::default()).is_err());
     assert!(!local.join("control-initialized.json").exists());
@@ -585,6 +587,7 @@ fn established_binding_with_missing_fence_is_not_reinitialized() {
         binding_id: service.identity.binding_id.clone(),
         history_limit: service.identity.history_limit,
         response_limit: service.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let fence = retry.local.join("canonical/source-fence");
     let saved = retry.local.join("canonical/saved-fence");
@@ -623,6 +626,7 @@ fn startup_rediscovers_and_removes_retired_files() {
         binding_id: service.identity.binding_id.clone(),
         history_limit: service.identity.history_limit,
         response_limit: service.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     service.close();
     drop(service);
@@ -646,6 +650,7 @@ fn corrupt_control_bytes_are_preserved_and_open_fails() {
         binding_id: service.identity.binding_id.clone(),
         history_limit: service.identity.history_limit,
         response_limit: service.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     service.close();
     drop(service);
@@ -670,6 +675,7 @@ fn corrupt_source_fence_is_preserved_and_open_fails() {
         binding_id: service.identity.binding_id.clone(),
         history_limit: service.identity.history_limit,
         response_limit: service.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     service.close();
     drop(service);
@@ -706,6 +712,7 @@ fn locked_retired_file_is_retried_on_next_start() {
         binding_id: service.identity.binding_id.clone(),
         history_limit: service.identity.history_limit,
         response_limit: service.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     service.close();
     drop(service);
@@ -721,6 +728,7 @@ fn locked_retired_file_is_retried_on_next_start() {
         binding_id: reopened.identity.binding_id.clone(),
         history_limit: reopened.identity.history_limit,
         response_limit: reopened.identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     reopened.close();
     drop(reopened);

@@ -1,5 +1,4 @@
 use super::*;
-use crate::protocol::*;
 use agentlaw_contracts::{wire, DomainError, RequestControl};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};

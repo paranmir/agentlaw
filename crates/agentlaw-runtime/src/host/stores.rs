@@ -1,22 +1,27 @@
 //! Per-binding ownership of store services.
 use crate::{
     installation::{
-        config, machine,
+        config,
         registry::{ConfigRegistry, ConfigSnapshot, ConfigState},
     },
     ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus},
     projection::ProjectionConfig,
     protocol::{BindingRef, RejectReason},
-    store::service::{StoreDeps, StoreService},
+    store::{
+        identity,
+        service::{StoreDeps, StoreService},
+    },
 };
 use agentlaw_contracts::RequestControl;
-use agentlaw_flows::runtime::StoreIdentity;
 use agentlaw_storage::BindingKey;
 use std::{
     collections::HashMap,
     ops::Deref,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::SystemTime,
 };
 
@@ -32,6 +37,7 @@ enum Entry {
 
 struct State {
     entries: HashMap<BindingRef, Entry>,
+    stopping: bool,
 }
 
 struct Inner {
@@ -40,6 +46,7 @@ struct Inner {
     deps: StoreDeps,
     installation: PathBuf,
     registry: Arc<ConfigRegistry>,
+    prewarm_cancel: Arc<AtomicBool>,
 }
 
 pub(super) struct Stores(Arc<Inner>);
@@ -65,31 +72,18 @@ impl Inner {
         state.entries.remove(&reference);
         self.changed.notify_all();
     }
-    fn open(&self, snapshot: &ConfigSnapshot) -> Result<StoreService, String> {
-        config::require_existing_binding(&self.installation, &snapshot.config)
-            .map_err(|e| e.to_string())?;
-        let local = snapshot.config.runtime_root(&self.installation);
-        let marker: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(local.join("control-initialized.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let binding_id = marker
-            .get("binding_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing binding identity")?
-            .to_owned();
-        let machine_id = machine::load_or_create(&self.installation)
-            .map_err(|e| e.to_string())?
-            .machine_id;
-        let identity = StoreIdentity {
-            root: snapshot.config.memory_store_path.clone(),
-            local,
-            user_id: snapshot.config.user_id.clone(),
-            machine_id,
-            binding_id,
-            history_limit: snapshot.config.history_response_limit_bytes,
-            response_limit: snapshot.config.response_limit_bytes,
-        };
+    fn open(
+        &self,
+        snapshot: &ConfigSnapshot,
+        control: &RequestControl,
+    ) -> Result<StoreService, String> {
+        if matches!(self.registry.current(), ConfigState::Ready(current) if current.key == snapshot.key)
+        {
+            config::require_existing_binding(&self.installation, &snapshot.config)
+                .map_err(|e| e.to_string())?;
+        }
+        let identity =
+            identity::resolve(&self.installation, snapshot).map_err(|e| e.to_string())?;
         let deps = StoreDeps {
             health: self.deps.health.clone(),
             semantic: self.deps.semantic.clone(),
@@ -102,7 +96,7 @@ impl Inner {
             coordination: self.deps.coordination.clone(),
             state: self.deps.state.clone(),
         };
-        StoreService::open(identity, deps, &RequestControl::default()).map_err(|e| e.to_string())
+        StoreService::open(identity, deps, control).map_err(|e| e.to_string())
     }
 }
 
@@ -115,20 +109,32 @@ impl Stores {
         Self(Arc::new(Inner {
             state: Mutex::new(State {
                 entries: HashMap::new(),
+                stopping: false,
             }),
             changed: Condvar::new(),
             deps,
             installation,
             registry,
+            prewarm_cancel: Arc::new(AtomicBool::new(false)),
         }))
     }
     pub(super) fn acquire(
         &self,
         snapshot: &Arc<ConfigSnapshot>,
     ) -> Result<StoreGuard, RejectReason> {
+        self.acquire_with_control(snapshot, &RequestControl::default())
+    }
+    fn acquire_with_control(
+        &self,
+        snapshot: &Arc<ConfigSnapshot>,
+        control: &RequestControl,
+    ) -> Result<StoreGuard, RejectReason> {
         let reference = snapshot.reference;
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            if state.stopping {
+                return Err(RejectReason::Stopping);
+            }
             match state.entries.get_mut(&reference) {
                 Some(Entry::Open {
                     service, active, ..
@@ -150,7 +156,7 @@ impl Stores {
                 None => {
                     state.entries.insert(reference, Entry::Opening);
                     drop(state);
-                    let result = self.0.open(snapshot);
+                    let result = self.0.open(snapshot, control);
                     state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
                     match result {
                         Ok(service) => {
@@ -181,10 +187,13 @@ impl Stores {
         }
     }
     pub(super) fn prewarm(&self, snapshot: &Arc<ConfigSnapshot>) {
-        if let Err(error) = self.acquire(snapshot) {
+        let control = RequestControl::new(self.0.prewarm_cancel.clone(), |_| {});
+        if let Err(error) = self.acquire_with_control(snapshot, &control) {
             self.0.deps.health.publish(
                 ComponentId {
-                    binding: Some(format!("{:?}", snapshot.reference)),
+                    binding: identity::resolve(&self.0.installation, snapshot)
+                        .ok()
+                        .map(|id| id.binding_id),
                     kind: ComponentKind::Store,
                 },
                 ComponentStatus {
@@ -222,6 +231,7 @@ impl Stores {
         }
     }
     pub(super) fn close_all(&self) {
+        self.stop_opening();
         loop {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.entries.is_empty() {
@@ -253,6 +263,14 @@ impl Stores {
             for (reference, service) in closing {
                 self.0.close(reference, service);
             }
+        }
+    }
+    pub(super) fn stop_opening(&self) {
+        self.0.prewarm_cancel.store(true, Ordering::Release);
+        {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.stopping = true;
+            self.0.changed.notify_all();
         }
     }
 }

@@ -27,6 +27,9 @@ pub fn adapt(mut value: Value, state: &Path, limit: usize) -> Result<Value> {
     {
         notice.insert("config_file".into(), json!(config_path));
     }
+    if value.get("code").and_then(Value::as_str) == Some("complete_content_in_file") {
+        return Ok(value);
+    }
     let mut size = Count(0);
     serde_json::to_writer(&mut size, &value).map_err(|_| failure())?;
     if size.0 <= limit as u64 {

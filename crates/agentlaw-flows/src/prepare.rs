@@ -121,6 +121,7 @@ impl Preparation for Runtime {
             binding_id: self.binding_id.clone(),
             history_limit: self.history_response_limit,
             response_limit: self.history_response_limit,
+            config_file: self.config_file.clone(),
         }
     }
     fn request(&self) -> &RequestControl {
@@ -191,6 +192,7 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
             binding_id: id.binding_id.clone(),
             history_limit: id.history_limit,
             response_limit: id.response_limit,
+            config_file: id.config_file.clone(),
         }
     }
     fn request(&self) -> &RequestControl {

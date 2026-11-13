@@ -212,6 +212,7 @@ impl MutationLane {
                         binding_id: identity.binding_id.clone(),
                         history_limit,
                         response_limit,
+                        config_file: identity.config_file.clone(),
                     };
                     let mut ctx = LaneCtx {
                         identity: &request_identity,

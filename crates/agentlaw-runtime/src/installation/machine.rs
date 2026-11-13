@@ -14,16 +14,13 @@ fn err() -> DomainError {
 }
 
 pub fn load_or_create(state: &Path) -> Result<Machine> {
-    let path = state.join("machine.json");
-    if path.exists() {
-        let value = agentlaw_contracts::validation::decode_unique(
-            &fs::read_to_string(&path).map_err(|_| err())?,
-        )?;
-        let machine: Machine = serde_json::from_value(value).map_err(|_| err())?;
-        agentlaw_storage::validate_id(&machine.machine_id).map_err(|_| err())?;
+    if let Some(machine) = inspect(state)? {
         return Ok(machine);
     }
-    fs::create_dir_all(state).map_err(|_| err())?;
+    let path = state.join("machine.json");
+    {
+        fs::create_dir_all(state).map_err(|_| err())?;
+    }
     if state.join("config.json").exists() {
         return Err(err());
     }
@@ -41,6 +38,20 @@ pub fn load_or_create(state: &Path) -> Result<Machine> {
     match tmp.persist_noclobber(&path) {
         Ok(_) => Ok(machine),
         Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => load_or_create(state),
+        Err(_) => Err(err()),
+    }
+}
+
+pub fn inspect(state: &Path) -> Result<Option<Machine>> {
+    let path = state.join("machine.json");
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let value = agentlaw_contracts::validation::decode_unique(&text)?;
+            let machine: Machine = serde_json::from_value(value).map_err(|_| err())?;
+            agentlaw_storage::validate_id(&machine.machine_id).map_err(|_| err())?;
+            Ok(Some(machine))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(err()),
     }
 }

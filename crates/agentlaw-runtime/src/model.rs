@@ -141,6 +141,11 @@ pub fn run_model_component(
             break Ok(());
         }
         let snapshot = supervisor.snapshot();
+        if snapshot.state == WorkerState::Failed {
+            break Err(snapshot
+                .cause
+                .unwrap_or_else(|| "model start failed".into()));
+        }
         let (state, reason) = match snapshot.state {
             WorkerState::Ready => (ComponentState::Ready, None),
             WorkerState::Starting | WorkerState::Loading => {

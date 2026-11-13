@@ -50,6 +50,7 @@ struct Inner {
     clock: Clock,
     warm_delivery: Mutex<bool>,
     on_warm: Arc<dyn Fn(bool) + Send + Sync>,
+    on_stopping: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 #[derive(Clone)]
 pub struct Lifecycle {
@@ -73,6 +74,7 @@ impl Lifecycle {
                 clock,
                 warm_delivery: Mutex::new(false),
                 on_warm,
+                on_stopping: Mutex::new(None),
             }),
         }
     }
@@ -81,6 +83,24 @@ impl Lifecycle {
     }
     pub fn counts(&self) -> ActivityCounts {
         self.inner.activity.counts()
+    }
+    pub fn set_on_stopping(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .on_stopping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    }
+    fn notify_stopping(&self) {
+        if let Some(callback) = self
+            .inner
+            .on_stopping
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            callback();
+        }
     }
     fn deliver_warm(&self) {
         let mut delivered = self
@@ -150,6 +170,7 @@ impl Lifecycle {
                 .is_some_and(|since| now.saturating_duration_since(since) >= DEFAULT_IDLE_TIMEOUT)
         {
             state.phase = LifecycleState::Stopping;
+            self.notify_stopping();
         }
         let result = PollResult { state: state.phase };
         drop(state);
@@ -174,6 +195,7 @@ impl Lifecycle {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.phase == LifecycleState::Running {
             state.phase = LifecycleState::Stopping;
+            self.notify_stopping();
         }
     }
     /// Call after draining accepted work; checkpoint and model cleanup run without the lock.

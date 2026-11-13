@@ -185,6 +185,7 @@ fn many_branch_and_merge_objects_use_file_delivery_before_value_allocation() {
         &RequestControl::default(),
         None,
         true,
+        None,
     )
     .unwrap();
     assert_eq!(result["code"], "complete_content_in_file");
@@ -376,6 +377,7 @@ fn semantic_candidates_use_the_acquired_change_id_and_epoch() {
         binding_id: "binding".into(),
         history_limit: 65536,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let mut ordered = changes.clone();
     ordered.sort();
@@ -493,6 +495,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         binding_id: "binding".into(),
         history_limit: 65536,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     for offer in [
         crate::semantic::OfferResult::Busy,
@@ -604,6 +607,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         machine_id: identity.machine_id.clone(),
         binding_id: identity.binding_id.clone(),
         response_limit: identity.response_limit,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let busy = ReadyHistory {
         offer: crate::semantic::OfferResult::Busy,
@@ -765,6 +769,7 @@ fn memory_and_file_workspace_artifacts_share_guidance_and_complete_content() {
             binding_id: "binding".into(),
             history_limit: 128,
             response_limit: 128,
+            config_file: Some(std::path::PathBuf::from("test-config.json")),
         };
         let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
         let ctx = crate::runtime::ReadCtx {
@@ -779,10 +784,17 @@ fn memory_and_file_workspace_artifacts_share_guidance_and_complete_content() {
         let expected = project(&store, &local, &request(&id), 2_000_000, &control).unwrap();
         let result = history(&ctx, &request(&id)).unwrap();
         assert_eq!(result["code"], "complete_content_in_file");
-        let actual: Value = serde_json::from_reader(
+        let mut actual: Value = serde_json::from_reader(
             File::open(result["artifact"]["path"].as_str().unwrap()).unwrap(),
         )
         .unwrap();
+        // The file body carries the limit notice with the installation config
+        // path; everything else is the complete history result.
+        assert_eq!(
+            actual["response_limit"]["config_file"],
+            json!(identity.config_file)
+        );
+        actual.as_object_mut().unwrap().remove("response_limit");
         assert_eq!(actual, expected);
         let guidance = result["next_action"].as_str().unwrap();
         assert!(guidance.contains("cannot access the path"));
@@ -862,6 +874,7 @@ fn oversized_acquired_history_uses_a_removed_temporary_workspace() {
         binding_id: "binding".into(),
         history_limit: 128 * 1024 * 1024,
         response_limit: 128 * 1024 * 1024,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
     let ctx = crate::runtime::ReadCtx {
@@ -931,6 +944,7 @@ fn serialized_response_below_budget_is_file_delivered_when_assembly_would_exceed
         binding_id: "binding".into(),
         history_limit: 128 * 1024 * 1024,
         response_limit: 128 * 1024 * 1024,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
     let ctx = crate::runtime::ReadCtx {

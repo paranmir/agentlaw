@@ -38,6 +38,7 @@ fn procedure_authorization_is_consumed_and_publication_is_recorded() {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let request = RequestControl::default();
     let mut ctx = LaneCtx {
@@ -108,6 +109,7 @@ fn cancellation_before_decision_preserves_source_and_retains_submission() {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let normal = RequestControl::default();
     let token = uuid::Uuid::new_v4();
@@ -173,6 +175,7 @@ fn decided_publication_recovers_even_if_request_was_cancelled() {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let mutation = procedure(&identity.machine_id);
     let entity = mutation.unit.entity_id.clone();
@@ -217,6 +220,7 @@ fn connect_rechecks_catalog_and_persists_association_before_follow_up() {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let request = RequestControl::default();
     let mut ctx = LaneCtx {

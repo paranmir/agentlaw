@@ -1,20 +1,15 @@
 //! Control and data listeners, connection admission and reservations.
-use super::{
-    dispatch::Dispatcher,
-    health,
-    lifecycle::{Lifecycle, LifecycleState},
-    mailbox::Mailbox,
-};
+use super::{dispatch::Dispatcher, health, lifecycle::Lifecycle, mailbox::Mailbox};
 use crate::{
     installation::{
-        delivery,
+        config, delivery,
         registry::{ConfigRegistry, ConfigState},
     },
     ports::{ActivityKind, HealthSink},
     protocol::*,
     transport,
 };
-use agentlaw_contracts::{wire, RequestControl};
+use agentlaw_contracts::RequestControl;
 use std::{
     collections::HashMap,
     io::{self, Read},
@@ -275,11 +270,21 @@ fn serve_control<D: Dispatcher>(mut stream: TcpStream, ctx: Arc<Context<D>>) {
                 ctx.lifecycle.stop();
                 ControlReply::ShutdownAccepted
             }
-            ControlRequest::ConfigGet { .. } => {
-                ControlReply::ConfigError(agentlaw_contracts::DomainError::new(
-                    "unimplemented",
-                    "ConfigGet is not implemented.",
-                ))
+            ControlRequest::ConfigGet { key } => {
+                let result = match ctx.registry.current() {
+                    ConfigState::Ready(snapshot) => {
+                        config::get_value(&ctx.state, Some(&snapshot.config), &key)
+                    }
+                    ConfigState::Missing => config::get_value(&ctx.state, None, &key),
+                    ConfigState::Invalid(reason) => Err(agentlaw_contracts::DomainError::new(
+                        "invalid_configuration",
+                        reason,
+                    )),
+                };
+                match result {
+                    Ok(value) => ControlReply::Config(value),
+                    Err(error) => ControlReply::ConfigError(error),
+                }
             }
         };
         if transport::send(&mut stream, &reply, MAX_CONTROL_REPLY_BYTES).is_err() {
@@ -324,9 +329,6 @@ fn admit_call<D: Dispatcher>(
     }
     let body_reservation =
         reserve_body(&ctx, u64::from(header.body_len)).ok_or(RejectReason::Busy)?;
-    if ctx.lifecycle.state() != LifecycleState::Running {
-        return Err(RejectReason::Stopping);
-    }
     let flag = Arc::new(AtomicBool::new(false));
     {
         let mut active = ctx.active.lock().unwrap();
@@ -343,27 +345,26 @@ fn admit_call<D: Dispatcher>(
     if stream.read_exact(&mut body).is_err() {
         return Ok(());
     }
-    let request = wire::decode_wire(&body).map_err(RejectReason::InvalidBody)?;
+    let classified = decode_body(header.kind, &body)?;
     drop(body);
-    let classified = classify(request);
-    if classified.kind() != header.kind {
-        return Err(RejectReason::KindMismatch);
-    }
-    let admitted = ctx.dispatcher.admit(&header.target, classified)?;
     let guard = ctx
         .lifecycle
         .begin(ActivityKind::Execution)
         .map_err(|e| e.stopping_reason().unwrap_or(RejectReason::Busy))?;
-    let limit = match header.target {
-        CallTarget::Store(reference) => ctx
-            .registry
-            .resolve(&reference)
-            .ok()
-            .map(|s| s.config.response_limit_bytes),
+    let history = matches!(&classified, Classified::Query(QueryRequest::History(_)));
+    let fallback = match header.target {
+        CallTarget::Store(reference) => ctx.registry.resolve(&reference).ok().map(|s| {
+            if history {
+                s.config
+                    .response_limit_bytes
+                    .min(s.config.history_response_limit_bytes)
+            } else {
+                s.config.response_limit_bytes
+            }
+        }),
         CallTarget::Setup => None,
-    }
-    .unwrap_or(MAX_RESULT_FRAME_BYTES as usize)
-    .min(MAX_RESULT_FRAME_BYTES as usize);
+    };
+    let admitted = ctx.dispatcher.admit(&header.target, classified)?;
     let mailbox = Arc::new(Mailbox::new(id, 16));
     let output = mailbox.clone();
     thread::spawn(move || {
@@ -373,7 +374,7 @@ fn admit_call<D: Dispatcher>(
             flag,
             output,
             id,
-            limit,
+            fallback,
             (guard, registration, slot, body_reservation),
         )
     });
@@ -386,7 +387,7 @@ fn run_execution<D: Dispatcher>(
     flag: Arc<AtomicBool>,
     mailbox: Arc<Mailbox>,
     id: RequestId,
-    limit: usize,
+    fallback: Option<usize>,
     resources: (
         super::lifecycle::LifecycleGuard,
         Registration,
@@ -398,8 +399,17 @@ fn run_execution<D: Dispatcher>(
     let control = RequestControl::new(flag, move |phase| progress.publish_progress(phase));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.dispatcher
-            .run(admitted, &control)
-            .and_then(|value| delivery::adapt(value, &ctx.state, limit))
+            .run_with_limit(admitted, &control)
+            .and_then(|(value, selected)| {
+                delivery::adapt(
+                    value,
+                    &ctx.state,
+                    selected
+                        .or(fallback)
+                        .unwrap_or(MAX_RESULT_FRAME_BYTES as usize)
+                        .min(MAX_RESULT_FRAME_BYTES as usize),
+                )
+            })
     }));
     let terminal = match result {
         Ok(Ok(result)) => DataFrame::Completed { id, result },

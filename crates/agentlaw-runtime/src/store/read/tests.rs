@@ -64,6 +64,7 @@ impl Fixture {
             binding_id: runtime.binding_id().into(),
             history_limit: 8192,
             response_limit: limit,
+            config_file: Some(std::path::PathBuf::from("test-config.json")),
         };
         Self {
             dir,

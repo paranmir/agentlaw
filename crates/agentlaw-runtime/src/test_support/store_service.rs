@@ -26,6 +26,7 @@ pub fn fixture() -> (tempfile::TempDir, StoreIdentity) {
         binding_id: id(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     (dir, identity)
 }

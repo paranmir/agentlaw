@@ -84,7 +84,7 @@ fn fetch() -> Option<String> {
 
 impl Advisor {
     pub fn maintenance_path(&self) -> PathBuf {
-        self.state.join("update-maintenance.json")
+        agentlaw_runtime::installation::gate::path(&self.state)
     }
     pub fn new(state: PathBuf) -> Self {
         let advisor = Self {

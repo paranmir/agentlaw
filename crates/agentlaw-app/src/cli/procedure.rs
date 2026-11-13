@@ -36,6 +36,10 @@ fn search(args: ProcedureSearchArgs) -> Result<Option<Value>> {
         &selected.user_id,
         &identity.machine_id,
         config::coordination_root(&state),
+    )?
+    .with_config_file(
+        std::path::absolute(state.join("config.json"))
+            .map_err(|e| DomainError::new("configuration_io", e.to_string()))?,
     )?;
     let worker = agentlaw_app::installed::worker_config(&state)?;
     if worker.model.is_some() {

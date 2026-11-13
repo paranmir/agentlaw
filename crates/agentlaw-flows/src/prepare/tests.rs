@@ -77,6 +77,7 @@ impl Fixture {
             binding_id: uuid::Uuid::new_v4().to_string(),
             history_limit: 8192,
             response_limit: 65536,
+            config_file: Some(std::path::PathBuf::from("test-config.json")),
         };
         let mut writer = ControlWriter::open(&local).unwrap();
         writer.bind_identity(&identity).unwrap();

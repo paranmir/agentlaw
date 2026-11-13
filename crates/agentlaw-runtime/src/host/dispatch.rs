@@ -12,4 +12,15 @@ pub trait Dispatcher: Send + Sync + 'static {
     ) -> Result<Self::Admitted, RejectReason>;
     fn run(&self, admitted: Self::Admitted, control: &RequestControl)
         -> Result<Value, DomainError>;
+    fn response_limit(&self, _admitted: &Self::Admitted) -> Option<usize> {
+        None
+    }
+    fn run_with_limit(
+        &self,
+        admitted: Self::Admitted,
+        control: &RequestControl,
+    ) -> Result<(Value, Option<usize>), DomainError> {
+        let limit = self.response_limit(&admitted);
+        self.run(admitted, control).map(|value| (value, limit))
+    }
 }

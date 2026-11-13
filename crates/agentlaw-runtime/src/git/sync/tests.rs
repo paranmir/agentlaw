@@ -675,6 +675,7 @@ fn handle_sync_completes_with_legacy_response_shape() {
         binding_id: uid(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let mut dependencies = deps(f._temp.path());
     dependencies.coordination = f.store.coordination_root().to_owned();
@@ -803,6 +804,7 @@ fn sync_service(f: &Fixture) -> crate::store::service::StoreService {
         binding_id: uid(),
         history_limit: 8192,
         response_limit: 65536,
+        config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let mut dependencies = crate::test_support::store_service::deps(f._temp.path());
     dependencies.coordination = f.store.coordination_root().to_owned();

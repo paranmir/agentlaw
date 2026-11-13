@@ -7,7 +7,7 @@ use super::{
     },
     general, help, input, procedure, share, sync,
 };
-use agentlaw_app::{config, installed::InstalledBackend, Backend};
+use agentlaw_app::{config, frontend::RuntimeBackend, Backend};
 use agentlaw_contracts::{DomainError, Result};
 use serde_json::Value;
 use std::{io, path::PathBuf};
@@ -30,7 +30,9 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
         Command::Schema => agentlaw_app::schema(),
         Command::Call(_) => {
             let request = agentlaw_contracts::parse_request(&input::read_stdin()?)?;
-            InstalledBackend::start()?.call_with_control(request, cli_control())?
+            let state = config::state_root()?;
+            agentlaw_app::update::managed::check_frontend_start(&state)?;
+            RuntimeBackend::new(state, false)?.call_with_control(request, cli_control())?
         }
         Command::Mcp {
             command: McpCommand::Serve(args),
@@ -43,7 +45,7 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             }
             let state = config::state_root()?;
             agentlaw_app::update::managed::check_frontend_start(&state)?;
-            let backend = InstalledBackend::start()?;
+            let backend = RuntimeBackend::new(state.clone(), true)?;
             let advisor = agentlaw_app::update::Advisor::new(state);
             agentlaw_app::transport::serve_with_advisor(
                 io::BufReader::new(io::stdin()),

@@ -411,6 +411,7 @@ pub fn recall(
         None,
         DeltaBudget::default(),
         &prepared.queries,
+        None,
     )
 }
 
@@ -445,7 +446,15 @@ pub fn recall_prepared(
     if let Some(id) = project_id {
         validate_id(id)?;
     }
-    recall_scoped(ctx, exact, request, project_id, budget, &prepared.queries)
+    recall_scoped(
+        ctx,
+        exact,
+        request,
+        project_id,
+        budget,
+        &prepared.queries,
+        None,
+    )
 }
 
 fn recall_scoped(
@@ -455,6 +464,7 @@ fn recall_scoped(
     fixed_project: Option<&str>,
     budget: DeltaBudget,
     prepared: &[PreparedQuery],
+    outer: Option<Value>,
 ) -> Result<Value> {
     ctx.request.check()?;
     let mut context = if let Some(project_id) = fixed_project {
@@ -488,7 +498,7 @@ fn recall_scoped(
                         recall_for: None,
                     },
                 )?;
-                let mut result = json!({"status":"needs_user_input", "code":"project_connection_required", "message":"Choose a project memory for this folder.", "project_path":request.project_path, "candidates":discovery["candidates"], "turn_instruction":"Project rules, Tasks and work targets have not been checked. Read partial_recall or its error; select or create a project explicitly, then repeat the original request."});
+                let mut result = json!({"status":"needs_user_input", "code":"project_connection_required", "message":"Choose a project memory for this folder.", "project_path":request.project_path, "candidates":discovery["candidates"], "turn_instruction":"Project rules, active Tasks and work targets have not been checked. Read partial_recall or its error; select or create a project explicitly, then repeat the original request."});
                 if request.recall_for.is_some() {
                     let mut partial = request.clone();
                     partial.project_path = None;
@@ -506,8 +516,9 @@ fn recall_scoped(
                         None,
                         budget,
                         &prepared[..prepared.len().min(1)],
+                        Some(result.clone()),
                     ) {
-                        Ok(value) => result["partial_recall"] = value,
+                        Ok(value) => return Ok(value),
                         Err(error) if error.code == "cancelled" => return Err(error),
                         Err(error) => result["partial_recall_error"] = to_value(error)?,
                     }
@@ -1296,7 +1307,13 @@ fn recall_scoped(
         result["pending_work_instruction"] = json!("Retained proposals need attention. Inspect the listed pending batch before revising or continuing it.");
     }
     ctx.request.check()?;
-    fit_response(ctx, &snapshot.streaming, result, required_procedure_count)
+    fit_response(
+        ctx,
+        &snapshot.streaming,
+        result,
+        required_procedure_count,
+        outer,
+    )
 }
 
 fn update_candidate_diagnostics(value: &mut Value, original: &Value, required: usize) {
@@ -1356,11 +1373,29 @@ fn fit_response(
     streaming: &streaming::StreamedSelection,
     value: Value,
     required_procedure_count: usize,
+    outer: Option<Value>,
 ) -> Result<Value> {
     let limit = ctx.identity.response_limit.min(256 * 1024 * 1024);
-    if streaming.serialized_size(&value, ctx.request)? <= limit {
-        return streaming.inline(&value, ctx.request);
+    let wrap = |partial: &Value| {
+        if let Some(mut result) = outer.clone() {
+            result["partial_recall"] = partial.clone();
+            result
+        } else {
+            partial.clone()
+        }
+    };
+    if streaming.serialized_size(&wrap(&value), ctx.request)? <= limit {
+        return streaming.inline(&wrap(&value), ctx.request);
     }
+    let config_file = ctx
+        .identity
+        .config_file
+        .as_ref()
+        .map(|path| json!(path))
+        .unwrap_or_else(|| {
+            json!("Use agentlaw config path to obtain the installation configuration file.")
+        });
+    let notice = json!({"applied_bytes": limit, "config_key":"response_limit_bytes", "config_file":config_file, "user_notice":"The result exceeds the configured response size."});
     let candidates = value["candidates"].as_array().cloned().unwrap_or_default();
     let procedures = value["learned_procedures"]
         .as_array()
@@ -1368,6 +1403,7 @@ fn fit_response(
         .unwrap_or_default();
     let required = required_procedure_count.min(procedures.len());
     let mut base = value.clone();
+    base["response_limit"] = notice.clone();
     base["candidates"] = json!([]);
     base["learned_procedures"] = json!(procedures[..required]);
     if base.get("candidate_counts").is_some() {
@@ -1378,8 +1414,10 @@ fn fit_response(
         object.remove("task_instruction");
     }
     update_candidate_diagnostics(&mut base, &value, required);
-    if streaming.serialized_size(&base, ctx.request)? > limit {
-        return streaming.finish_read(&base, &ctx.identity.local, ctx.request);
+    if streaming.serialized_size(&wrap(&base), ctx.request)? > limit {
+        let mut complete = wrap(&value);
+        complete["response_limit"] = notice;
+        return streaming.finish_read(&complete, &ctx.identity.local, ctx.request);
     }
     let task_instruction = value.get("task_instruction").cloned();
     let mut memory_groups: Vec<Vec<Value>> = Vec::new();
@@ -1409,7 +1447,7 @@ fn fit_response(
             }
         }
         update_candidate_diagnostics(&mut trial, &value, required);
-        if streaming.serialized_size(&trial, ctx.request)? <= limit {
+        if streaming.serialized_size(&wrap(&trial), ctx.request)? <= limit {
             base = trial;
             shown_memories += 1;
         }
@@ -1436,12 +1474,12 @@ fn fit_response(
             .extend(group);
         trial["candidate_counts"]["learned_procedures"]["shown"] = json!(shown_procedures + 1);
         update_candidate_diagnostics(&mut trial, &value, required);
-        if streaming.serialized_size(&trial, ctx.request)? <= limit {
+        if streaming.serialized_size(&wrap(&trial), ctx.request)? <= limit {
             base = trial;
             shown_procedures += 1;
         }
     }
-    streaming.inline(&base, ctx.request)
+    streaming.inline(&wrap(&base), ctx.request)
 }
 
 fn restore_procedure_versions(value: &mut Value, streaming: &streaming::StreamedSelection) {

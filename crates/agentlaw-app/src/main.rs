@@ -17,8 +17,7 @@ fn main() {
         let gate_state = state.clone();
         let assets_state = state.clone();
         let assets = std::sync::Arc::new(move || {
-            agentlaw_app::install::installed_assets(&assets_state)
-                .map_err(|error| error.to_string())
+            agentlaw_app::installed::model_assets(&assets_state).map_err(|error| error.to_string())
         });
         let installation_build = match agentlaw_runtime::installation::build_identity(&executable) {
             Ok(build) => build,
@@ -30,7 +29,7 @@ fn main() {
             assets,
             installation_build,
             start_gate: std::sync::Arc::new(move || {
-                agentlaw_app::update::managed::check_frontend_start(&gate_state)
+                agentlaw_runtime::installation::gate::check_start(&gate_state)
             }),
         };
         let code = match agentlaw_runtime::host::run(deps) {
