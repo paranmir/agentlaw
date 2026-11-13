@@ -100,6 +100,7 @@ fn request(kind: RequestKind) -> ValidatedRequest {
         RequestKind::Setup => {
             json!({"action":"connect_project_memory", "connect_project_memory":{"project_path":"C:/work/app", "memory_store_path":"C:/work/store"}})
         }
+        RequestKind::Admin => panic!("Admin is not a public request"),
     };
     ValidatedRequest::parse_public(&input.to_string()).unwrap()
 }

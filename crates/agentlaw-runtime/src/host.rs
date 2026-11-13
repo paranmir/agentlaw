@@ -5,6 +5,7 @@ pub mod dispatch;
 pub mod health;
 pub mod lifecycle;
 pub mod mailbox;
+mod maintenance;
 mod store_dispatch;
 mod stores;
 pub mod supervision;

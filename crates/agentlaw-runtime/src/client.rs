@@ -214,6 +214,16 @@ pub fn probe(state: &Path, installation_build: &str, hello_timeout: Duration) ->
 }
 
 impl Client {
+    pub fn admin(
+        &self,
+        _binding: crate::protocol::BindingRef,
+        _command: &crate::protocol::AdminCommand,
+        _control: &RequestControl,
+    ) -> Result<Value, ClientError> {
+        Err(ClientError::Rejected(RejectReason::StoreUnavailable(
+            "admin unavailable".into(),
+        )))
+    }
     pub fn setup(
         &self,
         command: SetupCommand,

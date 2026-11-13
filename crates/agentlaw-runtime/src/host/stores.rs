@@ -47,9 +47,42 @@ struct Inner {
     installation: PathBuf,
     registry: Arc<ConfigRegistry>,
     prewarm_cancel: Arc<AtomicBool>,
+    #[cfg(test)]
+    observer: Mutex<Option<Arc<dyn Fn(BindingRef, &'static str) + Send + Sync>>>,
 }
 
 pub(super) struct Stores(Arc<Inner>);
+
+pub(super) struct MaintenanceGuard;
+pub(super) struct AuditGuard;
+
+#[cfg(test)]
+impl Stores {
+    fn observe(&self, observer: impl Fn(BindingRef, &'static str) + Send + Sync + 'static) {
+        *self.0.observer.lock().unwrap() = Some(Arc::new(observer));
+    }
+}
+
+impl Stores {
+    #[allow(dead_code)]
+    fn notify_observer(&self, _binding: BindingRef, _event: &'static str) {
+        #[cfg(test)]
+        {
+            let observer = self.0.observer.lock().unwrap().clone();
+            if let Some(observer) = observer {
+                observer(_binding, _event);
+            }
+        }
+    }
+}
+
+impl MaintenanceGuard {
+    pub(super) fn reopen(&mut self, _control: &RequestControl) -> Result<(), RejectReason> {
+        Err(RejectReason::StoreUnavailable(
+            "maintenance unavailable".into(),
+        ))
+    }
+}
 
 pub(super) struct StoreGuard {
     inner: Arc<Inner>,
@@ -101,6 +134,32 @@ impl Inner {
 }
 
 impl Stores {
+    fn acquire_for_execution(
+        &self,
+        _snapshot: &Arc<ConfigSnapshot>,
+        _control: &RequestControl,
+    ) -> Result<StoreGuard, agentlaw_contracts::DomainError> {
+        Err(agentlaw_contracts::DomainError::new(
+            "unavailable",
+            "Execution acquire is not implemented.",
+        ))
+    }
+    pub(super) fn maintain(
+        &self,
+        _snapshot: &Arc<ConfigSnapshot>,
+        _control: &RequestControl,
+    ) -> Result<MaintenanceGuard, RejectReason> {
+        Err(RejectReason::StoreUnavailable(
+            "maintenance unavailable".into(),
+        ))
+    }
+    pub(super) fn audit_guard(
+        &self,
+        _snapshot: &Arc<ConfigSnapshot>,
+        _control: &RequestControl,
+    ) -> Result<AuditGuard, RejectReason> {
+        Err(RejectReason::StoreUnavailable("audit unavailable".into()))
+    }
     pub(super) fn new(
         installation: PathBuf,
         deps: StoreDeps,
@@ -116,6 +175,8 @@ impl Stores {
             installation,
             registry,
             prewarm_cancel: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            observer: Mutex::new(None),
         }))
     }
     pub(super) fn acquire(
@@ -306,3 +367,6 @@ impl Drop for StoreGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

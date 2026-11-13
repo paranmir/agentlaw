@@ -3,6 +3,33 @@ use serde_json::{json, Value};
 use std::io::Cursor;
 
 #[test]
+fn admin_body_rejects_wrong_kind_and_invalid_fields() {
+    let valid = br#"{"admin_command":{"repair":{}}}"#;
+    assert!(matches!(
+        decode_body(RequestKind::Admin, valid),
+        Ok(Classified::Admin(_))
+    ));
+    assert!(matches!(
+        decode_body(RequestKind::Query, valid),
+        Err(RejectReason::KindMismatch)
+    ));
+    let query = br#"{"action":"recall","recall":{"memory_ids":["id"]}}"#;
+    assert!(matches!(
+        decode_body(RequestKind::Admin, query),
+        Err(RejectReason::KindMismatch)
+    ));
+    for body in [
+        &br#"{"admin_command":{"repair":{"extra":1}}}"#[..],
+        &br#"{"admin_command":{"repair":{},"repair":{}}}"#[..],
+    ] {
+        assert!(matches!(
+            decode_body(RequestKind::Admin, body),
+            Err(RejectReason::InvalidBody(_))
+        ));
+    }
+}
+
+#[test]
 fn setup_body_rejects_incorrect_kind_and_invalid_fields() {
     let valid = br#"{"setup_command":{"config_set":{"key":"x","value":"y"}}}"#;
     for kind in [RequestKind::Query, RequestKind::Command] {

@@ -528,6 +528,25 @@ fn invalid_body_is_rejected_before_admission() {
 }
 
 #[test]
+fn admin_on_setup_target_is_rejected_before_execution() {
+    let fixture = Fixture::new(Fake::default());
+    let mut stream = fixture.data();
+    let id = RequestId::new();
+    let header = CallHeader {
+        id,
+        kind: RequestKind::Admin,
+        target: CallTarget::Setup,
+        body_len: 31,
+    };
+    send(&mut stream, &header);
+    assert!(
+        matches!(receive::<DataFrame>(&mut stream), DataFrame::Rejected { id: got, reason: RejectReason::InvalidBody(_) } if got == id)
+    );
+    assert_eq!(fixture.fake.admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.fake.runs.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn mismatched_classification_is_rejected_before_admission() {
     let f = Fixture::new(Fake::default());
     let mut stream = f.data();

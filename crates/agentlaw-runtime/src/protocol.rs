@@ -117,6 +117,7 @@ pub enum RequestKind {
     Query,
     Command,
     Setup,
+    Admin,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +125,42 @@ pub enum Classified {
     Query(QueryRequest),
     Command(CommandRequest),
     Setup(SetupRequest),
+    Admin(AdminCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryFilter {
+    pub scope: Option<String>,
+    pub project: Option<String>,
+    pub machine: Option<String>,
+    pub table: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdminCommand {
+    ContinuitySave,
+    HistoryExport {
+        memory_id: String,
+        output: PathBuf,
+    },
+    ProcedureList {
+        filter: InventoryFilter,
+        output: PathBuf,
+    },
+    ProcedureSearch {
+        query: String,
+        limit: Option<usize>,
+        filter: InventoryFilter,
+        output: PathBuf,
+    },
+    Audit,
+    Repair,
+}
+
+pub fn encode_admin(_command: &AdminCommand) -> Vec<u8> {
+    unimplemented!()
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +285,7 @@ impl Classified {
             Self::Query(_) => RequestKind::Query,
             Self::Command(_) => RequestKind::Command,
             Self::Setup(_) => RequestKind::Setup,
+            Self::Admin(_) => RequestKind::Admin,
         }
     }
 }

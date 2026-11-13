@@ -317,6 +317,17 @@ fn admit_call<D: Dispatcher>(
     header: CallHeader,
 ) -> Result<(), RejectReason> {
     let id = header.id;
+    if matches!(
+        (header.kind, header.target),
+        (RequestKind::Admin, CallTarget::Setup)
+    ) {
+        return Err(RejectReason::InvalidBody(
+            agentlaw_contracts::DomainError::new(
+                "invalid_input",
+                "Admin commands require a store target.",
+            ),
+        ));
+    }
     if header.body_len > MAX_WIRE_BODY_BYTES {
         return Err(RejectReason::BodyTooLarge);
     }

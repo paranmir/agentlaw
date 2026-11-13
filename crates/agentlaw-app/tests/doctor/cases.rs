@@ -514,3 +514,37 @@ fn doctor_audit_failure_preserves_health_and_corrupt_source_bytes() {
     assert!(value["worker_runtime"].get("code").is_none(), "{value}");
     assert_eq!(fs::read(&format).unwrap(), before);
 }
+
+#[test]
+fn audit_starts_runtime_and_reports_health_for_healthy_and_corrupt_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let cleanup = RuntimeCleanup(state.clone());
+    let source = temp.path().join("source");
+    create(&state, &source);
+    cleanup.shutdown();
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
+    let output = run(&state, &["doctor", "--audit"]);
+    let healthy = json_output(&output);
+    assert!(output.status.success(), "{healthy}");
+    assert_health(&healthy);
+    assert_eq!(healthy["worker_runtime"]["status"], "running", "{healthy}");
+    assert_eq!(healthy["audit"]["status"], "passed", "{healthy}");
+    cleanup.shutdown();
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
+    let format = source.join("format.md");
+    fs::write(&format, b"corrupted source bytes").unwrap();
+    let corrupt = fs::read(&format).unwrap();
+    let output = run(&state, &["doctor", "--audit"]);
+    let damaged = json_output(&output);
+    assert!(output.status.success(), "{damaged}");
+    assert_health(&damaged);
+    assert_eq!(damaged["worker_runtime"]["status"], "running", "{damaged}");
+    assert_eq!(damaged["audit"]["status"], "failed", "{damaged}");
+    assert_eq!(
+        damaged["audit"]["error"]["code"], "source_corrupt",
+        "{damaged}"
+    );
+    assert!(agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
+    assert_eq!(fs::read(format).unwrap(), corrupt);
+}

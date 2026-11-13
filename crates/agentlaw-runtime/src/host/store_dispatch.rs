@@ -186,6 +186,9 @@ impl Dispatcher for StoreDispatch {
     fn admit(&self, target: &CallTarget, request: Classified) -> Result<Admitted, RejectReason> {
         match target {
             CallTarget::Store(reference) => {
+                if matches!(request, Classified::Admin(_)) {
+                    return Err(RejectReason::StoreUnavailable("admin unavailable".into()));
+                }
                 let snapshot = self
                     .registry
                     .resolve(reference)
@@ -198,7 +201,7 @@ impl Dispatcher for StoreDispatch {
                 match request {
                     Classified::Query(request) => Ok(Admitted::Query(guard, snapshot, request)),
                     Classified::Command(request) => Ok(Admitted::Command(guard, snapshot, request)),
-                    Classified::Setup(_) => Err(RejectReason::KindMismatch),
+                    Classified::Setup(_) | Classified::Admin(_) => Err(RejectReason::KindMismatch),
                 }
             }
             CallTarget::Setup => match request {
