@@ -7,6 +7,16 @@ use crate::{
 use agentlaw_flows::runtime::StoreIdentity;
 use std::path::Path;
 
+pub fn resolve_import_stage(
+    _installation: &Path,
+    _snapshot: &ConfigSnapshot,
+    _stage: &crate::git::git_ops::ImportStageContext,
+) -> RuntimeResult<StoreIdentity> {
+    Err(RuntimeError::StoreUnavailable(
+        "Import stage is not implemented.".into(),
+    ))
+}
+
 pub fn resolve(installation: &Path, snapshot: &ConfigSnapshot) -> RuntimeResult<StoreIdentity> {
     let local = snapshot.config.runtime_root(installation);
     let binding_id = match std::fs::read(local.join("control-initialized.json")) {

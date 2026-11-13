@@ -157,9 +157,76 @@ pub enum AdminCommand {
     },
     Audit,
     Repair,
+    ShareInspect {
+        remote: String,
+        target_ref: String,
+    },
+    SharePush {
+        review: String,
+        allow_sensitive: bool,
+        user_confirmed: bool,
+    },
+    ShareFetch {
+        remote: String,
+    },
+    ImportPrepare {
+        commit: String,
+    },
+    ImportList,
+    ImportInspect {
+        import_ref: String,
+    },
+    ImportCall {
+        import_ref: String,
+        request: serde_json::Value,
+    },
+    ImportResolve {
+        import_ref: String,
+        choices: Option<serde_json::Value>,
+        user_confirmed: bool,
+    },
+    ImportPublish {
+        import_ref: String,
+        resolution: String,
+        user_confirmed: bool,
+    },
+    SyncAcceptFindings {
+        operation: String,
+        candidate: String,
+        findings_digest: String,
+        confirm_sharing: bool,
+    },
+    SyncPolicyPropose {
+        remote: String,
+        target_ref: String,
+    },
+    SyncPolicyConfigure {
+        record: serde_json::Value,
+        confirm_delegation: bool,
+    },
 }
 
 pub fn encode_admin(command: &AdminCommand) -> agentlaw_contracts::Result<Vec<u8>> {
+    if matches!(
+        command,
+        AdminCommand::ShareInspect { .. }
+            | AdminCommand::SharePush { .. }
+            | AdminCommand::ShareFetch { .. }
+            | AdminCommand::ImportPrepare { .. }
+            | AdminCommand::ImportList
+            | AdminCommand::ImportInspect { .. }
+            | AdminCommand::ImportCall { .. }
+            | AdminCommand::ImportResolve { .. }
+            | AdminCommand::ImportPublish { .. }
+            | AdminCommand::SyncAcceptFindings { .. }
+            | AdminCommand::SyncPolicyPropose { .. }
+            | AdminCommand::SyncPolicyConfigure { .. }
+    ) {
+        return Err(agentlaw_contracts::DomainError::new(
+            "unavailable",
+            "Administrative command is not implemented.",
+        ));
+    }
     let output = match command {
         AdminCommand::HistoryExport { output, .. }
         | AdminCommand::ProcedureList { output, .. }

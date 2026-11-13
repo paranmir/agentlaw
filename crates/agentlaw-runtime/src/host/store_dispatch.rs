@@ -239,7 +239,10 @@ impl Dispatcher for StoreDispatch {
                             filter,
                             output,
                         } => guard.procedure_search(query, limit, filter, output, control),
-                        _ => unreachable!(),
+                        _ => Err(DomainError::new(
+                            "unavailable",
+                            "Administrative command is not implemented.",
+                        )),
                     }
                 }
             },

@@ -67,7 +67,10 @@ pub(super) struct AuditGuard {
 
 #[cfg(test)]
 impl Stores {
-    fn observe(&self, observer: impl Fn(BindingRef, &'static str) + Send + Sync + 'static) {
+    pub(super) fn observe(
+        &self,
+        observer: impl Fn(BindingRef, &'static str) + Send + Sync + 'static,
+    ) {
         *self.0.observer.lock().unwrap() = Some(Arc::new(observer));
     }
 }

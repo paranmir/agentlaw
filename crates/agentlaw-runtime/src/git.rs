@@ -4,6 +4,7 @@ pub use control::SyncControl;
 pub mod git_ops;
 pub mod git_scan;
 pub mod handle;
+pub mod imports;
 pub mod sync;
 
 #[cfg(test)]

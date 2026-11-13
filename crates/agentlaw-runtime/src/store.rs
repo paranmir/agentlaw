@@ -2,6 +2,7 @@
 
 pub mod export;
 pub mod identity;
+pub mod import_stage;
 pub mod lane;
 pub mod maintenance;
 pub mod read;

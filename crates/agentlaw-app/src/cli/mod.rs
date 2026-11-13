@@ -7,6 +7,7 @@ mod help;
 mod input;
 mod parse;
 mod procedure;
+mod progress;
 mod share;
 mod sync;
 

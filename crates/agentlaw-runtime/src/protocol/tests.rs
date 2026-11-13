@@ -3,6 +3,142 @@ use serde_json::{json, Value};
 use std::io::Cursor;
 
 #[test]
+fn share_and_sync_admin_commands_round_trip_with_documented_wire_keys() {
+    let commands = [
+        (
+            AdminCommand::ShareInspect {
+                remote: "origin".into(),
+                target_ref: "refs/heads/main".into(),
+            },
+            json!({"share_inspect":{"remote":"origin","target_ref":"refs/heads/main"}}),
+        ),
+        (
+            AdminCommand::SharePush {
+                review: "review".into(),
+                allow_sensitive: false,
+                user_confirmed: true,
+            },
+            json!({"share_push":{"review":"review","allow_sensitive":false,"user_confirmed":true}}),
+        ),
+        (
+            AdminCommand::ShareFetch {
+                remote: "origin".into(),
+            },
+            json!({"share_fetch":{"remote":"origin"}}),
+        ),
+        (
+            AdminCommand::ImportPrepare {
+                commit: "commit".into(),
+            },
+            json!({"import_prepare":{"commit":"commit"}}),
+        ),
+        (AdminCommand::ImportList, json!({"import_list":{}})),
+        (
+            AdminCommand::ImportInspect {
+                import_ref: "ref".into(),
+            },
+            json!({"import_inspect":{"import_ref":"ref"}}),
+        ),
+        (
+            AdminCommand::ImportCall {
+                import_ref: "ref".into(),
+                request: json!({"action":"recall","recall":{"recall_for":"fixture"}}),
+            },
+            json!({"import_call":{"import_ref":"ref","request":{"action":"recall","recall":{"recall_for":"fixture"}}}}),
+        ),
+        (
+            AdminCommand::ImportResolve {
+                import_ref: "ref".into(),
+                choices: None,
+                user_confirmed: true,
+            },
+            json!({"import_resolve":{"import_ref":"ref","choices":null,"user_confirmed":true}}),
+        ),
+        (
+            AdminCommand::ImportPublish {
+                import_ref: "ref".into(),
+                resolution: "token".into(),
+                user_confirmed: true,
+            },
+            json!({"import_publish":{"import_ref":"ref","resolution":"token","user_confirmed":true}}),
+        ),
+        (
+            AdminCommand::SyncAcceptFindings {
+                operation: "op".into(),
+                candidate: "candidate".into(),
+                findings_digest: "digest".into(),
+                confirm_sharing: true,
+            },
+            json!({"sync_accept_findings":{"operation":"op","candidate":"candidate","findings_digest":"digest","confirm_sharing":true}}),
+        ),
+        (
+            AdminCommand::SyncPolicyPropose {
+                remote: "origin".into(),
+                target_ref: "refs/heads/main".into(),
+            },
+            json!({"sync_policy_propose":{"remote":"origin","target_ref":"refs/heads/main"}}),
+        ),
+        (
+            AdminCommand::SyncPolicyConfigure {
+                record: json!({"enabled":true}),
+                confirm_delegation: true,
+            },
+            json!({"sync_policy_configure":{"record":{"enabled":true},"confirm_delegation":true}}),
+        ),
+    ];
+    for (command, expected) in commands {
+        let body = encode_admin(&command).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"admin_command":expected})
+        );
+        assert!(matches!(
+            decode_body(RequestKind::Admin, &body),
+            Ok(Classified::Admin(_))
+        ));
+    }
+}
+
+#[test]
+fn import_list_requires_an_empty_object_and_rejects_duplicate_or_unknown_fields() {
+    assert!(matches!(
+        decode_body(
+            RequestKind::Admin,
+            br#"{"admin_command":{"import_list":{}}}"#
+        ),
+        Ok(Classified::Admin(AdminCommand::ImportList))
+    ));
+    for body in [
+        &br#"{"admin_command":{"import_list":null}}"#[..],
+        &br#"{"admin_command":{"import_list":{"extra":true}}}"#[..],
+        &br#"{"admin_command":{"import_list":{},"import_list":{}}}"#[..],
+        &br#"{"admin_command":{"share_fetch":{"remote":"a","remote":"b"}}}"#[..],
+        &br#"{"admin_command":{"share_fetch":{"remote":"a","extra":true}}}"#[..],
+    ] {
+        assert!(matches!(
+            decode_body(RequestKind::Admin, body),
+            Err(RejectReason::InvalidBody(_))
+        ));
+    }
+}
+
+#[test]
+fn import_call_rejects_store_switch_and_sync_requests() {
+    for request in [
+        json!({"action":"connect_project_memory","connect_project_memory":{"project_path":"C:/work/project","memory_store_path":"C:/other","intent":"connect"}}),
+        json!({"action":"sync","sync":{"command":"status","operation_id":"fixture"}}),
+    ] {
+        let body = serde_json::to_vec(
+            &json!({"admin_command":{"import_call":{"import_ref":"ref","request":request}}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(decode_body(RequestKind::Admin, &body), Err(RejectReason::InvalidBody(error)) if error.code == "invalid_import_request")
+        );
+    }
+}
+
+#[test]
 fn admin_body_rejects_wrong_kind_and_invalid_fields() {
     let valid = br#"{"admin_command":{"repair":{}}}"#;
     assert!(matches!(
