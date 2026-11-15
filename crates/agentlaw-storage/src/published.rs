@@ -59,6 +59,20 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
+    /// Construct an isolated import review using the binding's coordinated source.
+    pub fn prepare_import_union(
+        &self,
+        incoming: &Store,
+        root: &std::path::Path,
+        local: &std::path::Path,
+    ) -> Result<Store> {
+        self.store.prepare_import_union(incoming, root, local)
+    }
+    /// Validate a staged review against this binding's current source position.
+    pub fn validate_imported_source(&self, staged: &Store, expected_generation: u64) -> Result<()> {
+        self.store
+            .validate_imported_source(staged, expected_generation)
+    }
     pub fn with_source_read<T>(
         &self,
         read: impl FnOnce(&std::path::Path, u64) -> Result<T>,

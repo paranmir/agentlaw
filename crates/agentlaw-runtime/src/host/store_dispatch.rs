@@ -47,6 +47,7 @@ pub(super) struct StoreDispatch {
     stores: Arc<Stores>,
     setup: Mutex<()>,
     assets: Arc<dyn Fn() -> Result<Option<agentlaw_worker::ModelAssets>, String> + Send + Sync>,
+    imports: crate::git::imports::ProgressRegistry,
 }
 
 pub(super) enum Admitted {
@@ -69,6 +70,7 @@ impl StoreDispatch {
             stores,
             setup: Mutex::new(()),
             assets,
+            imports: crate::git::imports::ProgressRegistry::default(),
         }
     }
     fn setup(
@@ -223,6 +225,26 @@ impl Dispatcher for StoreDispatch {
                 AdminCommand::Audit | AdminCommand::Repair => {
                     super::maintenance::run(&self.stores, &snapshot, request, control)
                 }
+                AdminCommand::ImportList => {
+                    control.check()?;
+                    let local = snapshot.config.runtime_root(&self.state).join("git");
+                    let progress = self.imports.scoped(&local);
+                    Ok(serde_json::json!({"imports":crate::git::imports::list(&local, &progress)?}))
+                }
+                request @ (AdminCommand::ImportPrepare { .. }
+                | AdminCommand::ImportInspect { .. }
+                | AdminCommand::ImportCall { .. }
+                | AdminCommand::ImportResolve { .. }
+                | AdminCommand::ImportPublish { .. }) => {
+                    let local = snapshot.config.runtime_root(&self.state).join("git");
+                    super::imports::run(
+                        &snapshot,
+                        request,
+                        control,
+                        &self.stores,
+                        &self.imports.scoped(&local),
+                    )
+                }
                 other => {
                     let guard = self.stores.acquire_for_execution(&snapshot, control)?;
                     match other {
@@ -239,6 +261,34 @@ impl Dispatcher for StoreDispatch {
                             filter,
                             output,
                         } => guard.procedure_search(query, limit, filter, output, control),
+                        AdminCommand::ShareInspect { remote, target_ref } => {
+                            guard.share_inspect(&remote, &target_ref, control)
+                        }
+                        AdminCommand::SharePush {
+                            review,
+                            allow_sensitive,
+                            user_confirmed,
+                        } => guard.share_push(&review, allow_sensitive, user_confirmed, control),
+                        AdminCommand::ShareFetch { remote } => guard.share_fetch(&remote, control),
+                        AdminCommand::SyncAcceptFindings {
+                            operation,
+                            candidate,
+                            findings_digest,
+                            confirm_sharing,
+                        } => guard.sync_accept_findings(
+                            &operation,
+                            &candidate,
+                            &findings_digest,
+                            confirm_sharing,
+                            control,
+                        ),
+                        AdminCommand::SyncPolicyPropose { remote, target_ref } => {
+                            guard.sync_policy_propose(&remote, &target_ref, control)
+                        }
+                        AdminCommand::SyncPolicyConfigure {
+                            record,
+                            confirm_delegation,
+                        } => guard.sync_policy_configure(record, confirm_delegation, control),
                         _ => Err(DomainError::new(
                             "unavailable",
                             "Administrative command is not implemented.",

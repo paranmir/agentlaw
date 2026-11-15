@@ -58,6 +58,12 @@ pub enum LaneCommand {
     },
     PublishSyncOverlay(SyncOverlayInput),
     PublishImport(ImportPublishInput),
+    ImportReceipt(String),
+    ImportChoices {
+        operation_id: String,
+        choices: std::collections::BTreeMap<String, agentlaw_storage::import_conflict::ImportSide>,
+    },
+    ImportChoiceDecided(String),
     SetExactGeneration {
         generation_id: String,
         exact_file: PathBuf,
@@ -66,6 +72,7 @@ pub enum LaneCommand {
 pub enum LaneReply {
     Applied(Applied),
     Published(PublishReceipt),
+    ImportReceipt(Option<PublishReceipt>),
     Reserved(bool),
     Done,
 }
@@ -404,6 +411,30 @@ fn execute(ctx: &mut LaneCtx<'_>, command: LaneCommand) -> (Result<LaneReply>, b
             })();
             (result, true)
         }
+        LaneCommand::ImportReceipt(operation_id) => (
+            ctx.source
+                .sync_receipt(&operation_id)
+                .map(LaneReply::ImportReceipt)
+                .map_err(storage),
+            false,
+        ),
+        LaneCommand::ImportChoiceDecided(operation_id) => (
+            ctx.source
+                .import_choice_decided(&operation_id)
+                .map(LaneReply::Reserved)
+                .map_err(storage),
+            false,
+        ),
+        LaneCommand::ImportChoices {
+            operation_id,
+            choices,
+        } => (
+            ctx.source
+                .choose_import_conflicts(&operation_id, &choices, true)
+                .map(LaneReply::Published)
+                .map_err(storage),
+            true,
+        ),
         LaneCommand::PublishImport(input) => {
             let result = (|| {
                 ctx.request.check()?;

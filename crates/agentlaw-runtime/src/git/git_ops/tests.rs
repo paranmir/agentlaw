@@ -1,6 +1,97 @@
 use super::*;
 use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
 use serde_json::json;
+fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<SaveReceipt> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::continuity_save(&fixture.handle, local, message)
+}
+fn inspect_share(store: &Store, local: &Path, remote: &str, target: &str) -> Result<ShareReview> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::inspect_share(&fixture.handle, local, remote, target)
+}
+fn push_review(store: &Store, local: &Path, review: &str, accepted: bool) -> Result<PushReceipt> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::push_review(
+        &fixture.handle,
+        local,
+        review,
+        accepted,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<ImportReview> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::prepare_import(
+        &fixture.handle,
+        local,
+        commit,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn get_import_stage(store: &Store, local: &Path, import_ref: &str) -> Result<ImportStageContext> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::get_import_stage(&fixture.handle, local, import_ref)
+}
+fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<ImportResolution> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::resolve_import(
+        &fixture.handle,
+        local,
+        import_ref,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn inspect_import(store: &Store, local: &Path, import_ref: &str) -> Result<ImportReview> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::inspect_import(
+        &fixture.handle,
+        local,
+        import_ref,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn publish_import(
+    store: &Store,
+    local: &Path,
+    import_ref: &str,
+    resolution: &str,
+    confirmed: bool,
+) -> Result<ImportPublishReceipt> {
+    let source = store.owned_published_reader();
+    let root = store
+        .with_source_read(|root, _| Ok(root.to_owned()))
+        .unwrap();
+    let binding_local = store.local_root().to_owned();
+    let coordination = store.coordination_root().to_owned();
+    let writer = agentlaw_flows::control::ControlWriter::open(&binding_local).unwrap();
+    let identity = agentlaw_flows::runtime::StoreIdentity {
+        root: root.clone(),
+        local: binding_local.clone(),
+        user_id: "user".into(),
+        machine_id: uuid::Uuid::new_v4().to_string(),
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        history_limit: 8192,
+        response_limit: 65536,
+        config_file: None,
+    };
+    let lane_store = Store::open_with_coordination(&root, &binding_local, &coordination).unwrap();
+    let lane = crate::store::lane::MutationLane::start(identity, lane_store, writer).unwrap();
+    let handle = crate::git::handle::GitStoreHandle {
+        root,
+        local: binding_local,
+        coordination,
+        source,
+        lane: lane.sender(),
+    };
+    super::publish_import(
+        &handle,
+        local,
+        import_ref,
+        resolution,
+        confirmed,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
 fn fixture() -> (tempfile::TempDir, PathBuf, Store, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();

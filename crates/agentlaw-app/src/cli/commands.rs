@@ -603,6 +603,8 @@ pub(crate) struct ShareFetchArgs {
 pub(crate) enum ImportCommand {
     /// Prepare an isolated review workspace for an immutable commit.
     Prepare(ImportPrepareArgs),
+    /// List imports and their current review status.
+    List,
     /// Inspect a returned isolated import.
     Inspect(ImportRefArgs),
     /// Execute an Agentlaw request within an isolated import workspace.

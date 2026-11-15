@@ -54,23 +54,48 @@ fn runtime_probe_to_worker(probe: agentlaw_runtime::client::Probe) -> Value {
 }
 
 pub fn doctor(state: &Path, mode: DoctorMode) -> Result<Value> {
-    doctor_with_health(state, mode, &|| {
-        let executable = std::env::current_exe()
-            .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
-        let build = agentlaw_runtime::installation::build_identity(&executable)
-            .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
-        Ok(runtime_probe_to_worker(agentlaw_runtime::client::probe(
-            state,
-            &build,
-            std::time::Duration::from_secs(5),
-        )))
-    })
+    doctor_with_control(state, mode, &agentlaw_contracts::RequestControl::default())
+}
+pub fn doctor_with_control(
+    state: &Path,
+    mode: DoctorMode,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<Value> {
+    doctor_with_health_and_control(
+        state,
+        mode,
+        &|| {
+            let executable = std::env::current_exe()
+                .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
+            let build = agentlaw_runtime::installation::build_identity(&executable)
+                .map_err(|e| DomainError::new("worker_diagnosis_incomplete", e.to_string()))?;
+            Ok(runtime_probe_to_worker(agentlaw_runtime::client::probe(
+                state,
+                &build,
+                std::time::Duration::from_secs(5),
+            )))
+        },
+        control,
+    )
 }
 
 pub fn doctor_with_health(
     state: &Path,
     mode: DoctorMode,
     health: &dyn Fn() -> Result<Value>,
+) -> Result<Value> {
+    doctor_with_health_and_control(
+        state,
+        mode,
+        health,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn doctor_with_health_and_control(
+    state: &Path,
+    mode: DoctorMode,
+    health: &dyn Fn() -> Result<Value>,
+    control: &agentlaw_contracts::RequestControl,
 ) -> Result<Value> {
     let selected = config::load(state)?;
     let worker=health().unwrap_or_else(|error|json!({
@@ -92,10 +117,7 @@ pub fn doctor_with_health(
     }
     let audit = match RuntimeBackend::new(state.to_owned(), false) {
         Ok(mut backend) => {
-            let audit = backend.admin(
-                &agentlaw_runtime::protocol::AdminCommand::Audit,
-                &agentlaw_contracts::RequestControl::default(),
-            );
+            let audit = backend.admin(&agentlaw_runtime::protocol::AdminCommand::Audit, control);
             if let Ok(snapshot) = backend.health() {
                 result["worker_runtime"] =
                     runtime_probe_to_worker(agentlaw_runtime::client::Probe::Running(snapshot));

@@ -86,6 +86,232 @@ impl ActivePointerSink for PointerSink {
 }
 
 impl StoreService {
+    pub(crate) fn import_stage(
+        &self,
+        import_ref: &str,
+        published: bool,
+    ) -> Result<crate::git::git_ops::ImportStageContext> {
+        if published {
+            crate::git::git_ops::get_import_stage_for_publish(
+                &self.git_handle(),
+                &self.identity.local.join("git"),
+                import_ref,
+            )
+        } else {
+            crate::git::git_ops::get_import_stage(
+                &self.git_handle(),
+                &self.identity.local.join("git"),
+                import_ref,
+            )
+        }
+    }
+    pub(crate) fn deliver_import(
+        &self,
+        value: Value,
+        history: bool,
+        snapshot: &ConfigSnapshot,
+    ) -> Result<Value> {
+        let limit = if history {
+            snapshot
+                .config
+                .response_limit_bytes
+                .min(snapshot.config.history_response_limit_bytes)
+        } else {
+            snapshot.config.response_limit_bytes
+        };
+        crate::installation::delivery::adapt(value, &self.state, limit)
+    }
+    fn import_identity(&self, snapshot: &ConfigSnapshot) -> StoreIdentity {
+        StoreIdentity {
+            root: self.identity.root.clone(),
+            local: self.identity.local.clone(),
+            user_id: self.identity.user_id.clone(),
+            machine_id: self.identity.machine_id.clone(),
+            binding_id: self.identity.binding_id.clone(),
+            history_limit: snapshot.config.history_response_limit_bytes,
+            response_limit: snapshot.config.response_limit_bytes,
+            config_file: self.identity.config_file.clone(),
+        }
+    }
+    pub(crate) fn query_import(
+        &self,
+        request: QueryRequest,
+        snapshot: &ConfigSnapshot,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        self.query_identity(request, control, &self.import_identity(snapshot))
+    }
+    pub(crate) fn command_import(
+        &self,
+        request: CommandRequest,
+        snapshot: &ConfigSnapshot,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        self.command_identity(request, control, &self.import_identity(snapshot))
+    }
+    pub fn share_inspect(
+        &self,
+        remote: &str,
+        target_ref: &str,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        control.check()?;
+        let mut result = agentlaw_contracts::to_value(crate::git::git_ops::inspect_share(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            remote,
+            target_ref,
+        )?)?;
+        if result["findings"].as_array().is_some_and(|v| !v.is_empty()) {
+            result["next_action"] = json!("Explain the detected pattern categories in the user's language. Ask whether to share unchanged or cancel. Do not infer permission from a private destination, modify memory, mask content or rewrite history without a separate decision.");
+        }
+        Ok(result)
+    }
+    pub fn share_push(
+        &self,
+        review: &str,
+        allow_sensitive: bool,
+        user_confirmed: bool,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        agentlaw_contracts::to_value(crate::git::git_ops::push_review(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            review,
+            allow_sensitive && user_confirmed,
+            control,
+        )?)
+    }
+    pub fn share_fetch(&self, remote: &str, control: &RequestControl) -> Result<Value> {
+        agentlaw_contracts::to_value(crate::git::git_ops::fetch_share(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            remote,
+            control,
+        )?)
+    }
+    pub fn import_prepare(
+        &self,
+        commit: &str,
+        import_ref: &str,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        let mut result =
+            agentlaw_contracts::to_value(crate::git::git_ops::prepare_import_with_ref(
+                &self.git_handle(),
+                &self.identity.local.join("git"),
+                commit,
+                import_ref,
+                control,
+            )?)?;
+        result["next_action"] = json!("This is an isolated review workspace, not active memory. Inspect structural_conflicts, explain both states in the user's language, and ask the user to choose local or incoming where required. Submit agreed structural choices with share import resolve --ref <import_ref> --choices <JSON-file-or-> --user-confirmed. Use share import call --ref <import_ref> --json - with ordinary agentlaw requests for memory-head inspection and agreed semantic edits. No active memory or Git HEAD has changed. Publication requires a separate confirmation of the complete resolved import.");
+        Ok(result)
+    }
+    pub fn import_inspect(&self, import_ref: &str, control: &RequestControl) -> Result<Value> {
+        agentlaw_contracts::to_value(crate::git::git_ops::inspect_import(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            import_ref,
+            control,
+        )?)
+    }
+    pub fn import_resolve(&self, import_ref: &str, control: &RequestControl) -> Result<Value> {
+        let resolution = crate::git::git_ops::resolve_import(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            import_ref,
+            control,
+        )?;
+        let mut result = agentlaw_contracts::to_value(resolution)?;
+        if result["next_action"].is_null() {
+            result["next_action"] = json!("If unresolved structural conflicts or concurrent heads remain, inspect them and ask the user to decide before editing the isolated review workspace. Otherwise explain the exact resolved import and request confirmation. Only after confirmation, use share import publish --ref <import_ref> --resolution <resolution_token> --user-confirmed. Do not invent confirmation.");
+        }
+        Ok(result)
+    }
+    pub fn import_publish(
+        &self,
+        import_ref: &str,
+        resolution: &str,
+        confirmed: bool,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        agentlaw_contracts::to_value(crate::git::git_ops::publish_import(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            import_ref,
+            resolution,
+            confirmed,
+            control,
+        )?)
+    }
+    pub(crate) fn import_publish_observed(
+        &self,
+        import_ref: &str,
+        resolution: &str,
+        confirmed: bool,
+        control: &RequestControl,
+        after_publication: &dyn Fn() -> Result<()>,
+    ) -> Result<Value> {
+        agentlaw_contracts::to_value(crate::git::git_ops::publish_import_observed(
+            &self.git_handle(),
+            &self.identity.local.join("git"),
+            import_ref,
+            resolution,
+            confirmed,
+            control,
+            after_publication,
+        )?)
+    }
+    pub fn sync_accept_findings(
+        &self,
+        operation: &str,
+        candidate: &str,
+        digest: &str,
+        confirmed: bool,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        control.check()?;
+        crate::git::sync::accept_findings(
+            &self.git_handle(),
+            &self.identity.local,
+            &self.state,
+            operation,
+            candidate,
+            digest,
+            confirmed,
+        )
+    }
+    pub fn sync_policy_propose(
+        &self,
+        remote: &str,
+        target: &str,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        control.check()?;
+        agentlaw_contracts::to_value(crate::git::sync::propose_policy(
+            &self.git_handle(),
+            &self.identity.local,
+            remote,
+            target,
+        )?)
+    }
+    pub fn sync_policy_configure(
+        &self,
+        record: Value,
+        confirmed: bool,
+        control: &RequestControl,
+    ) -> Result<Value> {
+        control.check()?;
+        let text = serde_json::to_string(&record)
+            .map_err(|e| DomainError::new("invalid_input", e.to_string()))?;
+        let policy = crate::git::sync::prepare_policy_configuration(&text, confirmed)?;
+        crate::git::sync::configure_prepared_policy(
+            &self.state,
+            &self.git_handle(),
+            &self.identity.local,
+            policy,
+        )
+    }
     pub fn repair_derived(&self, control: &RequestControl) -> Result<Value> {
         control.phase("rebuilding_private_derived_generation");
         control.check()?;
@@ -147,7 +373,7 @@ impl StoreService {
     }
     pub fn continuity_save(&self, control: &RequestControl) -> Result<Value> {
         control.check()?;
-        agentlaw_contracts::to_value(crate::git::git_ops::continuity_save_from_handle(
+        agentlaw_contracts::to_value(crate::git::git_ops::continuity_save(
             &self.git_handle(),
             &self.identity.local.join("git"),
             "Agentlaw continuity snapshot\n",

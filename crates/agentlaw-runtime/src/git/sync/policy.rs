@@ -51,7 +51,7 @@ pub(super) fn digest(policy: &DelegationPolicy) -> String {
     git::hash(&serde_json::to_vec(policy).unwrap())
 }
 pub fn propose_policy(
-    store: &Store,
+    store: &crate::git::handle::GitStoreHandle,
     local: &Path,
     remote: &str,
     target_ref: &str,
@@ -104,28 +104,14 @@ pub fn propose_policy(
         push_permission: true,
     })
 }
-/// Explicit local CLI configuration, deliberately absent from the sync MCP action.
-pub fn configure_policy(
-    state: &Path,
-    store: &Store,
-    local: &Path,
-    file: &Path,
-    confirmed: bool,
-) -> Result<Value> {
-    require_delegation_confirmation(confirmed)?;
-    let policy: DelegationPolicy = read_json(file)?;
-    validate_policy(&policy)?;
-    configure_prepared_policy(state, store, local, PreparedPolicy(policy))
-}
-
 pub fn configure_prepared_policy(
     state: &Path,
-    store: &Store,
+    store: &crate::git::handle::GitStoreHandle,
     local: &Path,
     prepared: PreparedPolicy,
 ) -> Result<Value> {
     let policy = prepared.0;
-    check_bindings(store, local, &policy)?;
+    check_bindings_handle(store, local, &policy)?;
     let dir = state.join("policies");
     fs::create_dir_all(&dir).map_err(|_| git::io_error("policy directory"))?;
     git::save_local_json(
@@ -200,6 +186,32 @@ fn check_bindings(store: &Store, local: &Path, policy: &DelegationPolicy) -> Res
     git::run(&source, &["check-ref-format", &policy.target_ref])?;
     Ok(())
 }
+fn check_bindings_handle(
+    store: &crate::git::handle::GitStoreHandle,
+    local: &Path,
+    policy: &DelegationPolicy,
+) -> Result<()> {
+    let source = store
+        .with_source_read(|p, _| Ok(p.to_path_buf()))
+        .map_err(storage_error)?;
+    if source != policy.source
+        || fs::canonicalize(local).map_err(|_| git::io_error("policy local binding"))?
+            != policy.control
+    {
+        return Err(DomainError::new(
+            "sync_policy_binding",
+            "Delegation belongs to a different source/control binding.",
+        ));
+    }
+    let fetch = git::text(&source, &["remote", "get-url", "--all", &policy.remote])?;
+    if fetch != policy.fetch_endpoint
+        || git::endpoint(&source, &policy.remote)? != policy.push_endpoint
+    {
+        return Err(DomainError::new("sync_destination_changed", "Actual Git fetch/push endpoints differ from the registered policy. No new destination was authorized."));
+    }
+    git::run(&source, &["check-ref-format", &policy.target_ref])?;
+    Ok(())
+}
 pub(super) fn check(store: &Store, local: &Path, policy: &DelegationPolicy) -> Result<()> {
     validate_policy(policy)?;
     check_bindings(store, local, policy)?;
@@ -241,7 +253,7 @@ pub(super) fn findings_accepted(op: &Operation) -> Result<bool> {
         && accepted["authority_kind"] == "explicit_local_cli")
 }
 pub fn accept_findings(
-    store: &Store,
+    store: &crate::git::handle::GitStoreHandle,
     local: &Path,
     state: &Path,
     operation_id: &str,
@@ -251,17 +263,27 @@ pub fn accept_findings(
 ) -> Result<Value> {
     require_sharing_confirmation(confirmed)?;
     let _lane = git::lane(&local.join("git"))?;
-    let conn = db(local)?;
-    let raw: String = conn
-        .query_row(
-            "SELECT state FROM sync_operations WHERE operation_id=?1",
-            [operation_id],
-            |r| r.get(0),
-        )
-        .map_err(|_| git::io_error("findings operation"))?;
+    let raw = store
+        .sync_control()
+        .operation(operation_id)?
+        .ok_or_else(|| git::io_error("findings operation"))?;
     let op: Operation =
         serde_json::from_str(&raw).map_err(|_| git::io_error("findings operation decode"))?;
-    recheck(state, store, local, &op.policy, &op.policy_digest)?;
+    let actual = load(state, &op.policy.policy_id)?;
+    validate_policy(&actual)?;
+    check_bindings_handle(store, local, &actual)?;
+    if !actual.enabled {
+        return Err(DomainError::new(
+            "sync_delegation_disabled",
+            "The local sync policy is disabled.",
+        ));
+    }
+    if digest(&actual) != op.policy_digest {
+        return Err(DomainError::new(
+            "sync_policy_changed",
+            "The delegated policy changed.",
+        ));
+    }
     let scan = op
         .scan
         .as_ref()

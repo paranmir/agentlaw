@@ -10,7 +10,7 @@ use super::{
 use agentlaw_app::{config, frontend::RuntimeBackend, Backend};
 use agentlaw_contracts::{DomainError, Result};
 use serde_json::Value;
-use std::{io, path::PathBuf};
+use std::io;
 
 pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
     let value = match command {
@@ -66,7 +66,17 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             } else {
                 agentlaw_app::diagnostics::DoctorMode::Health
             };
-            agentlaw_app::diagnostics::doctor(&config::state_root()?, mode)?
+            if args.audit {
+                general::with_admin_progress(|control| {
+                    agentlaw_app::diagnostics::doctor_with_control(
+                        &config::state_root()?,
+                        mode,
+                        control,
+                    )
+                })?
+            } else {
+                agentlaw_app::diagnostics::doctor(&config::state_root()?, mode)?
+            }
         }
         Command::Repair => {
             general::runtime_admin(agentlaw_runtime::protocol::AdminCommand::Repair)?
@@ -177,28 +187,4 @@ pub(super) fn cli_control() -> agentlaw_flows::RequestControl {
             eprintln!("agentlaw: {phase}");
         },
     )
-}
-
-pub(super) fn selected_store() -> Result<(agentlaw_storage::Store, PathBuf)> {
-    let state = config::state_root()?;
-    let selected = config::load(&state)?.ok_or_else(|| {
-        DomainError::new(
-            "memory_store_connection_required",
-            "Connect a memory store before using operating commands.",
-        )
-    })?;
-    let local = selected.runtime_root(&state);
-    config::require_existing_binding(&state, &selected)?;
-    let store = agentlaw_storage::Store::open_with_coordination(
-        &selected.memory_store_path,
-        local.join("canonical"),
-        config::coordination_root(&state),
-    )
-    .map_err(|_| {
-        DomainError::new(
-            "source_unavailable",
-            "The selected source needs diagnosis or recovery; no Git operation was performed.",
-        )
-    })?;
-    Ok((store, local))
 }

@@ -87,11 +87,19 @@ fn fixture() -> Fixture {
     git(&root, &["config", "user.email", "fixture@example.invalid"]);
     publish_memory(&store, "Original memory.");
     let git_local = local.join("git");
-    let commit = git_ops::continuity_save(&store, &git_local, "fixture")
+    let git_handle = crate::test_support::store_service::git_handle(&store);
+    let commit = git_ops::continuity_save(&git_handle.handle, &git_local, "fixture")
         .unwrap()
         .commit_oid;
-    let review = git_ops::prepare_import(&store, &git_local, &commit).unwrap();
-    let stage = git_ops::get_import_stage(&store, &git_local, &review.import_ref).unwrap();
+    let review = git_ops::prepare_import(
+        &git_handle.handle,
+        &git_local,
+        &commit,
+        &RequestControl::default(),
+    )
+    .unwrap();
+    let stage =
+        git_ops::get_import_stage(&git_handle.handle, &git_local, &review.import_ref).unwrap();
     let stage_store = Store::open_with_coordination(
         &stage.store_path,
         stage.runtime_path.join("canonical"),
@@ -100,9 +108,16 @@ fn fixture() -> Fixture {
     .unwrap();
     let imported_id = publish_memory(&stage_store, "Staged imported memory.");
     drop(stage_store);
-    let token = git_ops::resolve_import(&store, &git_local, &review.import_ref)
-        .unwrap()
-        .resolution_token;
+    let token = git_ops::resolve_import(
+        &git_handle.handle,
+        &git_local,
+        &review.import_ref,
+        &RequestControl::default(),
+    )
+    .unwrap()
+    .resolution_token;
+    drop(git_handle);
+    crate::installation::machine::load_or_create(dir.path()).unwrap();
     let registry = Arc::new(ConfigRegistry::new());
     let snapshot = snapshot(&root, &local);
     let stores = Arc::new(Stores::new(

@@ -1145,7 +1145,11 @@ fn blocked_push(shutdown: bool) {
         .recv_timeout(Duration::from_secs(60))
         .expect("push result");
     worker.join().unwrap();
-    wait_file(&finished, Duration::from_secs(30));
+    // A normal shutdown finishes accepted work, so the hook completes. A killed
+    // runtime takes its Git process tree with it, so the hook may not finish.
+    if shutdown {
+        wait_file(&finished, Duration::from_secs(30));
+    }
     if shutdown {
         assert!(status.success(), "{result}");
         assert_eq!(result["commit_oid"], review["commit_oid"]);
@@ -1171,10 +1175,14 @@ fn blocked_push(shutdown: bool) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read_to_string(started).unwrap().lines().count(), 1);
-    assert_eq!(
-        std::fs::read_to_string(finished).unwrap().lines().count(),
-        1
-    );
+    let finished_runs = std::fs::read_to_string(&finished)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    if shutdown {
+        assert_eq!(finished_runs, 1);
+    } else {
+        assert!(finished_runs <= 1, "the push was resent");
+    }
 }
 
 #[test]

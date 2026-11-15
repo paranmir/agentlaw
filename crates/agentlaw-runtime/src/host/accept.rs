@@ -374,7 +374,7 @@ fn admit_call<D: Dispatcher>(
         .begin(ActivityKind::Execution)
         .map_err(|e| e.stopping_reason().unwrap_or(RejectReason::Busy))?;
     let history = matches!(&classified, Classified::Query(QueryRequest::History(_)));
-    let admin = matches!(&classified, Classified::Admin(_));
+    let admin = matches!(&classified, Classified::Admin(command) if !matches!(command, AdminCommand::ImportCall { .. }));
     let fallback = match header.target {
         CallTarget::Store(reference) => ctx.registry.resolve(&reference).ok().map(|s| {
             if history {

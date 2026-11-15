@@ -31,6 +31,7 @@ enum Entry {
         key: BindingKey,
         service: Arc<StoreService>,
         active: usize,
+        staged: bool,
     },
     Closing,
 }
@@ -65,8 +66,130 @@ pub(super) struct AuditGuard {
     reference: BindingRef,
 }
 
-#[cfg(test)]
 impl Stores {
+    pub(super) fn acquire_stage(
+        &self,
+        snapshot: &Arc<ConfigSnapshot>,
+        stage: &crate::git::git_ops::ImportStageContext,
+        control: &RequestControl,
+    ) -> agentlaw_contracts::Result<StoreGuard> {
+        let identity = identity::resolve_import_stage(&self.0.installation, snapshot, stage)
+            .map_err(|e| {
+                agentlaw_contracts::DomainError::new("store_unavailable", e.to_string())
+            })?;
+        let key =
+            agentlaw_storage::binding_identity(&identity.root, &identity.local).map_err(|e| {
+                agentlaw_contracts::DomainError::new("store_unavailable", e.to_string())
+            })?;
+        let reference = BindingRef::new(&key, &identity.user_id);
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            control.check()?;
+            if state.stopping {
+                return Err(agentlaw_contracts::DomainError::new(
+                    "runtime_stopping",
+                    "The runtime is stopping.",
+                ));
+            }
+            match state.entries.get_mut(&reference) {
+                Some(Entry::Open {
+                    service, active, ..
+                }) => {
+                    *active += 1;
+                    return Ok(StoreGuard {
+                        inner: self.0.clone(),
+                        reference,
+                        service: service.clone(),
+                    });
+                }
+                Some(_) => {
+                    state = self
+                        .0
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                None => {
+                    state.entries.insert(reference, Entry::Opening);
+                    drop(state);
+                    let result = self.0.open_identity(identity, control);
+                    state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                    match result {
+                        Ok(service) => {
+                            let service = Arc::new(service);
+                            state.entries.insert(
+                                reference,
+                                Entry::Open {
+                                    key,
+                                    service: service.clone(),
+                                    active: 1,
+                                    staged: true,
+                                },
+                            );
+                            self.0.changed.notify_all();
+                            return Ok(StoreGuard {
+                                inner: self.0.clone(),
+                                reference,
+                                service,
+                            });
+                        }
+                        Err(error) => {
+                            state.entries.remove(&reference);
+                            self.0.changed.notify_all();
+                            return Err(match error {
+                                RuntimeError::Domain(error) => error,
+                                other => agentlaw_contracts::DomainError::new(
+                                    "store_unavailable",
+                                    other.to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub(super) fn close_stage(
+        &self,
+        snapshot: &Arc<ConfigSnapshot>,
+        stage: &crate::git::git_ops::ImportStageContext,
+        control: &RequestControl,
+    ) -> agentlaw_contracts::Result<()> {
+        let key = agentlaw_storage::binding_identity(&stage.store_path, &stage.runtime_path)
+            .map_err(|e| {
+                agentlaw_contracts::DomainError::new("store_unavailable", e.to_string())
+            })?;
+        let reference = BindingRef::new(&key, &snapshot.config.user_id);
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            control.check()?;
+            match state.entries.get(&reference) {
+                None => return Ok(()),
+                Some(Entry::Open {
+                    active: 0,
+                    service,
+                    staged: true,
+                    ..
+                }) => {
+                    let service = service.clone();
+                    state.entries.insert(reference, Entry::Closing);
+                    drop(state);
+                    self.0.close(reference, service);
+                    return Ok(());
+                }
+                _ => {
+                    state = self
+                        .0
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            }
+        }
+    }
+    #[cfg(test)]
     pub(super) fn observe(
         &self,
         observer: impl Fn(BindingRef, &'static str) + Send + Sync + 'static,
@@ -123,6 +246,7 @@ impl Drop for MaintenanceGuard {
                         key: self.snapshot.key.clone(),
                         service,
                         active: 0,
+                        staged: false,
                     },
                 );
             }
@@ -175,6 +299,13 @@ impl Inner {
             config::require_existing_binding(&self.installation, &snapshot.config)?;
         }
         let identity = identity::resolve(&self.installation, snapshot)?;
+        self.open_identity(identity, control)
+    }
+    fn open_identity(
+        &self,
+        identity: agentlaw_flows::runtime::StoreIdentity,
+        control: &RequestControl,
+    ) -> Result<StoreService, RuntimeError> {
         let deps = StoreDeps {
             health: self.deps.health.clone(),
             semantic: self.deps.semantic.clone(),
@@ -326,6 +457,7 @@ impl Stores {
                     break;
                 }
                 _ => {
+                    self.notify_observer(reference, "maintain_waiting");
                     state = self
                         .0
                         .changed
@@ -458,6 +590,7 @@ impl Stores {
                                     key: snapshot.key.clone(),
                                     service: service.clone(),
                                     active: 1,
+                                    staged: false,
                                 },
                             );
                             self.0.changed.notify_all();
@@ -509,6 +642,7 @@ impl Stores {
                     key,
                     service,
                     active: 0,
+                    staged: false,
                 } if Some(key) != current.as_ref()
                     && !state.maintaining.contains_key(reference) =>
                 {
@@ -586,9 +720,10 @@ impl Drop for StoreGuard {
                 key,
                 service,
                 active,
+                staged,
             }) => {
                 *active -= 1;
-                if *active == 0 && !maintaining && selected.as_ref() != Some(key) {
+                if *active == 0 && !*staged && !maintaining && selected.as_ref() != Some(key) {
                     Some(service.clone())
                 } else {
                     None

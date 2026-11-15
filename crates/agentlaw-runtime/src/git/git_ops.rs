@@ -1,12 +1,12 @@
 //! Git is an explicit sharing boundary, never the completion condition of remembering.
 use agentlaw_contracts::{DomainError, Result};
-use agentlaw_storage::import_conflict::{ImportConflict, ImportSide};
+use agentlaw_storage::import_conflict::ImportConflict;
 use agentlaw_storage::Store;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -53,6 +53,8 @@ pub struct PushReceipt {
     pub commit_oid: String,
     pub target_ref: String,
     pub local_source_preserved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_ref: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchReceipt {
@@ -86,13 +88,28 @@ struct StoredImport {
     review: ImportReview,
     active_root: String,
 }
+pub(super) fn valid_review_record(value: serde_json::Value, reference: &str) -> bool {
+    serde_json::from_value::<StoredImport>(value).is_ok_and(|record| {
+        record.review.import_ref == reference
+            && valid_oid(&record.review.incoming_commit)
+            && valid_oid(&record.review.reviewed_tree)
+            && !record.active_root.is_empty()
+    })
+}
+pub(super) fn valid_completion_record(value: serde_json::Value) -> bool {
+    serde_json::from_value::<ImportPublishReceipt>(value).is_ok_and(|record| {
+        record.status == "published_and_committed"
+            && valid_oid(&record.commit_oid)
+            && uuid::Uuid::parse_str(&record.publication.operation_id).is_ok()
+    })
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportStageContext {
     pub store_path: PathBuf,
     pub runtime_path: PathBuf,
 }
 pub fn get_import_stage(
-    store: &Store,
+    store: &super::handle::GitStoreHandle,
     local: &Path,
     import_ref: &str,
 ) -> Result<ImportStageContext> {
@@ -111,6 +128,27 @@ pub fn get_import_stage(
         return Err(DomainError::new(
             "import_already_confirmed",
             "Confirmed import can only resume its exact publication/handoff.",
+        ));
+    }
+    Ok(ImportStageContext {
+        store_path: stored.review.staged_path,
+        runtime_path: dir.join("runtime"),
+    })
+}
+pub fn get_import_stage_for_publish(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    import_ref: &str,
+) -> Result<ImportStageContext> {
+    let _lane = lane(local)?;
+    let (dir, stored) = import_record(local, import_ref)?;
+    let root = store
+        .with_source_read(|root, _| Ok(root.to_string_lossy().to_string()))
+        .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?;
+    if root != stored.active_root {
+        return Err(DomainError::new(
+            "import_binding_mismatch",
+            "Import belongs to another source.",
         ));
     }
     Ok(ImportStageContext {
@@ -149,6 +187,14 @@ struct ImportHandoff {
     reference: String,
     expected_head: Option<String>,
     index_plan: IndexPlan,
+}
+pub(super) fn valid_handoff_record(value: serde_json::Value, reference: &str) -> bool {
+    serde_json::from_value::<ImportHandoff>(value).is_ok_and(|record| {
+        record.resolution.import_ref == reference
+            && !record.resolution.resolution_token.is_empty()
+            && valid_oid(&record.commit_oid)
+            && uuid::Uuid::parse_str(&record.operation_id).is_ok()
+    })
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct IndexPlan {
@@ -485,15 +531,32 @@ fn import_record(local: &Path, id: &str) -> Result<(PathBuf, StoredImport)> {
     .map_err(|_| io_error("import record decode"))?;
     Ok((dir, stored))
 }
+#[cfg(test)]
 pub(crate) fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<String> {
+    staged_tree_controlled(
+        repo,
+        staged,
+        local,
+        &agentlaw_contracts::RequestControl::default(),
+    )
+}
+fn staged_tree_controlled(
+    repo: &Path,
+    staged: &Path,
+    local: &Path,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<String> {
     let index = local.join(format!("resolution-{}.index", uuid::Uuid::new_v4()));
     let result = (|| {
-        let parent = optional_head(repo)?;
-        let out = command(repo)
-            .env("GIT_INDEX_FILE", git_path(&index))
-            .args(["read-tree", parent.as_deref().unwrap_or("--empty")])
-            .output()
-            .map_err(|_| io_error("resolution index"))?;
+        let head = output_cancellable(repo, &["rev-parse", "--verify", "HEAD"], control)?;
+        let parent = head
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&head.stdout).trim().to_owned());
+        let mut cmd = command(repo);
+        cmd.env("GIT_INDEX_FILE", git_path(&index))
+            .args(["read-tree", parent.as_deref().unwrap_or("--empty")]);
+        let out = wait_cancellable(cmd, control)?;
         if !out.status.success() {
             return Err(io_error("resolution index"));
         }
@@ -505,22 +568,20 @@ pub(crate) fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<St
             ".gitattributes",
         ] {
             if staged.join(path).exists() {
-                let out = command(repo)
-                    .env("GIT_INDEX_FILE", git_path(&index))
+                let mut cmd = command(repo);
+                cmd.env("GIT_INDEX_FILE", git_path(&index))
                     .env("GIT_WORK_TREE", git_path(staged))
-                    .args(["add", "-A", "-f", "--", path])
-                    .output()
-                    .map_err(|_| io_error("resolution capture"))?;
+                    .args(["add", "-A", "-f", "--", path]);
+                let out = wait_cancellable(cmd, control)?;
                 if !out.status.success() {
                     return Err(io_error("resolution capture"));
                 }
             }
         }
-        let out = command(repo)
-            .env("GIT_INDEX_FILE", git_path(&index))
-            .args(["write-tree"])
-            .output()
-            .map_err(|_| io_error("resolution tree"))?;
+        let mut cmd = command(repo);
+        cmd.env("GIT_INDEX_FILE", git_path(&index))
+            .args(["write-tree"]);
+        let out = wait_cancellable(cmd, control)?;
         if !out.status.success() {
             return Err(io_error("resolution tree"));
         }
@@ -531,80 +592,6 @@ pub(crate) fn staged_tree(repo: &Path, staged: &Path, local: &Path) -> Result<St
 }
 /// Validate the human/LLM-assisted edits already made through the staged Runtime.
 /// Concurrent heads are reported, never chosen here. Token binds exact reviewed bytes.
-pub fn resolve_import_with_choices(
-    store: &Store,
-    local: &Path,
-    import_ref: &str,
-    choices: &BTreeMap<String, ImportSide>,
-    user_confirmed: bool,
-) -> Result<ImportResolution> {
-    if !user_confirmed {
-        return Err(DomainError::new(
-            "confirmation_required",
-            "Explicit structural choices require user confirmation.",
-        ));
-    }
-    let context = get_import_stage(store, local, import_ref)?;
-    {
-        let _lane = lane(local)?;
-        let dir = local.join("imports").join(import_ref);
-        let staged = Store::open_with_coordination(
-            &context.store_path,
-            context.runtime_path.join("canonical"),
-            store.coordination_root(),
-        )
-        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
-        // Only an unfinished execution retains its identity. Equal later payloads
-        // are new intents (local -> incoming -> local must apply all three).
-        #[derive(Serialize, Deserialize)]
-        struct ChoiceExecution {
-            operation: String,
-            choices: BTreeMap<String, ImportSide>,
-        }
-        let execution = dir.join("choices-pending.json");
-        let pending: Option<ChoiceExecution> = if execution.exists() {
-            Some(
-                serde_json::from_reader(
-                    File::open(&execution).map_err(|_| io_error("choice execution"))?,
-                )
-                .map_err(|_| io_error("choice execution decode"))?,
-            )
-        } else {
-            None
-        };
-        let operation = if let Some(pending) = pending {
-            if pending.choices != *choices {
-                return Err(DomainError::new(
-                    "pending_structural_choice",
-                    "Resume the preceding explicit choices first; their retained execution has not completed. Then submit the new choices.",
-                ));
-            }
-            pending.operation
-        } else {
-            let operation = uuid::Uuid::new_v4().to_string();
-            save_local_json(
-                &execution,
-                &ChoiceExecution {
-                    operation: operation.clone(),
-                    choices: choices.clone(),
-                },
-            )?;
-            operation
-        };
-        if let Err(error) = staged.choose_import_conflicts(&operation, choices, true) {
-            if matches!(staged.import_choice_decided(&operation), Ok(false)) {
-                fs::remove_file(&execution)
-                    .map_err(|_| io_error("uncommitted choice execution cleanup"))?;
-            }
-            return Err(DomainError::new(
-                "structural_choice_failed",
-                error.to_string(),
-            ));
-        }
-        fs::remove_file(execution).map_err(|_| io_error("completed choice execution cleanup"))?;
-    }
-    resolve_import(store, local, import_ref)
-}
 fn conflicting_current_ids(staged: &Store) -> Result<Vec<String>> {
     let reader = staged.owned_published_reader();
     let mut cursor = None;
@@ -631,7 +618,14 @@ fn conflicting_current_ids(staged: &Store) -> Result<Vec<String>> {
     }
     Ok(conflicts)
 }
-pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<ImportResolution> {
+pub fn resolve_import(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    import_ref: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<ImportResolution> {
+    control.check()?;
+    control.phase("acquiring_import");
     let _lane = lane(local)?;
     let (dir, stored) = import_record(local, import_ref)?;
     let (root, generation) = store
@@ -650,6 +644,7 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
         store.coordination_root(),
     )
     .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
+    control.phase("verifying_import");
     let audit = staged
         .audit_source()
         .map_err(|e| DomainError::new("invalid_import_resolution", e.to_string()))?;
@@ -676,6 +671,8 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
         }
         cursor = page.last().map(|(k, id)| format!("{k}/{id}"));
     }
+    control.check()?;
+    control.phase("fixing_candidate");
     let tree = staged
         .with_source_read(|path, g| {
             if g != audit.source_position.sequence {
@@ -683,10 +680,15 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
                     "staged review changed".into(),
                 ));
             }
-            staged_tree(&root, path, local)
+            staged_tree_controlled(&root, path, local, control)
                 .map_err(|e| agentlaw_storage::Error::ExternalOperation(e.to_string()))
         })
-        .map_err(|e| DomainError::new("staged_capture", e.to_string()))?;
+        .map_err(|e| {
+            control
+                .check()
+                .err()
+                .unwrap_or_else(|| DomainError::new("staged_capture", e.to_string()))
+        })?;
     let token = format!(
         "{:x}",
         Sha256::digest(
@@ -723,12 +725,34 @@ pub fn resolve_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
 /// Explicit user confirmation publishes C6 first, then performs a resumable Git ref CAS.
 /// Same import/token resumes the durable handoff. No push and no active-index overwrite.
 pub fn publish_import(
-    store: &Store,
+    store: &super::handle::GitStoreHandle,
     local: &Path,
     import_ref: &str,
     resolution_token: &str,
     user_confirmed: bool,
+    control: &agentlaw_contracts::RequestControl,
 ) -> Result<ImportPublishReceipt> {
+    publish_import_observed(
+        store,
+        local,
+        import_ref,
+        resolution_token,
+        user_confirmed,
+        control,
+        &|| Ok(()),
+    )
+}
+pub(crate) fn publish_import_observed(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    import_ref: &str,
+    resolution_token: &str,
+    user_confirmed: bool,
+    control: &agentlaw_contracts::RequestControl,
+    after_publication: &dyn Fn() -> Result<()>,
+) -> Result<ImportPublishReceipt> {
+    control.check()?;
+    control.phase("verifying_import_resolution");
     if !user_confirmed {
         return Err(DomainError::new(
             "confirmation_required",
@@ -792,10 +816,15 @@ pub fn publish_import(
                         "staged generation changed".into(),
                     ));
                 }
-                staged_tree(&root, path, local)
+                staged_tree_controlled(&root, path, local, control)
                     .map_err(|e| agentlaw_storage::Error::ExternalOperation(e.to_string()))
             })
-            .map_err(|e| DomainError::new("stale_import_resolution", e.to_string()))?;
+            .map_err(|e| {
+                control
+                    .check()
+                    .err()
+                    .unwrap_or_else(|| DomainError::new("stale_import_resolution", e.to_string()))
+            })?;
         if tree != resolution.reviewed_tree {
             return Err(DomainError::new(
                 "stale_import_resolution",
@@ -803,7 +832,7 @@ pub fn publish_import(
             ));
         }
         let incoming = dir.join("incoming");
-        run(
+        run_cancellable(
             &root,
             &[
                 "fetch",
@@ -813,6 +842,7 @@ pub fn publish_import(
                 &git_path(&incoming).to_string_lossy(),
                 &stored.review.incoming_commit,
             ],
+            control,
         )?;
         let symbolic = command(&root)
             .args(["symbolic-ref", "-q", "HEAD"])
@@ -856,27 +886,22 @@ pub fn publish_import(
             "A different approved import is already decided.",
         ));
     }
-    let publication = if let Some(receipt) = store
-        .sync_receipt(&plan.operation_id)
-        .map_err(|e| DomainError::new("import_recovery", e.to_string()))?
-    {
+    let publication = if let Some(receipt) = store.import_receipt(&plan.operation_id, control)? {
         receipt
     } else {
-        let staged = Store::open_read_only_with_coordination(
-            &stored.review.staged_path,
-            dir.join("runtime/canonical"),
-            store.coordination_root(),
-        )
-        .map_err(|e| DomainError::new("staged_source_unavailable", e.to_string()))?;
-        store
-            .publish_imported_source_at(
-                &plan.operation_id,
-                &staged,
-                stored.review.source_generation,
-                resolution.staged_generation,
-            )
-            .map_err(|e| DomainError::new("import_publication", e.to_string()))?
+        control.phase("publishing_import");
+        store.publish_import(
+            crate::store::lane::ImportPublishInput {
+                operation_id: plan.operation_id.clone(),
+                staged_root: stored.review.staged_path.clone(),
+                staged_local: dir.join("runtime/canonical"),
+                expected_generation: stored.review.source_generation,
+                staged_generation: plan.resolution.staged_generation,
+            },
+            control,
+        )?
     };
+    after_publication()?;
     apply_ref_index(
         &root,
         &plan.reference,
@@ -945,6 +970,184 @@ pub(crate) fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     }
     Ok(out.stdout)
 }
+pub(crate) fn output_cancellable(
+    repo: &Path,
+    args: &[&str],
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<std::process::Output> {
+    let mut cmd = command(repo);
+    cmd.args(args);
+    wait_cancellable(cmd, control)
+}
+fn wait_cancellable(
+    mut cmd: Command,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<std::process::Output> {
+    wait_cancellable_tracked(&mut cmd, control, None)
+}
+fn wait_cancellable_tracked(
+    cmd: &mut Command,
+    control: &agentlaw_contracts::RequestControl,
+    started: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    control.check()?;
+    super::process::prepare(cmd);
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| io_error("command launch"))?;
+    if let Some(started) = started {
+        started.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let mut tree = super::process::Tree::attach(&child).ok();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io_error("command output"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io_error("command output"))?;
+    let (send, receive) = std::sync::mpsc::channel();
+    let out_send = send.clone();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = out_send.send((true, stdout.read_to_end(&mut bytes).map(|_| bytes)));
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = send.send((false, stderr.read_to_end(&mut bytes).map(|_| bytes)));
+    });
+    let mut status = None;
+    let mut output = None;
+    let mut error_output = None;
+    loop {
+        if let Err(cancelled) = control.check() {
+            if let Some(tree) = tree.take() {
+                tree.terminate();
+            } else {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            return Err(cancelled);
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(value)) => status = Some(value),
+                Ok(None) => {}
+                Err(_) => {
+                    if let Some(tree) = tree.take() {
+                        tree.terminate();
+                    } else {
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    return Err(io_error("command wait"));
+                }
+            }
+        }
+        if status.is_some() && output.is_some() && error_output.is_some() {
+            break;
+        }
+        if output.is_some() && error_output.is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        match receive.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok((true, bytes)) => output = Some(bytes.map_err(|_| io_error("command output"))?),
+            Ok((false, bytes)) => {
+                error_output = Some(bytes.map_err(|_| io_error("command output"))?)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(tree) = tree.take() {
+                    tree.terminate();
+                } else {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+                return Err(io_error("command output"));
+            }
+        }
+    }
+    drop(tree);
+    Ok(std::process::Output {
+        status: status.expect("child status was collected"),
+        stdout: output.expect("stdout was collected"),
+        stderr: error_output.expect("stderr was collected"),
+    })
+}
+fn run_cancellable(
+    repo: &Path,
+    args: &[&str],
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<Vec<u8>> {
+    let output = output_cancellable(repo, args, control)?;
+    if !output.status.success() {
+        return Err(DomainError::new("git_command_failed", format!("Git {} failed (exit {:?}); stderr omitted to avoid exposing credentials or remembered content.", args.first().unwrap_or(&"operation"), output.status.code())));
+    }
+    Ok(output.stdout)
+}
+pub(crate) fn text_cancellable(
+    repo: &Path,
+    args: &[&str],
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<String> {
+    String::from_utf8(run_cancellable(repo, args, control)?)
+        .map(|text| text.trim().to_owned())
+        .map_err(|_| io_error("non-UTF8 metadata"))
+}
+fn optional_head_cancellable(
+    repo: &Path,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<Option<String>> {
+    let output = output_cancellable(repo, &["rev-parse", "--verify", "HEAD"], control)?;
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+fn git_root_cancellable(
+    repo: &Path,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<PathBuf> {
+    let root = text_cancellable(repo, &["rev-parse", "--show-toplevel"], control)?;
+    let actual = fs::canonicalize(root).map_err(|_| io_error("repository root"))?;
+    let expected = fs::canonicalize(repo).map_err(|_| io_error("source root"))?;
+    if actual != expected {
+        return Err(DomainError::new(
+            "wrong_git_repository",
+            "Memory operations cannot use an enclosing project repository.",
+        ));
+    }
+    Ok(actual)
+}
+fn endpoint_cancellable(
+    repo: &Path,
+    remote: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<String> {
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err(DomainError::new(
+            "invalid_remote",
+            "Use an explicit configured remote name.",
+        ));
+    }
+    let values = text_cancellable(
+        repo,
+        &["remote", "get-url", "--push", "--all", remote],
+        control,
+    )?;
+    if values.lines().count() != 1 {
+        return Err(DomainError::new(
+            "ambiguous_destination",
+            "Exactly one push URL is required for a bound sharing review.",
+        ));
+    }
+    Ok(values)
+}
 pub(crate) fn text(repo: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(run(repo, args)?)
         .map(|s| s.trim().to_string())
@@ -994,41 +1197,8 @@ pub(crate) fn valid_oid(s: &str) -> bool {
 
 /// Capture under C6's source read gate, then create a commit and CAS the expected ref.
 /// No fetch, merge, push, user-index write, author invention or force-update occurs.
-pub fn continuity_save(store: &Store, local: &Path, message: &str) -> Result<SaveReceipt> {
-    continuity_save_source(store, local, message)
-}
-
-trait CooperativeSource {
-    fn with_source_read<T>(
-        &self,
-        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
-    ) -> agentlaw_storage::Result<T>;
-}
-impl CooperativeSource for Store {
-    fn with_source_read<T>(
-        &self,
-        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
-    ) -> agentlaw_storage::Result<T> {
-        Store::with_source_read(self, read)
-    }
-}
-impl CooperativeSource for super::handle::GitStoreHandle {
-    fn with_source_read<T>(
-        &self,
-        read: impl FnOnce(&Path, u64) -> agentlaw_storage::Result<T>,
-    ) -> agentlaw_storage::Result<T> {
-        self.source.with_source_read(read)
-    }
-}
-pub(crate) fn continuity_save_from_handle(
-    handle: &super::handle::GitStoreHandle,
-    local: &Path,
-    message: &str,
-) -> Result<SaveReceipt> {
-    continuity_save_source(handle, local, message)
-}
-fn continuity_save_source(
-    store: &impl CooperativeSource,
+pub fn continuity_save(
+    store: &super::handle::GitStoreHandle,
     local: &Path,
     message: &str,
 ) -> Result<SaveReceipt> {
@@ -1276,7 +1446,7 @@ fn save_review(local: &Path, id: &str, value: &StoredReview) -> Result<()> {
     file.sync_all().map_err(|_| io_error("review sync"))
 }
 pub fn inspect_share(
-    store: &Store,
+    store: &super::handle::GitStoreHandle,
     local: &Path,
     remote: &str,
     target_ref: &str,
@@ -1329,11 +1499,14 @@ pub fn inspect_share(
     Ok(review)
 }
 pub fn push_review(
-    store: &Store,
+    store: &super::handle::GitStoreHandle,
     local: &Path,
     review_id: &str,
     accept_findings: bool,
+    control: &agentlaw_contracts::RequestControl,
 ) -> Result<PushReceipt> {
+    control.check()?;
+    control.phase("pushing_reviewed_commit");
     if uuid::Uuid::parse_str(review_id).is_err() {
         return Err(DomainError::new(
             "invalid_review_ref",
@@ -1351,7 +1524,7 @@ pub fn push_review(
     let repo = store
         .with_source_read(|root, _| Ok(root.to_path_buf()))
         .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?;
-    let bound_endpoint = endpoint(&repo, &r.remote)?;
+    let bound_endpoint = endpoint_cancellable(&repo, &r.remote, control)?;
     if repo.to_string_lossy() != stored.repo
         || r.review_ref != review_id
         || r.policy_version != POLICY
@@ -1363,7 +1536,9 @@ pub fn push_review(
         ));
     }
     let scan=stored.scan.as_ref().ok_or_else(||DomainError::new("sharing_scan_receipt_required","This older review has no sealed scan receipt. Inspect once with the current build before sharing."))?;
+    control.check()?;
     super::git_scan::validate(scan)?;
+    control.check()?;
     if scan.object_set_digest != stored.closure_digest
         || scan.findings != r.findings
         || scan.tree_oid != r.tree_oid
@@ -1381,16 +1556,34 @@ pub fn push_review(
         ));
     }
     let refspec = format!("{}:{}", r.commit_oid, r.target_ref);
-    let outcome = command(&scan.transfer_store)
-        .args(["push", "--porcelain", "--", &bound_endpoint, &refspec])
-        .output()
-        .map_err(|_| io_error("push launch"))?;
+    control.check()?;
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let mut cmd = command(&scan.transfer_store);
+    cmd.args(["push", "--porcelain", "--", &bound_endpoint, &refspec]);
+    let outcome = match wait_cancellable_tracked(&mut cmd, control, Some(&started)) {
+        Ok(output) => output,
+        Err(error)
+            if started.load(std::sync::atomic::Ordering::Acquire)
+                && matches!(error.code.as_str(), "cancelled" | "git_process_containment") =>
+        {
+            return Ok(PushReceipt {
+                status: "sharing_outcome_unknown".into(),
+                commit_oid: r.commit_oid.clone(),
+                target_ref: r.target_ref.clone(),
+                local_source_preserved: true,
+                review_ref: Some(review_id.to_owned()),
+            })
+        }
+        Err(error) => return Err(error),
+    };
     let status = if outcome.status.success() {
         "pushed"
     } else {
-        let remote = command(&repo)
-            .args(["ls-remote", "--refs", "--", &bound_endpoint, &r.target_ref])
-            .output();
+        let remote = output_cancellable(
+            &repo,
+            &["ls-remote", "--refs", "--", &bound_endpoint, &r.target_ref],
+            control,
+        );
         match remote {
             Ok(out)
                 if out.status.success()
@@ -1401,6 +1594,7 @@ pub fn push_review(
             {
                 "pushed_confirmed_after_response_loss"
             }
+            Err(error) if error.code == "cancelled" => "sharing_outcome_unknown",
             _ => "sharing_outcome_unknown",
         }
     };
@@ -1409,23 +1603,35 @@ pub fn push_review(
         commit_oid: r.commit_oid.clone(),
         target_ref: r.target_ref.clone(),
         local_source_preserved: true,
+        review_ref: if status == "sharing_outcome_unknown" {
+            Some(review_id.to_owned())
+        } else {
+            None
+        },
     })
 }
 
 /// Network fetch writes only an isolated bare object/ref cache, never active files or HEAD.
-pub fn fetch_share(store: &Store, local: &Path, remote: &str) -> Result<FetchReceipt> {
+pub fn fetch_share(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    remote: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<FetchReceipt> {
+    control.check()?;
+    control.phase("fetching_remote");
     let _lane = lane(local)?;
     let repo = store
         .with_source_read(|root, _| Ok(root.to_path_buf()))
         .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?;
-    git_root(&repo)?;
+    git_root_cancellable(&repo, control)?;
     if remote.is_empty() || remote.starts_with('-') {
         return Err(DomainError::new(
             "invalid_remote",
             "Use a configured remote name.",
         ));
     }
-    let url = text(&repo, &["remote", "get-url", "--all", remote])?;
+    let url = text_cancellable(&repo, &["remote", "get-url", "--all", remote], control)?;
     if url.lines().count() != 1 {
         return Err(DomainError::new(
             "ambiguous_destination",
@@ -1435,8 +1641,8 @@ pub fn fetch_share(store: &Store, local: &Path, remote: &str) -> Result<FetchRec
     let fetch_ref = uuid::Uuid::new_v4().to_string();
     let cache = local.join("fetch-cache").join(&fetch_ref);
     fs::create_dir_all(&cache).map_err(|_| io_error("fetch cache"))?;
-    run(&cache, &["init", "--bare"])?;
-    run(
+    run_cancellable(&cache, &["init", "--bare"], control)?;
+    run_cancellable(
         &cache,
         &[
             "fetch",
@@ -1445,14 +1651,16 @@ pub fn fetch_share(store: &Store, local: &Path, remote: &str) -> Result<FetchRec
             &url,
             "+refs/heads/*:refs/agentlaw/incoming/*",
         ],
+        control,
     )?;
-    let refs = text(
+    let refs = text_cancellable(
         &cache,
         &[
             "for-each-ref",
             "--format=%(objectname) %(refname)",
             "refs/agentlaw/incoming/",
         ],
+        control,
     )?;
     let fetched_refs = refs.lines().map(str::to_owned).collect();
     Ok(FetchReceipt {
@@ -1464,7 +1672,29 @@ pub fn fetch_share(store: &Store, local: &Path, remote: &str) -> Result<FetchRec
 }
 /// Prepare the incoming immutable tree for review. This does NOT claim that a clean
 /// checkout is a semantic merge or authorize replacing active current/history.
-pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<ImportReview> {
+pub fn prepare_import(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    commit: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<ImportReview> {
+    prepare_import_with_ref(
+        store,
+        local,
+        commit,
+        &uuid::Uuid::new_v4().to_string(),
+        control,
+    )
+}
+pub(crate) fn prepare_import_with_ref(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    commit: &str,
+    import_ref: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<ImportReview> {
+    control.check()?;
+    control.phase("acquiring_import");
     if !valid_oid(commit) {
         return Err(DomainError::new(
             "invalid_commit",
@@ -1475,12 +1705,14 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
     let (active_root, generation) = store
         .with_source_read(|root, g| Ok((root.to_path_buf(), g)))
         .map_err(|e| DomainError::new("source_unavailable", e.to_string()))?;
-    git_root(&active_root)?;
+    git_root_cancellable(&active_root, control)?;
     let mut source = None;
-    let candidate = command(&active_root)
-        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
-        .output()
-        .map_err(|_| io_error("incoming commit lookup"))?;
+    control.phase("verifying_import");
+    let candidate = output_cancellable(
+        &active_root,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        control,
+    )?;
     if candidate.status.success() {
         source = Some(active_root.clone());
     } else {
@@ -1488,10 +1720,11 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
         if caches.exists() {
             for entry in fs::read_dir(caches).map_err(|_| io_error("fetch-cache inventory"))? {
                 let path = entry.map_err(|_| io_error("fetch-cache entry"))?.path();
-                let found = command(&path)
-                    .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
-                    .output()
-                    .map_err(|_| io_error("fetched commit lookup"))?;
+                let found = output_cancellable(
+                    &path,
+                    &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                    control,
+                )?;
                 if found.status.success() {
                     source = Some(path);
                     break;
@@ -1505,12 +1738,14 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
             "Fetch the requested immutable commit into the preparation cache first.",
         )
     })?;
-    let import_ref = uuid::Uuid::new_v4().to_string();
+    let import_ref = import_ref.to_owned();
+    control.phase("building_review_workspace");
+    control.check()?;
     let dir = local.join("imports").join(&import_ref);
     let staged = dir.join("incoming");
     fs::create_dir_all(&staged).map_err(|_| io_error("staged source"))?;
-    run(&staged, &["init"])?;
-    run(
+    run_cancellable(&staged, &["init"], control)?;
+    run_cancellable(
         &staged,
         &[
             "fetch",
@@ -1520,18 +1755,23 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
             &git_path(&source).to_string_lossy(),
             commit,
         ],
+        control,
     )?;
-    run(&staged, &["checkout", "--detach", commit])?;
+    run_cancellable(&staged, &["checkout", "--detach", commit], control)?;
     let validated = Store::attach_existing_with_coordination(
         &staged,
         dir.join("incoming-control"),
         store.coordination_root(),
     )
     .map_err(|e| DomainError::new("incoming_source_invalid", e.to_string()))?;
-    let tree = text(&staged, &["rev-parse", &format!("{commit}^{{tree}}")])?;
+    let tree = text_cancellable(
+        &staged,
+        &["rev-parse", &format!("{commit}^{{tree}}")],
+        control,
+    )?;
     let merged = dir.join("source");
     let union = store
-        .prepare_import_union(&validated, &merged, dir.join("runtime/canonical"))
+        .prepare_import_union(&validated, &merged, &dir.join("runtime/canonical"))
         .map_err(|e| DomainError::new("import_union_requires_review", e.to_string()))?;
     let review = ImportReview {
         completion: None,
@@ -1543,7 +1783,7 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
         import_ref: import_ref.clone(),
         incoming_commit: commit.into(),
         reviewed_tree: tree,
-        active_head: optional_head(&active_root)?,
+        active_head: optional_head_cancellable(&active_root, control)?,
         source_generation: generation,
         status: "review_required".into(),
         staged_path: merged,
@@ -1565,7 +1805,13 @@ pub fn prepare_import(store: &Store, local: &Path, commit: &str) -> Result<Impor
         .map_err(|_| io_error("import review sync"))?;
     Ok(review)
 }
-pub fn inspect_import(store: &Store, local: &Path, import_ref: &str) -> Result<ImportReview> {
+pub fn inspect_import(
+    store: &super::handle::GitStoreHandle,
+    local: &Path,
+    import_ref: &str,
+    control: &agentlaw_contracts::RequestControl,
+) -> Result<ImportReview> {
+    control.check()?;
     if uuid::Uuid::parse_str(import_ref).is_err() {
         return Err(DomainError::new(
             "invalid_import_ref",
@@ -1605,8 +1851,7 @@ pub fn inspect_import(store: &Store, local: &Path, import_ref: &str) -> Result<I
         )
         .map_err(|_| io_error("import handoff decode"))?;
         let applied = store
-            .sync_receipt(&handoff.operation_id)
-            .map_err(|e| DomainError::new("import_recovery", e.to_string()))?
+            .import_receipt(&handoff.operation_id, control)?
             .is_some();
         review.status = if applied {
             "canonical_published_git_handoff_pending"

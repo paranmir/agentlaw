@@ -18,7 +18,47 @@ fn runtime_setup(command: SetupCommand) -> Result<Value> {
 }
 pub(super) fn runtime_admin(command: AdminCommand) -> Result<Value> {
     let state = configuration::state_root()?;
-    agentlaw_app::frontend::RuntimeBackend::new(state, false)?.admin(&command, &cli_control())
+    with_admin_progress(|control| {
+        agentlaw_app::frontend::RuntimeBackend::new(state, false)?.admin(&command, control)
+    })
+}
+pub(super) fn with_admin_progress(
+    operation: impl FnOnce(&agentlaw_contracts::RequestControl) -> Result<Value>,
+) -> Result<Value> {
+    let (send, receive) = std::sync::mpsc::channel::<Option<String>>();
+    let progress = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let Ok(mut timer) = super::progress::ProgressTimer::new(
+            move || started.elapsed(),
+            std::time::Duration::from_secs(5),
+        ) else {
+            return;
+        };
+        loop {
+            match receive.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Some(phase)) => {
+                    let _ = timer.update(&phase);
+                }
+                Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = timer.finish();
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let _ = timer.tick(&mut std::io::stderr().lock());
+        }
+    });
+    let notify = send.clone();
+    let control = agentlaw_contracts::RequestControl::new(
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        move |phase| {
+            let _ = notify.send(Some(phase.to_owned()));
+        },
+    );
+    let result = operation(&control);
+    let _ = send.send(None);
+    let _ = progress.join();
+    result
 }
 
 pub(super) fn install(args: InstallArgs) -> Result<Value> {

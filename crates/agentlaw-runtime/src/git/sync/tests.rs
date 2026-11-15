@@ -1,4 +1,37 @@
 use super::*;
+fn call(
+    store: &Store,
+    local: &Path,
+    state: &Path,
+    user: &str,
+    machine: &str,
+    request: SyncRequest,
+    control: RequestControl,
+) -> Result<Value> {
+    let fixture = crate::test_support::store_service::git_handle_in(store, local);
+    super::call_with_handle(&fixture.handle, state, user, machine, request, control)
+}
+fn propose_policy(
+    store: &Store,
+    local: &Path,
+    remote: &str,
+    target: &str,
+) -> Result<DelegationPolicy> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    super::propose_policy(&fixture.handle, local, remote, target)
+}
+fn configure_policy(
+    state: &Path,
+    store: &Store,
+    local: &Path,
+    file: &Path,
+    confirmed: bool,
+) -> Result<Value> {
+    let fixture = crate::test_support::store_service::git_handle(store);
+    let input = std::fs::read_to_string(file).map_err(|_| git::io_error("sync record read"))?;
+    let prepared = super::prepare_policy_configuration(&input, confirmed)?;
+    super::configure_prepared_policy(state, &fixture.handle, local, prepared)
+}
 use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -75,7 +108,12 @@ impl Fixture {
         let machine = uid();
         let id = uid();
         save(&store, &id, &machine, "base");
-        git::continuity_save(&store, &local.join("git"), "base").unwrap();
+        git::continuity_save(
+            &crate::test_support::store_service::git_handle(&store).handle,
+            &local.join("git"),
+            "base",
+        )
+        .unwrap();
         git::run(&source, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
         let mut policy = propose_policy(&store, &local, "origin", "refs/heads/main").unwrap();
         policy.enabled = true;
@@ -141,7 +179,12 @@ impl Fixture {
         .unwrap();
         let store = view.open(&self.store).unwrap();
         save(&store, &self.id, &self.machine, body);
-        git::continuity_save(&store, &view.local.join("git"), "remote change").unwrap();
+        git::continuity_save(
+            &crate::test_support::store_service::git_handle(&store).handle,
+            &view.local.join("git"),
+            "remote change",
+        )
+        .unwrap();
         git::run(
             &view.root,
             &[
@@ -593,7 +636,12 @@ fn incoming_projection_keeps_raw_bytes_despite_attributes_and_autocrlf() {
         .unwrap();
     git::run(&source, &["config", "core.autocrlf", "false"]).unwrap();
     fs::write(source.join(".gitattributes"), b"* text\n").unwrap();
-    git::continuity_save(&f.store, &f.local.join("git"), "text attributes fixture").unwrap();
+    git::continuity_save(
+        &crate::test_support::store_service::git_handle(&f.store).handle,
+        &f.local.join("git"),
+        "text attributes fixture",
+    )
+    .unwrap();
     git::run(&source, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
     let root = f._temp.path().join("raw-projection");
     fs::create_dir_all(&root).unwrap();

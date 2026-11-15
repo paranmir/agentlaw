@@ -207,26 +207,6 @@ pub enum AdminCommand {
 }
 
 pub fn encode_admin(command: &AdminCommand) -> agentlaw_contracts::Result<Vec<u8>> {
-    if matches!(
-        command,
-        AdminCommand::ShareInspect { .. }
-            | AdminCommand::SharePush { .. }
-            | AdminCommand::ShareFetch { .. }
-            | AdminCommand::ImportPrepare { .. }
-            | AdminCommand::ImportList
-            | AdminCommand::ImportInspect { .. }
-            | AdminCommand::ImportCall { .. }
-            | AdminCommand::ImportResolve { .. }
-            | AdminCommand::ImportPublish { .. }
-            | AdminCommand::SyncAcceptFindings { .. }
-            | AdminCommand::SyncPolicyPropose { .. }
-            | AdminCommand::SyncPolicyConfigure { .. }
-    ) {
-        return Err(agentlaw_contracts::DomainError::new(
-            "unavailable",
-            "Administrative command is not implemented.",
-        ));
-    }
     let output = match command {
         AdminCommand::HistoryExport { output, .. }
         | AdminCommand::ProcedureList { output, .. }
@@ -243,6 +223,7 @@ pub fn encode_admin(command: &AdminCommand) -> agentlaw_contracts::Result<Vec<u8
         AdminCommand::ContinuitySave => serde_json::json!({"continuity_save":{}}),
         AdminCommand::Audit => serde_json::json!({"audit":{}}),
         AdminCommand::Repair => serde_json::json!({"repair":{}}),
+        AdminCommand::ImportList => serde_json::json!({"import_list":{}}),
         _ => serde_json::to_value(command)
             .map_err(|e| agentlaw_contracts::DomainError::new("invalid_input", e.to_string()))?,
     };
@@ -313,7 +294,10 @@ pub fn decode_body(kind: RequestKind, body: &[u8]) -> Result<Classified, RejectR
         if let Some(map) = command.as_object() {
             if map.len() == 1 {
                 let (key, fields) = map.iter().next().unwrap();
-                if matches!(key.as_str(), "continuity_save" | "audit" | "repair") {
+                if matches!(
+                    key.as_str(),
+                    "continuity_save" | "audit" | "repair" | "import_list"
+                ) {
                     if !fields.as_object().is_some_and(|fields| fields.is_empty()) {
                         return Err(RejectReason::InvalidBody(
                             agentlaw_contracts::DomainError::new(
@@ -332,6 +316,39 @@ pub fn decode_body(kind: RequestKind, body: &[u8]) -> Result<Classified, RejectR
                 "Admin command has invalid fields.",
             ))
         })?;
+        if let AdminCommand::ImportCall { request, .. } = &command {
+            let text = serde_json::to_string(request).map_err(|_| {
+                RejectReason::InvalidBody(agentlaw_contracts::DomainError::new(
+                    "invalid_input",
+                    "Invalid import request.",
+                ))
+            })?;
+            let request = agentlaw_contracts::wire::ValidatedRequest::parse_public(&text)
+                .map_err(RejectReason::InvalidBody)?;
+            match request.request() {
+                Request::Sync(_) => {
+                    return Err(RejectReason::InvalidBody(
+                        agentlaw_contracts::DomainError::new(
+                            "sync_requires_app_adapter",
+                            "Sync is not available in an import review.",
+                        ),
+                    ))
+                }
+                Request::ConnectProjectMemory(connect)
+                    if connect.memory_store_path.is_some()
+                        || !matches!(connect.intent, None | Some(ConnectIntent::Discover))
+                        || connect.restore_context == Some(true) =>
+                {
+                    return Err(RejectReason::InvalidBody(
+                        agentlaw_contracts::DomainError::new(
+                            "invalid_import_request",
+                            "Only project discovery is available in an import review.",
+                        ),
+                    ))
+                }
+                _ => {}
+            }
+        }
         Classified::Admin(command)
     } else if let Some(object) = value
         .as_object()

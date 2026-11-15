@@ -9,7 +9,7 @@ use agentlaw_storage::{
     sync::{Capture, CaptureLimits, OverlayGuard},
     Store,
 };
-pub use policy::{accept_findings, configure_policy, propose_policy, DelegationPolicy};
+pub use policy::{accept_findings, propose_policy, DelegationPolicy};
 pub use policy::{
     configure_prepared_policy, prepare_policy_configuration, require_delegation_confirmation,
     require_sharing_confirmation, PreparedPolicy,
@@ -172,6 +172,7 @@ fn save_packet(op: &Operation) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn persist(conn: &rusqlite::Connection, op: &Operation) -> Result<()> {
     let row = sync_row(op);
     conn.execute(
@@ -181,73 +182,23 @@ fn persist(conn: &rusqlite::Connection, op: &Operation) -> Result<()> {
     .map_err(|_| git::io_error("sync operation persistence"))?;
     save_packet(op)
 }
-enum SyncBackend<'a> {
-    Legacy {
-        conn: rusqlite::Connection,
-        store: &'a Store,
-    },
-    Handle {
-        sync: super::SyncControl,
-        handle: &'a super::handle::GitStoreHandle,
-    },
+struct SyncBackend<'a> {
+    sync: super::SyncControl,
+    handle: &'a super::handle::GitStoreHandle,
 }
 impl SyncBackend<'_> {
     fn request(&self, id: &str) -> Result<Option<super::control::SyncReceipt>> {
-        use rusqlite::OptionalExtension;
-        match self {
-            Self::Handle { sync, .. } => sync.request(id),
-            Self::Legacy { conn, .. } => conn
-                .query_row(
-                    "SELECT operation_id,digest,response FROM sync_requests WHERE request_id=?1",
-                    [id],
-                    |r| {
-                        Ok(super::control::SyncReceipt {
-                            operation_id: r.get(0)?,
-                            digest: r.get(1)?,
-                            response: r.get(2)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(|_| git::io_error("sync request replay")),
-        }
+        self.sync.request(id)
     }
     fn active_for(&self, source: &Path) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        match self {
-            Self::Handle { sync, .. } => sync.active_for(source),
-            Self::Legacy { conn, .. } => conn
-                .query_row(
-                    "SELECT operation_id FROM sync_operations WHERE source=?1 AND active=1",
-                    [source.to_string_lossy().as_ref()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|_| git::io_error("sync source slot")),
-        }
+        self.sync.active_for(source)
     }
     fn operation(&self, id: &str) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        match self {
-            Self::Handle { sync, .. } => sync.operation(id),
-            Self::Legacy { conn, .. } => conn
-                .query_row(
-                    "SELECT state FROM sync_operations WHERE operation_id=?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|_| git::io_error("sync operation lookup")),
-        }
+        self.sync.operation(id)
     }
     fn persist(&self, op: &Operation, control: &RequestControl) -> Result<()> {
-        match self {
-            Self::Handle { sync, .. } => {
-                sync.persist(sync_row(op), control)?;
-                save_packet(op)
-            }
-            Self::Legacy { conn, .. } => persist(conn, op),
-        }
+        self.sync.persist(sync_row(op), control)?;
+        save_packet(op)
     }
     fn reserve(
         &self,
@@ -256,58 +207,23 @@ impl SyncBackend<'_> {
         digest: &str,
         control: &RequestControl,
     ) -> Result<bool> {
-        match self {
-            Self::Handle { sync, .. } => sync.reserve(id, operation, digest, control),
-            Self::Legacy { conn, .. } => conn
-                .execute(
-                    "INSERT OR IGNORE INTO sync_requests VALUES(?1,?2,?3,NULL)",
-                    rusqlite::params![id, operation, digest],
-                )
-                .map(|n| n != 0)
-                .map_err(|_| git::io_error("sync request intent")),
-        }
+        self.sync.reserve(id, operation, digest, control)
     }
     fn complete(&self, id: &str, response: String, control: &RequestControl) -> Result<()> {
-        match self {
-            Self::Handle { sync, .. } => sync.complete(id, response, control),
-            Self::Legacy { conn, .. } => {
-                conn.execute(
-                    "UPDATE sync_requests SET response=?1 WHERE request_id=?2",
-                    rusqlite::params![response, id],
-                )
-                .map_err(|_| git::io_error("sync request receipt"))?;
-                Ok(())
-            }
-        }
+        self.sync.complete(id, response, control)
     }
-    fn publish(&self, store: &Store, plan: &LocalPlan, control: &RequestControl) -> Result<()> {
-        match self {
-            Self::Handle { handle, .. } => {
-                handle.publish_sync_overlay(
-                    crate::store::lane::SyncOverlayInput {
-                        publication_id: plan.publication_id.clone(),
-                        baseline_root: plan.baseline.root.clone(),
-                        baseline_local: plan.baseline.local.clone(),
-                        resolved_root: plan.resolved.root.clone(),
-                        resolved_local: plan.resolved.local.clone(),
-                        guard: plan.guard.as_ref().unwrap().clone(),
-                    },
-                    control,
-                )?;
-            }
-            Self::Legacy { store: owner, .. } => {
-                owner
-                    .publish_sync_overlay_control(
-                        &plan.publication_id,
-                        &plan.baseline.open(store)?,
-                        &plan.resolved.open(store)?,
-                        plan.guard.as_ref().unwrap(),
-                        None,
-                        Some(&control.cancel),
-                    )
-                    .map_err(storage_error)?;
-            }
-        }
+    fn publish(&self, _store: &Store, plan: &LocalPlan, control: &RequestControl) -> Result<()> {
+        self.handle.publish_sync_overlay(
+            crate::store::lane::SyncOverlayInput {
+                publication_id: plan.publication_id.clone(),
+                baseline_root: plan.baseline.root.clone(),
+                baseline_local: plan.baseline.local.clone(),
+                resolved_root: plan.resolved.root.clone(),
+                resolved_local: plan.resolved.local.clone(),
+                guard: plan.guard.as_ref().unwrap().clone(),
+            },
+            control,
+        )?;
         Ok(())
     }
 }
@@ -328,23 +244,6 @@ pub fn require_git_slot_clear(local: &Path) -> Result<()> {
         return Err(DomainError::new("sync_operation_active","A fixed-cutoff sync owns Git handoff for this binding. Resume/status that operation; ordinary remember_this remains available."));
     }
     Ok(())
-}
-pub fn call(
-    store: &Store,
-    local: &Path,
-    state: &Path,
-    user: &str,
-    machine: &str,
-    request: SyncRequest,
-    control: RequestControl,
-) -> Result<Value> {
-    let backend = SyncBackend::Legacy {
-        conn: db(local)?,
-        store,
-    };
-    call_inner(
-        store, local, state, user, machine, request, control, &backend,
-    )
 }
 fn call_inner(
     store: &Store,
@@ -1425,10 +1324,10 @@ pub fn call_with_handle(
     let store = Store::open_read_only_with_coordination(
         &handle.root,
         handle.local.join("canonical"),
-        &handle.coordination,
+        handle.coordination_root(),
     )
     .map_err(storage_error)?;
-    let backend = SyncBackend::Handle {
+    let backend = SyncBackend {
         sync: handle.sync_control(),
         handle,
     };

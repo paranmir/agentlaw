@@ -324,6 +324,10 @@ deadline, and these bounds are not a measured large-corpus performance guarantee
 
 ### Existing separate continuity/import/share commands
 
+Share, import, and sync commands run inside the installation runtime, starting it
+if needed. Long import steps report their current step and elapsed time on stderr;
+the JSON result goes to stdout. `share import list` shows imports without a reference.
+
 ```text
 agentlaw continuity save
 agentlaw share inspect --remote <name> --target-ref <refs/heads/name>

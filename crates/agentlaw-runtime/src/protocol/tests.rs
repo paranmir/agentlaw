@@ -124,16 +124,25 @@ fn import_list_requires_an_empty_object_and_rejects_duplicate_or_unknown_fields(
 
 #[test]
 fn import_call_rejects_store_switch_and_sync_requests() {
-    for request in [
-        json!({"action":"connect_project_memory","connect_project_memory":{"project_path":"C:/work/project","memory_store_path":"C:/other","intent":"connect"}}),
-        json!({"action":"sync","sync":{"command":"status","operation_id":"fixture"}}),
+    // Existing codes: a store switch is not an import-review request, and sync
+    // needs the installation's sync adapter rather than a review workspace.
+    for (request, code) in [
+        (
+            json!({"action":"connect_project_memory","connect_project_memory":{"project_path":"C:/work/project","memory_store_path":"C:/other","intent":"discover"}}),
+            "invalid_import_request",
+        ),
+        (
+            json!({"action":"sync","sync":{"command":"status","operation_id":"6f1d2c3b-9a8e-4f70-8d61-2b5c4e7a9f10"}}),
+            "sync_requires_app_adapter",
+        ),
     ] {
         let body = serde_json::to_vec(
             &json!({"admin_command":{"import_call":{"import_ref":"ref","request":request}}}),
         )
         .unwrap();
         assert!(
-            matches!(decode_body(RequestKind::Admin, &body), Err(RejectReason::InvalidBody(error)) if error.code == "invalid_import_request")
+            matches!(decode_body(RequestKind::Admin, &body), Err(RejectReason::InvalidBody(ref error)) if error.code == code),
+            "{code}"
         );
     }
 }
