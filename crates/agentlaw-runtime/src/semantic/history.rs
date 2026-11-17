@@ -12,7 +12,6 @@ use agentlaw_search::vector_file::{
 };
 use agentlaw_search::ScopeFilter;
 use agentlaw_storage::published::OwnedPublishedReader;
-use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -23,31 +22,6 @@ pub(super) struct Completed {
     model: String,
     pub(super) active: ActiveFile,
     gate: Arc<Mutex<()>>,
-}
-
-fn path(shared: &Shared, identity: &VectorFileIdentity) -> std::path::PathBuf {
-    let VectorFileKind::History { subject } = &identity.kind else {
-        unreachable!()
-    };
-    let mut hash = Sha256::new();
-    for field in [
-        identity.binding.as_str(),
-        "history",
-        subject,
-        identity.epoch.as_str(),
-        identity.model_digest.as_str(),
-        identity.config.as_str(),
-    ] {
-        hash.update((field.len() as u64).to_be_bytes());
-        hash.update(field.as_bytes());
-    }
-    hash.update((identity.dimension as u64).to_be_bytes());
-    hash.update((shared.config.chunk_bytes as u64).to_be_bytes());
-    shared
-        .config
-        .indices_root
-        .join(format!("{:x}", hash.finalize()))
-        .join("vector.sqlite")
 }
 
 impl HistorySemanticPort for SemanticSearch {
@@ -206,7 +180,7 @@ impl HistorySemanticPort for SemanticSearch {
             let file = completed
                 .filter(|c| c.active.identity == identity)
                 .map(|c| c.active.path.clone())
-                .unwrap_or_else(|| path(shared, &identity));
+                .unwrap_or_else(|| super::identity::path(&shared.config, &identity));
             (identity, file, target, ReaderGuard(readers), gate, token)
         };
         let _readers = readers;
@@ -647,7 +621,7 @@ fn process(
         generation: "initial".into(),
         dimension: shared.config.dimension,
     };
-    let file = path(shared, &identity);
+    let file = super::identity::path(&shared.config, &identity);
     let mut writer = {
         let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());

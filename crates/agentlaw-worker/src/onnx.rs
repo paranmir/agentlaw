@@ -9,6 +9,34 @@ pub struct ModelAssets {
     pub tokenizer_json: PathBuf,
     pub runtime_library: PathBuf,
 }
+impl ModelAssets {
+    /// Compute vector-space identity without initializing native inference.
+    pub fn model_digest(&self) -> Result<String, EmbeddingError> {
+        self.identity().map(|(digest, _)| digest)
+    }
+    fn identity(&self) -> Result<(String, Vec<String>), EmbeddingError> {
+        let mut hash = Sha256::new();
+        let mut buf = [0u8; 65536];
+        let mut artifact_hashes = Vec::new();
+        for path in [&self.onnx_model, &self.tokenizer_json] {
+            let mut f = File::open(path).map_err(fail)?;
+            let mut artifact_hash = Sha256::new();
+            loop {
+                let n = f.read(&mut buf).map_err(fail)?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+                artifact_hash.update(&buf[..n]);
+            }
+            artifact_hashes.push(format!("{:x}", artifact_hash.finalize()));
+        }
+        Ok((
+            format!("granite-r2-256:{:x}", hash.finalize()),
+            artifact_hashes,
+        ))
+    }
+}
 pub struct OnnxProvider {
     tokenizer: tokenizers::Tokenizer,
     session: Mutex<Session>,
@@ -148,22 +176,7 @@ impl OnnxProvider {
                 )));
             }
         }
-        let mut hash = Sha256::new();
-        let mut buf = [0u8; 65536];
-        let mut artifact_hashes = Vec::new();
-        for path in [&assets.onnx_model, &assets.tokenizer_json] {
-            let mut f = File::open(path).map_err(fail)?;
-            let mut artifact_hash = Sha256::new();
-            loop {
-                let n = f.read(&mut buf).map_err(fail)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buf[..n]);
-                artifact_hash.update(&buf[..n]);
-            }
-            artifact_hashes.push(format!("{:x}", artifact_hash.finalize()));
-        }
+        let (digest, artifact_hashes) = assets.identity()?;
         let supported_models = [
             "f9defdceaaae9d4d4007ad601b05b6e436375e7293e52b74ed1f7a3933c5b26a",
             "f1fdd44e7e1ac51f12ab7957c7bd092e064d596c288513bf9d326842f669edee",
@@ -199,7 +212,7 @@ impl OnnxProvider {
         let provider = Self {
             tokenizer,
             session: Mutex::new(session),
-            digest: format!("granite-r2-256:{:x}", hash.finalize()),
+            digest,
         };
         provider.warmup()?;
         Ok(provider)

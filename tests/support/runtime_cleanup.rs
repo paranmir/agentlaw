@@ -35,3 +35,14 @@ impl Drop for RuntimeCleanup {
         self.shutdown();
     }
 }
+
+/// Own one managed-update fixture child, including panic cleanup.
+#[allow(dead_code)]
+pub struct OwnedStaticChild(pub std::process::Child);
+
+impl Drop for OwnedStaticChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}

@@ -798,7 +798,101 @@ pub struct VectorReadView {
     pub config_digest: String,
     dimension: usize,
 }
+fn legacy_vector_identity(c: &Connection) -> Result<(String, String, i64)> {
+    Ok(c.query_row(
+        "SELECT model,config,dimension FROM vector_meta",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?)
+}
+
 impl ExactVectorIndex {
+    /// Inspect the released vector layout without creating tables or checkpointing it.
+    pub fn stored_identity(path: impl AsRef<Path>) -> Result<(String, String, usize)> {
+        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        c.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        c.execute_batch("BEGIN DEFERRED")?;
+        let unknown: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT IN ('vector_meta','vectors','vector_buckets','ann_profile'))", [], |row| row.get(0))?;
+        if unknown {
+            return Err(Error::Invalid("unrecognized vector schema".into()));
+        }
+        let rows: i64 = c.query_row("SELECT count(*) FROM vector_meta", [], |row| row.get(0))?;
+        if rows != 1 {
+            return Err(Error::Invalid("ambiguous vector identity".into()));
+        }
+        let layouts: &[(&str, &[&str])] = &[
+            (
+                "vector_meta",
+                &[
+                    "singleton",
+                    "generation",
+                    "commit_id",
+                    "ack",
+                    "model",
+                    "config",
+                    "dimension",
+                ],
+            ),
+            (
+                "vectors",
+                &["memory", "change_id", "section", "scope", "vector"],
+            ),
+            (
+                "vector_buckets",
+                &[
+                    "table_id",
+                    "bucket",
+                    "scope",
+                    "memory",
+                    "change_id",
+                    "section",
+                ],
+            ),
+            ("ann_profile", &["singleton", "version"]),
+        ];
+        for (table, expected) in layouts {
+            let mut statement = c.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+            let columns = statement
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if columns
+                .iter()
+                .map(String::as_str)
+                .ne(expected.iter().copied())
+            {
+                return Err(Error::Invalid("unrecognized vector columns".into()));
+            }
+        }
+        let (model, config, dimension) = legacy_vector_identity(&c)?;
+        if model.is_empty() || config.is_empty() || !(1..=65536).contains(&dimension) {
+            return Err(Error::Invalid("invalid vector identity".into()));
+        }
+        let (generation, commit, ack): (i64, i64, i64) = c.query_row(
+            "SELECT generation,commit_id,ack FROM vector_meta WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if generation < 1 || commit < 0 || ack < 0 {
+            return Err(Error::Invalid("invalid vector progress".into()));
+        }
+        c.prepare("SELECT memory,change_id,section,scope,vector FROM vectors LIMIT 0")?;
+        c.prepare(
+            "SELECT table_id,bucket,scope,memory,change_id,section FROM vector_buckets LIMIT 0",
+        )?;
+        let version: i64 = c.query_row(
+            "SELECT version FROM ann_profile WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != 1 {
+            return Err(Error::Invalid("unsupported vector profile".into()));
+        }
+        Ok((model, config, dimension as usize))
+    }
+
     pub fn commit_stream(
         &mut self,
         source_generation: i64,
@@ -851,10 +945,7 @@ impl ExactVectorIndex {
             "INSERT OR IGNORE INTO vector_meta VALUES(1,1,0,0,?1,?2,?3)",
             params![model, config, dimension as i64],
         )?;
-        let (m, cfg, dim): (String, String, i64) =
-            c.query_row("SELECT model,config,dimension FROM vector_meta", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
+        let (m, cfg, dim) = legacy_vector_identity(&c)?;
         if m != model || cfg != config || dim != dimension as i64 {
             return Err(Error::Invalid(
                 "model/config/dimension generation mismatch; rebuild separately".into(),

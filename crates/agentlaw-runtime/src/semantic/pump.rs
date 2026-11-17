@@ -7,7 +7,6 @@ use agentlaw_search::vector_file::{
     VectorFileIdentity, VectorFileKind, VectorFileProgress, VectorFileReadView, VectorFileWriter,
 };
 use agentlaw_storage::published::{OwnedPublishedReader, SourcePosition as StoragePosition};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -24,20 +23,6 @@ fn storage_position(p: &SourcePosition) -> Result<StoragePosition> {
         epoch: p.epoch.clone(),
         sequence: u64::try_from(p.sequence).map_err(|_| "negative source sequence")?,
     })
-}
-fn id_path(shared: &Shared, binding: &str, model: &str, epoch: &str) -> std::path::PathBuf {
-    let mut hash = Sha256::new();
-    for field in [binding, "current", epoch, model, &shared.config.config_id] {
-        hash.update((field.len() as u64).to_be_bytes());
-        hash.update(field.as_bytes());
-    }
-    hash.update((shared.config.dimension as u64).to_be_bytes());
-    hash.update((shared.config.chunk_bytes as u64).to_be_bytes());
-    shared
-        .config
-        .indices_root
-        .join(format!("{:x}", hash.finalize()))
-        .join("vector.sqlite")
 }
 fn report(shared: &Shared, binding: &str, state: ComponentState, reason: Option<String>) {
     shared.health.publish(
@@ -424,7 +409,7 @@ fn session(
         generation: "initial".into(),
         dimension: shared.config.dimension,
     };
-    let initial_path = id_path(shared, name, model, &start.epoch);
+    let initial_path = super::identity::path(&shared.config, &identity);
     let dir = initial_path.parent().unwrap();
     let gate = {
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());

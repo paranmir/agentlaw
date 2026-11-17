@@ -2,7 +2,7 @@
 use fs2::FileExt;
 #[path = "../../../tests/support/runtime_cleanup.rs"]
 mod runtime_cleanup;
-use runtime_cleanup::RuntimeCleanup;
+use runtime_cleanup::{OwnedStaticChild, RuntimeCleanup};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -82,14 +82,6 @@ fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
         serde_json::from_slice(&line).unwrap_or_else(|_| panic!("Invalid CLI output: {line:?}"));
     assert!(status.success(), "{value}");
     value
-}
-
-struct OwnedStaticChild(Child);
-impl Drop for OwnedStaticChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 fn static_output(binary: &Path, state: &Path, cwd: &Path, args: &[&str]) -> Output {
@@ -524,7 +516,10 @@ fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
             }),
         "the current update's installation record was not retained"
     );
-    assert_eq!(fs::read(legacy).unwrap(), b"legacy fixture");
+    assert!(
+        !legacy.exists(),
+        "the previous update-check result is an operating file to delete"
+    );
     assert!(!fixture.state.join("update-maintenance.json").exists());
     assert_eq!(fs::read(memory_format).unwrap(), original_memory);
     assert!(complete["activation"] == "verified");
@@ -1465,4 +1460,83 @@ fn bundle_missing_worker_entry_is_rejected_without_replacing_the_old_installatio
         "{result}"
     );
     assert_eq!(snapshot(&fixture.root.join("bin")), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn update_completes_with_busy_operating_file_pending_and_startup_retries_only_that_file() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let busy = fixture.state.join("worker/component-busy.json");
+    fs::create_dir_all(busy.parent().unwrap()).unwrap();
+    fs::write(&busy, b"previous-version component state").unwrap();
+    // Permit reads and writes but deny deletion, as a real Windows user does
+    // when another process still has the old file open.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&busy)
+        .unwrap();
+    let mut update = start_fixture_update(&fixture);
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(90));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["cleanup"], "completed", "{result}");
+    assert!(
+        busy.exists(),
+        "a Windows sharing violation must leave the file pending"
+    );
+    let plan_path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(plan["cleanup_completed"], true);
+    let cleanup_id = plan["cleanup_plan_id"].as_str().unwrap();
+    let cleanup_path = fixture
+        .state
+        .join("cleanup-plans")
+        .join(format!("{cleanup_id}.json"));
+    let cleanup: Value = serde_json::from_slice(&fs::read(&cleanup_path).unwrap()).unwrap();
+    assert!(
+        cleanup["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == json!(busy) && item["phase"] == "cleanup_deferred"),
+        "completed update must report the busy deletion as pending: {cleanup}"
+    );
+    drop(held);
+    let added_later = fixture
+        .state
+        .join("worker/component-created-after-update.json");
+    fs::write(&added_later, b"not approved by the update inventory").unwrap();
+    let runtime = fixture.root.join("bin").join(binary_name());
+    let mut frontend = McpClient::new(&runtime, &fixture.state);
+    let recall =
+        frontend.call(json!({"action":"recall","recall":{"recall_for":"verify startup retries"}}));
+    assert_eq!(recall["isError"], false, "{recall}");
+    assert!(
+        !busy.exists(),
+        "runtime startup did not retry the recorded deletion"
+    );
+    assert_eq!(
+        fs::read(&added_later).unwrap(),
+        b"not approved by the update inventory",
+        "runtime startup must not perform a fresh operating-file inventory"
+    );
+    let retried: Value = serde_json::from_slice(&fs::read(&cleanup_path).unwrap()).unwrap();
+    assert!(
+        retried["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == json!(busy) && item["phase"] == "removed"),
+        "{retried}"
+    );
+    assert!(!retried["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["source"] == json!(added_later)));
 }

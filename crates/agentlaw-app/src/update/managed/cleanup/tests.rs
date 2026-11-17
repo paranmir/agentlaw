@@ -453,7 +453,6 @@ fn cleanup_inventory_deletes_only_named_owned_paths_and_sidecars() {
     for path in [
         "state/worker/daemon.lock",
         "state/worker/launch.lock",
-        "state/worker/model.lock",
         "state/worker/endpoint.json",
         "state/worker/component-recall.json",
         "state/worker/indices/old/writer.lock",
@@ -473,6 +472,7 @@ fn cleanup_inventory_deletes_only_named_owned_paths_and_sidecars() {
         expected.insert(write_fixture(&root, &format!("{dir}/owned")));
     }
     let protected = [
+        "state/worker/model.lock",
         "state/runtime/git/imports/live/acquisitions/file",
         "state/runtime/canonical/recovery/acquisitions/file",
         "state/worker/indices/old/vector.sqlite",
@@ -505,8 +505,9 @@ fn cleanup_inventory_deletes_only_named_owned_paths_and_sidecars() {
         .all(|item| item.phase == "removed"));
 }
 
+#[cfg(windows)]
 #[test]
-fn frontend_start_and_update_preserve_legacy_inventory_until_transition() {
+fn runtime_start_retries_recorded_operating_file_deletions_without_fresh_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     fs::write(
@@ -514,41 +515,42 @@ fn frontend_start_and_update_preserve_legacy_inventory_until_transition() {
         b"agentlaw-managed-layout-v1\n",
     )
     .unwrap();
-    let broker = write_fixture(&root, "state/worker/broker.sqlite");
-    let endpoint = write_fixture(&root, "state/worker/endpoint.json");
-    let ingress = write_fixture(&root, "state/worker/source-ingress/current");
-    let mut plan = fixture_plan(&root);
-    for item in &mut plan.items {
-        item.phase = "cleanup_deferred".into();
-    }
+    let busy = write_fixture(&root, "state/runtime/bootstrap.sqlite");
+    let plan = fixture_plan(&root);
     cleanup_save(&plan).unwrap();
-    let update = Plan {
-        id: uuid::Uuid::new_v4().to_string(),
-        root: root.clone(),
-        tag: "v1.0.0".into(),
-        archive: target_archive().unwrap().to_owned(),
-        archive_digest: "0".repeat(64),
-        bin_before: String::new(),
-        bin_before_hashes: BTreeMap::new(),
-        registrations: Vec::new(),
-        phase: "completed".into(),
-        bundle_hashes: None,
-        launcher_digest: None,
-        previous_bundle: None,
-        activation_verified: true,
-        recovery_obligations_closed: true,
-        cleanup_plan_id: Some(plan.id.clone()),
-        cleanup_completed: true,
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(Some(busy.clone())),
     };
+    let report = execute_plan_with(&root, &plan.id, None, &recorder, false, true).unwrap();
+    assert!(
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["path"] == json!(busy) && item["phase"] == "cleanup_deferred"),
+        "{report}"
+    );
+    let update = completed_update(&root, &plan.id);
     save(&update).unwrap();
+    let added_later = write_fixture(&root, "state/worker/component-added-after-update.json");
+    *recorder.busy.borrow_mut() = None;
     super::super::check_frontend_start(&root.join("state")).unwrap();
-    execute_plan_locked(&root, &plan.id, Some(&update.id)).unwrap();
-    assert!(broker.exists() && endpoint.exists() && ingress.exists());
-    assert!(cleanup_load(&root, &plan.id)
-        .unwrap()
+    assert!(
+        !busy.exists(),
+        "runtime start must retry the recorded sharing violation"
+    );
+    assert_eq!(
+        fs::read(&added_later).unwrap(),
+        b"fixture",
+        "startup must not inventory newly matching paths"
+    );
+    let saved = cleanup_load(&root, &plan.id).unwrap();
+    assert!(saved
         .items
         .iter()
-        .all(|item| item.phase == "cleanup_deferred"));
+        .any(|item| item.source == busy && item.phase == "removed"));
+    assert!(!saved.items.iter().any(|item| item.source == added_later));
 }
 
 #[test]
@@ -730,4 +732,1032 @@ fn sharing_violation_is_retried_on_frontend_start_without_new_state() {
             .len(),
         1
     );
+}
+
+fn managed_cleanup_root() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".agentlaw-layout"),
+        b"agentlaw-managed-layout-v1\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("state")).unwrap();
+    dir
+}
+
+fn verified_finalizing_update(root: &Path) -> Plan {
+    let mut update = completed_update(root, "not-yet-inventoried");
+    update.phase = "finalizing".into();
+    update.cleanup_plan_id = None;
+    update.cleanup_completed = false;
+    let bytes = b"verified candidate fixture";
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    update.bundle_hashes = Some(BTreeMap::from([(binary_name().into(), hash)]));
+    let candidate = candidate_executable(&update).unwrap();
+    fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    fs::write(candidate, bytes).unwrap();
+    // A real finalizing update still owns its previous bundle and staged assets.
+    let previous = previous_bundle(&update);
+    fs::create_dir_all(&previous).unwrap();
+    for name in [binary_name(), worker_binary_name(), "LICENSE.agentlaw"] {
+        let path = previous.join(name);
+        fs::write(&path, b"previous bundle fixture").unwrap();
+        update
+            .bin_before_hashes
+            .insert(name.into(), digest(&path).unwrap());
+    }
+    update.bin_before = update.bin_before_hashes[binary_name()].clone();
+    let staged = stage(root, &update.id);
+    fs::create_dir_all(&staged).unwrap();
+    let archive = staged.join(&update.archive);
+    fs::write(&archive, b"pinned release archive fixture").unwrap();
+    update.archive_digest = digest(&archive).unwrap();
+    let launcher = staged.join("launcher.asset");
+    fs::write(&launcher, b"pinned launcher fixture").unwrap();
+    update.launcher_digest = Some(digest(&launcher).unwrap());
+    save(&update).unwrap();
+    update
+}
+
+#[test]
+fn verified_update_removes_previous_operating_files_and_preserves_authoritative_and_live_data() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (_, current_index) = real_binding_index_fixture(&root);
+    let mut obsolete = Vec::new();
+    for binding in ["state/runtime", "state/bindings/binding"] {
+        for name in [
+            "bootstrap.sqlite",
+            "background-status.sqlite",
+            "exact-maintenance.sqlite",
+            "history-search/a-jobs.sqlite",
+            "response-artifacts/response-registry.sqlite",
+        ] {
+            for suffix in ["", "-wal", "-shm"] {
+                obsolete.push(write_fixture(&root, &format!("{binding}/{name}{suffix}")));
+            }
+        }
+        for name in ["canonical/acquisitions", "canonical/history-cache"] {
+            let directory = root.join(binding).join(name);
+            write_fixture(&root, &format!("{binding}/{name}/owned"));
+            obsolete.push(directory);
+        }
+    }
+    for base in [
+        "state/worker/broker.sqlite",
+        "state/worker/indices/legacy/lexical.sqlite",
+        "state/artifacts/response-registry.sqlite",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            obsolete.push(write_fixture(&root, &format!("{base}{suffix}")));
+        }
+    }
+    for path in [
+        "state/worker/daemon.lock",
+        "state/worker/launch.lock",
+        "state/worker/endpoint.json",
+        "state/worker/indices/legacy/writer.lock",
+        "state/worker/component-recall.json",
+        "state/update-check.json",
+        "state/update-check.lock",
+    ] {
+        obsolete.push(write_fixture(&root, path));
+    }
+    for path in [
+        "state/worker/source-ingress",
+        "state/worker/indices/legacy/generations",
+    ] {
+        write_fixture(&root, &format!("{path}/owned"));
+        obsolete.push(root.join(path));
+    }
+    let mut protected = vec![
+        "state/worker/model.lock",
+        "state/worker/execution-selection.json",
+        "source/format.md",
+        "state/runtime/control.sqlite",
+        "state/runtime/pending.sqlite",
+        "state/runtime/canonical/recovery/acquisitions/record",
+        "state/runtime/git/imports/live/acquisitions/record",
+        "state/machine.json",
+        "models/model.onnx",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let path = root.join(relative);
+        if path.exists() {
+            path
+        } else {
+            write_fixture(&root, relative)
+        }
+    })
+    .collect::<Vec<_>>();
+    protected.push(current_index.join("vector.sqlite"));
+    // A model liveness lock is an empty file, unlike obsolete status payloads.
+    fs::write(&protected[0], b"").unwrap();
+    let before: Vec<_> = protected
+        .iter()
+        .map(|p| (p.clone(), fs::read(p).unwrap()))
+        .collect();
+    let source_before = cleanup_fixture_tree(&root.join("source"));
+    let recovery_before = cleanup_fixture_tree(&root.join("state/runtime/canonical/recovery"));
+    let mut update = verified_finalizing_update(&root);
+    let mut unverified = update.clone();
+    unverified.activation_verified = false;
+    assert_eq!(
+        cleanup_update_plan(&mut unverified).unwrap_err().code,
+        "cleanup_plan_state"
+    );
+    assert!(
+        obsolete.iter().all(|p| p.exists()),
+        "cleanup ran before candidate verification"
+    );
+    cleanup_update_plan(&mut update).unwrap();
+    assert_eq!(
+        update.phase, "finalizing",
+        "cleanup must happen before update completion"
+    );
+    for (path, bytes) in before {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "protected data changed: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        cleanup_fixture_tree(&root.join("source")),
+        source_before,
+        "published source bytes changed"
+    );
+    assert_eq!(
+        cleanup_fixture_tree(&root.join("state/runtime/canonical/recovery")),
+        recovery_before,
+        "publication recovery bytes changed"
+    );
+    let remaining: Vec<_> = obsolete.iter().filter(|p| p.exists()).collect();
+    assert!(
+        remaining.is_empty(),
+        "verified update left previous-version operating files: {remaining:?}"
+    );
+    assert!(cleanup_complete(&update).unwrap());
+}
+
+fn real_binding_index_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    use agentlaw_runtime::{
+        ports::HealthSink,
+        semantic::{SemanticConfig, SemanticIndexer, INDEX_CONFIG_VERSION},
+    };
+    use agentlaw_worker::supervisor::{IndexWorkPort, ModelRequestIds};
+    let source = root.join("source");
+    let local = root.join("state/runtime");
+    let store = agentlaw_storage::Store::open(&source, local.join("canonical")).unwrap();
+    let machine =
+        agentlaw_runtime::installation::machine::load_or_create(&root.join("state")).unwrap();
+    let identity = agentlaw_flows::store::StoreIdentity {
+        root: source.clone(),
+        local: local.clone(),
+        user_id: "fixture-user".into(),
+        machine_id: machine.machine_id,
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        history_limit: 8192,
+        response_limit: 65536,
+        config_file: None,
+    };
+    let mut control = agentlaw_flows::control::ControlWriter::open(&local).unwrap();
+    control.bind_identity(&identity).unwrap();
+    control.finish_binding_initialization(&identity).unwrap();
+    fs::write(
+        root.join("state/config.json"),
+        serde_json::to_vec(&config::Config {
+            memory_store_path: source,
+            user_id: identity.user_id.clone(),
+            runtime_path: None,
+            history_response_limit_bytes: 8192,
+            response_limit_bytes: 65536,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    drop(control);
+    let current_binding = identity.binding_id.clone();
+    let ids = ModelRequestIds::new();
+    let health = HealthSink::default();
+    let preparation_indexer = SemanticIndexer::start(
+        SemanticConfig::new(
+            root.join("state/worker/indices"),
+            INDEX_CONFIG_VERSION.into(),
+        ),
+        ids,
+        health.clone(),
+    )
+    .unwrap();
+    let service = agentlaw_runtime::store::service::StoreService::open(
+        identity,
+        agentlaw_runtime::store::service::StoreDeps {
+            health,
+            semantic: std::sync::Arc::new(agentlaw_runtime::semantic::SemanticSearch::new(
+                preparation_indexer.clone(),
+                agentlaw_runtime::model::ModelHandle::new(),
+            )),
+            indexer: preparation_indexer.clone(),
+            projection: agentlaw_runtime::projection::ProjectionConfig::new(),
+            coordination: store.coordination_root().to_path_buf(),
+            state: root.join("state"),
+        },
+        &agentlaw_contracts::RequestControl::default(),
+    )
+    .unwrap();
+    let request = || {
+        serde_json::from_value(json!({"memories":[{
+        "operation":"create","what_to_remember":"Retained source and pending proposals survive operating-file cleanup.",
+        "evidence":"Confirmed fixture observation","applies_to":["user"]}]})).unwrap()
+    };
+    let saved = service
+        .command(
+            agentlaw_runtime::protocol::CommandRequest::Remember(request()),
+            &agentlaw_contracts::RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(saved["status"], "remembered");
+    let pending = service
+        .command(
+            agentlaw_runtime::protocol::CommandRequest::Remember(request()),
+            &agentlaw_contracts::RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(pending["status"], "resolution_required");
+    let inspected = service.query(agentlaw_runtime::protocol::QueryRequest::PendingInspect(
+        serde_json::from_value(json!({"pending_action":"inspect","pending_batch_ref":pending["pending_batch_ref"]})).unwrap()),
+        &agentlaw_contracts::RequestControl::default()).unwrap();
+    assert_eq!(inspected["status"], "pending");
+    service.close();
+    assert!(preparation_indexer.shutdown(Duration::from_secs(10)));
+    drop(service);
+    let indices = root.join("state/worker/indices");
+    let mut known = BTreeSet::new();
+    let mut paths = Vec::new();
+    // A prior binding no longer exists in any retained control store; both files
+    // carry real vector-file identities, not directory-name guesses.
+    for binding in [uuid::Uuid::new_v4().to_string(), current_binding] {
+        let indexer = SemanticIndexer::start(
+            SemanticConfig::new(indices.clone(), INDEX_CONFIG_VERSION.into()),
+            ModelRequestIds::new(),
+            HealthSink::default(),
+        )
+        .unwrap();
+        indexer
+            .open_binding(&binding, store.owned_published_reader())
+            .unwrap();
+        indexer.model_ready("fixture-model");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !indexer
+            .progress(&binding)
+            .is_some_and(|progress| progress.complete)
+        {
+            if let Some(work) = indexer.next_work("fixture-model") {
+                let mut vector = vec![0.0; 256];
+                vector[0] = 1.0;
+                indexer.finish(work.id, Ok(vector));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic fixture index did not complete: {:?}",
+                indexer.progress(&binding)
+            );
+            std::thread::yield_now();
+        }
+        assert!(indexer.shutdown(Duration::from_secs(10)));
+        let found = fs::read_dir(&indices)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| !known.contains(path))
+            .unwrap();
+        assert!(found.join("vector.sqlite").is_file());
+        known.insert(found.clone());
+        paths.push(found);
+    }
+    (paths.remove(0), paths.remove(0))
+}
+
+#[test]
+fn obsolete_owned_index_directory_is_removed_while_current_and_unrecognized_directories_survive() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (obsolete, current) = real_binding_index_fixture(&root);
+    let unknown = write_fixture(&root, "state/worker/indices/unrecognized/vector.sqlite");
+    let note = write_fixture(&root, "state/worker/indices/unrecognized/notes.txt");
+    let current_bytes = fs::read(current.join("vector.sqlite")).unwrap();
+    let plan = fixture_plan(&root);
+    cleanup_save(&plan).unwrap();
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(None),
+    };
+    execute_plan_with(&root, &plan.id, None, &recorder, false, true).unwrap();
+    assert_eq!(
+        fs::read(current.join("vector.sqlite")).unwrap(),
+        current_bytes
+    );
+    assert_eq!(fs::read(unknown).unwrap(), b"fixture");
+    assert_eq!(fs::read(note).unwrap(), b"fixture");
+    assert!(
+        !obsolete.exists(),
+        "a genuine index for a retired binding was not removed: {}",
+        obsolete.display()
+    );
+}
+
+#[test]
+fn model_liveness_lock_holder_fixture() {
+    let Some(path) = std::env::var_os("AGENTLAW_MODEL_LOCK_FIXTURE") else {
+        return;
+    };
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    println!("model-lock-held");
+    std::io::stdout().flush().unwrap();
+    let mut release = String::new();
+    std::io::stdin().read_line(&mut release).unwrap();
+    assert_eq!(release.trim(), "exit");
+}
+
+#[test]
+fn cleanup_preserves_the_model_liveness_lock_while_its_owned_child_runs_and_after_retry() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let worker = root.join("state/worker");
+    fs::create_dir_all(&worker).unwrap();
+    let model_lock = worker.join("model.lock");
+    fs::write(&model_lock, b"").unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "update::managed::cleanup::tests::model_liveness_lock_holder_fixture",
+            "--nocapture",
+        ])
+        .env("AGENTLAW_MODEL_LOCK_FIXTURE", &model_lock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = ChildGuard(command.spawn().unwrap());
+    let output = child.0.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output).lines() {
+            if line.unwrap().contains("model-lock-held") {
+                let _ = ready_tx.send(());
+            }
+        }
+    });
+    ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let plan = fixture_plan(&root);
+    cleanup_save(&plan).unwrap();
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(None),
+    };
+    execute_plan_with(&root, &plan.id, None, &recorder, false, true).unwrap();
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "cleanup terminated the model child"
+    );
+    assert_eq!(fs::metadata(&model_lock).unwrap().len(), 0);
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&model_lock)
+        .unwrap();
+    assert!(
+        probe.try_lock_exclusive().is_err(),
+        "model liveness lock was replaced"
+    );
+    drop(probe);
+    writeln!(child.0.stdin.take().unwrap(), "exit").unwrap();
+    assert!(child.0.wait().unwrap().success());
+    execute_plan_with(&root, &plan.id, None, &recorder, false, true).unwrap();
+    assert!(
+        model_lock.exists(),
+        "cleanup retry removed the live model liveness-lock path"
+    );
+    assert!(
+        !recorder.paths.borrow().contains(&model_lock),
+        "model.lock was submitted for deletion"
+    );
+}
+
+fn cleanup_fixture_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, current: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, result);
+            } else {
+                result.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = BTreeMap::new();
+    visit(root, root, &mut result);
+    result
+}
+
+fn legacy_daemon_index_fixture(root: &Path) -> PathBuf {
+    let _ = real_binding_index_fixture(root);
+    let local = root.join("state/runtime");
+    let binding = agentlaw_flows::control::ControlReader::open(&local)
+        .unwrap()
+        .binding_id()
+        .unwrap();
+    let store =
+        agentlaw_storage::Store::open(root.join("source"), local.join("canonical")).unwrap();
+    let epoch = store
+        .owned_published_reader()
+        .read_snapshot()
+        .unwrap()
+        .position()
+        .epoch
+        .clone();
+    let model = format!("{:x}", Sha256::digest(b"retired daemon model"));
+    let config = format!("{:x}", Sha256::digest(b"retired daemon configuration"));
+    // The retired daemon hashed a JSON tuple, not the current length-prefixed identity.
+    let key = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(
+                binding.as_str(),
+                model.as_str(),
+                config.as_str(),
+                epoch.as_str(),
+            ))
+            .unwrap()
+        )
+    );
+    let directory = root.join("state/worker/indices").join(key);
+    fs::create_dir_all(&directory).unwrap();
+    let db = rusqlite::Connection::open(directory.join("vector.sqlite")).unwrap();
+    // Frozen schema from the old ExactVectorIndex, including its ANN tables.
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+         CREATE TABLE vector_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+             generation INTEGER NOT NULL,commit_id INTEGER NOT NULL,ack INTEGER NOT NULL,
+             model TEXT NOT NULL,config TEXT NOT NULL,dimension INTEGER NOT NULL);
+         CREATE TABLE vectors(memory TEXT NOT NULL,change_id TEXT NOT NULL,section TEXT NOT NULL,
+             scope TEXT NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(memory,change_id,section)) WITHOUT ROWID;
+         CREATE TABLE vector_buckets(table_id INTEGER NOT NULL,bucket INTEGER NOT NULL,scope TEXT NOT NULL,
+             memory TEXT NOT NULL,change_id TEXT NOT NULL,section TEXT NOT NULL,
+             PRIMARY KEY(table_id,bucket,scope,memory,change_id,section)) WITHOUT ROWID;
+         CREATE INDEX bucket_memory ON vector_buckets(memory);
+         CREATE TABLE ann_profile(singleton INTEGER PRIMARY KEY,version INTEGER);
+         INSERT INTO ann_profile VALUES(1,1);"
+    ).unwrap();
+    db.execute(
+        "INSERT INTO vector_meta VALUES(1,1,0,0,?1,?2,256)",
+        rusqlite::params![model, config],
+    )
+    .unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(db);
+    directory
+}
+
+#[test]
+fn verified_update_retires_the_daemon_vector_format_and_preserves_unproven_ownership() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let legacy = legacy_daemon_index_fixture(&root);
+    let unknown = root.join("state/worker/indices").join("0".repeat(64));
+    assert_ne!(legacy, unknown);
+    fs::create_dir_all(&unknown).unwrap();
+    fs::copy(legacy.join("vector.sqlite"), unknown.join("vector.sqlite")).unwrap();
+    fs::write(
+        unknown.join("user-notes.txt"),
+        b"not established as product-owned",
+    )
+    .unwrap();
+    let unknown_before = cleanup_fixture_tree(&unknown);
+    let mut update = verified_finalizing_update(&root);
+    cleanup_update_plan(&mut update).unwrap();
+    assert_eq!(
+        cleanup_fixture_tree(&unknown),
+        unknown_before,
+        "unproven index ownership must be preserved"
+    );
+    assert!(
+        !legacy.exists(),
+        "the real retired daemon format survived a verified update: {}",
+        legacy.display()
+    );
+}
+
+#[cfg(windows)]
+fn partially_removed_index_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf, CleanupPlan, Plan) {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (obsolete, current) = real_binding_index_fixture(root);
+    let first_id = "11111111-1111-4111-8111-111111111111";
+    let second_id = "22222222-2222-4222-8222-222222222222";
+    let first = obsolete.join(format!("vector-{first_id}.sqlite"));
+    let second = obsolete.join(format!("vector-{second_id}.sqlite"));
+    for (path, generation) in [(&first, first_id), (&second, second_id)] {
+        fs::copy(obsolete.join("vector.sqlite"), path).unwrap();
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute(
+            "UPDATE binding_vector_meta SET generation=?1 WHERE singleton=1",
+            [generation],
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    let wal = obsolete.join(format!("vector-{first_id}.sqlite-wal"));
+    fs::write(&wal, []).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(3)
+        .open(&wal)
+        .unwrap();
+    let plan = fixture_plan(root);
+    assert!(
+        plan.items.iter().any(|item| item.source == obsolete),
+        "fixture must begin as an owned retired directory"
+    );
+    cleanup_save(&plan).unwrap();
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(None),
+    };
+    execute_plan_with(root, &plan.id, None, &recorder, false, true).unwrap();
+    assert!(
+        !first.exists(),
+        "first pass must really remove the database before its held WAL"
+    );
+    assert!(wal.exists());
+    assert!(
+        second.exists(),
+        "the other generation must survive the sharing violation"
+    );
+    let mut saved = cleanup_load(root, &plan.id).unwrap();
+    assert!(saved
+        .items
+        .iter()
+        .any(|item| item.source == obsolete && item.phase == "cleanup_deferred"));
+    let update = completed_update(root, &plan.id);
+    add_completed_artifacts(&mut saved, &update);
+    cleanup_save(&saved).unwrap();
+    save(&update).unwrap();
+    drop(held);
+    (obsolete, wal, current, saved, update)
+}
+
+#[cfg(windows)]
+#[test]
+fn partial_index_deletion_retry_removes_orphan_sidecars_and_finishes_the_recorded_item() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (obsolete, wal, current, plan, _) = partially_removed_index_fixture(&root);
+    let current_before = cleanup_fixture_tree(&current);
+    retry_pending(&root);
+    assert_eq!(cleanup_fixture_tree(&current), current_before);
+    let saved = cleanup_load(&root, &plan.id).unwrap();
+    let item = saved
+        .items
+        .iter()
+        .find(|item| item.source == obsolete)
+        .unwrap();
+    assert!(
+        !wal.exists() && !obsolete.exists(),
+        "retry stranded an orphan sidecar or retired directory; phase={}",
+        item.phase
+    );
+    assert_eq!(
+        item.phase, "removed",
+        "retry must finish rather than block a partially removed owned directory"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn partial_index_retry_preserves_a_surviving_database_restored_from_another_binding() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (obsolete, _, current, plan, _) = partially_removed_index_fixture(&root);
+    let surviving = obsolete.join("vector-22222222-2222-4222-8222-222222222222.sqlite");
+    // Restoring a backup from another binding while cleanup was deferred changes ownership.
+    fs::copy(current.join("vector.sqlite"), &surviving).unwrap();
+    let restored_bytes = fs::read(&surviving).unwrap();
+    retry_pending(&root);
+    assert_eq!(
+        fs::read(&surviving).unwrap(),
+        restored_bytes,
+        "retry removed a surviving database whose identity no longer belongs to this directory"
+    );
+    let saved = cleanup_load(&root, &plan.id).unwrap();
+    assert_ne!(
+        saved
+            .items
+            .iter()
+            .find(|item| item.source == obsolete)
+            .unwrap()
+            .phase,
+        "removed"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn partial_index_retry_preserves_unrecognized_content_added_while_deletion_was_deferred() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (obsolete, _, _, _, _) = partially_removed_index_fixture(&root);
+    let note = obsolete.join("user-added-after-update.txt");
+    fs::write(&note, b"new unrecognized content").unwrap();
+    retry_pending(&root);
+    assert_eq!(fs::read(note).unwrap(), b"new unrecognized content");
+}
+
+#[cfg(windows)]
+fn recorded_startup_retry_fixture(root: &Path) -> (PathBuf, CleanupPlan) {
+    let path = write_fixture(root, "state/worker/component-recorded-retry.json");
+    let plan = fixture_plan(root);
+    cleanup_save(&plan).unwrap();
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(Some(path.clone())),
+    };
+    execute_plan_with(root, &plan.id, None, &recorder, false, true).unwrap();
+    let mut saved = cleanup_load(root, &plan.id).unwrap();
+    assert!(saved
+        .items
+        .iter()
+        .any(|item| item.source == path && item.phase == "cleanup_deferred"));
+    let update = completed_update(root, &plan.id);
+    add_completed_artifacts(&mut saved, &update);
+    cleanup_save(&saved).unwrap();
+    save(&update).unwrap();
+    (path, saved)
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_retry_excludes_runtime_admission_until_recorded_removal_finishes() {
+    struct PausedRemoval {
+        entered: std::sync::mpsc::SyncSender<()>,
+        proceed: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl Removal for PausedRemoval {
+        fn remove(&self, path: &Path, directory: bool) -> std::io::Result<()> {
+            if let Some(proceed) = self.proceed.lock().unwrap().take() {
+                self.entered.send(()).unwrap();
+                proceed.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+            FilesystemRemoval.remove(path, directory)
+        }
+    }
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (path, _) = recorded_startup_retry_fixture(&root);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let retry_root = root.clone();
+    let retry = std::thread::spawn(move || {
+        retry_pending_with(
+            &retry_root,
+            &PausedRemoval {
+                entered: entered_tx,
+                proceed: std::sync::Mutex::new(Some(release_rx)),
+            },
+            true,
+        );
+    });
+    entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(
+        path.exists(),
+        "removal gate must pause before the file is removed"
+    );
+    let owner =
+        agentlaw_runtime::installation::owner::OwnerLock::try_acquire(&root.join("state")).unwrap();
+    let start_allowed = owner.is_some()
+        && agentlaw_runtime::installation::gate::check_start(&root.join("state")).is_ok();
+    drop(owner);
+    release_tx.send(()).unwrap();
+    retry.join().unwrap();
+    assert!(
+        !start_allowed,
+        "runtime owner/start gate admitted a runtime while retry removal was paused"
+    );
+    assert!(
+        !path.exists(),
+        "recorded removal did not finish after its gate was released"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_retry_defers_for_a_live_runtime_owner_and_removes_the_file_after_owner_exit() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (path, plan) = recorded_startup_retry_fixture(&root);
+    let owner = agentlaw_runtime::installation::owner::OwnerLock::try_acquire(&root.join("state"))
+        .unwrap()
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let recorder = RecordingRemoval {
+        paths: RefCell::new(Vec::new()),
+        busy: RefCell::new(None),
+    };
+    retry_pending_with(&root, &recorder, true);
+    let still_present = fs::read(&path).ok();
+    let attempted_while_live = recorder.paths.borrow().contains(&path);
+    drop(owner);
+    // Always release the owner before reporting a failure, so cleanup cannot strand a test lock.
+    assert_eq!(
+        still_present,
+        Some(before),
+        "retry deleted data while a live runtime owned the installation"
+    );
+    assert!(
+        !attempted_while_live,
+        "retry attempted removal without lifecycle exclusion"
+    );
+    retry_pending(&root);
+    assert!(
+        !path.exists(),
+        "retry was not attempted after the runtime owner exited"
+    );
+    assert!(cleanup_load(&root, &plan.id)
+        .unwrap()
+        .items
+        .iter()
+        .any(|item| item.source == path && item.phase == "removed"));
+}
+
+#[cfg(windows)]
+#[path = "../../../../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+
+#[cfg(windows)]
+fn completed_retry_crash_installation(root: &Path) -> (PathBuf, CleanupPlan, Plan) {
+    let _ = real_binding_index_fixture(root);
+    let (path, cleanup) = recorded_startup_retry_fixture(root);
+    let update_path = legacy::children(&root.join("state/update-plans"))
+        .unwrap()
+        .into_iter()
+        .find(|path| {
+            let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            value["cleanup_plan_id"] == cleanup.id
+        })
+        .unwrap();
+    let id = record_id(&update_path).unwrap();
+    let mut update = load(root, id).unwrap();
+    // Match a completed managed installation, including its verified native candidate.
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy(std::env::current_exe().unwrap(), bin.join(binary_name())).unwrap();
+    fs::write(
+        bin.join(worker_binary_name()),
+        b"compatibility placeholder fixture",
+    )
+    .unwrap();
+    fs::write(bin.join("LICENSE.agentlaw"), b"fixture license").unwrap();
+    update.bundle_hashes = Some(bundle_hashes(&bin).unwrap());
+    let candidate = candidate_executable(&update).unwrap();
+    fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    fs::copy(bin.join(binary_name()), candidate).unwrap();
+    save(&update).unwrap();
+    assert_eq!(update.phase, "completed");
+    (path, cleanup, update)
+}
+
+#[cfg(windows)]
+#[test]
+fn startup_cleanup_retry_crash_fixture() {
+    let Some(root) = std::env::var_os("AGENTLAW_STARTUP_RETRY_CRASH_ROOT") else {
+        return;
+    };
+    struct PausedBeforeRemoval {
+        root: PathBuf,
+    }
+    impl Removal for PausedBeforeRemoval {
+        fn remove(&self, _: &Path, _: bool) -> std::io::Result<()> {
+            let state = self.root.join("state");
+            let excluded = agentlaw_runtime::installation::owner::owner_alive(&state).unwrap()
+                || agentlaw_runtime::installation::gate::check_start(&state).is_err();
+            assert!(
+                excluded,
+                "retry must hold lifecycle exclusion before the crash point"
+            );
+            fs::write(
+                state.join("fixture-startup-retry-held"),
+                b"held before removal",
+            )
+            .unwrap();
+            println!("startup-cleanup-retry-held");
+            std::io::stdout().flush().unwrap();
+            let mut release = String::new();
+            std::io::stdin().read_line(&mut release).unwrap();
+            panic!("parent must kill this child before any gate destructor runs");
+        }
+    }
+    let root = PathBuf::from(root);
+    retry_pending_with(&root, &PausedBeforeRemoval { root: root.clone() }, true);
+    panic!("recorded retry did not reach the crash hook");
+}
+
+#[cfg(windows)]
+fn normal_frontend_recall_after_retry(root: &Path) -> Result<Value> {
+    // This is the same preflight used by ordinary MCP/CLI startup.
+    super::super::check_frontend_start(&root.join("state"))?;
+    struct RunningHost {
+        cleanup: runtime_cleanup::RuntimeCleanup,
+        thread: Option<
+            std::thread::JoinHandle<
+                agentlaw_runtime::ports::RuntimeResult<agentlaw_runtime::host::RunExit>,
+            >,
+        >,
+    }
+    impl Drop for RunningHost {
+        fn drop(&mut self) {
+            self.cleanup.shutdown();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+    let state = root.join("state");
+    let executable = std::env::current_exe().unwrap();
+    let build = agentlaw_runtime::installation::build_identity(&executable).unwrap();
+    let gate_state = state.clone();
+    let deps = agentlaw_runtime::ports::HostDeps {
+        state: state.clone(),
+        executable,
+        assets: std::sync::Arc::new(|| Ok(None)),
+        installation_build: build.clone(),
+        start_gate: std::sync::Arc::new(move || super::super::check_frontend_start(&gate_state)),
+    };
+    let mut host = RunningHost {
+        cleanup: runtime_cleanup::RuntimeCleanup(state.clone()),
+        thread: Some(std::thread::spawn(move || {
+            agentlaw_runtime::host::run(deps)
+        })),
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        agentlaw_runtime::client::probe(&state, &build, Duration::from_millis(100)),
+        agentlaw_runtime::client::Probe::Running(_)
+    ) {
+        assert!(
+            !host.thread.as_ref().unwrap().is_finished(),
+            "normal runtime exited before admission"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "normal runtime did not become ready"
+        );
+        std::thread::yield_now();
+    }
+    let mut frontend = crate::frontend::RuntimeBackend::new(state, false)?;
+    let result = crate::call_json(
+        &mut frontend,
+        &json!({"action":"recall","recall":{"recall_for":"Retained source"}}).to_string(),
+    );
+    drop(frontend);
+    host.cleanup.shutdown();
+    let stopped = host.thread.take().unwrap().join().unwrap().unwrap();
+    assert!(matches!(stopped, agentlaw_runtime::host::RunExit::Stopped));
+    result
+}
+
+#[cfg(windows)]
+#[test]
+fn killed_startup_cleanup_retry_does_not_leave_a_completed_update_blocking_frontend_start() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let state = root.join("state");
+    let (path, cleanup, update) = completed_retry_crash_installation(&root);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&path)
+        .unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "update::managed::cleanup::tests::startup_cleanup_retry_crash_fixture",
+            "--nocapture",
+        ])
+        .env("AGENTLAW_STARTUP_RETRY_CRASH_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+    let mut child = runtime_cleanup::OwnedStaticChild(command.spawn().unwrap());
+    let stdout = child.0.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if line.unwrap().contains("startup-cleanup-retry-held") {
+                let _ = ready_tx.send(());
+            }
+        }
+    });
+    ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(state.join("fixture-startup-retry-held").is_file());
+    assert!(child.0.try_wait().unwrap().is_none());
+    if let Ok(bytes) = fs::read(maintenance_path(&state)) {
+        let marker: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(marker["plan_id"], update.id);
+        assert_eq!(marker["drain"], true);
+    }
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+    reader.join().unwrap();
+    assert!(
+        agentlaw_runtime::installation::owner::OwnerLock::try_acquire(&state)
+            .unwrap()
+            .is_some(),
+        "OS exclusion must be released when the retry process dies"
+    );
+    assert!(path.exists(), "the crash hook must precede actual removal");
+    let result = normal_frontend_recall_after_retry(&root);
+    assert!(
+        result.is_ok(),
+        "completed-update cleanup crash permanently blocked normal frontend startup: {result:?}"
+    );
+    assert!(result.unwrap().is_object());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"fixture",
+        "the still-held file should remain pending"
+    );
+    drop(held);
+    // The ordinary later start must still consume the retained deletion record.
+    let later = normal_frontend_recall_after_retry(&root);
+    assert!(later.is_ok(), "later normal start failed: {later:?}");
+    assert!(
+        !path.exists(),
+        "the crash lost the recorded deletion instead of retrying it later"
+    );
+    let saved = cleanup_load(&root, &cleanup.id).unwrap();
+    assert!(saved
+        .items
+        .iter()
+        .any(|item| item.source == path && item.phase == "removed"));
+}
+
+#[cfg(windows)]
+#[test]
+fn unfinished_update_maintenance_still_blocks_frontend_start_with_completed_cleanup_pending() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (path, _, _) = completed_retry_crash_installation(&root);
+    let update = verified_finalizing_update(&root);
+    assert_eq!(update.phase, "finalizing");
+    let candidate = candidate_executable(&update).unwrap();
+    let hash = update
+        .bundle_hashes
+        .as_ref()
+        .unwrap()
+        .get(binary_name())
+        .unwrap();
+    let _gate = agentlaw_runtime::installation::gate::MaintenanceGate::open(
+        &root.join("state"),
+        &update.id,
+        &candidate,
+        hash,
+    )
+    .unwrap();
+    let before = fs::read(maintenance_path(&root.join("state"))).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let error = normal_frontend_recall_after_retry(&root).unwrap_err();
+    assert_eq!(error.code, "update_maintenance");
+    assert_eq!(
+        fs::read(maintenance_path(&root.join("state"))).unwrap(),
+        before,
+        "unfinished update gate must never be mistaken for abandoned completed-update cleanup"
+    );
+    assert_eq!(fs::read(path).unwrap(), bytes);
 }

@@ -1758,6 +1758,7 @@ fn closed_successor(plan: &Plan) -> Result<Option<Plan>> {
 }
 
 fn status_snapshot(plan: &Plan) -> Result<Value> {
+    let pending_cleanup = cleanup::pending_paths(plan)?;
     let cleanup_verified = plan.cleanup_completed && cleanup::cleanup_complete(plan)?;
     if plan.phase == "completed" && cleanup_verified && plan.recovery_obligations_closed {
         if let Some(successor) = closed_successor(plan)? {
@@ -1874,21 +1875,23 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
         && !maintenance_open
         && bundle == "installed_and_verified"
         && overall == "verified";
-    Ok(
-        json!({"status":if completed {"completed"} else {"incomplete"},
-        "plan_id":plan.id,"phase":plan.phase,"tag":plan.tag,"root":plan.root,
-        "bundle":bundle,"registrations":overall,"registration_details":registration_items,
-        "current_session":"unknown","activation":activation,
-        "previous_bundle":previous_bundle(plan),
-        "cleanup":if cleanup_verified {"completed"} else {"incomplete"},
-        "recovery_obligations_closed":plan.recovery_obligations_closed,
-        "maintenance_gate_open":maintenance_open,
-        "next_action":if completed {
-            "Restart the harness normally. The candidate MCP and recall have already passed the internal readiness probe."
-        } else {
-            "The update is incomplete. Resume this pinned plan after inspecting the reported blocker; do not report restart as successful installation."
-        }}),
-    )
+    let mut result = json!({"status":if completed {"completed"} else {"incomplete"},
+    "plan_id":plan.id,"phase":plan.phase,"tag":plan.tag,"root":plan.root,
+    "bundle":bundle,"registrations":overall,"registration_details":registration_items,
+    "current_session":"unknown","activation":activation,
+    "previous_bundle":previous_bundle(plan),
+    "cleanup":if cleanup_verified {"completed"} else {"incomplete"},
+    "recovery_obligations_closed":plan.recovery_obligations_closed,
+    "maintenance_gate_open":maintenance_open,
+    "next_action":if completed {
+        "Restart the harness normally. The candidate MCP and recall have already passed the internal readiness probe."
+    } else {
+        "The update is incomplete. Resume this pinned plan after inspecting the reported blocker; do not report restart as successful installation."
+    }});
+    if !pending_cleanup.is_empty() {
+        result["cleanup_pending"] = json!(pending_cleanup);
+    }
+    Ok(result)
 }
 
 pub fn status_with_root(id: &str, requested_root: &Path) -> Result<Value> {

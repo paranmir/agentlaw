@@ -3,9 +3,6 @@ use super::*;
 
 mod legacy;
 
-// 새 runtime이 기존 broker 경로를 대체하는 전환 단계에서 활성화한다.
-const LEGACY_OPERATING_CLEANUP_ENABLED: bool = false;
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ManifestEntry {
     relative: PathBuf,
@@ -72,10 +69,13 @@ fn cleanup_save(plan: &CleanupPlan) -> Result<()> {
 }
 
 fn inspection_error(reason: std::io::Error) -> DomainError {
+    inspection_failure(reason, "cleanup_unknown", "Cannot inspect a cleanup item.")
+}
+fn inspection_failure(reason: std::io::Error, code: &str, message: &str) -> DomainError {
     if is_sharing_violation(&reason) {
         error("cleanup_deferred", "An item is in use.")
     } else {
-        error("cleanup_unknown", "Cannot inspect a cleanup item.")
+        error(code, message)
     }
 }
 
@@ -171,8 +171,9 @@ fn manifest_entry_with_hash(
         .strip_prefix(root)
         .map_err(|_| error("cleanup_scope", "Cleanup escaped its approved directory."))?
         .to_path_buf();
-    let metadata = fs::symlink_metadata(path).map_err(|_| {
-        error(
+    let metadata = fs::symlink_metadata(path).map_err(|reason| {
+        inspection_failure(
+            reason,
             "cleanup_drift",
             "A cleanup item disappeared or cannot be inspected.",
         )
@@ -214,8 +215,9 @@ fn complete_manifest(path: &Path) -> Result<Vec<ManifestEntry>> {
 
 fn complete_manifest_with_hash(path: &Path, hash_contents: bool) -> Result<Vec<ManifestEntry>> {
     let mut out = Vec::new();
-    let root_metadata = fs::symlink_metadata(path)
-        .map_err(|_| error("cleanup_drift", "Cannot inspect the cleanup root."))?;
+    let root_metadata = fs::symlink_metadata(path).map_err(|reason| {
+        inspection_failure(reason, "cleanup_drift", "Cannot inspect the cleanup root.")
+    })?;
     let root_identity = entry_identity(path, &root_metadata)?;
     let root_volume = root_identity.split(':').next();
     let mut pending = vec![path.to_path_buf()];
@@ -228,12 +230,22 @@ fn complete_manifest_with_hash(path: &Path, hash_contents: bool) -> Result<Vec<M
             ));
         }
         if info.kind == "directory" {
-            for child in fs::read_dir(&entry)
-                .map_err(|_| error("cleanup_drift", "Cannot enumerate a cleanup directory."))?
-            {
+            for child in fs::read_dir(&entry).map_err(|reason| {
+                inspection_failure(
+                    reason,
+                    "cleanup_drift",
+                    "Cannot enumerate a cleanup directory.",
+                )
+            })? {
                 pending.push(
                     child
-                        .map_err(|_| error("cleanup_drift", "Cannot inspect a cleanup entry."))?
+                        .map_err(|reason| {
+                            inspection_failure(
+                                reason,
+                                "cleanup_drift",
+                                "Cannot inspect a cleanup entry.",
+                            )
+                        })?
                         .path(),
                 );
             }
@@ -498,8 +510,49 @@ fn validate_item(plan: &CleanupPlan, index: usize, finishing_plan: Option<&str>)
             "A cleanup plan path escaped its pinned scope.",
         ));
     }
+    if legacy::protected(&plan.root, &item.source) {
+        return Ok(false);
+    }
     if item.kind == "legacy" {
-        return Ok(legacy::inventory(&plan.root)?.contains(&item.source));
+        if legacy::index_directory(&plan.root, &item.source)
+            && (!item.removed_entries.is_empty() || item.entry_intent.is_some())
+        {
+            let mut removed = item.removed_entries.clone();
+            if let Some(intent) = &item.entry_intent {
+                if !exists_exact(&item.source.join(intent))? {
+                    removed.insert(intent.clone());
+                }
+            }
+            let metadata: Vec<_> = item
+                .manifest
+                .iter()
+                .filter(|entry| {
+                    entry.relative.components().count() == 1
+                        && entry
+                            .relative
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("vector") && name.ends_with(".sqlite")
+                            })
+                })
+                .collect();
+            // With all metadata removed, the pinned manifest is the remaining
+            // ownership proof; verify_remaining rejects new or replaced objects.
+            if !metadata.is_empty()
+                && metadata
+                    .iter()
+                    .all(|entry| removed.contains(&entry.relative))
+            {
+                return Ok(true);
+            }
+            return Ok(legacy::eligible_index_after_removals(
+                &plan.root,
+                &item.source,
+                &removed,
+            ));
+        }
+        return legacy::eligible(&plan.root, &item.source);
     }
     if matches!(
         item.kind.as_str(),
@@ -761,7 +814,8 @@ fn exists_exact(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(reason) if reason.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(error(
+        Err(reason) => Err(inspection_failure(
+            reason,
             "inspection_unknown",
             "Cannot inspect a cleanup path.",
         )),
@@ -813,14 +867,17 @@ fn worker_lifetime_guards(root: &Path) -> Result<Option<Vec<fs::File>>> {
     }
     let mut guards = Vec::new();
     for name in ["launch.lock", "daemon.lock", "model.lock"] {
-        let lock = match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(worker.join(name))
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(7);
+        }
+        let lock = match options.open(worker.join(name)) {
             Ok(lock) => lock,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) if is_sharing_violation(&e) => continue,
+            Err(e) if is_sharing_violation(&e) => return Ok(None),
             Err(_) => {
                 return Err(error(
                     "cleanup_lock",
@@ -908,6 +965,12 @@ fn remove_item(plan: &mut CleanupPlan, index: usize, removal: &impl Removal) -> 
         } else {
             plan.items[index].source.join(&entry.relative)
         };
+        if legacy::protected(&plan.root, &target) {
+            return Err(error(
+                "cleanup_protected",
+                "The model liveness lock is not a cleanup item.",
+            ));
+        }
         if exists_exact(&target)? {
             if manifest_entry_with_hash(
                 &plan.items[index].source,
@@ -965,14 +1028,7 @@ fn retryable(item: &CleanupItem) -> bool {
 }
 
 fn execute_plan_locked(root: &Path, id: &str, finishing_plan: Option<&str>) -> Result<Value> {
-    execute_plan_with(
-        root,
-        id,
-        finishing_plan,
-        &FilesystemRemoval,
-        false,
-        LEGACY_OPERATING_CLEANUP_ENABLED,
-    )
+    execute_plan_with(root, id, finishing_plan, &FilesystemRemoval, false, true)
 }
 
 fn execute_plan_with(
@@ -988,20 +1044,36 @@ fn execute_plan_with(
         plan.permanent_internal_removal_approved = true;
         cleanup_save(&plan)?;
     }
+    for item in &mut plan.items {
+        if legacy::protected(root, &item.source) {
+            item.phase = "preserved".into();
+            item.entry_intent = None;
+            item.retrying = false;
+        }
+    }
+    cleanup_save(&plan)?;
     let Some(worker_guards) = worker_lifetime_guards(&root)? else {
-        return Ok(
-            json!({"status":"deferred","reason":"worker_runtime_active","cleanup_plan_id":id,
-            "next_action":"Retry approved cleanup after the worker exits naturally."}),
-        );
+        let mut result = cleanup_report(&plan);
+        result["status"] = json!("deferred");
+        result["reason"] = json!("worker_runtime_active");
+        return Ok(result);
     };
-    // The old lock files themselves are in the cleanup inventory. Holding
-    // their handles while deleting them would prevent deletion on Windows.
-    drop(worker_guards);
-    for index in 0..plan.items.len() {
+    // Keep the old-worker lifetime exclusion through revalidation and removal.
+    // Delete-sharing handles retain lifetime exclusion on Windows. Remove the
+    // retired daemon admission paths last, after all other data removal, so a
+    // legacy launcher cannot bypass their held handles by recreating the paths.
+    let _worker_guards = worker_guards;
+    let admission = root.join("state/worker");
+    let mut order: Vec<_> = (0..plan.items.len()).collect();
+    order.sort_by_key(|&index| {
+        let path = &plan.items[index].source;
+        path == &admission.join("daemon.lock") || path == &admission.join("launch.lock")
+    });
+    for index in order {
         if plan.items[index].kind == "legacy" && !allow_legacy {
             continue;
         }
-        if plan.items[index].phase == "removed" {
+        if matches!(plan.items[index].phase.as_str(), "removed" | "preserved") {
             continue;
         }
         if retry_only && !retryable(&plan.items[index]) {
@@ -1036,8 +1108,13 @@ fn execute_plan_with(
         let (source_present, holding_present) =
             match (exists_exact(&source), exists_exact(&holding)) {
                 (Ok(source), Ok(holding)) => (source, holding),
-                _ => {
-                    plan.items[index].phase = "cleanup_unknown".into();
+                (Err(problem), _) | (_, Err(problem)) => {
+                    plan.items[index].phase = if problem.code == "cleanup_deferred" {
+                        "cleanup_deferred"
+                    } else {
+                        "cleanup_unknown"
+                    }
+                    .into();
                     cleanup_save(&plan)?;
                     continue;
                 }
@@ -1166,18 +1243,19 @@ fn execute_plan_with(
             cleanup_save(&plan)?;
         }
     }
-    Ok(
-        json!({"cleanup_plan_id":id,"root":root,"items":plan.items.iter().map(|item| json!({
-        "path":item.source,"phase":item.phase,
-        "removed_entries":item.removed_entries,"entry_intent":item.entry_intent
-    })).collect::<Vec<_>>() }),
-    )
+    Ok(cleanup_report(&plan))
+}
+
+fn cleanup_report(plan: &CleanupPlan) -> Value {
+    json!({"cleanup_plan_id":plan.id,"root":plan.root,"items":plan.items.iter().map(|item| json!({
+        "path":item.source,"phase":item.phase,"removed_entries":item.removed_entries,"entry_intent":item.entry_intent
+    })).collect::<Vec<_>>()})
 }
 
 /// Retry only known sharing violations. Failures here must not prevent normal
 /// memory use; the existing plan retains the result for later inspection.
 pub(super) fn retry_pending(root: &Path) {
-    retry_pending_with(root, &FilesystemRemoval, LEGACY_OPERATING_CLEANUP_ENABLED);
+    retry_pending_with(root, &FilesystemRemoval, true);
 }
 
 fn retry_pending_with(root: &Path, removal: &impl Removal, allow_legacy: bool) {
@@ -1185,12 +1263,7 @@ fn retry_pending_with(root: &Path, removal: &impl Removal, allow_legacy: bool) {
 }
 
 pub(super) fn retry_pending_under_update_lock(root: &Path) {
-    retry_pending_inner(
-        root,
-        &FilesystemRemoval,
-        LEGACY_OPERATING_CLEANUP_ENABLED,
-        true,
-    );
+    retry_pending_inner(root, &FilesystemRemoval, true, true);
 }
 
 fn retry_pending_inner(
@@ -1235,6 +1308,15 @@ fn retry_pending_inner(
     let Ok(_install_lock) = install::lock_install_state(&state) else {
         return;
     };
+    if maintenance_path(&state).exists() {
+        return;
+    }
+    // The existing runtime owner lock excludes admission and is released by the
+    // kernel on death. Completed cleanup must not create an update marker.
+    let Ok(Some(_owner)) = agentlaw_runtime::installation::owner::OwnerLock::try_acquire(&state)
+    else {
+        return;
+    };
     for path in paths {
         let Some(id) = record_id(&path) else { continue };
         let Ok(plan) = load(root, id) else { continue };
@@ -1261,9 +1343,9 @@ fn retry_pending_inner(
     }
 }
 
-/// Consume only artifacts pinned by the update being finished. The caller
-/// already owns the root update and install locks and has completed the MCP
-/// probe, so no broad inventory or second user confirmation is involved.
+/// Pin the verified update's artifacts and exact previous-version operating paths.
+/// The caller owns the update/install locks and has completed the candidate probe.
+/// Later startup retries consume this saved plan without creating a new inventory.
 pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
     if !plan.activation_verified || !plan.recovery_obligations_closed || plan.phase != "finalizing"
     {
@@ -1314,13 +1396,11 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
         for version in old_versions {
             paths.push(("version", version));
         }
-        if LEGACY_OPERATING_CLEANUP_ENABLED {
-            paths.extend(
-                legacy::inventory(&plan.root)?
-                    .into_iter()
-                    .map(|path| ("legacy", path)),
-            );
-        }
+        paths.extend(
+            legacy::inventory(&plan.root)?
+                .into_iter()
+                .map(|path| ("legacy", path)),
+        );
         paths.extend(previous_records(&plan.root, &plan.id)?);
         let mut items = Vec::new();
         for (kind, source) in paths {
@@ -1387,11 +1467,12 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
     };
     execute_plan_locked(&plan.root, &id, Some(&plan.id))?;
     let observed = cleanup_load(&plan.root, &id)?;
-    if observed
-        .items
-        .iter()
-        .any(|item| !matches!(item.phase.as_str(), "removed" | "cleanup_deferred"))
-    {
+    if observed.items.iter().any(|item| {
+        !matches!(
+            item.phase.as_str(),
+            "removed" | "cleanup_deferred" | "preserved"
+        )
+    }) {
         return Err(error(
             "cleanup_incomplete",
             "The cleanup outcome could not be confirmed.",
@@ -1405,14 +1486,15 @@ pub(super) fn cleanup_complete(plan: &Plan) -> Result<bool> {
         return Ok(false);
     };
     let cleanup = cleanup_load(&plan.root, id)?;
-    Ok(cleanup
+    Ok(cleanup.items.iter().all(|item| {
+        matches!(
+            item.phase.as_str(),
+            "removed" | "cleanup_deferred" | "preserved"
+        )
+    }) && cleanup
         .items
         .iter()
-        .all(|item| matches!(item.phase.as_str(), "removed" | "cleanup_deferred"))
-        && cleanup
-            .items
-            .iter()
-            .any(|item| item.kind == "previous" && item.source == previous_bundle(plan))
+        .any(|item| item.kind == "previous" && item.source == previous_bundle(plan))
         && cleanup
             .items
             .iter()
@@ -1420,3 +1502,20 @@ pub(super) fn cleanup_complete(plan: &Plan) -> Result<bool> {
 }
 #[cfg(test)]
 mod tests;
+
+/// Known sharing violations are successful update completion with pending work,
+/// not a request for approval or a claim that the bytes were removed.
+pub(super) fn pending_paths(plan: &Plan) -> Result<Vec<PathBuf>> {
+    if !plan.cleanup_completed {
+        return Ok(Vec::new());
+    }
+    let Some(id) = &plan.cleanup_plan_id else {
+        return Ok(Vec::new());
+    };
+    Ok(cleanup_load(&plan.root, id)?
+        .items
+        .into_iter()
+        .filter(|item| item.phase == "cleanup_deferred")
+        .map(|item| item.source)
+        .collect())
+}

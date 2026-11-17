@@ -114,25 +114,31 @@ fn stored_value_error(error: rusqlite::Error) -> VectorFileError {
         _ => VectorFileError::Corrupt(error.to_string()),
     }
 }
-fn check(c: &Connection, id: &VectorFileIdentity) -> VectorFileResult<()> {
+fn stored_identity(c: &Connection) -> VectorFileResult<VectorFileIdentity> {
     let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='binding_vector_meta')", [], |r| r.get(0)).map_err(stored_value_error)?;
     if !exists {
         return Err(VectorFileError::Mismatch);
     }
     let found: (String,String,String,String,String,String,String,i64) = c.query_row("SELECT binding,kind,subject,epoch,model,config,generation,dimension FROM binding_vector_meta WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).map_err(stored_value_error)?;
-    let (k, s) = kind(id);
-    if found
-        != (
-            id.binding.clone(),
-            k.into(),
-            s.into(),
-            id.epoch.clone(),
-            id.model_digest.clone(),
-            id.config.clone(),
-            id.generation.clone(),
-            id.dimension as i64,
-        )
-    {
+    let kind = match (found.1.as_str(), found.2.as_str()) {
+        ("current", "") => VectorFileKind::Current,
+        ("history", subject) => VectorFileKind::History {
+            subject: subject.into(),
+        },
+        _ => return Err(VectorFileError::Mismatch),
+    };
+    Ok(VectorFileIdentity {
+        binding: found.0,
+        kind,
+        epoch: found.3,
+        model_digest: found.4,
+        config: found.5,
+        generation: found.6,
+        dimension: usize::try_from(found.7).map_err(|_| VectorFileError::Mismatch)?,
+    })
+}
+fn check(c: &Connection, id: &VectorFileIdentity) -> VectorFileResult<()> {
+    if stored_identity(c)? != *id {
         return Err(VectorFileError::Mismatch);
     }
     c.prepare("SELECT memory,change_id,section,scope,vector FROM vectors LIMIT 0")
@@ -317,17 +323,42 @@ impl VectorFileWriter {
         Ok(())
     }
 }
+fn open_read_connection(path: &Path) -> VectorFileResult<Connection> {
+    if !path.exists() {
+        return Err(VectorFileError::Missing);
+    }
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
+    c.execute_batch("PRAGMA temp_store=MEMORY; BEGIN DEFERRED;")?;
+    Ok(c)
+}
+impl VectorFileIdentity {
+    /// Inspect existing vector metadata without creating or checkpointing a file.
+    pub fn read(path: impl AsRef<Path>) -> VectorFileResult<Self> {
+        let c = open_read_connection(path.as_ref())?;
+        let id = stored_identity(&c)?;
+        validate_identity(&id)?;
+        check(&c, &id)?;
+        let unknown: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT IN ('binding_vector_meta','vectors','completed_changes','vector_buckets','ann_profile'))", [], |row| row.get(0))?;
+        if unknown {
+            return Err(VectorFileError::Mismatch);
+        }
+        let profile: i64 = c.query_row(
+            "SELECT version FROM ann_profile WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if profile != 1 {
+            return Err(VectorFileError::Mismatch);
+        }
+        Ok(id)
+    }
+}
 impl VectorFileReadView {
     pub fn open(path: impl AsRef<Path>, id: &VectorFileIdentity) -> VectorFileResult<Self> {
         validate_identity(id)?;
-        let path = path.as_ref();
-        if !path.exists() {
-            return Err(VectorFileError::Missing);
-        }
-        let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        c.busy_timeout(std::time::Duration::from_secs(5))?;
-        c.execute_batch("PRAGMA temp_store=MEMORY; BEGIN DEFERRED;")?;
+        let c = open_read_connection(path.as_ref())?;
         check(&c, id)?;
         let p = progress(&c, &id.epoch)?;
         Ok(Self {

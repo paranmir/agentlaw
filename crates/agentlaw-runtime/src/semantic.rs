@@ -3,6 +3,7 @@
 mod batch;
 mod generation;
 mod history;
+pub mod identity;
 mod pump;
 mod quarantine;
 mod search;

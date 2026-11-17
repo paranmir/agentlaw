@@ -42,6 +42,25 @@ pub(super) fn crash_point(point: &str) {
     }
 }
 
+pub(super) fn valid_id(id: &str) -> bool {
+    id == "initial" || uuid::Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id)
+}
+
+pub(super) fn file_id(name: &str) -> Option<&str> {
+    if name == "vector.sqlite" {
+        return Some("initial");
+    }
+    name.strip_prefix("vector-")
+        .and_then(|s| s.strip_suffix(".sqlite"))
+        .filter(|id| *id != "initial" && valid_id(id))
+}
+
+pub(super) fn temporary_id(name: &str) -> Option<&str> {
+    name.strip_prefix(".generation-")
+        .and_then(|s| s.strip_suffix(".tmp"))
+        .filter(|id| *id != "initial" && valid_id(id))
+}
+
 pub(super) fn file(dir: &Path, id: &str) -> PathBuf {
     if id == "initial" {
         dir.join("vector.sqlite")
@@ -52,11 +71,7 @@ pub(super) fn file(dir: &Path, id: &str) -> PathBuf {
 
 pub(super) fn selected(dir: &Path) -> Result<String, String> {
     match std::fs::read_to_string(dir.join("active-generation")) {
-        Ok(id)
-            if id == "initial" || uuid::Uuid::parse_str(&id).is_ok_and(|u| u.to_string() == id) =>
-        {
-            Ok(id)
-        }
+        Ok(id) if valid_id(&id) => Ok(id),
         Ok(_) => Err("invalid semantic generation pointer".into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("initial".into()),
         Err(e) => Err(e.to_string()),
@@ -144,26 +159,15 @@ pub(super) fn cleanup(dir: &Path, active: &str, protected: &[PathBuf]) -> Result
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if let Some(id) = name
-            .strip_prefix(".generation-")
-            .and_then(|s| s.strip_suffix(".tmp"))
-        {
-            if uuid::Uuid::parse_str(id).is_ok_and(|u| u.to_string() == id) {
-                candidates.insert(entry.path());
-            }
+        if temporary_id(name).is_some() {
+            candidates.insert(entry.path());
             continue;
         }
         let base = name
             .strip_suffix("-wal")
             .or_else(|| name.strip_suffix("-shm"))
             .unwrap_or(name);
-        let id = if base == "vector.sqlite" {
-            Some("initial")
-        } else {
-            base.strip_prefix("vector-")
-                .and_then(|s| s.strip_suffix(".sqlite"))
-                .filter(|id| uuid::Uuid::parse_str(id).is_ok_and(|u| u.to_string() == *id))
-        };
+        let id = file_id(base);
         if id.is_some_and(|id| id != active) {
             candidates.insert(dir.join(base));
         }

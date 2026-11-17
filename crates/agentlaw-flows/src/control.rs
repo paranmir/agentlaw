@@ -207,6 +207,13 @@ impl ControlReader {
         }
         Ok(Self { connection })
     }
+    pub fn binding_id(&self) -> Result<String> {
+        sql(self.connection.query_row(
+            "SELECT value FROM settings WHERE key='binding_id'",
+            [],
+            |row| row.get(0),
+        ))
+    }
     pub fn exact_association(
         &self,
         binding: &str,

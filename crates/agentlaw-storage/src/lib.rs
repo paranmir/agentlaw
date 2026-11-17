@@ -344,6 +344,18 @@ struct Fence {
     operation_id: Option<String>,
     manifest_digest: Option<String>,
 }
+fn load_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let envelope = codec::parse_json(&fs::read(path)?)?;
+    let bytes = envelope["payload"]
+        .as_str()
+        .ok_or_else(|| Error::Corrupt("record payload".into()))?
+        .as_bytes();
+    if envelope["digest"] != codec::digest(bytes) {
+        return Err(Error::Corrupt("record digest".into()));
+    }
+    Ok(serde_json::from_value(codec::parse_json(bytes)?)?)
+}
+
 pub struct Store {
     root: PathBuf,
     local: PathBuf,
@@ -386,6 +398,12 @@ impl Store {
         let epoch: String = s.load(&s.local.join("source-epoch"))?;
         validate_id(&epoch)?;
         Ok(s)
+    }
+    /// Read an existing binding's epoch without opening or changing source state.
+    pub fn read_source_epoch(local: impl AsRef<Path>) -> Result<String> {
+        let epoch: String = load_record(&local.as_ref().join("source-epoch"))?;
+        validate_id(&epoch)?;
+        Ok(epoch)
     }
     pub fn local_root(&self) -> &Path {
         &self.local
@@ -786,15 +804,7 @@ impl Store {
         install(path, &serde_json::to_vec(&envelope)?)
     }
     fn load<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
-        let envelope = codec::parse_json(&fs::read(path)?)?;
-        let bytes = envelope["payload"]
-            .as_str()
-            .ok_or_else(|| Error::Corrupt("record payload".into()))?
-            .as_bytes();
-        if envelope["digest"] != codec::digest(bytes) {
-            return Err(Error::Corrupt("record digest".into()));
-        }
-        Ok(serde_json::from_value(codec::parse_json(bytes)?)?)
+        load_record(path)
     }
     fn fence(&self) -> Result<Fence> {
         let path = self.local.join("source-fence");
