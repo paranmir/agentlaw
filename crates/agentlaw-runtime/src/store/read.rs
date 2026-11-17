@@ -64,6 +64,15 @@ impl ReadCoordinator {
         self.run_recall(ctx, &request, Some(project_id))
     }
 
+    pub(super) fn run_restore_for_project(
+        &self,
+        ctx: &ReadCtx<'_>,
+        request: RecallRequest,
+        project_id: &str,
+    ) -> FlowResult<(Value, Vec<DomainError>)> {
+        self.run_recall_with_diagnostics(ctx, &request, Some(project_id))
+    }
+
     /// Prepares a remember or procedure command outside the mutation lane.
     pub fn run_prepare(&self, ctx: &ReadCtx<'_>, request: RememberRequest) -> FlowResult<Prepared> {
         ctx.request.check()?;
@@ -88,10 +97,22 @@ impl ReadCoordinator {
         request: &RecallRequest,
         project_id: Option<&str>,
     ) -> FlowResult<Value> {
+        self.run_recall_with_diagnostics(ctx, request, project_id)
+            .map(|(value, _)| value)
+    }
+
+    /// Runs recall and returns its semantic completeness diagnostics separately from the
+    /// delivered value, which may hold the content inline or point to a file.
+    fn run_recall_with_diagnostics(
+        &self,
+        ctx: &ReadCtx<'_>,
+        request: &RecallRequest,
+        project_id: Option<&str>,
+    ) -> FlowResult<(Value, Vec<DomainError>)> {
         ctx.request.check()?;
         let prepared = agentlaw_flows::read::prepare_recall(ctx, request)?;
         self.with_exact(ctx, |exact| {
-            agentlaw_flows::read::recall_prepared(
+            agentlaw_flows::read::recall_prepared_with_diagnostics(
                 ctx,
                 exact,
                 request,

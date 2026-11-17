@@ -797,7 +797,14 @@ impl Store {
         Ok(serde_json::from_value(codec::parse_json(bytes)?)?)
     }
     fn fence(&self) -> Result<Fence> {
-        self.load(&self.local.join("source-fence"))
+        let path = self.local.join("source-fence");
+        self.load(&path).map_err(|error| match error {
+            Error::Json(_) | Error::Corrupt(_) => Error::Corrupt(format!(
+                "source fence is corrupt: {}: {error}",
+                path.display()
+            )),
+            other => other,
+        })
     }
     fn ensure_clean(&self) -> Result<u64> {
         if self.local.join("validation-required").exists() {

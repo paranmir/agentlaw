@@ -1,5 +1,8 @@
 use crate::*;
 
+/// Guidance returned when a retained connection cannot finish restoring context.
+pub const RESTORE_PREPARATION_INCOMPLETE_INSTRUCTION: &str = "Project association is retained, but semantic context restoration is incomplete. Read the returned diagnostics and any full-content artifact; do not claim complete restoration. Repeat this connect request with restore_context after the provider recovers.";
+
 /// Durable adapters own catalog publication and exact local folder associations.
 /// Failure during create must retain/reuse the catalog identity, not mint another.
 pub trait ContextRepository {

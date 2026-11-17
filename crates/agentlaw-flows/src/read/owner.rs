@@ -518,6 +518,7 @@ pub fn recall(
         DeltaBudget::default(),
         &prepared.queries,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -549,10 +550,25 @@ pub fn recall_prepared(
     budget: DeltaBudget,
     prepared: &PreparedRecall,
 ) -> Result<Value> {
+    recall_prepared_with_diagnostics(ctx, exact, request, project_id, budget, prepared)
+        .map(|(value, _)| value)
+}
+
+/// Returns semantic completeness diagnostics independently of inline or file delivery.
+#[doc(hidden)]
+pub fn recall_prepared_with_diagnostics(
+    ctx: &ReadCtx<'_>,
+    exact: &mut ExactSnapshot,
+    request: &RecallRequest,
+    project_id: Option<&str>,
+    budget: DeltaBudget,
+    prepared: &PreparedRecall,
+) -> Result<(Value, Vec<DomainError>)> {
     if let Some(id) = project_id {
         validate_id(id)?;
     }
-    recall_scoped(
+    let mut diagnostics = Vec::new();
+    let value = recall_scoped(
         ctx,
         exact,
         request,
@@ -560,7 +576,9 @@ pub fn recall_prepared(
         budget,
         &prepared.queries,
         None,
-    )
+        &mut diagnostics,
+    )?;
+    Ok((value, diagnostics))
 }
 
 fn recall_scoped(
@@ -571,6 +589,7 @@ fn recall_scoped(
     budget: DeltaBudget,
     prepared: &[PreparedQuery],
     outer: Option<Value>,
+    completeness_diagnostics: &mut Vec<DomainError>,
 ) -> Result<Value> {
     ctx.request.check()?;
     let mut context = if let Some(project_id) = fixed_project {
@@ -623,6 +642,7 @@ fn recall_scoped(
                         budget,
                         &prepared[..prepared.len().min(1)],
                         Some(result.clone()),
+                        completeness_diagnostics,
                     ) {
                         Ok(value) => return Ok(value),
                         Err(error) if error.code == "cancelled" => return Err(error),
@@ -1180,6 +1200,13 @@ fn recall_scoped(
     assembled
         .diagnostics
         .retain(|d| !d.message.starts_with("Learned procedure discovery"));
+    completeness_diagnostics.extend(
+        assembled
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.starts_with("semantic_channel_"))
+            .cloned(),
+    );
     let mut protected = BTreeSet::new();
     for id in request.memory_ids.as_deref().unwrap_or(&[]) {
         if let Some(state) = snapshot.current(id)? {

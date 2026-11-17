@@ -78,6 +78,14 @@ pub(crate) fn prepare_test_selection(
 }
 
 pub fn run(deps: crate::ports::HostDeps) -> crate::ports::RuntimeResult<RunExit> {
+    run_with_clock(deps, std::sync::Arc::new(std::time::Instant::now))
+}
+
+/// Runs the host with the idle and lease clock supplied by the caller; tests use it to advance time.
+fn run_with_clock(
+    deps: crate::ports::HostDeps,
+    clock: lifecycle::Clock,
+) -> crate::ports::RuntimeResult<RunExit> {
     let Some(_owner) = crate::installation::owner::OwnerLock::try_acquire(&deps.state)
         .map_err(|e| crate::ports::RuntimeError::Unavailable(e.to_string()))?
     else {
@@ -209,25 +217,28 @@ pub fn run(deps: crate::ports::HostDeps) -> crate::ports::RuntimeResult<RunExit>
     let warm_model = model.clone();
     let lifecycle_ref = Arc::new(OnceLock::<lifecycle::Lifecycle>::new());
     let warm_lifecycle = Arc::downgrade(&lifecycle_ref);
-    let lifecycle = lifecycle::Lifecycle::system(Arc::new(move |warm| {
-        warm_model.set_warm(warm);
-        if warm {
-            let Some(guard) = warm_lifecycle.upgrade().and_then(|cell| {
-                cell.get()
-                    .and_then(|l| l.begin(ActivityKind::Execution).ok())
-            }) else {
-                return;
-            };
-            let stores = warm_stores.clone();
-            let registry = warm_registry.clone();
-            std::thread::spawn(move || {
-                let _guard = guard;
-                if let ConfigState::Ready(snapshot) = registry.current() {
-                    stores.prewarm(&snapshot);
-                }
-            });
-        }
-    }));
+    let lifecycle = lifecycle::Lifecycle::new(
+        clock,
+        Arc::new(move |warm| {
+            warm_model.set_warm(warm);
+            if warm {
+                let Some(guard) = warm_lifecycle.upgrade().and_then(|cell| {
+                    cell.get()
+                        .and_then(|l| l.begin(ActivityKind::Execution).ok())
+                }) else {
+                    return;
+                };
+                let stores = warm_stores.clone();
+                let registry = warm_registry.clone();
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    if let ConfigState::Ready(snapshot) = registry.current() {
+                        stores.prewarm(&snapshot);
+                    }
+                });
+            }
+        }),
+    );
     let _ = lifecycle_ref.set(lifecycle.clone());
     let stopping_stores = stores.clone();
     lifecycle.set_on_stopping(Arc::new(move || stopping_stores.stop_opening()));

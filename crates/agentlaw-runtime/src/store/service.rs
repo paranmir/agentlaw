@@ -709,7 +709,15 @@ impl StoreService {
                     project_id.as_deref(),
                     follow_up.recall_for,
                     |request, project_id| {
-                        self.query_for_project(request, project_id, control, identity)
+                        self.with_read_ctx(identity, control, |ctx| {
+                            let (value, completeness) = self
+                                .reads
+                                .run_restore_for_project(ctx, request, project_id)?;
+                            for diagnostic in completeness {
+                                diagnostics.push(agentlaw_flows::to_value(diagnostic)?);
+                            }
+                            Ok(value)
+                        })
                     },
                 );
                 match recall {
@@ -719,21 +727,15 @@ impl StoreService {
                 }
             }
             if !diagnostics.is_empty() {
+                if follow_up.restore {
+                    result["code"] = json!("restore_preparation_incomplete");
+                    result["turn_instruction"] =
+                        json!(agentlaw_flows::context::RESTORE_PREPARATION_INCOMPLETE_INSTRUCTION);
+                }
                 result["diagnostics"] = json!(diagnostics);
             }
         }
         Ok(result)
-    }
-    fn query_for_project(
-        &self,
-        request: RecallRequest,
-        project_id: &str,
-        control: &RequestControl,
-        identity: &StoreIdentity,
-    ) -> Result<Value> {
-        self.with_read_ctx(identity, control, |ctx| {
-            self.reads.run_recall_for_project(ctx, request, project_id)
-        })
     }
     /// Builds the request-scoped read context over a fresh read-only control connection.
     fn with_read_ctx<T>(
