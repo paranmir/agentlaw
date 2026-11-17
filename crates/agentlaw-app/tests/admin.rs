@@ -421,45 +421,6 @@ fn runtime_authored_procedure_is_found_by_management_search() {
         json!({"action":"remember_this","remember_this":{"authoring_ref":prepared["authoring_ref"],"procedure":{"operation":"create","evidence_memory_ids":[evidence],"applies_to":["user"],"name":"Verify migration fixture","use_when":"Before migration","instructions":"Run checks.","evidence":"Observed migration."}}}),
     );
     let id = authored["procedure_ref"]["procedure_id"].as_str().unwrap();
-    {
-        use rusqlite::OptionalExtension;
-        let config = agentlaw_app::config::load(&state).unwrap().unwrap();
-        let local = config.runtime_root(&state);
-        let control = rusqlite::Connection::open_with_flags(
-            local.join("control.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let legacy: Option<String> = control
-            .query_row(
-                "SELECT value FROM settings WHERE key='exact_active_generation'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap();
-        if let Some(path) = legacy {
-            let path = std::path::PathBuf::from(path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                local.join(path)
-            };
-            let index = rusqlite::Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let exists: bool = index
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM exact_units WHERE id=?1)",
-                    [id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(!exists, "legacy index contains the procedure");
-        }
-    }
     let (status, list_out, list_err) = command(&state, &["learned-procedure", "list"]);
     assert!(status.success(), "{}", String::from_utf8_lossy(&list_err));
     let list_text = String::from_utf8(list_out).unwrap();
@@ -509,24 +470,6 @@ fn runtime_authored_procedure_is_found_by_management_search() {
     assert!(result["shown"].as_u64().unwrap() >= 1);
     assert_eq!(result["complete"], true);
     assert!(std::fs::read_to_string(output).unwrap().contains(id));
-    // The runtime searches its active projection; the legacy in-process path
-    // would create the old settings-key index while searching.
-    let config = agentlaw_app::config::load(&state).unwrap().unwrap();
-    let local = config.runtime_root(&state);
-    let control = rusqlite::Connection::open_with_flags(
-        local.join("control.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let legacy: i64 = control
-        .query_row(
-            "SELECT count(*) FROM settings WHERE key='exact_active_generation'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(legacy, 0, "management search used the legacy index");
-    assert!(!local.join("exact-v3.sqlite").exists());
 }
 
 #[test]

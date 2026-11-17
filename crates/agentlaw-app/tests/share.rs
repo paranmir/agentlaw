@@ -486,13 +486,6 @@ fn staged_calls_reject_store_switch_and_sync_and_keep_delivery_and_diagnostics()
     let artifact = large["artifact"]["path"].as_str().unwrap();
     let contents = std::fs::read_to_string(artifact).unwrap();
     assert!(contents.contains(&text));
-    assert!(!active.state.join("worker/endpoint.json").exists());
-    #[cfg(windows)]
-    {
-        let output = Command::new("powershell").args(["-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*worker-daemon*' } | Select-Object -ExpandProperty CommandLine"]).output().unwrap();
-        assert!(output.status.success());
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(active.state.to_str().unwrap()));
-    }
 }
 
 #[test]

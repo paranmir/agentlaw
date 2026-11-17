@@ -150,6 +150,16 @@ fn binary_name() -> &'static str {
     }
 }
 
+// Both 0.4.x daemon bundles and current placeholder bundles require this entry.
+// Keep it when validating installed bundles and pinned recovery plans as well as archives.
+fn worker_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "agentlaw-worker.exe"
+    } else {
+        "agentlaw-worker"
+    }
+}
+
 fn candidate_executable(plan: &Plan) -> Result<PathBuf> {
     let hash = plan
         .bundle_hashes
@@ -245,17 +255,9 @@ fn publish_candidate(plan: &Plan, source: &Path) -> Result<PathBuf> {
 }
 
 fn bundle_hashes(directory: &Path) -> Result<BTreeMap<String, String>> {
-    let expected: BTreeSet<&str> = [
-        binary_name(),
-        if cfg!(windows) {
-            "agentlaw-worker.exe"
-        } else {
-            "agentlaw-worker"
-        },
-        "LICENSE.agentlaw",
-    ]
-    .into_iter()
-    .collect();
+    let expected: BTreeSet<&str> = [binary_name(), worker_binary_name(), "LICENSE.agentlaw"]
+        .into_iter()
+        .collect();
     let mut hashes = BTreeMap::new();
     for entry in fs::read_dir(directory)
         .map_err(|_| error("update_drift", "The managed binary bundle is unavailable."))?
@@ -747,11 +749,7 @@ pub fn prepare(id: &str) -> Result<Value> {
         .collect();
     let expected: BTreeSet<String> = [
         binary_name(),
-        if cfg!(windows) {
-            "agentlaw-worker.exe"
-        } else {
-            "agentlaw-worker"
-        },
+        worker_binary_name(),
         if cfg!(windows) {
             "agentlaw-launcher.exe"
         } else {
@@ -791,13 +789,7 @@ pub fn prepare(id: &str) -> Result<Value> {
     }
     let candidate = unpacked.join(binary_name());
     if !candidate.is_file()
-        || !unpacked
-            .join(if cfg!(windows) {
-                "agentlaw-worker.exe"
-            } else {
-                "agentlaw-worker"
-            })
-            .is_file()
+        || !unpacked.join(worker_binary_name()).is_file()
         || !unpacked.join("LICENSE").is_file()
         || !unpacked
             .join(if cfg!(windows) {
@@ -861,15 +853,7 @@ pub fn prepare(id: &str) -> Result<Value> {
         .map_err(|_| error("update_io", "Cannot retain the release launcher asset."))?;
     plan.launcher_digest = Some(digest(&stage.join("launcher.asset"))?);
     let mut hashes = BTreeMap::new();
-    for name in [
-        binary_name(),
-        if cfg!(windows) {
-            "agentlaw-worker.exe"
-        } else {
-            "agentlaw-worker"
-        },
-        "LICENSE.agentlaw",
-    ] {
+    for name in [binary_name(), worker_binary_name(), "LICENSE.agentlaw"] {
         hashes.insert(name.to_owned(), digest(&unpacked.join(name))?);
     }
     plan.bundle_hashes = Some(hashes);
@@ -1882,7 +1866,6 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
     } else {
         "verification_pending"
     };
-    let broker_runtime = observed_broker_runtime(plan);
     let maintenance_open = maintenance_path(&plan.root.join("state")).exists();
     let completed = plan.phase == "completed"
         && plan.activation_verified
@@ -1895,7 +1878,7 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
         json!({"status":if completed {"completed"} else {"incomplete"},
         "plan_id":plan.id,"phase":plan.phase,"tag":plan.tag,"root":plan.root,
         "bundle":bundle,"registrations":overall,"registration_details":registration_items,
-        "current_session":"unknown","activation":activation,"broker_runtime":broker_runtime,
+        "current_session":"unknown","activation":activation,
         "previous_bundle":previous_bundle(plan),
         "cleanup":if cleanup_verified {"completed"} else {"incomplete"},
         "recovery_obligations_closed":plan.recovery_obligations_closed,
@@ -1906,44 +1889,6 @@ fn status_snapshot(plan: &Plan) -> Result<Value> {
             "The update is incomplete. Resume this pinned plan after inspecting the reported blocker; do not report restart as successful installation."
         }}),
     )
-}
-
-fn observed_broker_runtime(plan: &Plan) -> &'static str {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    let old = plan.bin_before_hashes.get(binary_name());
-    let new = plan
-        .bundle_hashes
-        .as_ref()
-        .and_then(|hashes| hashes.get(binary_name()));
-    let mut found = None;
-    for process in system.processes().values() {
-        if !process.cmd().iter().any(|arg| arg == "worker-daemon") {
-            continue;
-        }
-        let Some(path) = process.exe() else {
-            return "unknown";
-        };
-        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if !path.starts_with(&plan.root) {
-            continue;
-        }
-        let Ok(hash) = digest(&path) else {
-            return "unknown";
-        };
-        let kind = if old == Some(&hash) {
-            "old"
-        } else if new == Some(&hash) {
-            "new"
-        } else {
-            "unknown"
-        };
-        if found.is_some_and(|prior| prior != kind) {
-            return "unknown";
-        }
-        found = Some(kind);
-    }
-    found.unwrap_or("unknown")
 }
 
 pub fn status_with_root(id: &str, requested_root: &Path) -> Result<Value> {

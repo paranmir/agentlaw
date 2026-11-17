@@ -64,7 +64,6 @@ fn main() {
 enum ErrorPolicy {
     Stdout,
     Stderr,
-    Worker,
     ModelChild,
 }
 
@@ -83,7 +82,6 @@ mod tests {
             ),
             (vec!["model-child"], ErrorPolicy::ModelChild),
             (vec!["model-child", "extra"], ErrorPolicy::Stdout),
-            (vec!["worker-daemon", "--bad"], ErrorPolicy::Worker),
             (
                 vec!["learned-procedure", "search", "--bad"],
                 ErrorPolicy::Stderr,
@@ -115,7 +113,6 @@ impl ErrorPolicy {
             return Self::Stderr;
         }
         match (first, second) {
-            (Some(first), _) if first == OsStr::new("worker-daemon") => Self::Worker,
             (Some(first), Some(second))
                 if first == OsStr::new("learned-procedure")
                     && (second == OsStr::new("list") || second == OsStr::new("search")) =>
@@ -129,7 +126,6 @@ impl ErrorPolicy {
     fn for_command(command: &cli::Command) -> Self {
         match command {
             cli::Command::ModelChild => Self::ModelChild,
-            cli::Command::WorkerDaemon(_) => Self::Worker,
             cli::Command::Mcp { .. } | cli::Command::LearnedProcedure { .. } => Self::Stderr,
             _ => Self::Stdout,
         }
@@ -145,12 +141,8 @@ impl ErrorPolicy {
                 eprintln!("{}", agentlaw_app::error_payload(error));
                 agentlaw_app::exit_code(error)
             }
-            Self::Worker => {
-                eprintln!("{}", agentlaw_app::error_payload(error));
-                1
-            }
             Self::ModelChild => {
-                eprintln!("agentlaw: private model child failed; consult the broker diagnostic");
+                eprintln!("agentlaw: private model child failed; consult the runtime diagnostic");
                 1
             }
         };

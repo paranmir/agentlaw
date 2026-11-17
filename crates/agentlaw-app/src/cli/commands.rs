@@ -106,8 +106,6 @@ pub(crate) enum Command {
         command: ShareCommand,
     },
     #[command(hide = true)]
-    WorkerDaemon(WorkerDaemonArgs),
-    #[command(hide = true)]
     ModelChild,
 }
 
@@ -662,18 +660,6 @@ pub(crate) struct ImportPublishArgs {
     pub user_confirmed: bool,
 }
 
-#[derive(Debug, Args)]
-pub(crate) struct WorkerDaemonArgs {
-    #[arg(long, value_name = "PATH")]
-    pub state_dir: PathBuf,
-    #[arg(long, value_name = "PATH", requires_all = ["tokenizer", "ort_library"])]
-    pub model: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires_all = ["model", "ort_library"])]
-    pub tokenizer: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires_all = ["model", "tokenizer"])]
-    pub ort_library: Option<PathBuf>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,7 +727,6 @@ mod tests {
             vec!["sync", "resolve", "--help"],
             vec!["share", "import", "publish", "-h"],
             vec!["store", "create", "--help"],
-            vec!["worker-daemon", "--help"],
         ] {
             assert_eq!(parse(&args).unwrap_err().kind(), ErrorKind::DisplayHelp);
         }
@@ -806,7 +791,6 @@ mod tests {
                 "r",
                 "--user-confirmed",
             ],
-            vec!["worker-daemon", "--state-dir", "state", "--model", "model"],
             vec!["update", "--confirm-update", "p", "check"],
             vec!["update", "status"],
             vec!["mcp", "serve"],

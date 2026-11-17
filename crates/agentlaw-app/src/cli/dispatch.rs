@@ -1,10 +1,7 @@
 //! Typed command execution. Resource acquisition starts at this boundary.
 
 use super::{
-    commands::{
-        Command, HelpFormat, McpCommand, SupportCommand, UpdateArgs, UpdateCommand,
-        WorkerDaemonArgs,
-    },
+    commands::{Command, HelpFormat, McpCommand, SupportCommand, UpdateArgs, UpdateCommand},
     general, help, input, procedure, share, sync,
 };
 use agentlaw_app::{config, frontend::RuntimeBackend, Backend};
@@ -89,16 +86,6 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
         Command::Continuity { command } => general::continuity(command)?,
         Command::Sync { command } => sync::execute(command)?,
         Command::Share { command } => share::execute(command)?,
-        Command::WorkerDaemon(args) => {
-            let configuration = worker_configuration(args)?;
-            agentlaw_worker::run_daemon(configuration).map_err(|_| {
-                DomainError::new(
-                    "worker_failed",
-                    "Embedding worker terminated with an error.",
-                )
-            })?;
-            return Ok(None);
-        }
         Command::ModelChild => {
             agentlaw_worker::run_model_child().map_err(|_| {
                 DomainError::new("model_child_failed", "The private model child failed.")
@@ -126,49 +113,6 @@ fn update(args: UpdateArgs) -> Result<Value> {
             "Update preparation cannot be combined with a subcommand.",
         )),
     }
-}
-
-fn worker_configuration(args: WorkerDaemonArgs) -> Result<agentlaw_worker::RuntimeConfig> {
-    if !args.state_dir.is_absolute()
-        || args
-            .model
-            .iter()
-            .chain(args.tokenizer.iter())
-            .chain(args.ort_library.iter())
-            .any(|path| !path.is_absolute())
-    {
-        return Err(DomainError::new(
-            "invalid_arguments",
-            "Worker paths must be absolute.",
-        ));
-    }
-    let model = match (args.model, args.tokenizer, args.ort_library) {
-        (None, None, None) => None,
-        (Some(onnx_model), Some(tokenizer_json), Some(runtime_library)) => {
-            Some(agentlaw_worker::ModelAssets {
-                onnx_model,
-                tokenizer_json,
-                runtime_library,
-            })
-        }
-        _ => {
-            return Err(DomainError::new(
-                "invalid_arguments",
-                "Supply all three model artifact paths together.",
-            ))
-        }
-    };
-    let executable = std::env::current_exe().map_err(|_| {
-        DomainError::new(
-            "worker_unavailable",
-            "Could not locate the worker executable.",
-        )
-    })?;
-    Ok(agentlaw_worker::RuntimeConfig {
-        state_dir: args.state_dir,
-        executable,
-        model,
-    })
 }
 
 pub(super) fn cli_control() -> agentlaw_flows::RequestControl {

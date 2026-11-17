@@ -4,7 +4,6 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -13,7 +12,6 @@ fs2 = "0.4"
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 sha2 = "0.10"
-agentlaw-search = { path = "../agentlaw-search" }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "=0.2.189"

@@ -1,6 +1,6 @@
 //! Worker configuration for operating commands.
 use agentlaw_contracts::{DomainError, Result};
-use agentlaw_worker::{ModelAssets, RuntimeConfig};
+use agentlaw_worker::ModelAssets;
 use std::path::{Path, PathBuf};
 
 pub fn model_assets(state: &Path) -> Result<Option<ModelAssets>> {
@@ -35,17 +35,4 @@ pub fn model_assets(state: &Path) -> Result<Option<ModelAssets>> {
             )),
         };
     Ok(model)
-}
-
-pub fn worker_config(state: &Path) -> Result<RuntimeConfig> {
-    Ok(RuntimeConfig {
-        state_dir: state.join("worker"),
-        executable: std::env::current_exe().map_err(|_| {
-            DomainError::new(
-                "worker_unavailable",
-                "Could not locate the worker host executable.",
-            )
-        })?,
-        model: model_assets(state)?,
-    })
 }

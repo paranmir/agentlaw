@@ -329,7 +329,6 @@ fn two_mcp_frontends_share_one_runtime_and_memory() {
         endpoint.pid
     );
     assert!(agentlaw_runtime::installation::owner::owner_alive(&state).unwrap());
-    assert!(!state.join("worker/endpoint.json").exists());
 }
 
 #[test]
@@ -958,7 +957,6 @@ fn installed_real_model_cli_mcp_and_codex_config_smoke() {
         replica_machine["machine_id"]
     );
     assert!(!cloned.join("control.sqlite").exists());
-    assert!(!cloned.join("broker.sqlite").exists());
     // This only asks the installed Codex binary to parse an isolated profile.
     // It sends no model request and never touches the active user's auth/config.
     if let Some(exe) = std::env::var_os("AGENTLAW_SMOKE_CODEX") {

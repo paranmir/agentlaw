@@ -38,6 +38,7 @@ fn send(w: &mut impl Write, value: Value) {
     w.flush().unwrap();
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--probe") { return; }
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let launch = read(&mut input).unwrap();
@@ -82,6 +83,18 @@ fn main() {
             .arg("-o").arg(directory.path().join("model_fixture.exe"))
             .output().unwrap();
         assert!(output.status.success(), "helper compilation: {}", String::from_utf8_lossy(&output.stderr));
+        // Production reuses its running executable; prepare this generated image
+        // before the tests start timing model readiness and recovery.
+        let mut probe = std::process::Command::new(directory.path().join("model_fixture.exe"));
+        probe.arg("--probe").stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            probe.creation_flags(0x08000000);
+        }
+        let output = probe.output().expect("start generated model fixture");
+        assert!(output.status.success(), "helper probe: {}", String::from_utf8_lossy(&output.stderr));
         directory
     });
     directory.path().join("model_fixture.exe")

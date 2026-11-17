@@ -209,12 +209,7 @@ fn root_help_aliases_are_json_and_hide_internal_commands() {
                     "{value}"
                 );
             }
-            for private in [
-                "worker-daemon",
-                "model-child",
-                "update apply",
-                "update --confirm-update",
-            ] {
+            for private in ["model-child", "update apply", "update --confirm-update"] {
                 assert!(
                     usages.iter().all(|usage| !usage.contains(private)),
                     "{value}"
@@ -229,12 +224,7 @@ fn root_help_aliases_are_json_and_hide_internal_commands() {
         let text = successful_text(&home.run(&["help", "--format", "text"]), &[]);
         assert!(text.contains("Commands:"), "{text}");
         assert!(text.contains("learned-procedure"), "{text}");
-        for private in [
-            "worker-daemon",
-            "model-child",
-            "update apply",
-            "--confirm-update",
-        ] {
+        for private in ["model-child", "update apply", "--confirm-update"] {
             assert!(!text.contains(private), "{text}");
         }
     }
@@ -350,7 +340,7 @@ fn describe_returns_selected_cli_metadata_and_schema_remains_mcp_metadata() {
     assert_eq!(root["path"], json!([]));
     let children = root["commands"].as_array().expect("public child metadata");
     assert!(children.iter().any(|c| c["name"] == "sync"), "{root}");
-    for private in ["worker-daemon", "model-child"] {
+    for private in ["model-child"] {
         assert!(children.iter().all(|c| c["name"] != private), "{root}");
     }
     let resolve = successful_json(&home.run(&["describe", "sync", "resolve"]));

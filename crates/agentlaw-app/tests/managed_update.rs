@@ -1213,3 +1213,256 @@ fn harness_drift_stops_before_publication_and_reopens_old_startup() {
         .exists());
     assert!(!fixture.state.join("update-maintenance.json").exists());
 }
+
+// A native placeholder fixture lets bundle validation run before the production
+// worker binary is replaced. Its process behavior is checked separately in worker tests.
+fn placeholder_bundle_executable() -> PathBuf {
+    static BUILD: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = BUILD.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("placeholder.rs");
+        fs::write(
+            &source,
+            r#"fn main() {
+    eprintln!("agentlaw-worker is no longer used");
+    std::process::exit(1);
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .arg("--crate-name=placeholder_fixture")
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.path().join(worker_name()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "placeholder fixture compilation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir
+    });
+    dir.path().join(worker_name())
+}
+
+fn pin_worker_bundle_entries(fixture: &Fixture, candidate: &Path) {
+    // The copied test runner is a real native executable with the old-daemon fixture route.
+    // It survives deletion of the production daemon implementation.
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        fixture.root.join("bin").join(worker_name()),
+    )
+    .unwrap();
+    let staged = fixture
+        .root
+        .join(format!(".update-{}", fixture.id))
+        .join("unpacked");
+    fs::copy(candidate, staged.join(worker_name())).unwrap();
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["bin_before_hashes"][worker_name()] =
+        json!(hash(&fixture.root.join("bin").join(worker_name())));
+    plan["bundle_hashes"][worker_name()] = json!(hash(&staged.join(worker_name())));
+    fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+}
+
+#[test]
+fn old_daemon_drain_fixture() {
+    let Some(state) = std::env::var_os("AGENTLAW_OLD_DAEMON_FIXTURE_STATE") else {
+        return;
+    };
+    let state = PathBuf::from(state);
+    let worker = state.join("worker");
+    fs::create_dir_all(&worker).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(worker.join("daemon.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        worker.join("endpoint.json"),
+        serde_json::to_vec(&json!({
+            "protocol_version":2,"pid":std::process::id(),
+            "incarnation":uuid::Uuid::new_v4().to_string(),
+            "address":endpoint.local_addr().unwrap().to_string(),
+            "secret":"a".repeat(64),"config":"legacy-test-fixture"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(state.join("fixture-old-daemon-ready"), b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "old daemon did not receive the drain marker"
+        );
+        if let Ok(bytes) = fs::read(state.join("update-maintenance.json")) {
+            if serde_json::from_slice::<Value>(&bytes).is_ok_and(|marker| marker["drain"] == true) {
+                fs::write(state.join("fixture-old-daemon-drain-seen"), bytes).unwrap();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // An owned exit gate proves the updater waits for actual exit after requesting drain.
+    while !state.join("fixture-old-daemon-release").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "old daemon exit gate was not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(endpoint);
+    drop(lock);
+}
+
+#[test]
+fn update_drains_old_worker_daemon_and_waits_for_its_exit_before_completing() {
+    let fixture = Fixture::new();
+    pin_worker_bundle_entries(&fixture, &placeholder_bundle_executable());
+    let mut command = Command::new(fixture.root.join("bin").join(worker_name()));
+    command
+        .args(["--exact", "old_daemon_drain_fixture", "--nocapture"])
+        .env("AGENTLAW_OLD_DAEMON_FIXTURE_STATE", &fixture.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut daemon = OwnedStaticChild(command.spawn().unwrap());
+    wait_for_update_fixture(
+        &mut daemon,
+        || fixture.state.join("fixture-old-daemon-ready").is_file(),
+        Duration::from_secs(10),
+    );
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.state.join("worker/daemon.lock"))
+        .unwrap();
+    assert!(
+        lock.try_lock_exclusive().is_err(),
+        "old daemon must own its lifetime lock"
+    );
+    drop(lock);
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("worker/endpoint.json")).unwrap())
+            .unwrap();
+    assert_eq!(endpoint["pid"], daemon.0.id());
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut daemon,
+        || {
+            fixture
+                .state
+                .join("fixture-old-daemon-drain-seen")
+                .is_file()
+        },
+        Duration::from_secs(30),
+    );
+    let drain: Value = serde_json::from_slice(
+        &fs::read(fixture.state.join("fixture-old-daemon-drain-seen")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(drain["drain"], true);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert!(
+        update.0.try_wait().unwrap().is_none(),
+        "update completed before the old daemon exited"
+    );
+    fs::write(fixture.state.join("fixture-old-daemon-release"), b"exit").unwrap();
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(90));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    assert!(
+        daemon
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success()),
+        "old daemon survived completed update"
+    );
+    assert_eq!(
+        hash(&fixture.root.join("bin").join(worker_name())),
+        hash(&placeholder_bundle_executable())
+    );
+}
+
+#[test]
+fn old_worker_bundle_and_its_pinned_recovery_plan_remain_valid() {
+    let fixture = Fixture::new();
+    pin_worker_bundle_entries(&fixture, &std::env::current_exe().unwrap());
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    // Resuming the durable plan exercises validation of a previously published old layout.
+    let recovered = fixture.apply();
+    assert_eq!(recovered["status"], "completed", "{recovered}");
+    assert_eq!(recovered["bundle"], "installed_and_verified", "{recovered}");
+}
+
+#[test]
+fn placeholder_worker_bundle_and_its_pinned_recovery_plan_validate() {
+    let fixture = Fixture::new();
+    let placeholder = placeholder_bundle_executable();
+    pin_worker_bundle_entries(&fixture, &placeholder);
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    assert_eq!(
+        hash(&fixture.root.join("bin").join(worker_name())),
+        hash(&placeholder)
+    );
+    let recovered = fixture.apply();
+    assert_eq!(recovered["status"], "completed", "{recovered}");
+    assert_eq!(recovered["bundle"], "installed_and_verified", "{recovered}");
+}
+
+#[test]
+fn bundle_missing_worker_entry_is_rejected_without_replacing_the_old_installation() {
+    let fixture = Fixture::new();
+    let staged = fixture
+        .root
+        .join(format!(".update-{}", fixture.id))
+        .join("unpacked");
+    fs::rename(
+        staged.join(worker_name()),
+        fixture.root.parent().unwrap().join("omitted-worker"),
+    )
+    .unwrap();
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["bundle_hashes"]
+        .as_object_mut()
+        .unwrap()
+        .remove(worker_name());
+    fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let before = snapshot(&fixture.root.join("bin"));
+    let mut update = start_fixture_update(&fixture);
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(30));
+    assert!(!status.success(), "{result}");
+    assert_eq!(result["code"], "update_drift", "{result}");
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incomplete")),
+        "{result}"
+    );
+    assert_eq!(snapshot(&fixture.root.join("bin")), before);
+}

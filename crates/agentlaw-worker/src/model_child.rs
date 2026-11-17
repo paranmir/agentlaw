@@ -1,4 +1,5 @@
 //! Private model execution boundary. This process never publishes source or index data.
+pub(crate) use crate::util::Result;
 use crate::{EmbeddingError, EmbeddingProvider, ModelAssets, OnnxProvider};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,6 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
-pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Launch {
     pub incarnation: String,
