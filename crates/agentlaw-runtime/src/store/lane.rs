@@ -4,7 +4,7 @@ use agentlaw_flows::{
     apply::Applied,
     control::ControlWriter,
     prepare::Prepared,
-    runtime::{LaneCtx, StoreIdentity},
+    store::{LaneCtx, StoreIdentity},
     DomainError, RequestControl, Result,
 };
 use agentlaw_storage::{sync::OverlayGuard, PublishReceipt, Store};

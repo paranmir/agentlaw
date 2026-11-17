@@ -1,10 +1,9 @@
 //! Write review: pending batches, overlap checks and procedure authoring.
 use crate::read::{procedure_output, Channels};
-use crate::runtime::*;
+use crate::store::*;
 use crate::*;
 use crate::{context::*, write::*};
 use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
-use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -58,37 +57,6 @@ impl ReviewSource for ReadReview<'_, '_, '_> {
     }
 }
 
-struct LegacyReview<'a> {
-    runtime: &'a Runtime,
-    index: crate::exact::ExactIndex,
-}
-impl ReviewSource for LegacyReview<'_> {
-    fn position(&self) -> Result<agentlaw_storage::published::SourcePosition> {
-        self.index
-            .position()?
-            .ok_or_else(|| DomainError::new("exact_not_ready", "Exact index has no position."))
-    }
-    fn heads(&self, ids: &[String]) -> Result<Vec<crate::exact::HeadRecord>> {
-        self.index.heads(ids)
-    }
-    fn identical_bodies(&self, body: &str) -> Result<Vec<String>> {
-        self.index.identical_bodies(body)
-    }
-    fn related(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
-        self.index.related(ids)
-    }
-    fn reverse_required(&self, ids: &[String]) -> Result<Vec<String>> {
-        self.index.reverse_required(ids)
-    }
-    fn search(&mut self, scopes: &[String], query: &str) -> Result<Channels> {
-        self.runtime
-            .search_scopes_channels(&self.index, scopes, query, 128)
-    }
-    fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot> {
-        self.runtime.snapshot_for_recall(ids, procedures)
-    }
-}
-
 trait Preparation {
     fn identity(&self) -> StoreIdentity;
     fn request(&self) -> &RequestControl;
@@ -109,72 +77,6 @@ trait Preparation {
     ) -> Result<(Vec<CurrentState>, Vec<DomainError>)>;
     fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot>;
     fn nearby(&mut self, query: &str, path: Option<&str>) -> Result<Value>;
-}
-
-impl Preparation for Runtime {
-    fn identity(&self) -> StoreIdentity {
-        StoreIdentity {
-            root: self.root.clone(),
-            local: self.local.clone(),
-            user_id: self.user_id.clone(),
-            machine_id: self.machine_id.clone(),
-            binding_id: self.binding_id.clone(),
-            history_limit: self.history_response_limit,
-            response_limit: self.history_response_limit,
-            config_file: self.config_file.clone(),
-        }
-    }
-    fn request(&self) -> &RequestControl {
-        &self.request_control
-    }
-    fn context(&self, path: Option<&str>) -> Result<RequestContext> {
-        resolve_context(self, path)
-    }
-    fn load(&self, reference: &PendingBatchRef) -> Result<(Retained, String, Option<String>)> {
-        crate::control::load_pending(&self.control, &self.binding_id, reference)
-    }
-    fn authoring_result(&self, token: &str) -> Result<Option<(String, String, Option<String>)>> {
-        crate::control::authoring_result(&self.control, &self.binding_id, token)
-    }
-    fn authoring_basis(&self, token: &str) -> Result<Option<String>> {
-        sql(self
-            .control
-            .query_row(
-                "SELECT basis FROM authoring WHERE token=?1 AND binding=?2 AND used=0",
-                params![token, self.binding_id],
-                |row| row.get(0),
-            )
-            .optional())
-    }
-    fn material(
-        &mut self,
-        context: &RequestContext,
-        proposals: &[MemoryProposal],
-    ) -> Result<Snapshot> {
-        let mut review = LegacyReview {
-            runtime: self,
-            index: self.exact_index()?,
-        };
-        write_material(&mut review, context, proposals)
-    }
-    fn overlaps(
-        &mut self,
-        snapshot: &Snapshot,
-        prepared: &PreparedIntent,
-        affected: &BTreeSet<String>,
-    ) -> Result<(Vec<CurrentState>, Vec<DomainError>)> {
-        let mut review = LegacyReview {
-            runtime: self,
-            index: self.exact_index()?,
-        };
-        overlap_candidates(&mut review, snapshot, prepared, affected)
-    }
-    fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot> {
-        self.snapshot_for_recall(ids, procedures)
-    }
-    fn nearby(&mut self, query: &str, path: Option<&str>) -> Result<Value> {
-        self.search_procedures(query, path, 5)
-    }
 }
 
 struct ReadPreparation<'a, 'b, 'c> {
@@ -649,33 +551,8 @@ pub(crate) fn query_records(body: &str) -> Vec<&str> {
     }
     result
 }
-impl Runtime {
-    pub(crate) fn pending_response(retained: &Retained, status: &str) -> Value {
-        json!({"status":status,"pending_batch_ref":retained.batch.reference,"proposal_map":retained.batch.proposals.iter().enumerate().map(|(i,p)|json!({"proposal_index":i,"proposal_id":p.proposal_id})).collect::<Vec<_>>(),"proposals":retained.batch.proposals,"issues":retained.issues,"resolution_ref":retained.resolution_ref,"diagnostics":retained.diagnostics})
-    }
-    pub(crate) fn remember(&mut self, request: RememberRequest) -> Result<Value> {
-        let prepared = prepare_remember(self, request)?;
-        if let Prepared::Replay(value) = prepared {
-            return Ok(value);
-        }
-        let identity = Preparation::identity(self);
-        let mut writer = crate::control::ControlWriter::open(&self.local)?;
-        match crate::apply::apply(
-            &mut LaneCtx {
-                identity: &identity,
-                source: &self.store,
-                control: &mut writer,
-                request: &self.request_control,
-            },
-            prepared,
-        )? {
-            crate::apply::Applied::Response(value) => Ok(value),
-            crate::apply::Applied::Connected { .. } => Err(DomainError::new(
-                "invalid_input",
-                "Unexpected connection plan.",
-            )),
-        }
-    }
+pub(crate) fn pending_response(retained: &Retained, status: &str) -> Value {
+    json!({"status":status,"pending_batch_ref":retained.batch.reference,"proposal_map":retained.batch.proposals.iter().enumerate().map(|(i,p)|json!({"proposal_index":i,"proposal_id":p.proposal_id})).collect::<Vec<_>>(),"proposals":retained.batch.proposals,"issues":retained.issues,"resolution_ref":retained.resolution_ref,"diagnostics":retained.diagnostics})
 }
 
 fn mutations(
@@ -829,9 +706,7 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
                 return if status == "published" {
                     decode(result.as_deref().unwrap_or("null")).map(Prepared::Replay)
                 } else {
-                    Ok(Prepared::Replay(Runtime::pending_response(
-                        &retained, &status,
-                    )))
+                    Ok(Prepared::Replay(pending_response(&retained, &status)))
                 }
             }
             Some(PendingAction::Discard) => {

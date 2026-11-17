@@ -303,7 +303,7 @@ impl Inner {
     }
     fn open_identity(
         &self,
-        identity: agentlaw_flows::runtime::StoreIdentity,
+        identity: agentlaw_flows::store::StoreIdentity,
         control: &RequestControl,
     ) -> Result<StoreService, RuntimeError> {
         let deps = StoreDeps {

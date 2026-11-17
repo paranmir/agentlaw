@@ -5,7 +5,7 @@ use crate::{
     semantic::{SemanticConfig, SemanticIndexer, SemanticSearch},
     store::service::StoreDeps,
 };
-use agentlaw_flows::runtime::StoreIdentity;
+use agentlaw_flows::store::StoreIdentity;
 use agentlaw_storage::Store;
 use agentlaw_worker::supervisor::ModelRequestIds;
 use std::{path::Path, sync::Arc};

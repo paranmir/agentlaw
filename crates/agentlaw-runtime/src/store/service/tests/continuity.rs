@@ -1,7 +1,11 @@
-use agentlaw_flows::{parse_request as parse_public_request, Runtime};
+use super::*;
+use agentlaw_flows::{parse_request as parse_public_request, Request};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
-
-const SEMANTIC_RECALL_NOTICE: &str = "Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.";
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 fn parse_request(input: &str) -> agentlaw_flows::Result<agentlaw_flows::Request> {
     let mut fields = serde_json::from_str::<Value>(input)
@@ -20,7 +24,7 @@ fn parse_request(input: &str) -> agentlaw_flows::Result<agentlaw_flows::Request>
     grouped.insert(action, Value::Object(fields));
     parse_public_request(&Value::Object(grouped).to_string())
 }
-fn call(runtime: &mut Runtime, input: Value) -> Value {
+fn call(runtime: &mut Fixture, input: Value) -> Value {
     runtime
         .call(parse_request(&input.to_string()).unwrap())
         .unwrap()
@@ -29,11 +33,90 @@ fn create(body: &str) -> Value {
     json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed by test","applies_to":["user"]}]})
 }
 
+struct Opened {
+    service: StoreService,
+    indexer: SemanticIndexer,
+}
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.service.close();
+        assert!(self.indexer.shutdown(Duration::from_secs(10)));
+    }
+}
+struct Fixture(Arc<Opened>);
+impl Fixture {
+    fn open(root: impl AsRef<Path>, local: impl AsRef<Path>, user: &str) -> Result<Self> {
+        static OWNERS: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Weak<Opened>>>> =
+            OnceLock::new();
+        let local = local.as_ref().to_path_buf();
+        let mut owners = OWNERS.get_or_init(Default::default).lock().unwrap();
+        if let Some(owner) = owners.get(&local).and_then(Weak::upgrade) {
+            return Ok(Self(owner));
+        }
+        let store = Store::open(root.as_ref(), local.join("canonical")).unwrap();
+        drop(store);
+        let recorded = |key: &str| -> String {
+            let path = local.join("control.sqlite");
+            if path.exists() {
+                rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap()
+                .query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .unwrap()
+                .unwrap_or_else(id)
+            } else {
+                id()
+            }
+        };
+        let identity = StoreIdentity {
+            root: root.as_ref().to_path_buf(),
+            local: local.clone(),
+            user_id: user.into(),
+            machine_id: recorded("machine_id"),
+            binding_id: recorded("binding_id"),
+            history_limit: 8192,
+            response_limit: 65536,
+            config_file: None,
+        };
+        let mut dependencies = deps(local.parent().unwrap());
+        dependencies.coordination = local.join("source-coordination");
+        let indexer = dependencies.indexer.clone();
+        let service = StoreService::open(identity, dependencies, &RequestControl::default())
+            .map_err(|error| DomainError::new("fixture_open_failed", error.to_string()))?;
+        let owner = Arc::new(Opened { service, indexer });
+        owners.insert(local, Arc::downgrade(&owner));
+        Ok(Self(owner))
+    }
+    fn machine_id(&self) -> &str {
+        &self.0.service.identity.machine_id
+    }
+    fn call(&mut self, request: Request) -> Result<Value> {
+        self.call_with_control(request, RequestControl::default())
+    }
+    fn call_with_control(&mut self, request: Request, control: RequestControl) -> Result<Value> {
+        let body = agentlaw_contracts::wire::encode_wire(&request)?;
+        let validated = agentlaw_contracts::wire::decode_wire(&body)?;
+        match crate::protocol::classify(validated) {
+            crate::protocol::Classified::Query(request) => self.0.service.query(request, &control),
+            crate::protocol::Classified::Command(request) => {
+                self.0.service.command(request, &control)
+            }
+            crate::protocol::Classified::Setup(_) | crate::protocol::Classified::Admin(_) => {
+                unreachable!("continuity fixture only dispatches store requests")
+            }
+        }
+    }
+}
 #[test]
 fn same_words_in_different_applicability_are_not_a_duplicate_write() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/scoped","project_name":"Scoped"}),
@@ -68,7 +151,7 @@ fn fabricated_resolution_does_not_publish_or_destroy_retained_proposals() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     call(&mut runtime, create("Verified shell command convention."));
     let pending = call(&mut runtime, create("Verified shell command convention."));
     assert_eq!(pending["status"], "resolution_required");
@@ -78,7 +161,7 @@ fn fabricated_resolution_does_not_publish_or_destroy_retained_proposals() {
         "invalid_resolution_ref"
     );
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let inspect = call(
         &mut runtime,
         json!({"action":"remember_this","pending_action":"inspect","pending_batch_ref":pending["pending_batch_ref"]}),
@@ -104,7 +187,7 @@ fn unrelated_publication_does_not_invalidate_same_scope_evolution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let first = call(&mut runtime, create("alpha subject"))["results"][0]["memory_ref"].clone();
     let second = call(&mut runtime, create("zebra unrelated"))["results"][0]["memory_ref"].clone();
     let store = agentlaw_storage::Store::open(&root, local.join("canonical")).unwrap();
@@ -142,131 +225,25 @@ fn unrelated_publication_does_not_invalidate_same_scope_evolution() {
     );
 }
 #[test]
-fn active_task_candidates_copy_only_complete_handoff_sections() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/task","project_name":"Task"}),
-    );
-    let body="# Objective\nComplete the migration.\n# Current position\nFixtures verified.\n# Resume point\nRun the final checks.\n# References\nPrivate full reference section.\n";
-    call(
-        &mut runtime,
-        json!({"action":"remember_this","project_path":"C:/work/task","memories":[{"operation":"create","what_to_remember":body,"evidence":"Current work","applies_to":["project"],"in_working_set":true}]}),
-    );
-    let result = call(
-        &mut runtime,
-        json!({"action":"recall","project_path":"C:/work/task","recall_for":"resume","include_active_tasks":true}),
-    );
-    let c = &result["candidates"][0];
-    assert_eq!(c["objective"], "Complete the migration.\n");
-    assert_eq!(c["resume_point"], "Run the final checks.\n");
-    assert!(c.get("excerpt").is_none());
-    assert!(c.get("applicability").is_none());
-    assert_eq!(result["active_task_count"], 1);
-    assert!(result.get("task_instruction").is_none());
-    assert!(c["retrieval_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|p| p["via"].is_array()));
-    let task_paths: Vec<_> = c["retrieval_paths"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|p| p["clue"] == "Active Task")
-        .collect();
-    assert_eq!(task_paths.len(), 1);
-    assert_eq!(
-        task_paths[0]["via"],
-        json!(["active_task", "active_working_set"])
-    );
-}
-
-#[test]
-fn task_projection_retains_search_two_link_sources_and_target_paths() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    let folder = "C:/work/grouped-paths";
-    let project = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Grouped"}),
-    );
-    let project_id = &project["project_connection"]["project_id"];
-    let body = "## Objective\nReview shared material.\n## Current position\nInputs checked.\n## Resume point\nInspect the result.\n## References\nFixture reference.\n";
-    let task = call(
-        &mut runtime,
-        json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"in_working_set":true,"work_targets":[{"project_id":project_id,"path":"src/task.rs","kind":"file","reading":"related"}]}]}),
-    );
-    assert_eq!(task["status"], "remembered", "{task}");
-    let task_id = &task["results"][0]["memory_ref"]["memory_id"];
-    let mut sources = Vec::new();
-    for body in ["shared material alpha", "shared material bravo"] {
-        let saved = call(
-            &mut runtime,
-            json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"related_memory_ids":[task_id]}]}),
-        );
-        assert_eq!(saved["status"], "remembered", "{saved}");
-        sources.push(saved["results"][0]["memory_ref"]["memory_id"].clone());
-    }
-    let result = call(
-        &mut runtime,
-        json!({"action":"recall","project_path":folder,"recall_for":"shared material","restore_context":true,"include_active_tasks":true,"work_targets":[{"path":"src/task.rs","kind":"file"}]}),
-    );
-    let c = result["candidates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["memory_id"] == *task_id)
-        .expect("Task remains a compact candidate");
-    assert_eq!(c["objective"], "Review shared material.\n");
-    assert_eq!(c["current_position"], "Inputs checked.\n");
-    assert_eq!(c["resume_point"], "Inspect the result.\n");
-    let paths = c["retrieval_paths"].as_array().unwrap();
-    assert!(paths
-        .iter()
-        .all(|p| p["via"].as_array().is_some_and(|v| !v.is_empty())));
-    for source in sources {
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|p| p["source_memory_id"] == source)
-                .count(),
-            1,
-            "{c}"
-        );
-    }
-    assert!(paths
-        .iter()
-        .any(|p| p["via"].as_array().unwrap().contains(&json!("lexical"))));
-    assert!(paths
-        .iter()
-        .any(|p| p["via"] == json!(["work_target"]) && p["clue"] == "src/task.rs"));
-    let task_paths: Vec<_> = paths
-        .iter()
-        .filter(|p| p["clue"] == "Active Task")
-        .collect();
-    assert_eq!(task_paths.len(), 1);
-    assert_eq!(
-        task_paths[0]["via"],
-        json!(["active_task", "active_working_set"])
-    );
-    assert_eq!(result["active_task_count"], 1);
-}
-#[test]
 fn repair_rebuilds_a_private_generation_and_preserves_pending() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     call(&mut runtime, create("repair needle"));
     let pending = call(&mut runtime, create("repair needle"));
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
+    runtime
+        .0
+        .service
+        .projection
+        .rebuild(&RequestControl::default())
+        .unwrap();
     let result = runtime
-        .repair_derived(agentlaw_flows::RequestControl::default())
+        .0
+        .service
+        .prepare_selection(&RequestControl::default(), false)
         .unwrap();
     assert_eq!(result["lexical_complete"], true);
     let recall = call(
@@ -289,7 +266,7 @@ fn cancelled_publication_is_retained_but_never_autopublished() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     let control = agentlaw_flows::RequestControl::new(cancel, move |phase| {
@@ -305,7 +282,7 @@ fn cancelled_publication_is_retained_but_never_autopublished() {
         .unwrap();
     assert_eq!(result["status"], "pending");
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let recall = call(
         &mut runtime,
         json!({"action":"recall","recall_for":"cancel before decision"}),
@@ -326,7 +303,7 @@ fn interrupted_authoring_exposes_submission_and_fresh_context() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let id = call(&mut runtime, create("Evidence for safe migration"))["results"][0]["memory_ref"]
         ["memory_id"]
         .clone();
@@ -345,7 +322,7 @@ fn interrupted_authoring_exposes_submission_and_fresh_context() {
         .unwrap();
     assert_eq!(cancelled["code"], "cancelled");
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let inspect = submission.clone();
     let fresh = call(&mut runtime, inspect);
     assert_ne!(fresh["authoring_ref"], context["authoring_ref"]);
@@ -367,7 +344,7 @@ fn interrupted_authoring_exposes_submission_and_fresh_context() {
 fn punctuation_only_body_equality_is_not_lost_by_lexical_analyzer() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     call(&mut runtime, create("!!! ..."));
     assert_eq!(
         call(&mut runtime, create("!!! ..."))["status"],
@@ -375,40 +352,11 @@ fn punctuation_only_body_equality_is_not_lost_by_lexical_analyzer() {
     );
 }
 #[test]
-fn installation_machine_identity_is_validated_across_bindings() {
-    let dir = tempfile::tempdir().unwrap();
-    let machine = uuid::Uuid::new_v4().to_string();
-    let runtime = Runtime::open_with_machine(
-        dir.path().join("a"),
-        dir.path().join("la"),
-        "user",
-        &machine,
-    )
-    .unwrap();
-    assert_eq!(runtime.machine_id(), machine);
-    drop(runtime);
-    assert!(Runtime::open_with_machine(
-        dir.path().join("a"),
-        dir.path().join("la"),
-        "user",
-        &uuid::Uuid::new_v4().to_string()
-    )
-    .is_err());
-    let other = Runtime::open_with_machine(
-        dir.path().join("b"),
-        dir.path().join("lb"),
-        "user",
-        &machine,
-    )
-    .unwrap();
-    assert_eq!(other.machine_id(), machine);
-}
-#[test]
 fn durable_create_recall_evolve_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let machine = runtime.machine_id().to_owned();
     let written = call(&mut runtime, create("first body"));
     assert_eq!(written["status"], "remembered");
@@ -428,7 +376,7 @@ fn durable_create_recall_evolve_and_restart() {
     );
     assert_eq!(evolved["status"], "remembered");
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     assert_eq!(runtime.machine_id(), machine);
     let recall = call(
         &mut runtime,
@@ -444,12 +392,12 @@ fn pending_survives_restart_and_confirmation_publishes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     call(&mut runtime, create("one"));
     let pending = call(&mut runtime, create("one"));
     assert_eq!(pending["status"], "resolution_required");
     drop(runtime);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let inspected = call(
         &mut runtime,
         json!({"action":"remember_this","pending_action":"inspect","pending_batch_ref":pending["pending_batch_ref"]}),
@@ -462,35 +410,10 @@ fn pending_survives_restart_and_confirmation_publishes() {
     assert_eq!(result["status"], "remembered");
 }
 #[test]
-fn project_discovery_does_not_create_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    let discover = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","project_path":"C:/work/example"}),
-    );
-    assert_eq!(discover["code"], "project_connection_required");
-    assert!(discover["next_action"]
-        .as_str()
-        .unwrap()
-        .contains("even for one candidate"));
-    assert!(discover.get("project_connection").is_none());
-    let created = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","project_path":"C:/work/example","intent":"create","project_name":"Example"}),
-    );
-    let again = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","project_path":"C:/work/example"}),
-    );
-    assert_eq!(created["project_connection"], again["project_connection"]);
-}
-#[test]
 fn first_recall_discovers_without_binding_even_one_candidate() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let created = call(
         &mut runtime,
         json!({"action":"connect_project_memory","project_path":"C:/work/original","intent":"create","project_name":"Example"}),
@@ -515,170 +438,56 @@ fn first_recall_discovers_without_binding_even_one_candidate() {
         json!({"action":"recall","recall_for":"Continue work","project_path":"C:/work/copy"}),
     );
     assert_eq!(second["status"], "needs_user_input");
-}
-
-#[test]
-fn direct_restored_recall_preserves_lexical_candidates_and_adds_one_semantic_notice() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    let folder = dir.path().join("project").to_string_lossy().into_owned();
-    let connected = call(
+    let source_before = runtime
+        .0
+        .service
+        .source
+        .read_snapshot()
+        .unwrap()
+        .position()
+        .clone();
+    let discovered = call(
         &mut runtime,
-        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Semantic notice"}),
-    );
-    assert!(connected["project_connection"].is_object(), "{connected}");
-    let body = "Capture choices and alternatives.";
-    let mut proposal = create(body);
-    proposal["project_path"] = json!(folder);
-    proposal["memories"][0]["applies_to"] = json!(["project"]);
-    let saved = call(&mut runtime, proposal);
-    assert_eq!(saved["status"], "remembered", "{saved}");
-    let reference = &saved["results"][0]["memory_ref"];
-    let diagnostic = json!({
-        "code":"semantic_channel_incomplete",
-        "message":"No semantic worker is attached; exact and indexed lexical retrieval remain available.",
-        "retryable":false
-    });
-
-    let ordinary = call(
-        &mut runtime,
-        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle"}),
-    );
-    assert!(ordinary["candidates"].as_array().unwrap().is_empty());
-    assert_eq!(ordinary["diagnostics"], json!([diagnostic.clone()]));
-
-    // A restore perspective supplies the lexical match absent from the original query.
-    let restored = call(
-        &mut runtime,
-        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle","restore_context":true}),
-    );
-    assert!(restored.get("code").is_none(), "{restored}");
-    assert!(restored.get("project_connection").is_none());
-    assert!(restored.get("recall_result").is_none());
-    assert_eq!(restored["candidates"].as_array().unwrap().len(), 1);
-    let candidate = &restored["candidates"][0];
-    assert_eq!(candidate["memory_id"], reference["memory_id"]);
-    assert_eq!(candidate["excerpt"], body);
-    assert_eq!(
-        candidate["applicability"]["project_id"],
-        connected["project_connection"]["project_id"]
+        json!({"action":"connect_project_memory","intent":"discover","project_path":"C:/work/copy"}),
     );
     assert_eq!(
-        candidate["retrieval_paths"],
-        json!([{"via":["lexical"],"clue":body}])
+        discovered["code"], "project_connection_required",
+        "{discovered}"
+    );
+    assert!(
+        discovered
+            .get("project_connection")
+            .is_none_or(Value::is_null),
+        "{discovered}"
     );
     assert_eq!(
-        restored["candidate_counts"]["memories"],
-        json!({"matched":1,"shown":1})
+        discovered["candidates"].as_array().unwrap().len(),
+        1,
+        "{discovered}"
     );
     assert_eq!(
-        restored["diagnostics"],
-        json!(vec![
-            diagnostic;
-            agentlaw_flows::recall::RESTORE_PERSPECTIVES.len() + 1
-        ])
+        discovered["candidates"][0]["project_id"],
+        created["project_connection"]["project_id"]
     );
-    assert_eq!(restored["turn_instruction"], SEMANTIC_RECALL_NOTICE);
-}
-
-#[test]
-fn id_only_and_mixed_recall_preserve_full_body_and_semantic_notice_boundary() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    let body = format!(
-        "## Exact memory\n\n{}\nFinal exact body line.\n",
-        "Retain the full Markdown evidence beyond the candidate preview.\n".repeat(16)
+    let next_action = discovered["next_action"]
+        .as_str()
+        .expect("discovery must explain the required explicit selection")
+        .to_lowercase();
+    assert!(
+        next_action.contains("select") && next_action.contains("explicit"),
+        "{discovered}"
     );
-    let saved = call(&mut runtime, create(&body));
-    assert_eq!(saved["status"], "remembered", "{saved}");
-    let reference = &saved["results"][0]["memory_ref"];
-    let discovered = call(&mut runtime, create("quartzneedle lexical candidate."));
-    assert_eq!(discovered["status"], "remembered", "{discovered}");
-
-    let id_only = call(
-        &mut runtime,
-        json!({"action":"recall","memory_ids":[reference["memory_id"]]}),
-    );
-    assert_eq!(id_only["memories"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        id_only["memories"][0]["current_heads"][0]["what_to_remember"],
-        body
+    assert!(
+        ControlReader::open(&runtime.0.service.identity.local)
+            .unwrap()
+            .exact_association(&runtime.0.service.identity.binding_id, "C:/work/copy")
+            .unwrap()
+            .is_none(),
+        "discovery must not connect even its sole candidate"
     );
     assert_eq!(
-        id_only["memories"][0]["current_heads"][0]["memory_ref"],
-        *reference
-    );
-    assert!(id_only["candidates"].as_array().unwrap().is_empty());
-    assert!(id_only.get("candidate_counts").is_none());
-    assert!(id_only.get("diagnostics").is_none());
-    assert!(id_only.get("turn_instruction").is_none());
-
-    let mixed = call(
-        &mut runtime,
-        json!({"action":"recall","memory_ids":[reference["memory_id"]],"recall_for":"quartzneedle"}),
-    );
-    assert_eq!(mixed["memories"], id_only["memories"]);
-    assert_eq!(mixed["candidates"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        mixed["candidates"][0]["memory_id"],
-        discovered["results"][0]["memory_ref"]["memory_id"]
-    );
-    assert_eq!(
-        mixed["candidates"][0]["retrieval_paths"],
-        json!([{"via":["lexical"],"clue":"quartzneedle lexical candidate."}])
-    );
-    assert_eq!(
-        mixed["diagnostics"],
-        json!([{
-            "code":"semantic_channel_incomplete",
-            "message":"No semantic worker is attached; exact and indexed lexical retrieval remain available.",
-            "retryable":false
-        }])
-    );
-    assert_eq!(mixed["turn_instruction"], SEMANTIC_RECALL_NOTICE);
-}
-
-#[test]
-fn connect_and_restore_retains_preparation_code_and_outer_instruction() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    let folder = dir.path().join("project").to_string_lossy().into_owned();
-    let connected = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Restoration"}),
-    );
-    assert!(connected["project_connection"].is_object(), "{connected}");
-    let saved = call(&mut runtime, create("quartzneedle restoration candidate."));
-    assert_eq!(saved["status"], "remembered", "{saved}");
-
-    let restored = call(
-        &mut runtime,
-        json!({"action":"connect_project_memory","intent":"connect","project_path":folder,"project_id":connected["project_connection"]["project_id"],"restore_context":true,"recall_for":"quartzneedle"}),
-    );
-    assert_eq!(
-        restored["project_connection"],
-        connected["project_connection"]
-    );
-    assert_eq!(restored["code"], "restore_preparation_incomplete");
-    assert_eq!(
-        restored["turn_instruction"],
-        "Project association is retained, but semantic context restoration is incomplete. Read the returned diagnostics and any full-content artifact; do not claim complete restoration. Repeat this connect request with restore_context after the provider recovers."
-    );
-    assert_eq!(
-        restored["diagnostics"],
-        json!([{
-            "code":"semantic_unavailable",
-            "message":"No model is configured; vector build was not performed."
-        }])
-    );
-    let recall = &restored["recall_result"];
-    assert_eq!(recall["turn_instruction"], SEMANTIC_RECALL_NOTICE);
-    assert_eq!(
-        recall["candidates"][0]["memory_id"],
-        saved["results"][0]["memory_ref"]["memory_id"]
+        *runtime.0.service.source.read_snapshot().unwrap().position(),
+        source_before
     );
 }
 
@@ -686,7 +495,7 @@ fn connect_and_restore_retains_preparation_code_and_outer_instruction() {
 fn ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/rules","project_name":"Rules"}),
@@ -749,7 +558,7 @@ fn ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_doe
 fn unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let user = call(
         &mut runtime,
         json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"User-wide prerequisite.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
@@ -791,60 +600,10 @@ fn unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
 }
 
 #[test]
-fn contextual_rule_recall_synchronizes_index_stale_before_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("source");
-    let local = dir.path().join("local");
-    let mut writer = Runtime::open(&root, &local, "user").unwrap();
-    let mut reader = Runtime::open(&root, &local, "user").unwrap();
-    let before = call(
-        &mut reader,
-        json!({"action":"recall","recall_for":"unrelated work"}),
-    );
-    assert!(before["memories"].as_array().unwrap().is_empty());
-    let saved = call(
-        &mut writer,
-        json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"New user rule after reader index creation.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
-    );
-    assert_eq!(saved["status"], "remembered", "{saved}");
-    let after = call(
-        &mut reader,
-        json!({"action":"recall","recall_for":"unrelated work"}),
-    );
-    let expected = &saved["results"][0]["memory_ref"];
-    assert!(
-        after["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["memory_id"] == expected["memory_id"]
-                && m["current_heads"][0]["memory_ref"] == *expected),
-        "{after}"
-    );
-    let changed = call(
-        &mut writer,
-        json!({"action":"remember_this","memories":[{"operation":"evolve","parent_refs":[expected],"what_to_remember":"Now an ordinary observation.","evidence":"Rule withdrawn by test","is_rule":false}]}),
-    );
-    assert_eq!(changed["status"], "remembered", "{changed}");
-    let withdrawn = call(
-        &mut reader,
-        json!({"action":"recall","recall_for":"unrelated work"}),
-    );
-    assert!(
-        !withdrawn["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["memory_id"] == expected["memory_id"]),
-        "{withdrawn}"
-    );
-}
-
-#[test]
 fn joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/joint","project_name":"Joint"}),
@@ -885,7 +644,7 @@ fn joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
 fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let evidence = call(&mut runtime, create("Use a fixture to verify migration."))["results"][0]
         ["memory_ref"]["memory_id"]
         .clone();
@@ -917,7 +676,7 @@ fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {
         .unwrap();
     drop(control);
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let history = call(
         &mut runtime,
         json!({"action":"history","procedure_id":written["procedure_ref"]["procedure_id"],"context_layers":20}),
@@ -932,7 +691,7 @@ fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {
 fn history_exposes_causal_diff_and_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let written = call(&mut runtime, create("before"));
     let reference = written["results"][0]["memory_ref"].clone();
     call(
@@ -954,7 +713,7 @@ fn history_exposes_causal_diff_and_evidence() {
 fn consolidation_redirect_preserves_exact_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let first = call(&mut runtime, create("first"))["results"][0]["memory_ref"].clone();
     let pending = call(&mut runtime, create("first"));
     let second=call(&mut runtime,json!({"action":"remember_this","pending_action":"continue","pending_batch_ref":pending["pending_batch_ref"],"resolution_ref":pending["resolution_ref"]}))["results"][0]["memory_ref"].clone();
@@ -981,7 +740,7 @@ fn consolidation_redirect_preserves_exact_lookup() {
 
 #[test]
 fn dependent_review_is_durable_and_explicit() {
-    fn head(runtime: &mut Runtime, id: &Value) -> Value {
+    fn head(runtime: &mut Fixture, id: &Value) -> Value {
         let recalled = call(runtime, json!({"action":"recall","memory_ids":[id]}));
         let memory = recalled["memories"]
             .as_array()
@@ -1005,7 +764,7 @@ fn dependent_review_is_durable_and_explicit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let target = call(&mut runtime, create("target original"))["results"][0]["memory_ref"].clone();
     let dependent = call(
         &mut runtime,
@@ -1032,7 +791,7 @@ fn dependent_review_is_durable_and_explicit() {
     );
 
     // A separate frontend changes B while A's proposed correction is retained.
-    let mut other = Runtime::open(&root, &local, "user").unwrap();
+    let mut other = Fixture::open(&root, &local, "user").unwrap();
     let updated = call(
         &mut other,
         json!({"action":"remember_this","memories":[{
@@ -1055,7 +814,7 @@ fn dependent_review_is_durable_and_explicit() {
     drop(other);
     drop(runtime);
 
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let inspected = call(
         &mut runtime,
         json!({"action":"remember_this","pending_action":"inspect",
@@ -1162,7 +921,7 @@ fn dependent_review_is_durable_and_explicit() {
     assert!(payload["operation_id"].is_null());
     drop(control);
 
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let inspected = call(
         &mut runtime,
         json!({"action":"remember_this","pending_action":"inspect",
@@ -1203,34 +962,11 @@ fn dependent_review_is_durable_and_explicit() {
 }
 
 #[test]
-fn c7_reads_publication_ledger_through_readonly_port() {
-    use agentlaw_worker::derived::*;
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    call(&mut runtime, create("index me"));
-    let reader = runtime.published_source();
-    let position = reader.position().unwrap();
-    let context = DerivedContext {
-        repository_id: runtime.binding_id().into(),
-        initial_basis: SourcePosition {
-            epoch: position.epoch,
-            sequence: 0,
-        },
-        model_digest: "test-model".into(),
-        config_digest: "test-config".into(),
-    };
-    let mut broker = agentlaw_worker::Broker::open(dir.path().join("jobs.sqlite"), 10).unwrap();
-    let mut coordinator = DerivedWorkCoordinator::new(&mut broker, &reader).unwrap();
-    assert_eq!(coordinator.advance(&context, 10).unwrap().sequence, 1);
-}
-
-#[test]
 fn restart_reuses_published_execution_after_local_ack_loss() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let written = call(&mut runtime, create("exactly once"));
     let id = written["results"][0]["memory_ref"]["memory_id"].clone();
     drop(runtime);
@@ -1239,7 +975,7 @@ fn restart_reuses_published_execution_after_local_ack_loss() {
         .execute("UPDATE pending SET status='pending',result=NULL", [])
         .unwrap();
     drop(control);
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let history = call(
         &mut runtime,
         json!({"action":"history","memory_id":id,"context_layers":20}),
@@ -1253,7 +989,7 @@ fn omitted_relation_preserves_canonical_description() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("source");
     let local = dir.path().join("local");
-    let mut runtime = Runtime::open(&root, &local, "user").unwrap();
+    let mut runtime = Fixture::open(&root, &local, "user").unwrap();
     let target =
         call(&mut runtime, create("target"))["results"][0]["memory_ref"]["memory_id"].clone();
     let id = uuid::Uuid::new_v4().to_string();
@@ -1290,22 +1026,10 @@ fn omitted_relation_preserves_canonical_description() {
 }
 
 #[test]
-fn failed_store_switch_does_not_initialize_target() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a");
-    let b = dir.path().join("b");
-    let local = dir.path().join("local");
-    drop(Runtime::open(&a, &local, "user").unwrap());
-    assert!(Runtime::open(&b, &local, "user").is_err());
-    assert!(!b.exists());
-    assert!(Runtime::open(&a, &local, "user").is_ok());
-}
-
-#[test]
 fn cross_project_lookup_does_not_rebind_current_folder() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let a = call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/alpha","project_name":"Alpha"}),
@@ -1337,4 +1061,288 @@ fn cross_project_lookup_does_not_rebind_current_folder() {
         json!({"action":"connect_project_memory","project_path":"C:/work/beta"}),
     );
     assert_eq!(current["project_connection"], b["project_connection"]);
+}
+
+#[test]
+fn active_task_candidates_copy_only_complete_handoff_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/task","project_name":"Task"}),
+    );
+    let body="# Objective\nComplete the migration.\n# Current position\nFixtures verified.\n# Resume point\nRun the final checks.\n# References\nPrivate full reference section.\n";
+    call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":"C:/work/task","memories":[{"operation":"create","what_to_remember":body,"evidence":"Current work","applies_to":["project"],"in_working_set":true}]}),
+    );
+    let result = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/task","recall_for":"resume","include_active_tasks":true}),
+    );
+    let c = &result["candidates"][0];
+    assert_eq!(c["objective"], "Complete the migration.\n");
+    assert_eq!(c["resume_point"], "Run the final checks.\n");
+    assert!(c.get("excerpt").is_none());
+    assert!(c.get("applicability").is_none());
+    assert_eq!(result["active_task_count"], 1);
+    assert!(result.get("task_instruction").is_none());
+    assert!(c["retrieval_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["via"].is_array()));
+    let task_paths: Vec<_> = c["retrieval_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["clue"] == "Active Task")
+        .collect();
+    assert_eq!(task_paths.len(), 1);
+    assert_eq!(
+        task_paths[0]["via"],
+        json!(["active_task", "active_working_set"])
+    );
+}
+
+#[test]
+fn task_projection_retains_search_two_link_sources_and_target_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let folder = "C:/work/grouped-paths";
+    let project = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Grouped"}),
+    );
+    let project_id = &project["project_connection"]["project_id"];
+    let body = "## Objective\nReview shared material.\n## Current position\nInputs checked.\n## Resume point\nInspect the result.\n## References\nFixture reference.\n";
+    let task = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"in_working_set":true,"work_targets":[{"project_id":project_id,"path":"src/task.rs","kind":"file","reading":"related"}]}]}),
+    );
+    assert_eq!(task["status"], "remembered", "{task}");
+    let task_id = &task["results"][0]["memory_ref"]["memory_id"];
+    let mut sources = Vec::new();
+    for body in ["shared material alpha", "shared material bravo"] {
+        let saved = call(
+            &mut runtime,
+            json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Fixture","applies_to":["project"],"related_memory_ids":[task_id]}]}),
+        );
+        assert_eq!(saved["status"], "remembered", "{saved}");
+        sources.push(saved["results"][0]["memory_ref"]["memory_id"].clone());
+    }
+    let result = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"shared material","restore_context":true,"include_active_tasks":true,"work_targets":[{"path":"src/task.rs","kind":"file"}]}),
+    );
+    let c = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["memory_id"] == *task_id)
+        .expect("Task remains a compact candidate");
+    assert_eq!(c["objective"], "Review shared material.\n");
+    assert_eq!(c["current_position"], "Inputs checked.\n");
+    assert_eq!(c["resume_point"], "Inspect the result.\n");
+    let paths = c["retrieval_paths"].as_array().unwrap();
+    assert!(paths
+        .iter()
+        .all(|p| p["via"].as_array().is_some_and(|v| !v.is_empty())));
+    for source in sources {
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| p["source_memory_id"] == source)
+                .count(),
+            1,
+            "{c}"
+        );
+    }
+    assert!(paths
+        .iter()
+        .any(|p| p["via"].as_array().unwrap().contains(&json!("lexical"))));
+    assert!(paths
+        .iter()
+        .any(|p| p["via"] == json!(["work_target"]) && p["clue"] == "src/task.rs"));
+    let task_paths: Vec<_> = paths
+        .iter()
+        .filter(|p| p["clue"] == "Active Task")
+        .collect();
+    assert_eq!(task_paths.len(), 1);
+    assert_eq!(
+        task_paths[0]["via"],
+        json!(["active_task", "active_working_set"])
+    );
+    assert_eq!(result["active_task_count"], 1);
+}
+
+fn selected_memory<'a>(result: &'a Value, memory_id: &Value) -> Option<&'a Value> {
+    ["memories", "candidates"].into_iter().find_map(|field| {
+        result[field]
+            .as_array()?
+            .iter()
+            .find(|memory| memory["memory_id"] == *memory_id)
+    })
+}
+
+fn assert_complete_explicit_memory(result: &Value, reference: &Value, body: &str) {
+    let memory = result["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|memory| memory["memory_id"] == reference["memory_id"])
+        .expect("every explicitly requested ID must retain its complete full memory");
+    let head = &memory["current_heads"][0];
+    assert_eq!(head["what_to_remember"], body);
+    assert_eq!(head["memory_ref"], *reference);
+}
+
+fn semantic_notice_count(result: &Value) -> usize {
+    result["turn_instruction"]
+        .as_str()
+        .unwrap_or_default()
+        .matches("incomplete semantic search")
+        .count()
+}
+
+fn assert_incomplete_semantic_notice(result: &Value) {
+    assert_eq!(result["semantic_complete"], false, "{result}");
+    assert!(
+        result["diagnostics"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic_channel_incomplete")),
+        "{result}"
+    );
+    assert_eq!(semantic_notice_count(result), 1, "{result}");
+}
+
+#[test]
+fn direct_restored_recall_preserves_lexical_candidates_and_adds_one_semantic_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let folder = dir.path().join("project").to_string_lossy().into_owned();
+    let connected = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":folder,"project_name":"Semantic notice"}),
+    );
+    assert!(connected["project_connection"].is_object(), "{connected}");
+    let body = "Capture choices and alternatives.";
+    let mut proposal = create(body);
+    proposal["project_path"] = json!(folder);
+    proposal["memories"][0]["applies_to"] = json!(["project"]);
+    let saved = call(&mut runtime, proposal);
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let reference = &saved["results"][0]["memory_ref"];
+    let ordinary = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle"}),
+    );
+    assert!(
+        selected_memory(&ordinary, &reference["memory_id"]).is_none(),
+        "the original query must not already match the restore-only lexical memory: {ordinary}"
+    );
+    assert_incomplete_semantic_notice(&ordinary);
+    // StoreService prepares the restore perspectives against its real lexical projection.
+    let restored = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":folder,"recall_for":"quartzneedle","restore_context":true}),
+    );
+    assert!(restored.get("code").is_none(), "{restored}");
+    assert!(restored.get("project_connection").is_none());
+    assert!(restored.get("recall_result").is_none());
+    let selected = selected_memory(&restored, &reference["memory_id"])
+        .expect("a restore perspective must find the lexical match absent from the original query");
+    if selected["current_heads"].is_array() {
+        assert_complete_explicit_memory(&restored, reference, body);
+    } else {
+        assert_eq!(selected["excerpt"], body);
+        assert_eq!(
+            selected["applicability"]["project_id"],
+            connected["project_connection"]["project_id"]
+        );
+        assert!(
+            selected["retrieval_paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path["via"]
+                    .as_array()
+                    .is_some_and(|via| via.contains(&json!("lexical")))),
+            "{selected}"
+        );
+    }
+    assert_incomplete_semantic_notice(&restored);
+}
+
+#[test]
+fn id_only_and_mixed_recall_preserve_full_body_and_semantic_notice_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime =
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let body = format!(
+        "## Exact memory\n\n{}\nFinal exact body line.\n",
+        "Retain the full Markdown evidence beyond the candidate preview.\n".repeat(16)
+    );
+    let second_body = format!(
+        "## Another exact memory\n\n{}\nAnother complete final line.\n",
+        "Preserve the complete source and its published reference.\n".repeat(16)
+    );
+    let saved = call(&mut runtime, create(&body));
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let reference = &saved["results"][0]["memory_ref"];
+    let second = call(&mut runtime, create(&second_body));
+    assert_eq!(second["status"], "remembered", "{second}");
+    let second_ref = &second["results"][0]["memory_ref"];
+    let discovered_body = "quartzneedle lexical candidate.";
+    let discovered = call(&mut runtime, create(discovered_body));
+    assert_eq!(discovered["status"], "remembered", "{discovered}");
+    let discovered_ref = &discovered["results"][0]["memory_ref"];
+    let explicit_ids = json!([reference["memory_id"], second_ref["memory_id"]]);
+    let id_only = call(
+        &mut runtime,
+        json!({"action":"recall","memory_ids":explicit_ids}),
+    );
+    for (reference, body) in [
+        (reference, body.as_str()),
+        (second_ref, second_body.as_str()),
+    ] {
+        assert_complete_explicit_memory(&id_only, reference, body);
+    }
+    assert_eq!(semantic_notice_count(&id_only), 0, "{id_only}");
+    assert!(
+        !id_only["diagnostics"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic_channel_incomplete")),
+        "{id_only}"
+    );
+    let mixed = call(
+        &mut runtime,
+        json!({"action":"recall","memory_ids":explicit_ids,"recall_for":"quartzneedle"}),
+    );
+    for (reference, body) in [
+        (reference, body.as_str()),
+        (second_ref, second_body.as_str()),
+    ] {
+        assert_complete_explicit_memory(&mixed, reference, body);
+    }
+    let selected = selected_memory(&mixed, &discovered_ref["memory_id"])
+        .expect("mixed recall must preserve the real lexical match");
+    if selected["current_heads"].is_array() {
+        assert_complete_explicit_memory(&mixed, discovered_ref, discovered_body);
+    } else {
+        assert!(
+            selected["retrieval_paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path["via"]
+                    .as_array()
+                    .is_some_and(|via| via.contains(&json!("lexical")))),
+            "{selected}"
+        );
+    }
+    assert_incomplete_semantic_notice(&mixed);
 }

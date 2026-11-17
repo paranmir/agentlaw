@@ -1,9 +1,6 @@
 //! Causal history selection over acquired immutable source components.
 use crate::{history_diff, DomainError, HistoryRequest, RequestControl};
-use agentlaw_storage::{
-    history_spool::{Component, HistorySpool},
-    Store,
-};
+use agentlaw_storage::history_spool::{Component, HistorySpool};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -536,10 +533,7 @@ fn packet(
     Ok(())
 }
 /// Answers one history request for the store owner from a single source acquisition.
-pub fn history(
-    ctx: &crate::runtime::ReadCtx<'_>,
-    request: &HistoryRequest,
-) -> crate::Result<Value> {
+pub fn history(ctx: &crate::store::ReadCtx<'_>, request: &HistoryRequest) -> crate::Result<Value> {
     let identity = request
         .memory_id
         .as_deref()
@@ -553,9 +547,9 @@ pub fn history(
     // OwnedPublishedReader releases the shared source gate before returning.
     let acquired = ctx.source.acquire_history(&ctx.request.cancel);
     ctx.request.check()?;
-    let acquired = crate::runtime::source(acquired)?;
+    let acquired = crate::store::source(acquired)?;
     ctx.request.check()?;
-    let mut spool = crate::runtime::source(acquired.into_spool())?;
+    let mut spool = crate::store::source(acquired.into_spool())?;
     ctx.request.check()?;
     let workspace = ProjectionWorkspace::for_spool(
         &ctx.identity.local,
@@ -580,7 +574,7 @@ pub fn history(
 }
 fn search_owned(
     db: &Connection,
-    ctx: &crate::runtime::ReadCtx<'_>,
+    ctx: &crate::store::ReadCtx<'_>,
     spool: &HistorySpool,
     identity: &str,
     query: &str,
@@ -668,7 +662,7 @@ fn project_spool(
     limit: usize,
     control: &RequestControl,
     semantic: &dyn HistorySemanticChannel,
-    owned: Option<(&crate::runtime::ReadCtx<'_>, &ProjectionWorkspace)>,
+    owned: Option<(&crate::store::ReadCtx<'_>, &ProjectionWorkspace)>,
     config_file: Option<&Path>,
 ) -> crate::Result<Value> {
     let identity = request
@@ -971,59 +965,6 @@ fn project_spool(
     work.map_err(|_| failure())
 }
 
-pub fn project(
-    store: &Store,
-    local: &Path,
-    request: &HistoryRequest,
-    limit: usize,
-    control: &RequestControl,
-) -> crate::Result<Value> {
-    project_with_worker(store, local, request, limit, control, None)
-}
-pub fn project_with_worker(
-    store: &Store,
-    local: &Path,
-    request: &HistoryRequest,
-    limit: usize,
-    control: &RequestControl,
-    worker: Option<(&agentlaw_worker::Client, &str)>,
-) -> crate::Result<Value> {
-    project_with_worker_config(store, local, request, limit, control, worker, None)
-}
-pub(crate) fn project_with_worker_config(
-    store: &Store,
-    local: &Path,
-    request: &HistoryRequest,
-    limit: usize,
-    control: &RequestControl,
-    worker: Option<(&agentlaw_worker::Client, &str)>,
-    config_file: Option<&Path>,
-) -> crate::Result<Value> {
-    let identity = request
-        .memory_id
-        .as_deref()
-        .or(request.procedure_id.as_deref())
-        .ok_or_else(|| {
-            DomainError::new("invalid_history_request", "Specify one history identity.")
-        })?;
-    crate::validate_id(identity)?;
-    control.phase("acquiring_history");
-    let acquired = store.spool_history();
-    control.check()?;
-    let spool = acquired.map_err(|_| failure())?;
-    let semantic = WorkerHistorySemantic { worker };
-    project_spool(
-        spool,
-        local,
-        request,
-        limit,
-        control,
-        &semantic,
-        None,
-        config_file,
-    )
-}
-
 trait HistorySemanticChannel {
     fn candidates(
         &self,
@@ -1049,7 +990,7 @@ trait HistorySemanticChannel {
     ) -> Work<Vec<String>>;
 }
 struct PortHistorySemantic<'a, 'b> {
-    ctx: &'a crate::runtime::ReadCtx<'b>,
+    ctx: &'a crate::store::ReadCtx<'b>,
 }
 impl HistorySemanticChannel for PortHistorySemantic<'_, '_> {
     fn candidates(
@@ -1083,58 +1024,6 @@ impl HistorySemanticChannel for PortHistorySemantic<'_, '_> {
         self.candidates(identity, query, maximum, control)
             .map(|result| result.hits.into_iter().map(|hit| hit.change_id).collect())
             .map_err(|_| "semantic search unavailable".into())
-    }
-}
-struct WorkerHistorySemantic<'a> {
-    worker: Option<(&'a agentlaw_worker::Client, &'a str)>,
-}
-impl HistorySemanticChannel for WorkerHistorySemantic<'_> {
-    fn search(
-        &self,
-        db: &Connection,
-        directory: &Path,
-        identity: &str,
-        spool: &HistorySpool,
-        query: &str,
-        maximum: usize,
-        control: &RequestControl,
-    ) -> Work<Vec<String>> {
-        let worker = self.worker;
-        let (client, binding) = worker.ok_or("semantic worker unavailable")?;
-        if client.availability()? != agentlaw_worker::SemanticAvailability::Ready {
-            return Err("semantic worker not ready".into());
-        }
-        let mut index = crate::history_search::HistoricalSearch::open(
-            client,
-            directory.join(format!("{identity}-jobs.sqlite")),
-            binding,
-            identity,
-            &spool.source_position.epoch,
-        )?;
-        let mut st = db.prepare("SELECT id FROM nodes ORDER BY ordinal")?;
-        let mut rows = st.query([])?;
-        while let Some(row) = rows.next()? {
-            control.check()?;
-            let id: String = row.get(0)?;
-            if !index.contains(&id)? {
-                let mut reader = component(&db, &id, "body")?
-                    .open()?
-                    .chain(std::io::Cursor::new(b"\n".to_vec()))
-                    .chain(component(&db, &id, "evidence")?.open()?);
-                index.ingest(&id, "history", &mut reader)?;
-            }
-        }
-        let result = index.search(query, &["history".into()], maximum, &control.cancel)?;
-        if !result.semantic_complete {
-            return Err("historical semantic coverage incomplete".into());
-        }
-        Ok(
-            agentlaw_search::reciprocal_rank_fusion(&[result.lexical, result.vector])
-                .into_iter()
-                .take(maximum)
-                .map(|hit| hit.change_id)
-                .collect(),
-        )
     }
 }
 fn render_disk(

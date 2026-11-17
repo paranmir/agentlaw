@@ -4,7 +4,7 @@ use crate::{
     installation::{machine, registry::ConfigSnapshot},
     ports::{RuntimeError, RuntimeResult},
 };
-use agentlaw_flows::runtime::StoreIdentity;
+use agentlaw_flows::store::StoreIdentity;
 use std::path::Path;
 
 pub fn resolve_import_stage(

@@ -4,7 +4,7 @@ use crate::projection::ProjectionHandle;
 use crate::protocol::QueryRequest;
 use agentlaw_flows::exact::{DeltaBudget, ExactSnapshot};
 use agentlaw_flows::prepare::Prepared;
-use agentlaw_flows::runtime::ReadCtx;
+use agentlaw_flows::store::ReadCtx;
 use agentlaw_flows::{
     ConnectRequest, DomainError, RecallRequest, RememberRequest, Result as FlowResult,
 };

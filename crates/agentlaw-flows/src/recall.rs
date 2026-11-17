@@ -178,7 +178,7 @@ pub(crate) fn recall_with_control(
                                 excerpt: head.what_to_remember.clone(),
                                 applicability: head.applicability.clone(),
                                 retrieval_paths: vec![RetrievalPath {
-                                    via: vec!["active_task".into()],
+                                    via: vec!["active_task".into(), "active_working_set".into()],
                                     clue: "Active Task".into(),
                                     source_memory_id: None,
                                 }],

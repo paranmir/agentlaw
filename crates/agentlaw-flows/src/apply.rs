@@ -1,6 +1,6 @@
 //! Publishing retained work and recording its results.
 use crate::prepare::{ConnectPlanKind, PendingExpectation, Prepared};
-use crate::runtime::*;
+use crate::store::*;
 use crate::*;
 use agentlaw_storage::UnitState;
 use rusqlite::params;
@@ -58,7 +58,7 @@ pub fn apply(ctx: &mut LaneCtx<'_>, prepared: Prepared) -> Result<Applied> {
             let value = if plan.retained.issues.is_empty() {
                 publish_retained(ctx, plan.retained)?
             } else {
-                Runtime::pending_response(&plan.retained, "resolution_required")
+                crate::prepare::pending_response(&plan.retained, "resolution_required")
             };
             Ok(Applied::Response(value))
         }
@@ -377,7 +377,7 @@ pub(crate) fn publish_retained_parts(
                 json!({"code":"source_changed","message":"The source changed after review. Inspect retained proposals and continue to revalidate all heads and new dependencies."})
             }];
             save_pending_parts(connection, &retained, Some(&old))?;
-            Ok(Runtime::pending_response(
+            Ok(crate::prepare::pending_response(
                 &retained,
                 if cancelled {
                     "pending"
@@ -447,33 +447,5 @@ pub(crate) fn publish_procedure_parts(
             )
         }
         Err(error) => source(Err(error)),
-    }
-}
-
-impl Runtime {
-    #[cfg(test)]
-    pub(crate) fn save_pending(&self, retained: &Retained, old: Option<&str>) -> Result<()> {
-        save_pending_parts(&self.control, retained, old)
-    }
-    /// Schedule durable indexing through the authenticated worker IPC. Source
-    /// access remains in this read-only adapter; the worker receives no paths or
-    /// canonical write authority. Queue acceptance is not an index acknowledgment.
-    pub fn enqueue_derived(&self) -> Result<()> {
-        let worker = self.worker.as_ref().ok_or_else(|| {
-            DomainError::new(
-                "indexing_pending",
-                "No worker is attached; source publication remains complete.",
-            )
-        })?;
-        crate::read::pump(
-            worker,
-            &crate::derived::PublishedAdapter::new(
-                self.store.owned_published_reader(),
-                self.binding_id.clone(),
-            ),
-            &self.binding_id,
-            &self.local,
-            &self.request_control.cancel,
-        )
     }
 }

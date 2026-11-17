@@ -12,7 +12,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 agentlaw-storage = { path = "../agentlaw-storage" }
 agentlaw-search = { path = "../agentlaw-search" }
-agentlaw-worker = { path = "../agentlaw-worker" }
 time = { version = "0.3", features = ["formatting"] }
 tempfile = "3"
 

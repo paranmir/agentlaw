@@ -1158,3 +1158,152 @@ fn corruption_at_open_preserves_retained_proposals_and_decided_recovery_material
         );
     }
 }
+
+mod continuity;
+
+#[test]
+fn binding_rejects_a_different_machine_identity() {
+    let (dir, identity) = fixture();
+    let machine = identity.machine_id.clone();
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    assert_eq!(service.identity.machine_id, machine);
+    let identity = StoreIdentity {
+        machine_id: id(),
+        ..service.identity_for_test()
+    };
+    service.close();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    assert!(StoreService::open(identity, dependencies, &RequestControl::default()).is_err());
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    let (other, mut identity) = fixture();
+    identity.machine_id = machine.clone();
+    let dependencies = deps(other.path());
+    let indexer = dependencies.indexer.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    assert_eq!(service.identity.machine_id, machine);
+    service.close();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+}
+#[test]
+fn failed_store_switch_does_not_initialize_target() {
+    let (dir, identity) = fixture();
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    let original = service.identity_for_test();
+    let b = dir.path().join("other-source");
+    let switched = StoreIdentity {
+        root: b.clone(),
+        ..service.identity_for_test()
+    };
+    service.close();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    assert!(StoreService::open(switched, dependencies, &RequestControl::default()).is_err());
+    assert!(!b.exists());
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    let reopened = StoreService::open(original, dependencies, &RequestControl::default());
+    assert!(reopened.is_ok());
+    reopened.unwrap().close();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+}
+impl StoreService {
+    fn identity_for_test(&self) -> StoreIdentity {
+        StoreIdentity {
+            root: self.identity.root.clone(),
+            local: self.identity.local.clone(),
+            user_id: self.identity.user_id.clone(),
+            machine_id: self.identity.machine_id.clone(),
+            binding_id: self.identity.binding_id.clone(),
+            history_limit: self.identity.history_limit,
+            response_limit: self.identity.response_limit,
+            config_file: self.identity.config_file.clone(),
+        }
+    }
+}
+#[test]
+fn pending_notices_are_scoped_sorted_and_exclude_decided_work() {
+    let (dir, identity) = fixture();
+    let dependencies = deps(dir.path());
+    let indexer = dependencies.indexer.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    let connect = |name: &str| {
+        let path = dir.path().join(name);
+        service
+            .command(
+                CommandRequest::Connect(
+                    serde_json::from_value(
+                        json!({"project_path":path,"intent":"create","project_name":name}),
+                    )
+                    .unwrap(),
+                ),
+                &RequestControl::default(),
+            )
+            .unwrap()
+    };
+    let a = connect("Project A");
+    let b = connect("Project B");
+    let project_a = a["project_connection"]["project_id"].as_str().unwrap();
+    let project_b = b["project_connection"]["project_id"].as_str().unwrap();
+    let control =
+        rusqlite::Connection::open(service.identity.local.join("control.sqlite")).unwrap();
+    for (id, binding, project, status) in [
+        (
+            "b",
+            service.identity.binding_id.as_str(),
+            Some(project_a),
+            "pending",
+        ),
+        ("a", service.identity.binding_id.as_str(), None, "pending"),
+        (
+            "c",
+            service.identity.binding_id.as_str(),
+            Some(project_b),
+            "pending",
+        ),
+        ("d", service.identity.binding_id.as_str(), None, "discarded"),
+        ("e", "other-binding", None, "pending"),
+    ] {
+        control.execute("INSERT INTO pending(id,version,binding,payload,status) VALUES(?1,'version',?2,?3,?4)",
+            rusqlite::params![id, binding, json!({"context":{"project_id":project}}).to_string(), status]).unwrap();
+    }
+    for (project, expected_ids) in [
+        (None, vec!["a"]),
+        (Some(project_a), vec!["a", "b"]),
+        (Some(project_b), vec!["a", "c"]),
+    ] {
+        let reader = ControlReader::open(&service.identity.local).unwrap();
+        let actual = reader
+            .pending_notices(&service.identity.binding_id, project)
+            .unwrap();
+        let response = match project {
+            None => service.query(
+                QueryRequest::Recall(RecallRequest::default()),
+                &RequestControl::default(),
+            ),
+            Some(project) => {
+                service.with_read_ctx(&service.identity, &RequestControl::default(), |ctx| {
+                    service
+                        .reads
+                        .run_recall_for_project(ctx, RecallRequest::default(), project)
+                })
+            }
+        }
+        .unwrap();
+        assert_eq!(json!(actual), response["pending_batches"]);
+        let ids: Vec<_> = actual
+            .iter()
+            .map(|v| v["pending_batch_ref"]["pending_batch_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected_ids);
+    }
+    service.close();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+}

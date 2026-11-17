@@ -709,7 +709,7 @@ fn unchanged_sync_reuses_existing_commit_without_empty_git_history() {
 #[test]
 fn handle_sync_completes_with_legacy_response_shape() {
     use crate::{store::service::StoreService, test_support::store_service::deps};
-    use agentlaw_flows::runtime::StoreIdentity;
+    use agentlaw_flows::store::StoreIdentity;
     let f = Fixture::new();
     let source = f
         .store
@@ -839,7 +839,7 @@ fn slow_git_remote(f: &mut Fixture) -> SlowGit {
     SlowGit { started, release }
 }
 fn sync_service(f: &Fixture) -> crate::store::service::StoreService {
-    use agentlaw_flows::runtime::StoreIdentity;
+    use agentlaw_flows::store::StoreIdentity;
     let source = f
         .store
         .with_source_read(|p, _| Ok(p.to_path_buf()))

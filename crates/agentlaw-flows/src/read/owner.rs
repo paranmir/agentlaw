@@ -4,6 +4,24 @@ use crate::exact::{DeltaBudget, ExactSnapshot};
 use crate::semantic::{QueryVector, SemanticCoverage, SemanticError, SemanticQuery};
 use agentlaw_search::{Hit, ScopeFilter};
 
+struct IndexedSearch {
+    queries: BTreeMap<String, Discovery>,
+}
+impl RecallSearch for IndexedSearch {
+    fn search(&self, _: &RequestContext, q: &str, _: &[String]) -> Result<Discovery> {
+        let d = self.queries.get(q).ok_or_else(|| {
+            DomainError::new(
+                "search_basis_changed",
+                "The prepared query was not part of this read view.",
+            )
+        })?;
+        Ok(Discovery {
+            candidates: d.candidates.clone(),
+            full_ids: d.full_ids.clone(),
+            diagnostics: d.diagnostics.clone(),
+        })
+    }
+}
 const SEARCH_LIMIT: usize = 10_000;
 
 pub fn search_procedures_filtered(
@@ -272,7 +290,7 @@ fn search_one(
             let Ok(applicability) = scope_value(&h.metadata["applicability"]) else {
                 return false;
             };
-            let scope = crate::runtime::scope_token(&applicability);
+            let scope = crate::store::scope_token(&applicability);
             let scope = if procedure {
                 format!("procedure:{scope}")
             } else {
@@ -331,7 +349,6 @@ pub(crate) fn preparation_channels(
     };
     Ok(Channels {
         hits: found.hits,
-        lexical_ids: found.lexical_ids,
         lexical: found.lexical,
         vector: found.vector,
         complete: found.complete,
@@ -1177,11 +1194,7 @@ fn recall_scoped(
             },
         );
     }
-    let search = IndexedSearch {
-        queries,
-        procedure_order: procedures.1.clone(),
-        full_procedure: procedures.2.clone(),
-    };
+    let search = IndexedSearch { queries };
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| DomainError::new("clock_failed", "Cannot format the current time."))?;
@@ -1290,10 +1303,6 @@ fn recall_scoped(
             if !task {
                 ordinary.push(candidate);
             }
-        }
-        if !active.is_empty() {
-            result["task_instruction"] =
-                json!("Use the current active Task sections to resume the work.");
         }
         active.extend(ordinary);
         result["candidates"] = json!(active);

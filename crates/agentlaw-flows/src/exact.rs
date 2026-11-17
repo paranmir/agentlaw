@@ -1,10 +1,7 @@
 //! Rebuildable, disk-backed exact membership index. No current body inventory is
 //! retained in Rust; source publication pages update only changed identities.
 use crate::*;
-use agentlaw_storage::{
-    published::{PublishedChangeSource, SourcePosition},
-    CurrentUnit, UnitState,
-};
+use agentlaw_storage::{published::SourcePosition, CurrentUnit, UnitState};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -453,7 +450,7 @@ impl ExactSnapshot {
         let mut scopes: BTreeSet<String> = self.pinned.exact.all_scopes()?.into_iter().collect();
         for unit in &self.units {
             for head in unit.heads() {
-                scopes.insert(crate::runtime::scope_token(&crate::runtime::scope_value(
+                scopes.insert(crate::store::scope_token(&crate::store::scope_value(
                     &head.metadata["applicability"],
                 )?));
             }
@@ -524,7 +521,7 @@ impl ExactSnapshot {
                 continue;
             }
             for head in unit.heads() {
-                let scope = crate::runtime::scope_token(&crate::runtime::scope_value(
+                let scope = crate::store::scope_token(&crate::store::scope_value(
                     &head.metadata["applicability"],
                 )?);
                 if scopes.contains(&scope) {
@@ -1417,14 +1414,6 @@ pub struct HeadRecord {
     pub excerpt: String,
 }
 impl ExactIndex {
-    fn maintenance_gate(&self) -> Result<Connection> {
-        let gate = db(Connection::open(
-            self.directory.join("exact-maintenance.sqlite"),
-        ))?;
-        db(gate.busy_timeout(std::time::Duration::from_secs(30)))?;
-        db(gate.execute_batch("BEGIN IMMEDIATE"))?;
-        Ok(gate)
-    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let directory = path
             .as_ref()
@@ -1450,24 +1439,6 @@ impl ExactIndex {
         Ok(Self {
             connection,
             directory,
-        })
-    }
-    fn lexical(&self, epoch: &str) -> Result<agentlaw_search::SearchIndex> {
-        let name: Option<String> = db(self
-            .connection
-            .query_row(
-                "SELECT filename FROM exact_lexical WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional())?;
-        let name = name
-            .unwrap_or_else(|| format!("lexical-{:x}.sqlite", Sha256::digest(epoch.as_bytes())));
-        agentlaw_search::SearchIndex::open(self.directory.join(name)).map_err(|_| {
-            DomainError::new(
-                "lexical_index_failed",
-                "The derived lexical index is unavailable.",
-            )
         })
     }
     pub fn position(&self) -> Result<Option<SourcePosition>> {
@@ -1500,235 +1471,12 @@ impl ExactIndex {
             }))?;
         db(rows.collect())
     }
-    pub fn synchronize(
-        &mut self,
-        source: &agentlaw_storage::Store,
-        control: &RequestControl,
-    ) -> Result<SourcePosition> {
-        let _maintenance = self.maintenance_gate()?;
-        control.phase("synchronizing");
-        let reader = source.owned_published_reader();
-        let now = reader.position().map_err(|_| {
-            DomainError::new("source_unavailable", "Cannot inspect source position.")
-        })?;
-        let mut cursor = self.position()?.ok_or_else(|| {
-            DomainError::new(
-                "exact_index_rebuild_required",
-                "A verified initial inventory is required.",
-            )
-        })?;
-        if cursor.epoch != now.epoch {
-            return Err(DomainError::new(
-                "exact_index_rebuild_required",
-                "Source epoch changed.",
-            ));
-        }
-        while cursor.sequence < now.sequence {
-            control.check()?;
-            let page = reader.read_published_paths(&cursor, 1).map_err(|_| {
-                DomainError::new(
-                    "exact_index_coverage_unknown",
-                    "Canonical publication coverage is incomplete.",
-                )
-            })?;
-            let mut acquired = Vec::new();
-            for path in &page.canonical_paths {
-                let procedure = path.starts_with("current/procedure/");
-                if !procedure && !path.starts_with("current/memory/") {
-                    continue;
-                }
-                let id = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .ok_or_else(|| DomainError::new("source_corrupt", "Invalid canonical path."))?;
-                let unit = if procedure {
-                    reader.acquire_procedure(id)
-                } else {
-                    reader.acquire_current(id)
-                }
-                .map_err(|_| {
-                    DomainError::new("source_unavailable", "Cannot acquire changed identity.")
-                })?;
-                if unit.source_position != page.source_position {
-                    return Err(DomainError::new(
-                        "source_changed",
-                        "Source changed during incremental acquisition.",
-                    ));
-                }
-                acquired.push(unit);
-            }
-            if reader.position().map_err(|_| {
-                DomainError::new("source_unavailable", "Cannot verify source position.")
-            })? != page.source_position
-            {
-                return Err(DomainError::new(
-                    "source_changed",
-                    "Source changed during incremental acquisition.",
-                ));
-            }
-            let units = acquired
-                .iter()
-                .map(acquired_unit)
-                .collect::<Result<Vec<_>>>()?;
-            let mut lexical = self.lexical(&cursor.epoch)?;
-            let through = u64_to_i64(page.covered_through.sequence)?;
-            let stamp = lexical
-                .read_view()
-                .map_err(|_| DomainError::new("lexical_index_failed", "Cannot pin lexical index."))?
-                .stamp;
-            if stamp.ack < through {
-                let mut streams = Vec::new();
-                for (unit, body) in units.iter().zip(&acquired) {
-                    streams.extend(head_streams(unit, body)?);
-                }
-                lexical
-                    .commit_stream(
-                        through,
-                        units.iter().map(|u| Ok(index_id(u))),
-                        streams.into_iter().flatten(),
-                    )
-                    .map_err(|_| {
-                        DomainError::new(
-                            "lexical_index_failed",
-                            "Cannot commit acquired lexical records.",
-                        )
-                    })?;
-            }
-            let tx = db(self.connection.transaction())?;
-            for (unit, body) in units.iter().zip(&acquired) {
-                apply_unit(&tx, unit, body)?;
-            }
-            db(tx.execute("INSERT INTO exact_position VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch,sequence=excluded.sequence",params![page.covered_through.epoch,page.covered_through.sequence.to_string()]))?;
-            db(tx.commit())?;
-            cursor = page.covered_through;
-        }
-        Ok(cursor)
-    }
-    pub fn lexical_search(
-        &self,
-        query: &str,
-        context: &RequestContext,
-        limit: usize,
-    ) -> Result<Vec<agentlaw_search::Hit>> {
-        self.search_scopes(query, &allowed_scopes(context), limit)
-    }
     pub fn all_scopes(&self) -> Result<Vec<String>> {
         let mut st = db(self
             .connection
             .prepare("SELECT DISTINCT scope FROM exact_heads ORDER BY scope"))?;
         let rows = db(st.query_map([], |r| r.get(0)))?;
         db(rows.collect())
-    }
-    pub fn search_scopes(
-        &self,
-        query: &str,
-        scopes: &[String],
-        limit: usize,
-    ) -> Result<Vec<agentlaw_search::Hit>> {
-        let position = self.position()?.ok_or_else(|| {
-            DomainError::new(
-                "exact_index_coverage_unknown",
-                "No verified source position is indexed.",
-            )
-        })?;
-        let lexical = self.lexical(&position.epoch)?;
-        let mut view = lexical.read_view().map_err(|_| {
-            DomainError::new("lexical_index_failed", "Cannot pin lexical search view.")
-        })?;
-        if view.stamp.ack < u64_to_i64(position.sequence)? {
-            return Err(DomainError::new(
-                "lexical_index_incomplete",
-                "Lexical index has not committed the required source position.",
-            ));
-        }
-        view.search(
-            query,
-            &agentlaw_search::ScopeFilter {
-                allowed_scopes: scopes.to_vec(),
-            },
-            limit,
-            &[],
-            &[],
-            true,
-        )
-        .map_err(|_| DomainError::new("search_failed", "Indexed lexical search failed."))
-    }
-    pub fn rebuild(
-        &mut self,
-        source: &agentlaw_storage::Store,
-        control: &RequestControl,
-    ) -> Result<SourcePosition> {
-        let maintenance = self.maintenance_gate()?;
-        control.phase("rebuilding_exact_metadata");
-        let reader = source.owned_published_reader();
-        let before = reader.position().map_err(|_| {
-            DomainError::new(
-                "source_unavailable",
-                "Cannot inspect source before rebuild.",
-            )
-        })?;
-        let filename = format!("lexical-rebuild-{}.sqlite", uuid::Uuid::new_v4());
-        let mut lexical = agentlaw_search::SearchIndex::open(self.directory.join(&filename))
-            .map_err(|_| {
-                DomainError::new(
-                    "lexical_index_failed",
-                    "Cannot prepare a private rebuild index.",
-                )
-            })?;
-        let tx = db(self.connection.transaction())?;
-        db(tx.execute_batch("DELETE FROM exact_units;DELETE FROM exact_heads;DELETE FROM exact_edges;DELETE FROM exact_targets;DELETE FROM exact_bodies;DELETE FROM exact_previews;"))?;
-        let mut cursor = None;
-        loop {
-            control.check()?;
-            let (_, ids, more) = reader.inventory_page(cursor.as_deref(), 128).map_err(|_| {
-                DomainError::new(
-                    "exact_index_rebuild_failed",
-                    "Cannot enumerate canonical identities.",
-                )
-            })?;
-            for (kind, id) in ids {
-                control.check()?;
-                let acquired = if kind == "memory" {
-                    reader.acquire_current(&id)
-                } else {
-                    reader.acquire_procedure(&id)
-                }
-                .map_err(|_| {
-                    DomainError::new(
-                        "exact_index_rebuild_failed",
-                        "Cannot acquire canonical identity.",
-                    )
-                })?;
-                let unit = acquired_unit(&acquired)?;
-                apply_unit(&tx, &unit, &acquired)?;
-                lexical
-                    .commit_stream(
-                        0,
-                        std::iter::once(Ok(index_id(&unit))),
-                        head_streams(&unit, &acquired)?.into_iter().flatten(),
-                    )
-                    .map_err(|_| {
-                        DomainError::new(
-                            "lexical_index_failed",
-                            "Cannot populate private rebuild index.",
-                        )
-                    })?;
-                cursor = Some(format!("{kind}/{id}"));
-            }
-            if !more {
-                break;
-            }
-        }
-        lexical
-            .commit(u64_to_i64(before.sequence)?, &[], &[])
-            .map_err(|_| {
-                DomainError::new("lexical_index_failed", "Cannot seal private rebuild index.")
-            })?;
-        db(tx.execute("INSERT INTO exact_lexical VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET filename=excluded.filename",[filename]))?;
-        db(tx.execute("INSERT INTO exact_position VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch,sequence=excluded.sequence",params![before.epoch,before.sequence.to_string()]))?;
-        db(tx.commit())?;
-        drop(maintenance);
-        self.synchronize(source, control)
     }
     pub fn ids_matching(
         &self,
@@ -2067,9 +1815,8 @@ fn index_body(unit: &CurrentUnit, head: &agentlaw_storage::Head) -> String {
     }
 }
 fn index_scope(unit: &CurrentUnit, head: &agentlaw_storage::Head) -> Result<String> {
-    let scope = crate::runtime::scope_token(&crate::runtime::scope_value(
-        &head.metadata["applicability"],
-    )?);
+    let scope =
+        crate::store::scope_token(&crate::store::scope_value(&head.metadata["applicability"])?);
     Ok(if unit.entity_type == "learned_procedure" {
         format!("procedure:{scope}")
     } else {
@@ -2122,7 +1869,7 @@ fn apply_unit(
                     .sha256
             ],
         ))?;
-        let applicability = crate::runtime::scope_value(&head.metadata["applicability"])?;
+        let applicability = crate::store::scope_value(&head.metadata["applicability"])?;
         {
             use std::io::Read;
             let mut prefix = Vec::with_capacity(1600);
@@ -2149,7 +1896,7 @@ fn apply_unit(
                 params![unit.entity_id, version, excerpt],
             ))?;
         }
-        let scope = crate::runtime::scope_token(&applicability);
+        let scope = crate::store::scope_token(&applicability);
         let is_rule = head.metadata.get("is_rule").and_then(Value::as_bool);
         let task = head.metadata.get("in_working_set").and_then(Value::as_bool);
         db(tx.execute(

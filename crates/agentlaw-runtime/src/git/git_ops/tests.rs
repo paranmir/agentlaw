@@ -64,7 +64,7 @@ fn publish_import(
     let binding_local = store.local_root().to_owned();
     let coordination = store.coordination_root().to_owned();
     let writer = agentlaw_flows::control::ControlWriter::open(&binding_local).unwrap();
-    let identity = agentlaw_flows::runtime::StoreIdentity {
+    let identity = agentlaw_flows::store::StoreIdentity {
         root: root.clone(),
         local: binding_local.clone(),
         user_id: "user".into(),

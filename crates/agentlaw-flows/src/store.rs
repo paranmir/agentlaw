@@ -2,13 +2,12 @@
 use crate::write::*;
 use crate::*;
 use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
-use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 pub(crate) fn sql<T>(r: std::result::Result<T, rusqlite::Error>) -> Result<T> {
     r.map_err(|_| {
@@ -20,18 +19,6 @@ pub(crate) fn sql<T>(r: std::result::Result<T, rusqlite::Error>) -> Result<T> {
 }
 pub(crate) fn control_backup_required() -> DomainError {
     DomainError::new("control_backup_required","Authoritative local control state is absent or cannot be retained. Existing pending proposals and authoring decisions cannot be reconstructed from canonical memories. Preserve database and WAL/SHM files, stop clients, and restore a consistent backup for this binding; no empty replacement was created.")
-}
-fn record_background_status(local: &Path, error: Option<DomainError>) -> Result<()> {
-    let connection = sql(Connection::open(local.join("background-status.sqlite")))?;
-    sql(connection.busy_timeout(std::time::Duration::from_secs(5)))?;
-    sql(connection.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS status(id INTEGER PRIMARY KEY,payload TEXT NOT NULL);"))?;
-    if let Some(mut error) = error {
-        error.code = format!("background_{}", error.code);
-        sql(connection.execute("INSERT INTO status VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",[encode(&error)?]))?;
-    } else {
-        sql(connection.execute("DELETE FROM status WHERE id=1", []))?;
-    }
-    Ok(())
 }
 pub(crate) fn source<T>(r: agentlaw_storage::Result<T>) -> Result<T> {
     r.map_err(|e| match e {
@@ -98,21 +85,6 @@ pub struct LaneCtx<'a> {
     pub request: &'a RequestControl,
 }
 
-pub struct Runtime {
-    pub(crate) store: Store,
-    pub(crate) control: Connection,
-    pub(crate) root: PathBuf,
-    pub(crate) local: PathBuf,
-    pub(crate) user_id: String,
-    pub(crate) machine_id: String,
-    pub(crate) binding_id: String,
-    pub(crate) worker: Option<std::sync::Arc<agentlaw_worker::Client>>,
-    pub(crate) pump_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) background_error: std::sync::Arc<std::sync::Mutex<Option<DomainError>>>,
-    pub(crate) history_response_limit: usize,
-    pub(crate) config_file: Option<PathBuf>,
-    pub(crate) request_control: RequestControl,
-}
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub(crate) streaming: crate::read::streaming::StreamedSelection,
@@ -293,142 +265,6 @@ pub(crate) struct Retained {
     pub(crate) expected_generation: Option<u64>,
     #[serde(default)]
     pub(crate) publication_basis: Option<agentlaw_storage::ReadSet>,
-}
-impl Runtime {
-    pub fn with_worker(mut self, worker: agentlaw_worker::Client) -> Self {
-        let worker = std::sync::Arc::new(worker);
-        self.worker = Some(worker.clone());
-        let reader = self.store.owned_published_reader();
-        let binding = self.binding_id.clone();
-        let local = self.local.clone();
-        let stop = self.pump_stop.clone();
-        let background_error = self.background_error.clone();
-        std::thread::spawn(move || {
-            let adapter = crate::derived::PublishedAdapter::new(reader, binding.clone());
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let outcome = crate::read::pump(&worker, &adapter, &binding, &local, &stop);
-                let error = outcome.err();
-                let persisted = record_background_status(&local, error.clone());
-                if let Ok(mut current) = background_error.lock() {
-                    *current=match persisted{Ok(())=>error.map(|mut e|{e.code=format!("background_{}",e.code);e}),Err(_)=>Some(DomainError::new("background_status_unavailable","Background indexing status could not be persisted. No indexing completion is claimed; inspect local storage health."))};
-                }
-                for _ in 0..10 {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-        });
-        self
-    }
-    pub fn with_history_response_limit(mut self, bytes: usize) -> Self {
-        self.history_response_limit = bytes;
-        self
-    }
-    pub fn with_config_file(mut self, path: PathBuf) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(DomainError::new(
-                "invalid_path",
-                "Configuration path must be absolute.",
-            ));
-        }
-        self.config_file = Some(path);
-        Ok(self)
-    }
-    pub fn machine_id(&self) -> &str {
-        &self.machine_id
-    }
-    pub fn binding_id(&self) -> &str {
-        &self.binding_id
-    }
-    pub fn published_source(
-        &self,
-    ) -> crate::derived::PublishedAdapter<agentlaw_storage::published::PublishedReader<'_>> {
-        crate::derived::PublishedAdapter::new(
-            self.store.published_reader(),
-            self.binding_id.clone(),
-        )
-    }
-    pub fn call(&mut self, request: Request) -> Result<Value> {
-        if !self.local.join("control.sqlite").is_file() {
-            return Err(control_backup_required());
-        }
-        self.request_control.check()?;
-        self.request_control.phase("resolving");
-        let mut result = match request {
-            Request::ConnectProjectMemory(r) => self.connect_request(r),
-            Request::Sync(_) => Err(DomainError::new("sync_requires_app_adapter", "Use the installed Agentlaw MCP/CLI sync adapter; isolated ordinary-memory runtimes cannot transport Git or activate delegation.")),
-            Request::Recall(r) => self.recall_request(r),
-            Request::RememberThis(r) => self.remember(r),
-            Request::History(r) => {
-                let id = r
-                    .memory_id
-                    .as_ref()
-                    .or(r.procedure_id.as_ref())
-                    .ok_or_else(|| {
-                        DomainError::new("invalid_input", "A history subject is required.")
-                    })?;
-                validate_id(id)?;
-                crate::history_projection::project_with_worker_config(
-                    &self.store,
-                    &self.local,
-                    &r,
-                    self.history_response_limit,
-                    &self.request_control,
-                    self.worker
-                        .as_deref()
-                        .map(|client| (client, self.binding_id.as_str())),
-                    self.config_file.as_deref(),
-                )
-            }
-        }?;
-        let background = self
-            .background_error
-            .lock()
-            .ok()
-            .and_then(|e| e.clone())
-            .or_else(|| match Self::background_status(&self.local) {
-                Ok(status) => status,
-                Err(_) => Some(DomainError::new(
-                    "background_status_unavailable",
-                    "Background indexing status cannot be read; no indexing completion is claimed.",
-                )),
-            });
-        if let Some(error) = background {
-            if let Some(object) = result.as_object_mut() {
-                let diagnostics = object.entry("diagnostics").or_insert_with(|| json!([]));
-                if let Some(items) = diagnostics.as_array_mut() {
-                    items.push(to_value(error)?);
-                }
-            }
-        }
-        Ok(result)
-    }
-    pub fn background_status(local: impl AsRef<Path>) -> Result<Option<DomainError>> {
-        let path = local.as_ref().join("background-status.sqlite");
-        if !path.exists() {
-            return Ok(None);
-        }
-        let connection = sql(Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ))?;
-        let status: Option<String> = sql(connection
-            .query_row("SELECT payload FROM status WHERE id=1", [], |r| r.get(0))
-            .optional())?;
-        status.map(|s| decode(&s)).transpose()
-    }
-    pub fn call_with_control(
-        &mut self,
-        request: Request,
-        control: RequestControl,
-    ) -> Result<Value> {
-        let prior = std::mem::replace(&mut self.request_control, control);
-        let result = self.call(request);
-        self.request_control = prior;
-        result
-    }
 }
 pub(crate) fn scope_token(a: &Applicability) -> String {
     match a.scope.as_slice() {

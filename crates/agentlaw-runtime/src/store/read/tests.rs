@@ -4,7 +4,7 @@ use agentlaw_flows::{
     control::ControlReader,
     exact::{ExactIndex, ProjectionGenerations},
     history_cache::HistoryCacheGuards,
-    runtime::StoreIdentity,
+    store::StoreIdentity,
     RecallRequest, RequestControl,
 };
 use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 struct Fixture {
     dir: tempfile::TempDir,
-    runtime: agentlaw_flows::Runtime,
+    _journal: agentlaw_storage::JournalWriter,
     store: Store,
     registry: ProjectionGenerations,
     identity: StoreIdentity,
@@ -22,16 +22,26 @@ struct Fixture {
 }
 impl Fixture {
     fn new(limit: usize) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("source");
-        let local = dir.path().join("local");
-        let runtime = agentlaw_flows::Runtime::open(&root, &local, "user").unwrap();
-        let store = Store::open_with_coordination(
-            &root,
-            local.join("canonical"),
-            local.join("source-coordination"),
+        let (dir, mut identity) = crate::test_support::store_service::fixture();
+        identity.user_id = "user".into();
+        identity.response_limit = limit;
+        let root = identity.root.clone();
+        let local = identity.local.clone();
+        let dependencies = crate::test_support::store_service::deps(dir.path());
+        let coordination = dependencies.coordination.clone();
+        let indexer = dependencies.indexer.clone();
+        let machine_id = identity.machine_id.clone();
+        let binding_id = identity.binding_id.clone();
+        let service = crate::store::service::StoreService::open(
+            identity,
+            dependencies,
+            &RequestControl::default(),
         )
         .unwrap();
+        service.close();
+        assert!(indexer.shutdown(std::time::Duration::from_secs(10)));
+        let store =
+            Store::open_with_coordination(&root, local.join("canonical"), coordination).unwrap();
         let position = store
             .owned_published_reader()
             .read_snapshot()
@@ -60,15 +70,15 @@ impl Fixture {
             root: std::fs::canonicalize(root).unwrap(),
             local,
             user_id: "user".into(),
-            machine_id: runtime.machine_id().into(),
-            binding_id: runtime.binding_id().into(),
+            machine_id: machine_id.clone(),
+            binding_id: binding_id.clone(),
             history_limit: 8192,
             response_limit: limit,
             config_file: Some(std::path::PathBuf::from("test-config.json")),
         };
         Self {
             dir,
-            runtime,
+            _journal: store.hold_journal_writer().unwrap(),
             store,
             registry,
             identity,
@@ -405,12 +415,11 @@ fn candidate_items_are_omitted_as_whole_items_before_mandatory_content() {
 
 #[test]
 fn work_target_matching_is_case_sensitive_and_required_ignores_candidate_limit() {
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let path = f.dir.path().join("project");
     std::fs::create_dir(&path).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path.to_str().unwrap(),"intent":"create","project_name":"Example"}});
     let connected = f
-        .runtime
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap();
     let project = connected["project_connection"]["project_id"]
@@ -456,21 +465,18 @@ fn work_target_matching_is_case_sensitive_and_required_ignores_candidate_limit()
 
 #[test]
 fn consolidation_redirect_shadows_both_old_lexical_records() {
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let make = |body: &str| json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"observed","applies_to":["user"]}]}});
     let one = f
-        .runtime
         .call(agentlaw_flows::parse_request(&make("firstobsoleteword").to_string()).unwrap())
         .unwrap()["results"][0]["memory_ref"]
         .clone();
     let two = f
-        .runtime
         .call(agentlaw_flows::parse_request(&make("secondobsoleteword").to_string()).unwrap())
         .unwrap()["results"][0]["memory_ref"]
         .clone();
     let merge = json!({"action":"remember_this","remember_this":{"memories":[{"operation":"consolidate","consolidation_refs":[one,two],"what_to_remember":"mergedcurrentword","evidence":"observed"}]}});
     let result = f
-        .runtime
         .call(agentlaw_flows::parse_request(&merge.to_string()).unwrap())
         .unwrap();
     assert_eq!(result["status"], "remembered");
@@ -628,12 +634,11 @@ fn large_closure_spools_are_removed_after_file_delivery() {
 
 #[test]
 fn active_task_sections_remain_complete_when_other_candidates_are_present() {
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let path = f.dir.path().join("task-project");
     std::fs::create_dir(&path).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path.to_str().unwrap(),"intent":"create","project_name":"Task project"}});
     let connected = f
-        .runtime
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap();
     let project = connected["project_connection"]["project_id"]
@@ -687,14 +692,13 @@ fn active_task_sections_remain_complete_when_other_candidates_are_present() {
 
 #[test]
 fn discover_reports_candidates_without_binding_the_folder() {
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let existing = f.dir.path().join("existing-project");
     let other = f.dir.path().join("other-project");
     std::fs::create_dir(&existing).unwrap();
     std::fs::create_dir(&other).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":existing.to_str().unwrap(),"intent":"create","project_name":"Catalog example"}});
     let connected = f
-        .runtime
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap();
     let project = connected["project_connection"]["project_id"]
@@ -847,21 +851,19 @@ fn restore_uses_saved_project_after_the_folder_is_reconnected() {
             Ok(())
         }
     }
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let folder_a = f.dir.path().join("project-a");
     let folder_b = f.dir.path().join("project-b");
     std::fs::create_dir(&folder_a).unwrap();
     std::fs::create_dir(&folder_b).unwrap();
     let create = |path: &std::path::Path, name: &str| json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path.to_str().unwrap(),"intent":"create","project_name":name}});
     let a = f
-        .runtime
         .call(agentlaw_flows::parse_request(&create(&folder_a, "A").to_string()).unwrap())
         .unwrap()["project_connection"]["project_id"]
         .as_str()
         .unwrap()
         .to_owned();
     let b = f
-        .runtime
         .call(agentlaw_flows::parse_request(&create(&folder_b, "B").to_string()).unwrap())
         .unwrap()["project_connection"]["project_id"]
         .as_str()
@@ -890,8 +892,7 @@ fn restore_uses_saved_project_after_the_folder_is_reconnected() {
             .unwrap();
     }
     let reconnect = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":folder_a.to_str().unwrap(),"intent":"connect","project_id":b}});
-    f.runtime
-        .call(agentlaw_flows::parse_request(&reconnect.to_string()).unwrap())
+    f.call(agentlaw_flows::parse_request(&reconnect.to_string()).unwrap())
         .unwrap();
     let source = f.store.owned_published_reader();
     let position = source.read_snapshot().unwrap().position().clone();
@@ -1244,12 +1245,11 @@ fn automatically_applied_rules_are_minimal_but_explicit_and_required_rules_are_f
 
 #[test]
 fn task_heads_are_fitted_together_and_counted_once() {
-    let mut f = Fixture::new(4096);
+    let f = Fixture::new(4096);
     let folder = f.dir.path().join("group-project");
     std::fs::create_dir(&folder).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":folder.to_str().unwrap(),"intent":"create","project_name":"Grouping"}});
     let project = f
-        .runtime
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap()["project_connection"]["project_id"]
         .as_str()
@@ -1286,12 +1286,11 @@ fn task_heads_are_fitted_together_and_counted_once() {
 #[test]
 fn spooled_task_with_small_selected_sections_stays_inline() {
     use agentlaw_flows::exact::ExactIndexWriter;
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let folder = f.dir.path().join("spooled-project");
     std::fs::create_dir(&folder).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":folder.to_str().unwrap(),"intent":"create","project_name":"Spool"}});
     let project = f
-        .runtime
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap()["project_connection"]["project_id"]
         .as_str()
@@ -1394,10 +1393,11 @@ fn query_detecting_changed_source_epoch_wakes_idle_recovery() {
 #[test]
 fn active_task_published_during_embedding_is_in_the_final_recall() {
     use std::time::Duration;
-    let mut f = Fixture::new(65536);
+    let f = Fixture::new(65536);
     let path = f.dir.path().join("concurrent-task-project");
     std::fs::create_dir(&path).unwrap();
-    let connected = f.runtime.call(agentlaw_flows::parse_request(&json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path,"intent":"create","project_name":"Concurrent task"}}).to_string()).unwrap()).unwrap();
+    let connected =
+        f.connect(json!({"project_path":path,"intent":"create","project_name":"Concurrent task"}));
     let project = connected["project_connection"]["project_id"]
         .as_str()
         .unwrap()
@@ -1711,4 +1711,160 @@ fn damaged_vector_file_keeps_lexical_source_control_and_other_binding_reads_avai
     supervisor.shutdown();
     assert!(indexer.shutdown(Duration::from_secs(10)));
     assert_eq!(image(), damaged);
+}
+
+impl Fixture {
+    fn connect(&self, request: Value) -> Value {
+        self.call(agentlaw_flows::Request::ConnectProjectMemory(
+            serde_json::from_value(request).unwrap(),
+        ))
+        .unwrap()
+    }
+    fn call(&self, request: agentlaw_flows::Request) -> agentlaw_flows::Result<Value> {
+        let identity = StoreIdentity {
+            root: self.identity.root.clone(),
+            local: self.identity.local.clone(),
+            user_id: self.identity.user_id.clone(),
+            machine_id: self.identity.machine_id.clone(),
+            binding_id: self.identity.binding_id.clone(),
+            history_limit: self.identity.history_limit,
+            response_limit: 65536,
+            config_file: self.identity.config_file.clone(),
+        };
+        let deps = crate::test_support::store_service::deps(self.dir.path());
+        let indexer = deps.indexer.clone();
+        let service =
+            crate::store::service::StoreService::open(identity, deps, &RequestControl::default())
+                .unwrap();
+        let control = RequestControl::default();
+        let value = match request {
+            agentlaw_flows::Request::ConnectProjectMemory(request) => {
+                service.command(crate::protocol::CommandRequest::Connect(request), &control)
+            }
+            agentlaw_flows::Request::RememberThis(request) => {
+                service.command(crate::protocol::CommandRequest::Remember(request), &control)
+            }
+            _ => unreachable!("fixture only prepares writes and connections"),
+        };
+        service.close();
+        assert!(indexer.shutdown(std::time::Duration::from_secs(10)));
+        value
+    }
+}
+
+#[test]
+fn exact_current_larger_than_owned_budget_is_delivered_as_whole_file() {
+    use agentlaw_storage::codec;
+    use sha2::{Digest, Sha256};
+    use std::io::{Cursor, Read, Write};
+    let f = Fixture::new(65536);
+    let root = &f.identity.root;
+    let id = uuid::Uuid::new_v4().to_string();
+    let change = uuid::Uuid::new_v4().to_string();
+    let unit = CurrentUnit {
+        entity_id: id.clone(),
+        entity_type: "memory".into(),
+        state: UnitState::Live {
+            heads: vec![Head {
+                metadata: json!({"change_id":change,"applicability":{"scope":"user"},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":true,"relations":[],"work_targets":[]}),
+                body: String::new(),
+            }],
+        },
+    };
+    let frames = codec::read("current", &mut Cursor::new(unit.encode().unwrap())).unwrap();
+    let state = &frames[0];
+    let block = vec![b'x'; 65536];
+    let repetitions = 1025u64;
+    let bytes = block.len() as u64 * repetitions;
+    let mut hash = Sha256::new();
+    for _ in 0..repetitions {
+        hash.update(&block)
+    }
+    let digest = format!("{:x}", hash.finalize());
+    let parent = root.join("current/memory").join(&id[..2]);
+    std::fs::create_dir_all(&parent).unwrap();
+    let mut file =
+        std::io::BufWriter::new(std::fs::File::create(parent.join(format!("{id}.md"))).unwrap());
+    writeln!(file, "<!-- agentlaw-file-v1 kind=current -->").unwrap();
+    writeln!(
+        file,
+        "<!-- agentlaw-record-v1 type=state key={id} bytes={} sha256={} -->",
+        state.payload.len(),
+        codec::digest(&state.payload)
+    )
+    .unwrap();
+    file.write_all(&state.payload).unwrap();
+    file.write_all(b"\n<!-- /agentlaw-record-v1 -->\n").unwrap();
+    writeln!(
+        file,
+        "<!-- agentlaw-record-v1 type=body key={change} bytes={bytes} sha256={digest} -->"
+    )
+    .unwrap();
+    for _ in 0..repetitions {
+        file.write_all(&block).unwrap()
+    }
+    file.write_all(b"\n<!-- /agentlaw-record-v1 -->\n<!-- /agentlaw-file-v1 records=2 -->\n")
+        .unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let result = f
+        .query(json!({"memory_ids":[id]}), &RequestControl::default())
+        .unwrap();
+    assert_eq!(result["code"], "complete_content_in_file");
+    assert_eq!(result["content_read"], false);
+    assert!(result["artifact"]["bytes"].as_u64().unwrap() > bytes);
+    let length = std::fs::metadata(result["artifact"]["path"].as_str().unwrap())
+        .unwrap()
+        .len();
+    assert_eq!(length, result["artifact"]["bytes"].as_u64().unwrap());
+    let source = f.store.owned_published_reader();
+    let rebuilt = agentlaw_flows::exact::ExactIndexWriter::rebuild_shadow_in(
+        &f.dir.path().join("rebuilt-projection"),
+        &source,
+        &RequestControl::default(),
+    )
+    .unwrap();
+    let staged = f.registry.stage(rebuilt).unwrap();
+    f.registry.commit(staged).unwrap();
+    let restored = f
+        .query(
+            json!({"recall_for":"unrelated ordinary work"}),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(restored["code"], "complete_content_in_file");
+    assert!(restored["artifact"]["bytes"].as_u64().unwrap() > bytes);
+    let mut file = std::fs::File::open(restored["artifact"]["path"].as_str().unwrap()).unwrap();
+    let mut prefix = vec![0; 4096];
+    let n = file.read(&mut prefix).unwrap();
+    let prefix = String::from_utf8_lossy(&prefix[..n]);
+    assert!(prefix.contains("candidate_counts"));
+    assert!(prefix.contains("\"is_rule\":true"));
+    assert!(!prefix.contains("agentlaw-owned-body"));
+}
+
+#[test]
+fn streamed_exact_result_preserves_body_and_observed_version() {
+    let f = Fixture::new(1);
+    let body = "한글\r\n\"quote\"\\backslash\twithout final newline";
+    let id = Fixture::id();
+    f.publish(&id, body, false, json!([]), vec![]);
+    let current = f.store.read_current(&id).unwrap();
+    let reference = json!(current.references().unwrap()[0]);
+    let envelope = f
+        .query(json!({"memory_ids":[id]}), &RequestControl::default())
+        .unwrap();
+    assert_eq!(envelope["content_read"], false);
+    let result: Value = serde_json::from_slice(
+        &std::fs::read(envelope["artifact"]["path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result["memories"][0]["current_heads"][0]["what_to_remember"],
+        body
+    );
+    assert_eq!(
+        result["memories"][0]["current_heads"][0]["memory_ref"],
+        reference
+    );
 }

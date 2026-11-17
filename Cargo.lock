@@ -52,7 +52,6 @@ dependencies = [
  "agentlaw-contracts",
  "agentlaw-search",
  "agentlaw-storage",
- "agentlaw-worker",
  "rusqlite",
  "serde",
  "serde_json",

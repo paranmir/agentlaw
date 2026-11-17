@@ -1,5 +1,5 @@
 //! Resuming interrupted authoring and pending executions.
-use crate::runtime::*;
+use crate::store::*;
 use crate::*;
 use agentlaw_storage::{Mutation, Store};
 use rusqlite::{params, Connection};
@@ -101,23 +101,4 @@ fn recover_pending_parts(
         }
     }
     Ok(())
-}
-
-impl Runtime {
-    pub(crate) fn recover_authoring(&self) -> Result<()> {
-        recover_authoring_parts(
-            &self.store,
-            &self.control,
-            &self.binding_id,
-            &RequestControl::default(),
-        )
-    }
-    pub(crate) fn recover_pending_executions(&self) -> Result<()> {
-        recover_pending_parts(
-            &self.store,
-            &self.control,
-            &self.binding_id,
-            &self.request_control,
-        )
-    }
 }

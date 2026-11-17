@@ -21,8 +21,8 @@ use agentlaw_flows::{
     exact::{DeltaBudget, ExactIndexWriter, ProjectionGenerations},
     history_cache::HistoryCacheGuards,
     prepare::Prepared,
-    runtime::{ReadCtx, StoreIdentity},
     semantic::{SemanticCoverage, SemanticError},
+    store::{ReadCtx, StoreIdentity},
     DomainError, RecallRequest, RequestControl, Result,
 };
 use agentlaw_storage::{

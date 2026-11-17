@@ -1,5 +1,5 @@
 use super::*;
-use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
+use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
 static LARGE_HISTORY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn fixture(count: u32) -> (tempfile::TempDir, Store, String, Vec<String>) {
     let temp = tempfile::tempdir().unwrap();
@@ -52,7 +52,7 @@ fn request(id: &str) -> HistoryRequest {
 #[test]
 fn latest_has_compact_causal_map_not_one_node_per_revision() {
     let (temp, store, id, changes) = fixture(12);
-    let value = project(
+    let value = read_history(
         &store,
         temp.path(),
         &request(&id),
@@ -76,11 +76,12 @@ fn causal_range_is_inclusive_and_budget_provides_details_with_remaining_map() {
     r.context_layers = None;
     r.start_change_id = Some(changes[1].clone());
     r.end_change_id = Some(changes[10].clone());
-    let complete = project(&store, temp.path(), &r, 100_000, &RequestControl::default()).unwrap();
+    let complete =
+        read_history(&store, temp.path(), &r, 100_000, &RequestControl::default()).unwrap();
     assert_eq!(complete["changes"].as_array().unwrap().len(), 10);
     assert_eq!(complete["changes"][0]["change_id"], changes[1]);
     assert_eq!(complete["changes"][9]["change_id"], changes[10]);
-    let partial = project(&store, temp.path(), &r, 4096, &RequestControl::default()).unwrap();
+    let partial = read_history(&store, temp.path(), &r, 4096, &RequestControl::default()).unwrap();
     assert!(partial["changes"].as_array().is_some(), "{partial}");
     assert!(partial["remaining_requested_changes"].as_u64().unwrap() > 0);
     assert!(serde_json::to_vec(&partial).unwrap().len() <= 4096);
@@ -91,7 +92,7 @@ fn causal_range_is_inclusive_and_budget_provides_details_with_remaining_map() {
     r.start_change_id = Some(changes[10].clone());
     r.end_change_id = Some(changes[1].clone());
     assert_eq!(
-        project(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap()["code"],
+        read_history(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap()["code"],
         "invalid_history_interval"
     );
 }
@@ -99,7 +100,7 @@ fn causal_range_is_inclusive_and_budget_provides_details_with_remaining_map() {
 fn indivisible_change_uses_whole_frozen_file_and_search_is_ranked() {
     let (temp, store, id, _) = fixture(4);
     let mut r = request(&id);
-    let small = project(&store, temp.path(), &r, 128, &RequestControl::default()).unwrap();
+    let small = read_history(&store, temp.path(), &r, 128, &RequestControl::default()).unwrap();
     assert_eq!(small["content_read"], false);
     let original: Value =
         serde_json::from_reader(File::open(small["artifact"]["path"].as_str().unwrap()).unwrap())
@@ -111,7 +112,7 @@ fn indivisible_change_uses_whole_frozen_file_and_search_is_ranked() {
     r.history_for = Some("cancellation 2".into());
     r.max_matches = Some(1);
     r.context_layers = Some(1);
-    let query = project(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap();
+    let query = read_history(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap();
     let window = query["match_windows"][0]["changes"].as_array().unwrap();
     assert_eq!(window.len(), 2);
     assert_eq!(window[1]["matched"], true);
@@ -369,7 +370,7 @@ fn semantic_candidates_use_the_acquired_change_id_and_epoch() {
     let position = source.read_snapshot().unwrap().position().clone();
     let cache = crate::history_cache::HistoryCacheGuards::new();
     let control = RequestControl::default();
-    let identity = crate::runtime::StoreIdentity {
+    let identity = crate::store::StoreIdentity {
         root: temp.path().join("source"),
         local: temp.path().into(),
         user_id: "user".into(),
@@ -391,7 +392,7 @@ fn semantic_candidates_use_the_acquired_change_id_and_epoch() {
         hits: vec![hit(&ordered[1])],
         publish: None,
     };
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &reader,
@@ -416,7 +417,7 @@ fn semantic_candidates_use_the_acquired_change_id_and_epoch() {
         hits: vec![hit(&ordered[1])],
         publish: None,
     };
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &reader,
@@ -442,7 +443,7 @@ fn semantic_candidates_use_the_acquired_change_id_and_epoch() {
         hits: vec![hit(&next)],
         publish: Some((&store, id.clone(), next.clone())),
     };
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &reader,
@@ -487,7 +488,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
     let source = store.owned_published_reader();
     let cache = crate::history_cache::HistoryCacheGuards::new();
     let control = RequestControl::default();
-    let identity = crate::runtime::StoreIdentity {
+    let identity = crate::store::StoreIdentity {
         root: temp.path().join("source"),
         local: temp.path().into(),
         user_id: "user".into(),
@@ -503,7 +504,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         crate::semantic::OfferResult::Accepted,
     ] {
         let ports = UnavailableHistory(offer);
-        let ctx = crate::runtime::ReadCtx {
+        let ctx = crate::store::ReadCtx {
             identity: &identity,
             source: &source,
             control: &reader,
@@ -538,7 +539,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
             offer,
             position: position.clone(),
         };
-        let ctx = crate::runtime::ReadCtx {
+        let ctx = crate::store::ReadCtx {
             identity: &identity,
             source: &source,
             control: &reader,
@@ -559,7 +560,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         offer: crate::semantic::OfferResult::Accepted,
         position: position.clone(),
     };
-    let ready_ctx = crate::runtime::ReadCtx {
+    let ready_ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &reader,
@@ -571,7 +572,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
     let latest_request = request(&id);
     assert_eq!(
         history(&ready_ctx, &latest_request).unwrap(),
-        project(
+        read_history(
             &store,
             temp.path(),
             &latest_request,
@@ -585,7 +586,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
     range.end_change_id = Some(changes[2].clone());
     assert_eq!(
         history(&ready_ctx, &range).unwrap(),
-        project(
+        read_history(
             &store,
             temp.path(),
             &range,
@@ -599,7 +600,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
     let boundary = serde_json::to_vec(&history(&ready_ctx, &boundary_request).unwrap())
         .unwrap()
         .len();
-    let boundary_identity = crate::runtime::StoreIdentity {
+    let boundary_identity = crate::store::StoreIdentity {
         history_limit: boundary,
         root: identity.root.clone(),
         local: identity.local.clone(),
@@ -613,7 +614,7 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         offer: crate::semantic::OfferResult::Busy,
         position,
     };
-    let busy_ctx = crate::runtime::ReadCtx {
+    let busy_ctx = crate::store::ReadCtx {
         identity: &boundary_identity,
         source: &source,
         control: &reader,
@@ -640,11 +641,11 @@ fn owned_history_uses_memory_and_reports_unavailable_semantics() {
         );
     }
     let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
-    let small = crate::runtime::StoreIdentity {
+    let small = crate::store::StoreIdentity {
         history_limit: 128,
         ..identity
     };
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &small,
         source: &source,
         control: &reader,
@@ -761,7 +762,7 @@ fn memory_and_file_workspace_artifacts_share_guidance_and_complete_content() {
         let source = store.owned_published_reader();
         let cache = crate::history_cache::HistoryCacheGuards::new();
         let control = RequestControl::default();
-        let identity = crate::runtime::StoreIdentity {
+        let identity = crate::store::StoreIdentity {
             root: temp.path().join("source"),
             local: local.clone(),
             user_id: "user".into(),
@@ -772,7 +773,7 @@ fn memory_and_file_workspace_artifacts_share_guidance_and_complete_content() {
             config_file: Some(std::path::PathBuf::from("test-config.json")),
         };
         let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
-        let ctx = crate::runtime::ReadCtx {
+        let ctx = crate::store::ReadCtx {
             identity: &identity,
             source: &source,
             control: &control_reader,
@@ -781,7 +782,7 @@ fn memory_and_file_workspace_artifacts_share_guidance_and_complete_content() {
             history_cache: &cache,
             request: &control,
         };
-        let expected = project(&store, &local, &request(&id), 2_000_000, &control).unwrap();
+        let expected = read_history(&store, &local, &request(&id), 2_000_000, &control).unwrap();
         let result = history(&ctx, &request(&id)).unwrap();
         assert_eq!(result["code"], "complete_content_in_file");
         let mut actual: Value = serde_json::from_reader(
@@ -866,7 +867,7 @@ fn oversized_acquired_history_uses_a_removed_temporary_workspace() {
     let control_reader = crate::control::ControlReader::open(&control_dir).unwrap();
     let cache = crate::history_cache::HistoryCacheGuards::new();
     let control = RequestControl::default();
-    let identity = crate::runtime::StoreIdentity {
+    let identity = crate::store::StoreIdentity {
         root: temp.path().join("source"),
         local: local.clone(),
         user_id: "user".into(),
@@ -877,7 +878,7 @@ fn oversized_acquired_history_uses_a_removed_temporary_workspace() {
         config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &reader,
         control: &control_reader,
@@ -936,7 +937,7 @@ fn serialized_response_below_budget_is_file_delivered_when_assembly_would_exceed
     let source = store.owned_published_reader();
     let cache = crate::history_cache::HistoryCacheGuards::new();
     let control = RequestControl::default();
-    let identity = crate::runtime::StoreIdentity {
+    let identity = crate::store::StoreIdentity {
         root: temp.path().join("source"),
         local,
         user_id: "user".into(),
@@ -947,7 +948,7 @@ fn serialized_response_below_budget_is_file_delivered_when_assembly_would_exceed
         config_file: Some(std::path::PathBuf::from("test-config.json")),
     };
     let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
-    let ctx = crate::runtime::ReadCtx {
+    let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &control_reader,
@@ -977,4 +978,40 @@ fn serialized_response_below_budget_is_file_delivered_when_assembly_would_exceed
     assert!(std::str::from_utf8(&prefix[..n])
         .unwrap()
         .contains("latest_changes"));
+}
+
+fn read_history(
+    store: &Store,
+    local: &Path,
+    request: &HistoryRequest,
+    limit: usize,
+    control: &RequestControl,
+) -> crate::Result<Value> {
+    let identity = crate::store::StoreIdentity {
+        root: local.join("source"),
+        local: local.to_path_buf(),
+        user_id: "user".into(),
+        machine_id: uuid::Uuid::new_v4().to_string(),
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        history_limit: limit,
+        response_limit: usize::MAX,
+        config_file: None,
+    };
+    let _writer = crate::control::ControlWriter::open(local)?;
+    let reader = crate::control::ControlReader::open(local)?;
+    let source = store.owned_published_reader();
+    let cache = crate::history_cache::HistoryCacheGuards::new();
+    let ports = UnavailableHistory(crate::semantic::OfferResult::Accepted);
+    history(
+        &crate::store::ReadCtx {
+            identity: &identity,
+            source: &source,
+            control: &reader,
+            semantic: &ports,
+            history_semantic: &ports,
+            history_cache: &cache,
+            request: control,
+        },
+        request,
+    )
 }

@@ -50,11 +50,11 @@ fn pinned_old_generation_survives_activation_until_last_reader_drops() {
     control
         .execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         .unwrap();
-    control.execute("INSERT INTO settings(key,value) VALUES('exact_active_generation',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [staged.exact_file().to_str().unwrap()]).unwrap();
+    control.execute("INSERT INTO settings(key,value) VALUES('fixture_active_generation',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [staged.exact_file().to_str().unwrap()]).unwrap();
     registry.commit(staged).unwrap();
     let saved: String = control
         .query_row(
-            "SELECT value FROM settings WHERE key='exact_active_generation'",
+            "SELECT value FROM settings WHERE key='fixture_active_generation'",
             [],
             |row| row.get(0),
         )
@@ -634,18 +634,15 @@ fn shadow_rebuild_is_private_and_cancelled_rebuild_preserves_active_files() {
     assert_ne!(registry.pin().unwrap().generation.id, "old");
 }
 
-fn remember(runtime: &mut crate::Runtime, body: &str) {
-    let input = serde_json::json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed in projection test","applies_to":["user"]}]}});
-    runtime
-        .call(crate::parse_request(&input.to_string()).unwrap())
-        .unwrap();
+fn remember(fixture: &mut Fixture, body: &str) {
+    fixture.remember(body);
 }
 
 #[test]
 fn stale_projection_adds_published_documents_and_advance_replaces_delta() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -739,7 +736,7 @@ fn stale_projection_adds_published_documents_and_advance_replaces_delta() {
 fn delta_capacity_is_explicit_and_source_guard_can_be_released() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -786,7 +783,7 @@ fn delta_capacity_is_explicit_and_source_guard_can_be_released() {
 fn newly_published_rule_is_in_exact_membership_without_rebuilding() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -848,7 +845,7 @@ fn newly_published_rule_is_in_exact_membership_without_rebuilding() {
 fn missing_ledger_is_not_an_empty_success() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -932,7 +929,7 @@ fn source_epoch_change_and_ack_ahead_are_distinct_failures() {
 fn either_ack_may_be_ahead_and_delta_still_covers_both_views() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -1010,7 +1007,7 @@ fn either_ack_may_be_ahead_and_delta_still_covers_both_views() {
 fn pinned_snapshot_and_lexical_evaluation_do_not_write_projection_files() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -1077,7 +1074,7 @@ fn pinned_snapshot_and_lexical_evaluation_do_not_write_projection_files() {
 fn writer_synchronizes_new_publications_and_matches_shadow_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -1140,7 +1137,7 @@ fn writer_synchronizes_new_publications_and_matches_shadow_rebuild() {
 fn new_task_and_work_target_are_discovered_in_delta() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let connect = serde_json::json!({"action":"connect_project_memory","connect_project_memory":{"intent":"create","project_path":"C:/work/projection-test","project_name":"Projection"}});
     let connected = runtime
         .call(crate::parse_request(&connect.to_string()).unwrap())
@@ -1212,7 +1209,7 @@ fn new_task_and_work_target_are_discovered_in_delta() {
 fn advance_shadows_old_rule_and_old_terms_after_source_evolution() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -1376,7 +1373,7 @@ fn advance_shadows_old_rule_and_old_terms_after_source_evolution() {
 fn consolidation_redirect_removes_old_lexical_heads() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
@@ -1491,7 +1488,7 @@ fn recovery_registry_rejects_pins_until_valid_shadow_is_committed() {
 fn writerless_shadow_matches_writer_rebuild_and_can_be_consumed_for_retirement() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
-        crate::Runtime::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+        Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
     let store = agentlaw_storage::Store::open(
         dir.path().join("source"),
         dir.path().join("local/canonical"),
