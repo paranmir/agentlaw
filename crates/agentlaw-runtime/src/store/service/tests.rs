@@ -754,3 +754,407 @@ fn sync_command_runs_git_work_through_the_store_handle() {
         "{result:?}"
     );
 }
+
+fn configured_store_model(
+    dir: &std::path::Path,
+    missing_assets: bool,
+) -> (
+    StoreDeps,
+    crate::model::ModelHandle,
+    crate::host::supervision::Supervisor,
+) {
+    use crate::{
+        host::supervision::Supervisor,
+        model::{run_model_component, ModelHandle},
+        ports::{ComponentId, ComponentKind, HealthSink},
+        projection::ProjectionConfig,
+        semantic::{SemanticConfig, SemanticIndexer, SemanticSearch},
+        test_support::{model_assets, model_child_executable},
+    };
+    let ids = agentlaw_worker::supervisor::ModelRequestIds::new();
+    let health = HealthSink::default();
+    let indexer = SemanticIndexer::start(
+        SemanticConfig::new(dir.join("semantic"), "test".into()),
+        ids.clone(),
+        health.clone(),
+    )
+    .unwrap();
+    let handle = ModelHandle::new();
+    handle.set_warm(true);
+    let waker = handle.clone();
+    indexer.set_model_waker(Arc::new(move || waker.wake()));
+    let mut assets = model_assets(&dir.join("assets"));
+    if missing_assets {
+        assets.onnx_model = dir.join("assets/missing.onnx");
+    }
+    std::fs::create_dir_all(dir.join("worker")).unwrap();
+    let config = agentlaw_worker::RuntimeConfig {
+        state_dir: dir.join("worker"),
+        executable: model_child_executable(),
+        model: Some(assets),
+    };
+    let supervisor = Supervisor::new(health.clone());
+    let work = indexer.clone();
+    let sink = health.clone();
+    let worker_handle = handle.clone();
+    supervisor
+        .spawn(
+            ComponentId {
+                binding: None,
+                kind: ComponentKind::Model,
+            },
+            move |stop| {
+                run_model_component(
+                    config.clone(),
+                    Arc::new(work.clone()),
+                    ids.clone(),
+                    sink.clone(),
+                    worker_handle.clone(),
+                    stop,
+                )
+            },
+        )
+        .unwrap();
+    let dependencies = StoreDeps {
+        health,
+        semantic: Arc::new(SemanticSearch::new(indexer.clone(), handle.clone())),
+        indexer,
+        projection: ProjectionConfig::new(),
+        coordination: dir.join("coordination"),
+        state: dir.join("state"),
+    };
+    (dependencies, handle, supervisor)
+}
+
+#[test]
+fn failing_configured_model_keeps_store_operations_available_and_cancellation_unpublished() {
+    use crate::ports::ComponentKind;
+    let (dir, identity) = fixture();
+    let (dependencies, handle, supervisor) = configured_store_model(dir.path(), true);
+    let indexer = dependencies.indexer.clone();
+    let health = dependencies.health.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    wait_for(|| {
+        health.snapshot().iter().any(|(id, status)| {
+            id.kind == ComponentKind::Model
+                && status
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("fixture model assets missing"))
+        })
+    });
+    let before = service.source.read_snapshot().unwrap().position().clone();
+    let remembered = service.command(CommandRequest::Remember(serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"Lexical persistence survives model failure.","evidence":"Observed","applies_to":["user"]}]})).unwrap()), &RequestControl::default()).unwrap();
+    assert_eq!(remembered["status"], "remembered");
+    assert!(service.source.read_snapshot().unwrap().position().sequence > before.sequence);
+    let memory_id = remembered["results"][0]["memory_ref"]["memory_id"].clone();
+    assert_ne!(handle.snapshot().state, agentlaw_worker::WorkerState::Ready);
+    let query_control = RequestControl::default();
+    let recalled = thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel();
+        let service = &service;
+        let control = query_control.clone();
+        let memory_id = memory_id.clone();
+        scope.spawn(move || {
+            let result = service.query(
+                QueryRequest::Recall(serde_json::from_value(json!({"recall_for":"Lexical persistence survives","memory_ids":[memory_id]})).unwrap()),
+                &control,
+            );
+            let _ = done_tx.send(result);
+        });
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                query_control.cancel.store(true, Ordering::Release);
+                panic!("recall did not complete while the configured model remained unavailable: {error}");
+            }
+        }
+    });
+    assert_ne!(handle.snapshot().state, agentlaw_worker::WorkerState::Ready);
+    assert_eq!(recalled["semantic_complete"], false, "{recalled}");
+    assert_eq!(
+        recalled["memories"][0]["current_heads"][0]["what_to_remember"],
+        "Lexical persistence survives model failure."
+    );
+    let lexical = service
+        .query(
+            QueryRequest::Recall(
+                serde_json::from_value(json!({"recall_for":"Lexical persistence survives"}))
+                    .unwrap(),
+            ),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(lexical["semantic_complete"], false, "{lexical}");
+    assert!(
+        lexical["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["memory_id"] == memory_id)
+            || lexical["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["memory_id"] == memory_id),
+        "{lexical}"
+    );
+    assert!(
+        recalled["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("semantic_channel_"))),
+        "{recalled}"
+    );
+    let before_cancel = service.source.read_snapshot().unwrap().position().clone();
+    let control = RequestControl::default();
+    control.cancel.store(true, Ordering::Release);
+    let cancelled = service.command(CommandRequest::Remember(serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"This cancelled observation must never publish.","evidence":"Observed","applies_to":["user"]}]})).unwrap()), &control);
+    assert!(matches!(cancelled, Err(error) if error.code == "cancelled"));
+    assert_eq!(
+        service.source.read_snapshot().unwrap().position(),
+        &before_cancel
+    );
+    let path = dir.path().join("project");
+    std::fs::create_dir(&path).unwrap();
+    let connected = service.command(CommandRequest::Connect(serde_json::from_value(json!({"project_path":path,"intent":"create","project_name":"Failing model project","restore_context":true,"recall_for":"Restore project context"})).unwrap()), &RequestControl::default()).unwrap();
+    let reader = ControlReader::open(&service.identity.local).unwrap();
+    assert_eq!(
+        reader
+            .exact_association(&service.identity.binding_id, path.to_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .project_id,
+        connected["project_connection"]["project_id"]
+            .as_str()
+            .unwrap()
+    );
+    service.close();
+    supervisor.shutdown();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    assert_eq!(
+        connected["code"], "restore_preparation_incomplete",
+        "{connected}"
+    );
+    assert!(
+        connected["turn_instruction"]
+            .as_str()
+            .is_some_and(|s| s.contains("Repeat") || s.contains("resume")),
+        "{connected}"
+    );
+}
+
+#[test]
+fn restore_after_model_crash_keeps_incomplete_guidance_with_mandatory_content_in_a_file() {
+    let (dir, mut identity) = fixture();
+    identity.response_limit = 4096;
+    let (dependencies, handle, supervisor) = configured_store_model(dir.path(), false);
+    let indexer = dependencies.indexer.clone();
+    let service = StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+    let body = "A mandatory rule must be read in full before resuming project work.\n".repeat(600);
+    let saved = service.command(
+        CommandRequest::Remember(serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed mandatory context","applies_to":["user"],"is_rule":true}]})).unwrap()),
+        &RequestControl::default(),
+    ).unwrap();
+    assert_eq!(saved["status"], "remembered");
+    let memory_id = saved["results"][0]["memory_ref"]["memory_id"].clone();
+    wait_for(|| {
+        handle.snapshot().state == agentlaw_worker::WorkerState::Ready
+            && indexer
+                .progress(&service.identity.binding_id)
+                .is_some_and(|p| p.complete)
+    });
+    let target = service.source.read_snapshot().unwrap().position().clone();
+    let prepared = service.ensure_target(target, &RequestControl::default());
+    assert!(matches!(prepared.exact, ExactPreparation::Complete { .. }));
+    assert!(matches!(
+        prepared.semantic,
+        Ok(SemanticCoverage::CompleteAt(_))
+    ));
+    // Only the subsequent restore query crashes the child; source indexing can finish first.
+    let crash_query = "restore query crashes the ready child";
+    std::fs::write(dir.path().join("assets/crash-query"), crash_query).unwrap();
+    let path = dir.path().join("file-restore-project");
+    std::fs::create_dir(&path).unwrap();
+    let result = service.command(
+        CommandRequest::Connect(serde_json::from_value(json!({"project_path":path,"intent":"create","project_name":"File restore project","restore_context":true,"recall_for":crash_query})).unwrap()),
+        &RequestControl::default(),
+    ).unwrap();
+    assert!(
+        dir.path().join("assets/crashed").is_file(),
+        "restore query did not reach the ready child"
+    );
+    assert_eq!(
+        result["recall_result"]["code"], "complete_content_in_file",
+        "{result}"
+    );
+    assert_eq!(result["recall_result"]["content_read"], false, "{result}");
+    let artifact = result["recall_result"]["artifact"]["path"]
+        .as_str()
+        .unwrap();
+    let delivered: Value = serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+    assert_eq!(delivered["semantic_complete"], false, "{delivered}");
+    assert!(delivered["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "semantic_channel_incomplete"));
+    let rule = delivered["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["memory_id"] == memory_id)
+        .unwrap();
+    assert_eq!(rule["current_heads"][0]["what_to_remember"], body);
+    let reader = ControlReader::open(&service.identity.local).unwrap();
+    let association = reader
+        .exact_association(&service.identity.binding_id, path.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result["project_connection"]["project_id"],
+        association.project_id
+    );
+    assert!(
+        !result["diagnostics"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|d| d["code"] == "semantic_preparation_incomplete")),
+        "the child must crash after successful preparation, not during it: {result}"
+    );
+    service.close();
+    supervisor.shutdown();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    assert_eq!(result["code"], "restore_preparation_incomplete", "{result}");
+    assert!(
+        result["turn_instruction"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "{result}"
+    );
+    assert!(result["project_connection"].is_object());
+    assert!(result["recall_result"].is_object());
+}
+
+fn retained_storage_image(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(
+        base: &std::path::Path,
+        path: &std::path::Path,
+        files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(base, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(base).unwrap().to_owned(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, &root.join("source"), &mut files);
+    visit(root, &root.join("local/canonical"), &mut files);
+    for name in ["control.sqlite", "control.sqlite-wal"] {
+        let path = root.join("local").join(name);
+        if path.exists() {
+            files.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                std::fs::read(path).unwrap(),
+            );
+        }
+    }
+    files
+}
+
+#[test]
+fn corruption_at_open_preserves_retained_proposals_and_decided_recovery_material() {
+    use agentlaw_storage::{CurrentUnit, FaultPoint, Head, Mutation, UnitState};
+    for damaged_file in ["control.sqlite", "canonical/source-fence"] {
+        let (dir, identity) = fixture();
+        let dependencies = deps(dir.path());
+        let indexer = dependencies.indexer.clone();
+        let service =
+            StoreService::open(identity, dependencies, &RequestControl::default()).unwrap();
+        let first = service.command(CommandRequest::Remember(serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"An exact duplicate requires explicit review.","evidence":"Observed","applies_to":["user"]}]})).unwrap()), &RequestControl::default()).unwrap();
+        assert_eq!(first["status"], "remembered");
+        let pending = service.command(CommandRequest::Remember(serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"An exact duplicate requires explicit review.","evidence":"Observed","applies_to":["user"]}]})).unwrap()), &RequestControl::default()).unwrap();
+        assert_eq!(pending["status"], "resolution_required");
+        let reference = serde_json::from_value(pending["pending_batch_ref"].clone()).unwrap();
+        let retained = ControlReader::open(&service.identity.local)
+            .unwrap()
+            .pending_inspect(&service.identity.binding_id, &reference)
+            .unwrap();
+        assert_eq!(retained["status"], "pending");
+        let identity = StoreIdentity {
+            root: service.identity.root.clone(),
+            local: service.identity.local.clone(),
+            user_id: service.identity.user_id.clone(),
+            machine_id: service.identity.machine_id.clone(),
+            binding_id: service.identity.binding_id.clone(),
+            history_limit: service.identity.history_limit,
+            response_limit: service.identity.response_limit,
+            config_file: service.identity.config_file.clone(),
+        };
+        service.close();
+        drop(service);
+        assert!(indexer.shutdown(Duration::from_secs(10)));
+        let store = Store::open_with_coordination(
+            &identity.root,
+            identity.local.join("canonical"),
+            dir.path().join("coordination"),
+        )
+        .unwrap();
+        let result = store.publish_with_fault(&id(), vec![Mutation { unit: CurrentUnit { entity_id: id(), entity_type:"memory".into(), state:UnitState::Live { heads:vec![Head { metadata:json!({"change_id":id(),"applicability":{"scope":"user"},"origin":{"machine_id":identity.machine_id,"user_id":identity.user_id},"recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}), body:"Decided recovery data must remain available.".into() }] } }, expected_versions:vec![], evidence:"Interrupted publication".into() }], Some(FaultPoint::Decision));
+        assert!(matches!(
+            result,
+            Err(agentlaw_storage::Error::Interrupted(FaultPoint::Decision))
+        ));
+        drop(store);
+        let before_damage = retained_storage_image(dir.path());
+        assert!(
+            before_damage
+                .values()
+                .any(|bytes| String::from_utf8_lossy(bytes)
+                    .contains("Decided recovery data must remain available.")),
+            "recovery material must exist before corruption"
+        );
+        let file = identity.local.join(damaged_file);
+        if damaged_file == "control.sqlite" {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"damaged control!").unwrap();
+            file.sync_all().unwrap();
+        } else {
+            std::fs::write(file, b"damaged source fence").unwrap();
+        }
+        let baseline = retained_storage_image(dir.path());
+        let reopened = StoreService::open(identity, deps(dir.path()), &RequestControl::default());
+        let error = match reopened {
+            Err(error) => error,
+            Ok(service) => {
+                service.close();
+                panic!("corrupt binding opened successfully")
+            }
+        };
+        assert_eq!(
+            retained_storage_image(dir.path()),
+            baseline,
+            "opening {damaged_file} changed retained or recovery bytes"
+        );
+        assert!(
+            error.to_string().to_lowercase().contains("corrupt")
+                || error.to_string().contains("database")
+                || error.to_string().contains("fence"),
+            "{error:?}"
+        );
+    }
+}

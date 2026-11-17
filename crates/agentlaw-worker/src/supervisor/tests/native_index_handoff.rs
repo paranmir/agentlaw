@@ -324,3 +324,127 @@ fn finish_panic_must_not_deliver_a_second_conflicting_completion() {
         "finish received conflicting duplicate completions: {completions:?}"
     );
 }
+
+#[test]
+fn coincident_failure_signals_complete_waiters_once_and_keep_one_retry_deadline() {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn TerminateProcess(process: *mut std::ffi::c_void, code: u32) -> i32;
+    }
+    for exit_first in [true, false] {
+        let mut f = Recheck::new(true, true, false);
+        let inc = f.ready("first");
+        f.next_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Hold the supervisor at its existing status boundary while both callers queue.
+        let (release, gate) = mpsc::channel();
+        *f.index.status_gate.lock().unwrap() = Some(gate);
+        f.owner().wake();
+        f.status_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let first = f.running_query("shared pending request");
+        let second = f.running_query("shared pending request");
+        until(|| {
+            let state = f.shared.state.lock().unwrap();
+            state.queries.pending.len() == 1
+                && state
+                    .queries
+                    .flights
+                    .values()
+                    .any(|flight| flight.waiters == 2)
+        });
+        let signals = if exit_first {
+            vec![
+                Event::Exit(inc.clone()),
+                Event::Pipe(inc.clone(), "pipe EOF".into()),
+                Event::Pipe(inc.clone(), "running item IO failure".into()),
+            ]
+        } else {
+            vec![
+                Event::Pipe(inc.clone(), "running item IO failure".into()),
+                Event::Pipe(inc.clone(), "pipe EOF".into()),
+                Event::Exit(inc.clone()),
+            ]
+        };
+        for event in signals {
+            f.events.send(event).unwrap();
+        }
+        let child = f.handles.lock().unwrap().pop().unwrap();
+        assert_ne!(unsafe { TerminateProcess(child.as_raw_handle(), 27) }, 0);
+        release.send(()).unwrap();
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(QueryError::Unavailable(_))
+        ));
+        assert!(matches!(
+            second.join().unwrap(),
+            Err(QueryError::Unavailable(_))
+        ));
+        let completion = f.finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(completion.0, ModelRequestId(1));
+        assert!(completion.1);
+        let failure_time = *f.clock.lock().unwrap();
+        *f.clock.lock().unwrap() = failure_time + Duration::from_millis(500);
+        assert!(matches!(
+            f.owner()
+                .embed_query("attach during retry", &AtomicBool::new(false)),
+            Err(QueryError::Unavailable(_))
+        ));
+        *f.clock.lock().unwrap() = failure_time + Duration::from_millis(999);
+        let (release, gate) = mpsc::channel();
+        *f.index.status_gate.lock().unwrap() = Some(gate);
+        f.owner().wake();
+        f.status_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        release.send(()).unwrap();
+        // The next status boundary acknowledges the preceding lifecycle action.
+        // Keep the clock fixed until that action has evaluated the pre-deadline time.
+        let (release, gate) = mpsc::channel();
+        *f.index.status_gate.lock().unwrap() = Some(gate);
+        f.owner().wake();
+        f.status_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            f.observed.try_recv().is_err(),
+            "replacement started before the retry deadline"
+        );
+        *f.clock.lock().unwrap() = failure_time + Duration::from_secs(1);
+        release.send(()).unwrap();
+        f.owner().wake();
+        let replacement = f.ready("replacement");
+        assert_ne!(replacement, inc);
+        assert_eq!(
+            *f.clock.lock().unwrap(),
+            failure_time + Duration::from_secs(1)
+        );
+        // All old signals are stale after replacement and cannot complete work again.
+        f.events.send(Event::Exit(inc.clone())).unwrap();
+        f.events
+            .send(Event::Pipe(inc.clone(), "late EOF".into()))
+            .unwrap();
+        f.events
+            .send(Event::Pipe(inc, "late running item IO failure".into()))
+            .unwrap();
+        *f.clock.lock().unwrap() += Duration::from_secs(60);
+        let (release, gate) = mpsc::channel();
+        *f.index.status_gate.lock().unwrap() = Some(gate);
+        f.owner().wake();
+        f.status_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            f.finished.try_recv().is_err(),
+            "owned work was returned twice"
+        );
+        assert!(
+            f.observed.try_recv().is_err(),
+            "stale failure started another replacement"
+        );
+        release.send(()).unwrap();
+        f.shutdown().unwrap();
+        assert!(f.finished.try_recv().is_err());
+    }
+}

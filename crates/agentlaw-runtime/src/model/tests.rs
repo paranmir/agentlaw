@@ -365,3 +365,85 @@ fn restart_warm_health_and_shutdown() {
         .iter()
         .any(|(id, s)| *id == model_id() && s.state == ComponentState::Stopped));
 }
+
+#[test]
+fn persisted_backlog_starts_one_model_without_frontend_demand_and_completes_coverage() {
+    use crate::semantic::{SemanticConfig, SemanticIndexer};
+    use crate::test_support::{model_assets, model_child_executable, model_transcript};
+    use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+    let dir = tempfile::tempdir().unwrap();
+    let assets_root = dir.path().join("assets");
+    let assets = model_assets(&assets_root);
+    let executable = model_child_executable();
+    let store = Store::open(dir.path().join("source"), dir.path().join("local")).unwrap();
+    let receipt = store
+        .publish(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![Mutation {
+                unit: CurrentUnit {
+                    entity_id: uuid::Uuid::new_v4().to_string(),
+                    entity_type: "memory".into(),
+                    state: UnitState::Live {
+                        heads: vec![Head {
+                            metadata: serde_json::json!({
+                "change_id":uuid::Uuid::new_v4().to_string(),"applicability":{"scope":"user"},
+                "origin":{"machine_id":uuid::Uuid::new_v4().to_string(),"user_id":"user"},
+                "recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}),
+                            body: "Persisted source awaiting semantic indexing.".into(),
+                        }],
+                    },
+                },
+                expected_versions: vec![],
+                evidence: "Published before runtime startup".into(),
+            }],
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("source"), dir.path().join("local")).unwrap();
+    let ids = ModelRequestIds::new();
+    let health = HealthSink::default();
+    let indexer = SemanticIndexer::start(
+        SemanticConfig::new(dir.path().join("indices"), "test".into()),
+        ids.clone(),
+        health.clone(),
+    )
+    .unwrap();
+    let handle = ModelHandle::new();
+    let wake_handle = handle.clone();
+    indexer.set_model_waker(Arc::new(move || wake_handle.wake()));
+    indexer
+        .open_binding("backlog", store.owned_published_reader())
+        .unwrap();
+    let supervisor = Supervisor::new(health.clone());
+    let worker_index = indexer.clone();
+    let worker_handle = handle.clone();
+    std::fs::create_dir_all(dir.path().join("worker")).unwrap();
+    let runtime_config = RuntimeConfig {
+        state_dir: dir.path().join("worker"),
+        executable,
+        model: Some(assets),
+    };
+    supervisor
+        .spawn(model_id(), move |stop| {
+            run_model_component(
+                runtime_config.clone(),
+                Arc::new(worker_index.clone()),
+                ids.clone(),
+                health.clone(),
+                worker_handle.clone(),
+                stop,
+            )
+        })
+        .unwrap();
+    wait_for(|| {
+        indexer.progress("backlog").is_some_and(|p| {
+            p.complete
+                && p.ack
+                    .is_some_and(|a| a.sequence == receipt.generation as i64)
+        })
+    });
+    assert_eq!(model_transcript(&assets_root, "starts.jsonl").len(), 1);
+    assert!(!model_transcript(&assets_root, "requests.jsonl").is_empty());
+    supervisor.shutdown();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+}

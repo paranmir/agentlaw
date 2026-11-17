@@ -6,13 +6,19 @@ use crate::semantic::*;
 use rusqlite::Connection;
 use std::sync::Arc;
 
-struct Ports;
+enum Ports {
+    Ready,
+    Incomplete(&'static str),
+}
 impl SemanticPort for Ports {
     fn embed_query(
         &self,
         _: &str,
         _: &RequestControl,
     ) -> std::result::Result<QueryVector, SemanticError> {
+        if let Self::Incomplete(cause) = self {
+            return Err(SemanticError::Unavailable((*cause).into()));
+        }
         Ok(QueryVector {
             model: "test".into(),
             values: Arc::from([1.0]),
@@ -119,6 +125,13 @@ impl Fixture {
         }
     }
     fn prepare(&self, request: Value) -> Result<Prepared> {
+        self.prepare_with_semantic(request, &Ports::Ready)
+    }
+    fn prepare_with_semantic(
+        &self,
+        request: Value,
+        semantic: &dyn SemanticPort,
+    ) -> Result<Prepared> {
         let source = self.store.owned_published_reader();
         let reader = ControlReader::open(&self.identity.local)?;
         let cache = HistoryCacheGuards::new();
@@ -127,8 +140,8 @@ impl Fixture {
             identity: &self.identity,
             source: &source,
             control: &reader,
-            semantic: &Ports,
-            history_semantic: &Ports,
+            semantic,
+            history_semantic: &Ports::Ready,
             history_cache: &cache,
             request: &control,
         };
@@ -146,8 +159,8 @@ impl Fixture {
             identity: &self.identity,
             source: &source,
             control: &reader,
-            semantic: &Ports,
-            history_semantic: &Ports,
+            semantic: &Ports::Ready,
+            history_semantic: &Ports::Ready,
             history_cache: &cache,
             request: &control,
         };
@@ -478,5 +491,82 @@ fn changed_generation_returns_procedure_for_review_without_publication() {
     let result = response(f.apply(stale).unwrap());
     assert_eq!(result["status"], "authoring_required");
     assert_eq!(result["code"], "source_changed");
+    assert_eq!(f.store.generation().unwrap(), generation);
+}
+
+#[test]
+fn incomplete_embeddings_admit_only_identical_overlap_candidates() {
+    for cause in ["model loading", "model assets missing"] {
+        let mut f = Fixture::new();
+        let exact = f.run(
+            "remember_this",
+            create("Use the shell to inspect the workspace."),
+        );
+        let similar = f.run(
+            "remember_this",
+            create("Use the shell to inspect another workspace."),
+        );
+        assert_eq!(similar["status"], "remembered");
+        let plan = f
+            .prepare_with_semantic(
+                create("Use the shell to inspect the workspace."),
+                &Ports::Incomplete(cause),
+            )
+            .unwrap();
+        let result = response(f.apply(plan).unwrap());
+        assert_eq!(result["status"], "resolution_required");
+        let overlap = result["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["code"] == "possible_overlap")
+            .unwrap();
+        let candidates = overlap["current_memories"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{result}");
+        assert_eq!(
+            candidates[0]["memory_id"],
+            exact["results"][0]["memory_ref"]["memory_id"]
+        );
+        assert!(
+            result["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("semantic_channel_"))),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn newly_published_dependent_requires_review_before_a_prepared_change_can_publish() {
+    let mut f = Fixture::new();
+    let first = f.run(
+        "remember_this",
+        create("Persist data before acknowledging a request."),
+    );
+    let reference = first["results"][0]["memory_ref"].clone();
+    let prepared = f.prepare(json!({"memories":[{"operation":"evolve","parent_refs":[reference],"what_to_remember":"Acknowledge after persisting data and its journal.","evidence":"Revised protocol"}]})).unwrap();
+    let dependent = f.run("remember_this", json!({"memories":[{"operation":"create","applies_to":["user"],"what_to_remember":"The client can retry after the durable acknowledgment.","evidence":"Protocol dependency","required_memory_ids":[reference["memory_id"]]}]}));
+    assert_eq!(dependent["status"], "remembered");
+    let generation = f.store.generation().unwrap();
+    let result = response(f.apply(prepared).unwrap());
+    assert_eq!(result["status"], "resolution_required", "{result}");
+    assert_eq!(f.store.generation().unwrap(), generation);
+    let refreshed = f.run(
+        "remember_this",
+        json!({"pending_action":"continue","pending_batch_ref":result["pending_batch_ref"]}),
+    );
+    assert_eq!(refreshed["status"], "resolution_required", "{refreshed}");
+    assert!(
+        refreshed["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "required_dependent_review"),
+        "{refreshed}"
+    );
     assert_eq!(f.store.generation().unwrap(), generation);
 }

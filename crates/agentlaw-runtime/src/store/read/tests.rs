@@ -1390,3 +1390,325 @@ fn query_detecting_changed_source_epoch_wakes_idle_recovery() {
     }
     assert!(projection.shutdown(Duration::from_secs(10)));
 }
+
+#[test]
+fn active_task_published_during_embedding_is_in_the_final_recall() {
+    use std::time::Duration;
+    let mut f = Fixture::new(65536);
+    let path = f.dir.path().join("concurrent-task-project");
+    std::fs::create_dir(&path).unwrap();
+    let connected = f.runtime.call(agentlaw_flows::parse_request(&json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path,"intent":"create","project_name":"Concurrent task"}}).to_string()).unwrap()).unwrap();
+    let project = connected["project_connection"]["project_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = Fixture::id();
+    let change = Fixture::id();
+    let body = "# Objective\nShip the feature\n# Current position\nImplementation complete\n# Resume point\nReview verification\n# References\nDesign document\n";
+    let unit = CurrentUnit {
+        entity_id: id.clone(),
+        entity_type: "memory".into(),
+        state: UnitState::Live {
+            heads: vec![Head {
+                metadata: json!({"change_id":change,"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}),
+                body: body.into(),
+            }],
+        },
+    };
+    let expected_reference = unit.references().unwrap()[0].clone();
+    let projection = start_read_projection(&f);
+    let source = f.store.owned_published_reader();
+    let reader = ControlReader::open(&f.identity.local).unwrap();
+    let cache = HistoryCacheGuards::new();
+    let control = RequestControl::default();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let gate = QueryGate {
+        fake: f.semantic.clone(),
+        on_embed: true,
+        fired: Default::default(),
+        started: start_tx,
+        proceed: std::sync::Mutex::new(done_rx),
+    };
+    let ctx = ReadCtx {
+        identity: &f.identity,
+        source: &source,
+        control: &reader,
+        semantic: &gate,
+        history_semantic: &f.semantic,
+        history_cache: &cache,
+        request: &control,
+    };
+    let coordinator = ReadCoordinator::new(
+        projection.clone(),
+        DeltaBudget {
+            max_identities: 1,
+            ..DeltaBudget::default()
+        },
+    );
+    let store = &f.store;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            store
+                .publish(
+                    &Fixture::id(),
+                    vec![Mutation {
+                        unit,
+                        expected_versions: vec![],
+                        evidence: "Another session published a Task".into(),
+                    }],
+                )
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let request = serde_json::from_value(json!({"project_path":path,"recall_for":"unrelated search","include_active_tasks":true})).unwrap();
+        let result = coordinator
+            .run_query(&ctx, QueryRequest::Recall(request))
+            .unwrap();
+        assert_eq!(result["active_task_count"], 1, "{result}");
+        let task = result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["memory_id"] == id)
+            .expect("published task must not be omitted from complete recall");
+        assert_eq!(task["objective"], "Ship the feature\n");
+        assert_eq!(task["current_position"], "Implementation complete\n");
+        assert_eq!(task["resume_point"], "Review verification\n");
+        let exact = f
+            .query(json!({"memory_ids":[id]}), &RequestControl::default())
+            .unwrap();
+        assert_eq!(
+            exact["memories"][0]["current_heads"][0]["what_to_remember"],
+            body
+        );
+        assert_eq!(
+            exact["memories"][0]["current_heads"][0]["memory_ref"],
+            json!({"memory_id":expected_reference.memory_id,"observed_version":expected_reference.observed_version})
+        );
+        writer.join().unwrap();
+    });
+    assert!(projection.shutdown(Duration::from_secs(10)));
+}
+
+#[test]
+fn damaged_vector_file_keeps_lexical_source_control_and_other_binding_reads_available() {
+    use crate::test_support::{model_assets, model_child_executable};
+    use crate::{
+        host::supervision::Supervisor,
+        model::{run_model_component, ModelHandle},
+        ports::{ComponentId, ComponentKind, ComponentState, HealthSink},
+        semantic::{SemanticConfig, SemanticIndexer, SemanticSearch},
+    };
+    use agentlaw_flows::semantic::SemanticPort;
+    use agentlaw_worker::supervisor::ModelRequestIds;
+    use std::time::{Duration, Instant};
+    let f = Fixture::new(65536);
+    let other = Fixture::new(65536);
+    let id = Fixture::id();
+    f.publish(
+        &id,
+        "Corruption leaves this lexical marker readable.",
+        false,
+        json!([]),
+        vec![],
+    );
+    other.publish(
+        &Fixture::id(),
+        "Another binding remains semantically searchable.",
+        false,
+        json!([]),
+        vec![],
+    );
+    let asset_root = f.dir.path().join("assets");
+    let assets = model_assets(&asset_root);
+    let executable = model_child_executable();
+    let config = SemanticConfig::new(f.dir.path().join("vectors"), "test".into());
+    let health = HealthSink::default();
+    let model = ModelHandle::new();
+    let ids = ModelRequestIds::new();
+    let indexer = SemanticIndexer::start(config.clone(), ids.clone(), health.clone()).unwrap();
+    let wake = model.clone();
+    indexer.set_model_waker(std::sync::Arc::new(move || wake.wake()));
+    let supervisor = Supervisor::new(health.clone());
+    std::fs::create_dir_all(f.dir.path().join("worker")).unwrap();
+    let start_model = |supervisor: &Supervisor, indexer: &SemanticIndexer, ids: ModelRequestIds| {
+        let worker = indexer.clone();
+        let model = model.clone();
+        let health = health.clone();
+        let runtime = agentlaw_worker::RuntimeConfig {
+            state_dir: f.dir.path().join("worker"),
+            executable: executable.clone(),
+            model: Some(assets.clone()),
+        };
+        supervisor
+            .spawn(
+                ComponentId {
+                    binding: None,
+                    kind: ComponentKind::Model,
+                },
+                move |stop| {
+                    run_model_component(
+                        runtime.clone(),
+                        std::sync::Arc::new(worker.clone()),
+                        ids.clone(),
+                        health.clone(),
+                        model.clone(),
+                        stop,
+                    )
+                },
+            )
+            .unwrap();
+    };
+    start_model(&supervisor, &indexer, ids);
+    indexer
+        .open_binding(&f.identity.binding_id, f.store.owned_published_reader())
+        .unwrap();
+    let wait_complete = |indexer: &SemanticIndexer, binding: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !indexer.progress(binding).is_some_and(|p| p.complete) {
+            assert!(Instant::now() < deadline, "{:?}", indexer.progress(binding));
+            std::thread::yield_now();
+        }
+    };
+    wait_complete(&indexer, &f.identity.binding_id);
+    let vector_file = std::fs::read_dir(&config.indices_root)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("vector.sqlite"))
+        .find(|p| p.exists())
+        .unwrap();
+    indexer
+        .open_binding(
+            &other.identity.binding_id,
+            other.store.owned_published_reader(),
+        )
+        .unwrap();
+    wait_complete(&indexer, &other.identity.binding_id);
+    supervisor.shutdown();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    drop(indexer);
+    // Damage the existing vectors B-tree after all writers and readers have closed.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let db =
+            Connection::open_with_flags(&vector_file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let page: u64 = db
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name='vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        drop(db);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&vector_file)
+            .unwrap();
+        file.seek(SeekFrom::Start((page - 1) * size)).unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let image = || {
+        ["", "-wal"]
+            .into_iter()
+            .map(|suffix| {
+                let path = PathBuf::from(format!("{}{suffix}", vector_file.display()));
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("{e}"),
+                };
+                (path, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let damaged = image();
+    let ids = ModelRequestIds::new();
+    let indexer = SemanticIndexer::start(config, ids.clone(), health.clone()).unwrap();
+    let wake = model.clone();
+    indexer.set_model_waker(std::sync::Arc::new(move || wake.wake()));
+    model.set_warm(true);
+    let supervisor = Supervisor::new(health.clone());
+    start_model(&supervisor, &indexer, ids);
+    indexer
+        .open_binding(&f.identity.binding_id, f.store.owned_published_reader())
+        .unwrap();
+    indexer
+        .open_binding(
+            &other.identity.binding_id,
+            other.store.owned_published_reader(),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while model.snapshot().state != agentlaw_worker::WorkerState::Ready {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let search = SemanticSearch::new(indexer.clone(), model.clone());
+    let vector = search
+        .embed_query(
+            "The model still embeds queries.",
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert_eq!(vector.values.len(), 256);
+    let exact = f
+        .query_with_semantic(
+            json!({"memory_ids":[id]}),
+            &RequestControl::default(),
+            &search,
+        )
+        .unwrap();
+    assert_eq!(
+        exact["memories"][0]["current_heads"][0]["what_to_remember"],
+        "Corruption leaves this lexical marker readable."
+    );
+    let lexical = f
+        .query_with_semantic(
+            json!({"recall_for":"lexical marker"}),
+            &RequestControl::default(),
+            &search,
+        )
+        .unwrap();
+    assert_eq!(lexical["semantic_complete"], false, "{lexical}");
+    assert!(
+        lexical["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["memory_id"] == id),
+        "{lexical}"
+    );
+    assert!(f.store.owned_published_reader().read_snapshot().is_ok());
+    assert!(ControlReader::open(&f.identity.local)
+        .unwrap()
+        .pending_notices(&f.identity.binding_id, None)
+        .is_ok());
+    wait_complete(&indexer, &other.identity.binding_id);
+    let healthy = other
+        .query_with_semantic(
+            json!({"recall_for":"semantically searchable"}),
+            &RequestControl::default(),
+            &search,
+        )
+        .unwrap();
+    assert_ne!(healthy["semantic_complete"], false, "{healthy}");
+    assert!(health
+        .snapshot()
+        .iter()
+        .any(|(component, status)| component.binding.as_deref()
+            == Some(f.identity.binding_id.as_str())
+            && component.kind == ComponentKind::Semantic
+            && status.state == ComponentState::Degraded));
+    assert_eq!(
+        image(),
+        damaged,
+        "reads changed the damaged vector DB or WAL"
+    );
+    supervisor.shutdown();
+    assert!(indexer.shutdown(Duration::from_secs(10)));
+    assert_eq!(image(), damaged);
+}
