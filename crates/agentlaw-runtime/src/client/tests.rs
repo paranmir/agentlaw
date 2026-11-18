@@ -658,3 +658,446 @@ fn authentication_build_and_protocol_failures_do_not_retry() {
         );
     }
 }
+
+struct AttachClock {
+    origin: Instant,
+    current: Mutex<Instant>,
+    during_wait: Mutex<Option<Box<dyn Fn(Instant, Instant) + Send>>>,
+}
+impl AttachClock {
+    fn new() -> Arc<Self> {
+        let origin = Instant::now();
+        Arc::new(Self {
+            origin,
+            current: Mutex::new(origin),
+            during_wait: Mutex::new(None),
+        })
+    }
+    fn now(&self) -> Instant {
+        *self.current.lock().unwrap()
+    }
+    fn wait(&self, duration: Duration) {
+        let before = self.now();
+        let after = before + duration;
+        if let Some(hook) = self.during_wait.lock().unwrap().as_ref() {
+            hook(before, after);
+        }
+        *self.current.lock().unwrap() = after;
+    }
+}
+#[derive(Default)]
+struct AttachLaunchLog {
+    launched: Mutex<Vec<Instant>>,
+    already_owned: Mutex<Vec<Instant>>,
+}
+struct RecordingAttachLauncher {
+    clock: Arc<AttachClock>,
+    log: Arc<AttachLaunchLog>,
+    stop_on_launch: Option<usize>,
+    publish_on_launch: Option<(usize, PathBuf, Endpoint)>,
+}
+#[derive(Clone, Copy)]
+enum RecordedExit {
+    AlreadyOwned,
+    Blocked,
+    Running,
+}
+struct RecordedAttachCandidate {
+    clock: Arc<AttachClock>,
+    log: Arc<AttachLaunchLog>,
+    exit_at: Instant,
+    exit: RecordedExit,
+}
+impl RuntimeLauncher for RecordingAttachLauncher {
+    fn launch(&self) -> io::Result<Box<dyn RuntimeCandidate>> {
+        let now = self.clock.now();
+        let number = {
+            let mut launches = self.log.launched.lock().unwrap();
+            launches.push(now);
+            launches.len()
+        };
+        let exit = if let Some((expected, state, endpoint)) = &self.publish_on_launch {
+            if number == *expected {
+                transport::write_endpoint(state, endpoint)?;
+                RecordedExit::Running
+            } else {
+                RecordedExit::AlreadyOwned
+            }
+        } else if self.stop_on_launch == Some(number) {
+            RecordedExit::Blocked
+        } else {
+            RecordedExit::AlreadyOwned
+        };
+        Ok(Box::new(RecordedAttachCandidate {
+            clock: self.clock.clone(),
+            log: self.log.clone(),
+            // A candidate remains alive before its exit is observed, so launch time
+            // cannot accidentally serve as the backoff origin.
+            exit_at: now + Duration::from_millis(35),
+            exit,
+        }))
+    }
+}
+impl RuntimeCandidate for RecordedAttachCandidate {
+    fn try_exit(&mut self) -> io::Result<Option<CandidateExit>> {
+        let now = self.clock.now();
+        if now < self.exit_at {
+            return Ok(None);
+        }
+        match self.exit {
+            RecordedExit::AlreadyOwned => {
+                self.log.already_owned.lock().unwrap().push(now);
+                Ok(Some(CandidateExit::AlreadyOwned))
+            }
+            RecordedExit::Blocked => Ok(Some(CandidateExit::StartBlocked(DomainError::new(
+                "fixture_observation_complete",
+                "end of recorded launches",
+            )))),
+            RecordedExit::Running => Ok(None),
+        }
+    }
+}
+fn virtual_attach(state: &Path, launcher: &RecordingAttachLauncher) -> Result<Client, ClientError> {
+    attach_with_clock(
+        state,
+        "test-build",
+        launcher,
+        AttachLimits::default(),
+        &|| launcher.clock.now(),
+        &|duration| launcher.clock.wait(duration),
+    )
+}
+
+#[test]
+fn already_owned_relaunch_uses_observed_exit_times_and_capped_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = AttachClock::new();
+    let log = Arc::new(AttachLaunchLog::default());
+    let launcher = RecordingAttachLauncher {
+        clock,
+        log: log.clone(),
+        stop_on_launch: Some(7),
+        publish_on_launch: None,
+    };
+    let result = virtual_attach(dir.path(), &launcher);
+    assert!(
+        matches!(result, Err(ClientError::Domain(ref e)) if e.code == "fixture_observation_complete")
+    );
+    let launches = log.launched.lock().unwrap();
+    let exits = log.already_owned.lock().unwrap();
+    assert_eq!(
+        launches.len(),
+        7,
+        "there must be no extra candidate between retry deadlines"
+    );
+    assert_eq!(exits.len(), 6);
+    let intervals: Vec<_> = launches[1..]
+        .iter()
+        .zip(exits.iter())
+        .map(|(launch, observed)| launch.duration_since(*observed))
+        .collect();
+    assert_eq!(
+        intervals,
+        [100, 200, 400, 800, 1000, 1000]
+            .map(Duration::from_millis)
+            .to_vec()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn changed_endpoint_is_authenticated_during_the_already_owned_retry_delay() {
+    let server = Server::new();
+    let endpoint = transport::read_endpoint(server.dir.path()).unwrap();
+    let expected_address = endpoint.control;
+    let dir = tempfile::tempdir().unwrap();
+    let stale = BoundOnlyPort::bind(0);
+    assert_ne!(stale.address, expected_address);
+    transport::write_endpoint(
+        dir.path(),
+        &Endpoint {
+            control: stale.address,
+            data: stale.address,
+            ..endpoint.clone()
+        },
+    )
+    .unwrap();
+    let clock = AttachClock::new();
+    let log = Arc::new(AttachLaunchLog::default());
+    let published = Arc::new(Mutex::new(None));
+    let publisher_log = log.clone();
+    let publication = published.clone();
+    let state = dir.path().to_path_buf();
+    *clock.during_wait.lock().unwrap() = Some(Box::new(move |_, after| {
+        let mut published = publication.lock().unwrap();
+        if published.is_some() {
+            return;
+        }
+        if let Some(observed) = publisher_log.already_owned.lock().unwrap().first().copied() {
+            let at = observed + Duration::from_millis(50);
+            if after >= at {
+                transport::write_endpoint(&state, &endpoint).unwrap();
+                *published = Some(at);
+            }
+        }
+    }));
+    let launcher = RecordingAttachLauncher {
+        clock: clock.clone(),
+        log: log.clone(),
+        stop_on_launch: None,
+        publish_on_launch: None,
+    };
+    let client = virtual_attach(dir.path(), &launcher)
+        .unwrap_or_else(|e| panic!("changed endpoint was not authenticated: {e:?}"));
+    let published_at = published
+        .lock()
+        .unwrap()
+        .expect("new owner did not replace the failed address");
+    let observed = log.already_owned.lock().unwrap()[0];
+    let first_failed_at = log.launched.lock().unwrap()[0];
+    assert_eq!(published_at, observed + Duration::from_millis(50));
+    assert!(
+        clock.now() < first_failed_at + Duration::from_secs(1),
+        "new address authentication waited for the unchanged failed-address recheck deadline"
+    );
+    assert!(
+        clock.now() < observed + Duration::from_millis(100),
+        "endpoint authentication waited for the candidate retry deadline"
+    );
+    assert_eq!(log.launched.lock().unwrap().len(), 1);
+    assert_eq!(client.inner.endpoint.control, expected_address);
+}
+
+#[cfg(windows)]
+#[test]
+fn unreachable_endpoint_is_replaced_by_the_next_candidate_after_the_delay() {
+    let server = Server::new();
+    let endpoint = transport::read_endpoint(server.dir.path()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let stale = BoundOnlyPort::bind(0);
+    transport::write_endpoint(
+        dir.path(),
+        &Endpoint {
+            control: stale.address,
+            data: stale.address,
+            ..endpoint.clone()
+        },
+    )
+    .unwrap();
+    let clock = AttachClock::new();
+    let log = Arc::new(AttachLaunchLog::default());
+    let launcher = RecordingAttachLauncher {
+        clock: clock.clone(),
+        log: log.clone(),
+        stop_on_launch: None,
+        publish_on_launch: Some((2, dir.path().to_path_buf(), endpoint.clone())),
+    };
+    let client = virtual_attach(dir.path(), &launcher)
+        .unwrap_or_else(|e| panic!("new candidate did not recover stale endpoint: {e:?}"));
+    assert_eq!(client.inner.endpoint.control, endpoint.control);
+    let launches = log.launched.lock().unwrap();
+    let observed = log.already_owned.lock().unwrap();
+    assert_eq!(launches.len(), 2);
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        launches[1].duration_since(observed[0]),
+        Duration::from_millis(100)
+    );
+}
+
+struct SilentAttachServer {
+    address: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+    attempts: Arc<Mutex<Vec<Instant>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+impl SilentAttachServer {
+    fn new(clock: Arc<AttachClock>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let ended = stop.clone();
+        let observed = attempts.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            let mut held = Vec::new();
+            ready_tx.send(()).unwrap();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                if ended.load(Ordering::Acquire) {
+                    break;
+                }
+                stream.set_read_timeout(Some(WAIT)).unwrap();
+                let _: Hello = recv(&mut stream);
+                observed.lock().unwrap().push(clock.now());
+                held.push(stream); // No Hello response: the caller reaches its response deadline.
+            }
+        });
+        ready_rx.recv_timeout(WAIT).unwrap();
+        Self {
+            address,
+            stop,
+            attempts,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for SilentAttachServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn unchanged_failed_endpoint_is_rechecked_once_per_second_without_extending_start_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = AttachClock::new();
+    let server = SilentAttachServer::new(clock.clone());
+    transport::write_endpoint(
+        dir.path(),
+        &Endpoint {
+            protocol: PROTOCOL_VERSION,
+            installation_build: "test-build".into(),
+            control: server.address,
+            data: server.address,
+            secret: "a".repeat(64),
+            pid: std::process::id(),
+        },
+    )
+    .unwrap();
+    let log = Arc::new(AttachLaunchLog::default());
+    let launcher = RecordingAttachLauncher {
+        clock: clock.clone(),
+        log: log.clone(),
+        stop_on_launch: None,
+        publish_on_launch: None,
+    };
+    let result = attach_with_clock(
+        dir.path(),
+        "test-build",
+        &launcher,
+        AttachLimits {
+            start_wait: Duration::from_secs(30),
+            hello_timeout: Duration::from_millis(100),
+        },
+        &|| clock.now(),
+        &|duration| clock.wait(duration),
+    );
+    assert!(matches!(
+        result,
+        Err(ClientError::Runtime(RuntimeError::Unresponsive))
+    ));
+    assert_eq!(
+        clock.now().duration_since(clock.origin),
+        Duration::from_secs(30),
+        "candidate retries must not extend the original startup deadline"
+    );
+    let attempts = server.attempts.lock().unwrap();
+    let expected: Vec<_> = (0..30)
+        .map(|second| clock.origin + Duration::from_secs(second))
+        .collect();
+    assert_eq!(
+        *attempts, expected,
+        "unchanged failed address must be rechecked at one-second intervals"
+    );
+    assert!(log
+        .launched
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|at| *at < clock.origin + Duration::from_secs(30)));
+}
+
+#[cfg(windows)]
+#[link(name = "ws2_32")]
+unsafe extern "system" {
+    #[link_name = "socket"]
+    fn bound_fixture_socket(family: i32, kind: i32, protocol: i32) -> usize;
+    #[link_name = "setsockopt"]
+    fn bound_fixture_setsockopt(
+        socket: usize,
+        level: i32,
+        option: i32,
+        value: *const u8,
+        length: i32,
+    ) -> i32;
+    #[link_name = "bind"]
+    fn bound_fixture_bind(socket: usize, address: *const u8, length: i32) -> i32;
+    #[link_name = "getsockname"]
+    fn bound_fixture_getsockname(socket: usize, address: *mut u8, length: *mut i32) -> i32;
+    #[link_name = "closesocket"]
+    fn bound_fixture_close(socket: usize) -> i32;
+}
+#[cfg(windows)]
+struct BoundOnlyPort {
+    socket: usize,
+    address: std::net::SocketAddr,
+}
+#[cfg(windows)]
+impl BoundOnlyPort {
+    fn bind(port: u16) -> Self {
+        #[repr(C)]
+        struct Address {
+            family: u16,
+            port: u16,
+            address: u32,
+            padding: [u8; 8],
+        }
+        // Initialize the standard library's process-wide Winsock lifetime.
+        drop(TcpListener::bind("127.0.0.1:0").unwrap());
+        let socket = unsafe { bound_fixture_socket(2, 1, 6) };
+        assert_ne!(socket, usize::MAX, "creating the owned TCP socket failed");
+        let mut owned = Self {
+            socket,
+            address: ([127, 0, 0, 1], port).into(),
+        };
+        let exclusive: i32 = 1;
+        assert_eq!(
+            unsafe {
+                bound_fixture_setsockopt(socket, 0xffff, -5, (&exclusive as *const i32).cast(), 4)
+            },
+            0,
+            "exclusive port ownership failed: {}",
+            io::Error::last_os_error()
+        );
+        let mut address = Address {
+            family: 2,
+            port: port.to_be(),
+            address: u32::from_ne_bytes([127, 0, 0, 1]),
+            padding: [0; 8],
+        };
+        let mut length = std::mem::size_of::<Address>() as i32;
+        assert_eq!(
+            unsafe { bound_fixture_bind(socket, (&address as *const Address).cast(), length) },
+            0,
+            "binding the owned non-listening port failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe {
+                bound_fixture_getsockname(
+                    socket,
+                    (&mut address as *mut Address).cast(),
+                    &mut length,
+                )
+            },
+            0,
+            "reading the owned port failed"
+        );
+        owned.address = ([127, 0, 0, 1], u16::from_be(address.port)).into();
+        owned
+    }
+}
+#[cfg(windows)]
+impl Drop for BoundOnlyPort {
+    fn drop(&mut self) {
+        unsafe {
+            bound_fixture_close(self.socket);
+        }
+    }
+}

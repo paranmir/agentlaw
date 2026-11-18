@@ -132,6 +132,118 @@ pub trait RuntimeCandidate: Send {
     fn try_exit(&mut self) -> io::Result<Option<CandidateExit>>;
 }
 
+const ATTACH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn attach_with_clock(
+    state: &Path,
+    installation_build: &str,
+    launcher: &dyn RuntimeLauncher,
+    limits: AttachLimits,
+    now: &impl Fn() -> Instant,
+    wait: &impl Fn(Duration),
+) -> Result<Client, ClientError> {
+    let deadline = now() + limits.start_wait;
+    let mut candidate: Option<Box<dyn RuntimeCandidate>> = None;
+    let mut failed_endpoint: Option<((u32, std::net::SocketAddr, String), Instant)> = None;
+    let mut launch_after = now();
+    let mut relaunch_delay = Duration::from_millis(100);
+    loop {
+        if now() >= deadline {
+            return Err(ClientError::Runtime(RuntimeError::Unresponsive));
+        }
+        if let Ok(endpoint) = transport::read_endpoint(state) {
+            let identity = (endpoint.pid, endpoint.control, endpoint.secret.clone());
+            if failed_endpoint.as_ref().is_none_or(|(failed, at)| {
+                failed != &identity
+                    || now().saturating_duration_since(*at) >= Duration::from_secs(1)
+            }) {
+                let remaining = deadline.saturating_duration_since(now());
+                match hello(
+                    &endpoint,
+                    installation_build,
+                    limits.hello_timeout.min(remaining),
+                    ATTACH_CONNECT_TIMEOUT.min(remaining),
+                ) {
+                    Ok((stream, HelloReply::Accepted)) => {
+                        drop(stream);
+                        let connected = Client::connect_with_control(
+                            state,
+                            installation_build,
+                            |endpoint, request| {
+                                let remaining = deadline.saturating_duration_since(now());
+                                if remaining.is_zero() {
+                                    return Err(io::ErrorKind::TimedOut.into());
+                                }
+                                let (stream, reply) = hello(
+                                    endpoint,
+                                    installation_build,
+                                    limits.hello_timeout.min(remaining),
+                                    ATTACH_CONNECT_TIMEOUT.min(remaining),
+                                )?;
+                                if reply != HelloReply::Accepted {
+                                    return Err(io::Error::new(
+                                        if reply == HelloReply::Stopping {
+                                            io::ErrorKind::ConnectionAborted
+                                        } else {
+                                            io::ErrorKind::PermissionDenied
+                                        },
+                                        format!("hello rejected: {reply:?}"),
+                                    ));
+                                }
+                                let remaining = deadline.saturating_duration_since(now());
+                                if remaining.is_zero() {
+                                    return Err(io::ErrorKind::TimedOut.into());
+                                }
+                                let timeout = Duration::from_secs(5).min(remaining);
+                                stream.set_read_timeout(Some(timeout))?;
+                                stream.set_write_timeout(Some(timeout))?;
+                                control_request_on(stream, request)
+                            },
+                        );
+                        if let Ok(client) = connected {
+                            if now() >= deadline {
+                                return Err(ClientError::Runtime(RuntimeError::Unresponsive));
+                            }
+                            return Ok(client);
+                        }
+                        failed_endpoint = Some((identity, now()));
+                    }
+                    Ok((_, reply @ (HelloReply::BuildMismatch | HelloReply::ProtocolMismatch))) => {
+                        return Err(ClientError::Runtime(RuntimeError::Protocol(format!(
+                            "hello: {reply:?}"
+                        ))));
+                    }
+                    _ => {
+                        failed_endpoint = Some((identity, now()));
+                    }
+                }
+            }
+        }
+        if now() >= deadline {
+            return Err(ClientError::Runtime(RuntimeError::Unresponsive));
+        }
+        if let Some(active) = candidate.as_mut() {
+            match active.try_exit().map_err(unavailable)? {
+                Some(CandidateExit::AlreadyOwned) => {
+                    candidate = None;
+                    launch_after = now() + relaunch_delay;
+                    relaunch_delay = (relaunch_delay * 2).min(Duration::from_secs(1));
+                }
+                Some(CandidateExit::StartBlocked(error)) => return Err(ClientError::Domain(error)),
+                Some(CandidateExit::Failed(reason)) => return Err(unavailable(reason)),
+                None => {}
+            }
+        } else if now() >= launch_after {
+            candidate = Some(launcher.launch().map_err(unavailable)?);
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(ClientError::Runtime(RuntimeError::Unresponsive));
+        }
+        wait(Duration::from_millis(5).min(remaining));
+    }
+}
+
 pub enum Probe {
     NotRunning { stale_endpoint: bool },
     Running(HealthSnapshot),
@@ -268,75 +380,30 @@ impl Client {
         launcher: &dyn RuntimeLauncher,
         limits: AttachLimits,
     ) -> Result<Client, ClientError> {
-        let deadline = Instant::now() + limits.start_wait;
-        let mut candidate: Option<Box<dyn RuntimeCandidate>> = None;
-        let mut failed_endpoint: Option<((u32, std::net::SocketAddr, String), Instant)> = None;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(ClientError::Runtime(RuntimeError::Unresponsive));
-            }
-            if let Ok(endpoint) = transport::read_endpoint(state) {
-                let identity = (endpoint.pid, endpoint.control, endpoint.secret.clone());
-                if failed_endpoint.as_ref().is_none_or(|(failed, at)| {
-                    failed != &identity || at.elapsed() >= Duration::from_secs(1)
-                }) {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match hello(
-                        &endpoint,
-                        installation_build,
-                        limits.hello_timeout.min(remaining),
-                        Duration::from_secs(3).min(remaining),
-                    ) {
-                        Ok((stream, HelloReply::Accepted)) => {
-                            drop(stream);
-                            if let Ok(client) = Self::connect(state, installation_build) {
-                                return Ok(client);
-                            }
-                        }
-                        Ok((
-                            _,
-                            reply @ (HelloReply::BuildMismatch | HelloReply::ProtocolMismatch),
-                        )) => {
-                            return Err(ClientError::Runtime(RuntimeError::Protocol(format!(
-                                "hello: {reply:?}"
-                            ))));
-                        }
-                        Err(ref error)
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::ConnectionRefused
-                                    | io::ErrorKind::TimedOut
-                                    | io::ErrorKind::WouldBlock
-                            ) =>
-                        {
-                            failed_endpoint = Some((identity, Instant::now()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(active) = candidate.as_mut() {
-                match active.try_exit().map_err(unavailable)? {
-                    Some(CandidateExit::AlreadyOwned) => candidate = None,
-                    Some(CandidateExit::StartBlocked(error)) => {
-                        return Err(ClientError::Domain(error))
-                    }
-                    Some(CandidateExit::Failed(reason)) => return Err(unavailable(reason)),
-                    None => {}
-                }
-            } else {
-                candidate = Some(launcher.launch().map_err(unavailable)?);
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        attach_with_clock(
+            state,
+            installation_build,
+            launcher,
+            limits,
+            &Instant::now,
+            &thread::sleep,
+        )
     }
     pub fn connect(state: &Path, installation_build: &str) -> Result<Self, ClientError> {
+        Self::connect_with_control(state, installation_build, |endpoint, request| {
+            control_request(endpoint, installation_build, request)
+        })
+    }
+    fn connect_with_control(
+        state: &Path,
+        installation_build: &str,
+        request: impl Fn(&Endpoint, &ControlRequest) -> io::Result<ControlReply>,
+    ) -> Result<Self, ClientError> {
         let mut endpoint = transport::read_endpoint(state).map_err(unavailable)?;
         let client = uuid::Uuid::new_v4().to_string();
         for attempt in 0..2 {
-            match control_request(
+            match request(
                 &endpoint,
-                installation_build,
                 &ControlRequest::Lease {
                     client: client.clone(),
                 },
@@ -591,7 +658,10 @@ fn control_request(
     build: &str,
     request: &ControlRequest,
 ) -> io::Result<ControlReply> {
-    let mut stream = transport::connect(endpoint, endpoint.control, build)?;
+    let stream = transport::connect(endpoint, endpoint.control, build)?;
+    control_request_on(stream, request)
+}
+fn control_request_on(mut stream: TcpStream, request: &ControlRequest) -> io::Result<ControlReply> {
     transport::send(&mut stream, request, MAX_CONTROL_FRAME_BYTES)?;
     transport::receive(&mut stream, MAX_CONTROL_REPLY_BYTES)
 }

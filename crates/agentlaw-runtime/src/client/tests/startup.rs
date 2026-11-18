@@ -725,3 +725,81 @@ fn switched_store_closes_and_pinned_request_reopens_it() {
         "A retained marker for reopening the selected store"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn cold_attach_launches_a_candidate_before_a_bound_port_refusal_finishes() {
+    use crate::test_support::TestInstallation;
+    struct ObservedLauncher {
+        inner: TestLauncher,
+        started: Mutex<Vec<Instant>>,
+    }
+    impl RuntimeLauncher for ObservedLauncher {
+        fn launch(&self) -> io::Result<Box<dyn RuntimeCandidate>> {
+            self.started.lock().unwrap().push(Instant::now());
+            self.inner.launch()
+        }
+    }
+    let installation = TestInstallation::new();
+    installation.select_store("cold-owned-port").unwrap();
+    let launcher = ObservedLauncher {
+        inner: TestLauncher::new(installation.state()),
+        started: Mutex::new(Vec::new()),
+    };
+    let old_host = start_host(&launcher.inner);
+    let stale = transport::read_endpoint(installation.state()).unwrap();
+    kill(&old_host);
+    assert!(!owner_alive(installation.state()).unwrap());
+    // Keep the old address exclusively bound for the whole experiment, without listen().
+    let reserved = BoundOnlyPort::bind(stale.control.port());
+    assert_eq!(reserved.address, stale.control);
+    let refusal_started = Instant::now();
+    let refused = TcpStream::connect_timeout(&reserved.address, Duration::from_secs(5));
+    let refusal_elapsed = refusal_started.elapsed();
+    assert!(
+        matches!(refused, Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused),
+        "owned bound-only socket must reproduce an OS refusal: {refused:?}"
+    );
+
+    let started = Instant::now();
+    let client = Client::attach(
+        installation.state(),
+        BUILD,
+        &launcher,
+        AttachLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("cold attach did not recover its stale address: {error:?}"));
+    let attach_elapsed = started.elapsed();
+    let binding = client.resolve_binding().unwrap();
+    let recall = ValidatedRequest::parse_public(
+        &json!({
+            "action":"recall","recall":{"recall_for":"owned bound-only endpoint recovery"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let response = client
+        .call(
+            CallTarget::Store(binding),
+            recall,
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert!(response.is_object());
+    assert_ne!(client.inner.endpoint.pid, stale.pid);
+    assert!(owner_alive(installation.state()).unwrap());
+    let candidate_delay = launcher.started.lock().unwrap()[0].duration_since(started);
+    println!("owned-port refusal={refusal_elapsed:?}; candidate launch={candidate_delay:?}; attach={attach_elapsed:?}; first response={:?}", started.elapsed());
+    // The startup/call latency is only a measurement. This watchdog leaves
+    // generous scheduling headroom above the stale connection's 250ms budget.
+    if refusal_elapsed < Duration::from_millis(1800) {
+        println!(
+            "skipping candidate-delay assertion: this owned port did not reproduce the approximately two-second OS refusal ({refusal_elapsed:?})"
+        );
+    } else {
+        assert!(
+            candidate_delay < Duration::from_millis(1500),
+            "candidate launch exceeded the stale-dial allowance: launch={candidate_delay:?}, OS refusal={refusal_elapsed:?}; expected less than 1.5s with scheduling headroom for the 250ms connection budget"
+        );
+    }
+}
