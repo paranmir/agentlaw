@@ -626,6 +626,10 @@ fn start_ram_child(
     now: Instant,
     cached: Option<(String, crate::execution::Selection)>,
 ) -> std::result::Result<RamChild, RamStartError> {
+    std::fs::create_dir_all(&config.state_dir).map_err(|error| RamStartError {
+        cause: error.to_string(),
+        owned: None,
+    })?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

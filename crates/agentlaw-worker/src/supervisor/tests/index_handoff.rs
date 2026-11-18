@@ -255,3 +255,121 @@ fn index_work_port_crosses_threads_and_records_outcome() {
     assert_eq!(finished.0, ModelRequestId(42));
     assert_eq!(finished.1.unwrap(), vec![1.0, 2.0]);
 }
+
+#[cfg(windows)]
+#[test]
+fn first_model_demand_creates_missing_state_directory_and_reaches_ready() {
+    struct Idle {
+        checked: mpsc::Sender<()>,
+        ready: mpsc::Sender<String>,
+    }
+    impl IndexWorkPort for Idle {
+        fn model_ready(&self, model: &str) {
+            self.ready.send(model.into()).unwrap();
+        }
+        fn next_work(&self, _: &str) -> Option<IndexWork> {
+            None
+        }
+        fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+            unreachable!("this fixture has no indexing work")
+        }
+        fn status(&self) -> IndexWorkStatus {
+            self.checked.send(()).unwrap();
+            IndexWorkStatus {
+                runnable: false,
+                next_retry_at: None,
+                awaiting_model: false,
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("worker");
+    let asset = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"test asset").unwrap();
+        path
+    };
+    let config = RuntimeConfig {
+        state_dir: state_dir.clone(),
+        executable: std::env::current_exe().unwrap(),
+        model: Some(crate::ModelAssets {
+            onnx_model: asset("model.onnx"),
+            tokenizer_json: asset("tokenizer.json"),
+            runtime_library: asset("runtime"),
+        }),
+    };
+    assert!(!state_dir.exists());
+    let (events, incoming) = mpsc::channel();
+    let shared = fixture_shared(false, &events);
+    let worker_shared = shared.clone();
+    let (checked_tx, checked_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        model_supervision_loop(
+            config,
+            Arc::new(Idle {
+                checked: checked_tx,
+                ready: ready_tx,
+            }),
+            worker_shared,
+            HelperProcess,
+            Instant::now,
+            incoming,
+        )
+    });
+    let mut supervisor = ModelSupervisor {
+        shared,
+        thread: Some(thread),
+        ids: ModelRequestIds::new(),
+        stop_result: None,
+    };
+    checked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    supervisor.wake();
+    // A second loop boundary acknowledges the preceding idle lifecycle decision.
+    checked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(
+        !state_dir.exists(),
+        "configured supervisor created worker state before model demand"
+    );
+
+    supervisor.request_load();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = loop {
+        let snapshot = supervisor.snapshot();
+        if matches!(
+            snapshot.state,
+            WorkerState::Loading | WorkerState::Ready | WorkerState::Failed
+        ) {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first model demand did not produce a child-start outcome: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if started.state == WorkerState::Failed {
+        supervisor.stop().unwrap();
+        panic!("first model demand must create the missing worker directory and start its child; observed {started:?}");
+    }
+    assert!(started.incarnation.is_some(), "model child did not start");
+    assert!(
+        state_dir.is_dir(),
+        "first demand did not create the worker directory"
+    );
+    assert!(
+        state_dir.join("model.lock").is_file(),
+        "first demand did not create model.lock"
+    );
+    std::fs::write(state_dir.join("release-ready"), b"ready").unwrap();
+    assert_eq!(
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "helper-model"
+    );
+    assert_eq!(supervisor.snapshot().state, WorkerState::Ready);
+    assert_eq!(
+        supervisor.snapshot().model_digest.as_deref(),
+        Some("helper-model")
+    );
+    supervisor.stop().unwrap();
+}

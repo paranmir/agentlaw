@@ -98,8 +98,10 @@ fn idle_supervisor_does_not_create_files_or_start_unconfigured_model() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("worker");
+    assert!(!state_dir.exists());
     let config = RuntimeConfig {
-        state_dir: dir.path().into(),
+        state_dir: state_dir.clone(),
         executable: "missing".into(),
         model: None,
     };
@@ -146,7 +148,14 @@ fn idle_supervisor_does_not_create_files_or_start_unconfigured_model() {
         stop_result: None,
     };
     status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    supervisor.wake();
+    status_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        !state_dir.exists(),
+        "model demand must not create worker state when no model is configured"
+    );
     supervisor.stop().unwrap();
+    assert!(!state_dir.exists());
     assert_eq!(count.load(Ordering::SeqCst), 0);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
