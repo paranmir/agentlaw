@@ -4,9 +4,11 @@ version.workspace = true
 edition = "2021"
 
 [features]
+write-audit = ["agentlaw-sqlite/write-audit", "agentlaw-storage/write-audit"]
 test-support = []
 
 [dependencies]
+agentlaw-sqlite = { path = "../agentlaw-sqlite" }
 agentlaw-contracts = { path = "../agentlaw-contracts" }
 agentlaw-flows = { path = "../agentlaw-flows" }
 agentlaw-search = { path = "../agentlaw-search" }

@@ -197,12 +197,12 @@ impl VectorFileWriter {
         let path = path.as_ref();
         let existing = path.exists();
         if existing {
-            let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let c = agentlaw_sqlite::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
             check(&c, id)?;
             progress(&c, &id.epoch)?;
         }
-        let c = Connection::open(path)?;
+        let c = agentlaw_sqlite::open(path)?;
         // Closing a quarantined writer must not checkpoint or delete its WAL.
         c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         c.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -327,7 +327,7 @@ fn open_read_connection(path: &Path) -> VectorFileResult<Connection> {
     if !path.exists() {
         return Err(VectorFileError::Missing);
     }
-    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let c = agentlaw_sqlite::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
     c.execute_batch("PRAGMA temp_store=MEMORY; BEGIN DEFERRED;")?;

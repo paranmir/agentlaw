@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/agentlaw-sqlite",
   "crates/agentlaw-contracts",
   "crates/agentlaw-storage",
   "crates/agentlaw-search",

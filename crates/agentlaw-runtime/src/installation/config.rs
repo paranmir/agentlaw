@@ -377,16 +377,14 @@ pub fn binding_root(root: &Path, source: &Path) -> Result<PathBuf> {
     // reuse its proposal database and recovery files under runtime/.
     let original = root.join("runtime/control.sqlite");
     if original.is_file() {
-        let db = rusqlite::Connection::open_with_flags(
-            &original,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|_| {
-            DomainError::new(
-                "binding_unavailable",
-                "The original local binding cannot be inspected.",
-            )
-        })?;
+        let db =
+            agentlaw_sqlite::open_with_flags(&original, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| {
+                    DomainError::new(
+                        "binding_unavailable",
+                        "The original local binding cannot be inspected.",
+                    )
+                })?;
         let bound: String = db
             .query_row(
                 "SELECT value FROM settings WHERE key='store_root'",

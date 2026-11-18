@@ -137,7 +137,7 @@ impl ProjectionWorkspace {
             result.map_err(|e| agentlaw_storage::Error::Io(std::io::Error::other(e.to_string())))
         })?;
         if estimate <= HISTORY_WORKSPACE_MEMORY_LIMIT {
-            let db = Connection::open_in_memory()?;
+            let db = agentlaw_sqlite::open_in_memory()?;
             db.execute_batch(
                 "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;",
             )?;
@@ -150,7 +150,7 @@ impl ProjectionWorkspace {
             let root = local.join("canonical").join("history-spools");
             std::fs::create_dir_all(&root)?;
             let directory = tempfile::tempdir_in(root)?;
-            let db = Connection::open(directory.path().join("projection.sqlite"))?;
+            let db = agentlaw_sqlite::open(directory.path().join("projection.sqlite"))?;
             db.execute_batch(
                 "PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;",
             )?;
@@ -679,8 +679,8 @@ fn project_spool(
         None
     };
     let legacy_workspace = if let Some(directory) = legacy_directory {
-        let db =
-            Connection::open(directory.path().join("projection.sqlite")).map_err(|_| failure())?;
+        let db = agentlaw_sqlite::open(directory.path().join("projection.sqlite"))
+            .map_err(|_| failure())?;
         db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;").map_err(|_| failure())?;
         Some(ProjectionWorkspace {
             db,

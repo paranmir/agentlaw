@@ -150,8 +150,7 @@ fn db(local: &Path) -> Result<rusqlite::Connection> {
     if !path.is_file() {
         return Err(DomainError::new("control_backup_required","Restore the existing bound local control database; sync cannot replace it with an empty database."));
     }
-    let conn =
-        rusqlite::Connection::open(path).map_err(|_| git::io_error("sync control database"))?;
+    let conn = agentlaw_sqlite::open(path).map_err(|_| git::io_error("sync control database"))?;
     conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS sync_operations(operation_id TEXT PRIMARY KEY,source TEXT NOT NULL,state TEXT NOT NULL,active INTEGER NOT NULL); CREATE UNIQUE INDEX IF NOT EXISTS sync_source_slot ON sync_operations(source) WHERE active=1; CREATE TABLE IF NOT EXISTS sync_requests(request_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,digest TEXT NOT NULL,response TEXT);").map_err(|_|git::io_error("sync control schema"))?;
     Ok(conn)
 }

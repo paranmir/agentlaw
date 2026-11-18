@@ -163,7 +163,7 @@ fn validate_existing(connection: &Connection) -> Result<()> {
 impl SearchIndex {
     /// Open an existing lexical projection without creating or repairing schema.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open_with_flags(
+        let connection = agentlaw_sqlite::open_with_flags(
             path.as_ref(),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
@@ -195,7 +195,7 @@ impl SearchIndex {
         Self::open_mode(path.as_ref(), true)
     }
     fn open_mode(path: &Path, temporary: bool) -> Result<Self> {
-        let connection = Connection::open(path)?;
+        let connection = agentlaw_sqlite::open(path)?;
         configure(&connection)?;
         if temporary {
             let store = if path.to_string_lossy().contains("mode=memory") {
@@ -303,7 +303,7 @@ impl SearchIndex {
         Ok(())
     }
     pub fn read_view(&self) -> Result<ReadView> {
-        let c = Connection::open(&self.path)?;
+        let c = agentlaw_sqlite::open(&self.path)?;
         configure(&c)?;
         if self.temporary {
             let store = if self.path.to_string_lossy().contains("mode=memory") {
@@ -493,7 +493,7 @@ impl ReadView {
     /// Opens an existing generation without modifying the main database.
     pub fn open(path: &Path) -> SearchResult<Self> {
         let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            agentlaw_sqlite::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection
             .execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY; BEGIN DEFERRED;")?;
@@ -809,7 +809,7 @@ fn legacy_vector_identity(c: &Connection) -> Result<(String, String, i64)> {
 impl ExactVectorIndex {
     /// Inspect the released vector layout without creating tables or checkpointing it.
     pub fn stored_identity(path: impl AsRef<Path>) -> Result<(String, String, usize)> {
-        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let c = agentlaw_sqlite::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         c.set_db_config(
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
@@ -935,7 +935,7 @@ impl ExactVectorIndex {
         if dimension == 0 || dimension > 65536 {
             return Err(Error::Invalid("dimension out of range".into()));
         }
-        let c = Connection::open(path.as_ref())?;
+        let c = agentlaw_sqlite::open(path.as_ref())?;
         configure(&c)?;
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
   CREATE TABLE IF NOT EXISTS vector_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,commit_id INTEGER NOT NULL,ack INTEGER NOT NULL,model TEXT NOT NULL,config TEXT NOT NULL,dimension INTEGER NOT NULL);
@@ -998,7 +998,7 @@ impl ExactVectorIndex {
         Ok(())
     }
     pub fn read_view(&self) -> Result<VectorReadView> {
-        let c = Connection::open(&self.path)?;
+        let c = agentlaw_sqlite::open(&self.path)?;
         configure(&c)?;
         c.execute_batch("BEGIN DEFERRED")?;
         let (stamp, model_digest, config_digest) = c.query_row(

@@ -8,6 +8,9 @@ publish.workspace = true
 name = "agentlaw"
 path = "src/main.rs"
 
+[features]
+write-audit = ["agentlaw-runtime/write-audit"]
+
 [dependencies]
 agentlaw-contracts = { path = "../agentlaw-contracts" }
 agentlaw-runtime = { path = "../agentlaw-runtime" }

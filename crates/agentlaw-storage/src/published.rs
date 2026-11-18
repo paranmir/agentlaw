@@ -155,7 +155,7 @@ impl SourceReadGuard<'_> {
             .min(generation);
         let mut paths = std::collections::BTreeSet::new();
         if through > after.sequence {
-            let conn = rusqlite::Connection::open_with_flags(
+            let conn = agentlaw_sqlite::open_with_flags(
                 s.local.join("journal.sqlite"),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
@@ -413,7 +413,7 @@ impl PublishedChangeSource for PublishedReader<'_> {
                 changes: vec![],
             });
         }
-        let conn = rusqlite::Connection::open_with_flags(
+        let conn = agentlaw_sqlite::open_with_flags(
             s.local.join("journal.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )

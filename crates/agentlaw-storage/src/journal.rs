@@ -238,12 +238,11 @@ pub(super) fn ensure_ready(local: &Path) -> Result<()> {
     Ok(())
 }
 fn open_raw(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path)?;
+    let conn = agentlaw_sqlite::open(path)?;
     configure(conn)
 }
 fn open_existing(path: &Path) -> Result<rusqlite::Connection> {
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let conn = agentlaw_sqlite::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     configure(conn)
 }
 fn configure(conn: rusqlite::Connection) -> Result<rusqlite::Connection> {

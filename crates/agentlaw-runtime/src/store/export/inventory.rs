@@ -1,7 +1,7 @@
 //! Complete procedure inventory; disk-backed sorting keeps bodies out of the output.
 use agentlaw_contracts::{DomainError, RequestControl, Result};
 use agentlaw_storage::{published::OwnedPublishedReader, UnitState};
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -40,7 +40,8 @@ pub(super) fn list(
     let target = super::validate_output(store, output)?;
     fs::create_dir_all(local).map_err(|_| failure())?;
     let scratch = tempfile::tempdir_in(local).map_err(|_| failure())?;
-    let db = Connection::open(scratch.path().join("inventory.sqlite")).map_err(|_| failure())?;
+    let db =
+        agentlaw_sqlite::open(scratch.path().join("inventory.sqlite")).map_err(|_| failure())?;
     db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; CREATE TABLE rows(id TEXT NOT NULL,descriptor TEXT NOT NULL,PRIMARY KEY(id,descriptor)); CREATE TABLE competing(id TEXT PRIMARY KEY);").map_err(|_| failure())?;
     // Disposable derived output, never a source of memory. A crash simply discards this scratch.
     let project = if let Some(selector) = &options.project {

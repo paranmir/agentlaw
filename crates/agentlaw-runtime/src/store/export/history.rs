@@ -2,7 +2,7 @@
 use agentlaw_contracts::{DomainError, RequestControl, Result};
 use agentlaw_storage::history_spool::Component;
 use agentlaw_storage::published::OwnedPublishedReader;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
@@ -29,7 +29,7 @@ pub(super) fn export(
     // frames are streamed; one long line does not force a correspondingly large allocation.
     let scratch = tempfile::tempdir_in(&directory)
         .map_err(|_| error("Cannot prepare audit scratch space."))?;
-    let db = Connection::open(scratch.path().join("descriptors.sqlite"))
+    let db = agentlaw_sqlite::open(scratch.path().join("descriptors.sqlite"))
         .map_err(|_| error("Cannot open audit scratch space."))?;
     db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; CREATE TABLE bodies(id TEXT PRIMARY KEY,component TEXT); CREATE TABLE roots(id TEXT PRIMARY KEY); CREATE TABLE heads(id TEXT PRIMARY KEY);").map_err(|_|error("Cannot initialize audit scratch space."))?;
     let mut records = tempfile::NamedTempFile::new_in(&directory)

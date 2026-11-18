@@ -24,7 +24,7 @@ impl GenerationCatalog {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
-        let db = Connection::open(root.join("catalog.sqlite"))?;
+        let db = agentlaw_sqlite::open(root.join("catalog.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE IF NOT EXISTS generations(id TEXT PRIMARY KEY,state TEXT NOT NULL,model TEXT NOT NULL,config TEXT NOT NULL);CREATE TABLE IF NOT EXISTS active(singleton INTEGER PRIMARY KEY,id TEXT NOT NULL);")?;
         Ok(Self { root, db })

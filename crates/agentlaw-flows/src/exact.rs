@@ -312,7 +312,7 @@ impl ProjectionGenerations {
             };
             #[cfg(test)]
             tests::oracle::on_acquisition(self);
-            let exact = db(Connection::open_with_flags(
+            let exact = db(agentlaw_sqlite::open_with_flags(
                 &generation.exact_file,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             ))?;
@@ -950,7 +950,7 @@ impl ExactIndexWriter {
             }
             _ => return Err(exact_unavailable()),
         }
-        let check = db(Connection::open_with_flags(
+        let check = db(agentlaw_sqlite::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ))?;
@@ -990,7 +990,7 @@ impl ExactIndexWriter {
         let lexical =
             agentlaw_search::SearchIndex::open_existing(&lexical_path).map_err(lexical_error)?;
         drop(check);
-        let connection = db(Connection::open_with_flags(
+        let connection = db(agentlaw_sqlite::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         ))?;
@@ -1300,9 +1300,11 @@ impl ExactIndexWriter {
             }
             drop(view);
             for path in [&exact_file, &lexical_file] {
-                let connection =
-                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                        .map_err(exact_schema_error)?;
+                let connection = agentlaw_sqlite::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(exact_schema_error)?;
                 let status: String = connection
                     .query_row("PRAGMA quick_check", [], |row| row.get(0))
                     .map_err(exact_schema_error)?;
@@ -1420,7 +1422,7 @@ impl ExactIndex {
             .parent()
             .ok_or_else(|| DomainError::new("exact_index_failed", "Index directory is missing."))?
             .to_path_buf();
-        let connection = db(Connection::open(path))?;
+        let connection = db(agentlaw_sqlite::open(path))?;
         db(connection.busy_timeout(std::time::Duration::from_secs(5)))?;
         db(connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE;
         CREATE TABLE IF NOT EXISTS exact_position(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch TEXT NOT NULL,sequence TEXT NOT NULL);

@@ -49,6 +49,7 @@ dependencies = [
 name = "agentlaw-flows"
 version = "0.4.2"
 dependencies = [
+ "agentlaw-sqlite",
  "agentlaw-contracts",
  "agentlaw-search",
  "agentlaw-storage",
@@ -73,6 +74,7 @@ dependencies = [
 name = "agentlaw-runtime"
 version = "0.4.2"
 dependencies = [
+ "agentlaw-sqlite",
  "agentlaw-contracts",
  "agentlaw-flows",
  "agentlaw-search",
@@ -96,6 +98,7 @@ dependencies = [
 name = "agentlaw-search"
 version = "0.4.2"
 dependencies = [
+ "agentlaw-sqlite",
  "fs2",
  "rusqlite",
  "serde",
@@ -106,9 +109,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentlaw-sqlite"
+version = "0.4.2"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "agentlaw-storage"
 version = "0.4.2"
 dependencies = [
+ "agentlaw-sqlite",
  "base64 0.22.1",
  "fs2",
  "libc",

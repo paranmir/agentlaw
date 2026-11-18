@@ -8,8 +8,7 @@ fn no_pending(stage: &crate::git::git_ops::ImportStageContext) -> bool {
     if !db.exists() {
         return !stage.runtime_path.join("control-initialized.json").exists();
     }
-    let Ok(conn) =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let Ok(conn) = agentlaw_sqlite::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return false;
     };
@@ -93,11 +92,9 @@ fn find_semantic_indices(root: &Path, binding: &str) -> std::io::Result<Vec<Stri
             if !name.starts_with("vector") || path.extension().is_none_or(|ext| ext != "sqlite") {
                 continue;
             }
-            let db = rusqlite::Connection::open_with_flags(
-                &path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .map_err(std::io::Error::other)?;
+            let db =
+                agentlaw_sqlite::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(std::io::Error::other)?;
             let owner: String = db
                 .query_row(
                     "SELECT binding FROM binding_vector_meta WHERE singleton=1",

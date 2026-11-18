@@ -62,16 +62,14 @@ pub fn resolve_import_stage(
     };
     let recorded = if db_path.exists() {
         use rusqlite::OptionalExtension;
-        let db = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|_| {
-            RuntimeError::Domain(agentlaw_contracts::DomainError::new(
-                "control_backup_required",
-                "Staged control database cannot be inspected.",
-            ))
-        })?;
+        let db =
+            agentlaw_sqlite::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| {
+                    RuntimeError::Domain(agentlaw_contracts::DomainError::new(
+                        "control_backup_required",
+                        "Staged control database cannot be inspected.",
+                    ))
+                })?;
         let exists: bool = db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
@@ -140,7 +138,7 @@ pub fn resolve(installation: &Path, snapshot: &ConfigSnapshot) -> RuntimeResult<
             use rusqlite::OptionalExtension;
             let db = local.join("control.sqlite");
             if db.exists() {
-                let connection = rusqlite::Connection::open_with_flags(
+                let connection = agentlaw_sqlite::open_with_flags(
                     db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )

@@ -86,7 +86,7 @@ impl Store {
         if read_set.source_position.sequence == generation {
             return Ok(());
         }
-        let conn = rusqlite::Connection::open_with_flags(
+        let conn = agentlaw_sqlite::open_with_flags(
             self.local.join("journal.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )

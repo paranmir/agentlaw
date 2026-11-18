@@ -23,7 +23,7 @@ impl ControlWriter {
                 &std::fs::read(marker_path).map_err(|_| control_backup_required())?,
             )
             .map_err(|_| control_backup_required())?;
-            let existing = Connection::open_with_flags(
+            let existing = agentlaw_sqlite::open_with_flags(
                 local.join("control.sqlite"),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
@@ -39,7 +39,7 @@ impl ControlWriter {
                 return Err(control_backup_required());
             }
         }
-        let connection = sql(Connection::open(local.join("control.sqlite")))?;
+        let connection = sql(agentlaw_sqlite::open(local.join("control.sqlite")))?;
         sql(connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS associations(binding TEXT NOT NULL,path TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(binding,path));
@@ -128,7 +128,7 @@ impl ControlWriter {
             ));
         }
         drop(crate::exact::ExactIndexWriter::open(exact_file)?);
-        let index = sql(Connection::open_with_flags(
+        let index = sql(agentlaw_sqlite::open_with_flags(
             exact_file,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ))?;
@@ -196,7 +196,7 @@ pub struct ControlReader {
 }
 impl ControlReader {
     pub fn open(local: impl AsRef<Path>) -> Result<Self> {
-        let connection = sql(Connection::open_with_flags(
+        let connection = sql(agentlaw_sqlite::open_with_flags(
             local.as_ref().join("control.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ))?;

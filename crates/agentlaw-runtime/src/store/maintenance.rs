@@ -31,14 +31,13 @@ fn database_health(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(json!({"present":false}));
     }
-    let db =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| {
-                DomainError::new(
-                    "local_state_unreadable",
-                    "A local database cannot be inspected. No database was reset.",
-                )
-            })?;
+    let db = agentlaw_sqlite::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| {
+            DomainError::new(
+                "local_state_unreadable",
+                "A local database cannot be inspected. No database was reset.",
+            )
+        })?;
     let result: String = db
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .map_err(|_| {
@@ -54,10 +53,8 @@ fn journal_corrupt(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     let inspect = || -> std::result::Result<String, rusqlite::Error> {
-        let db = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let db =
+            agentlaw_sqlite::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
     };
     match inspect() {

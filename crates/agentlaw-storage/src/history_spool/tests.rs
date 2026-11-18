@@ -77,6 +77,12 @@ fn spilling_acquired_history_keeps_prior_component_handles_and_cleans_up() {
     spool.spill_to_file().unwrap();
     let path = spool.path().to_path_buf();
     assert!(path.is_file());
+    #[cfg(feature = "write-audit")]
+    {
+        let counts = agentlaw_sqlite::audit::snapshot(path.to_str().unwrap());
+        assert_eq!(counts.writes, 1);
+        assert_eq!(counts.commits, 1);
+    }
     assert_eq!(prior.read_owned().unwrap(), b"small body");
     let mut after = None;
     spool

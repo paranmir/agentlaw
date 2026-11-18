@@ -78,7 +78,7 @@ pub struct Component {
 impl Component {
     pub fn open(&self) -> Result<ComponentReader> {
         Ok(ComponentReader {
-            conn: Connection::open_with_flags(
+            conn: agentlaw_sqlite::open_with_flags(
                 &self.spool,
                 if self.spool.to_string_lossy().starts_with("file:") {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -205,7 +205,7 @@ impl Store {
                 .write(true)
                 .open(cache_path.with_extension("lease"))?;
             lease_file.lock_shared()?;
-            let conn = Connection::open_with_flags(
+            let conn = agentlaw_sqlite::open_with_flags(
                 &cache_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
@@ -223,7 +223,7 @@ impl Store {
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
         let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
-        let conn = Connection::open(&path)?;
+        let conn = agentlaw_sqlite::open(&path)?;
         initialize_spool(&conn, false)?;
         let history = self.safe_path("history")?;
         if history.exists() {
@@ -378,9 +378,12 @@ impl HistorySpool {
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
         let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
+        #[cfg(feature = "write-audit")]
+        agentlaw_sqlite::audit::vacuum_into(&self.conn, &path)?;
+        #[cfg(not(feature = "write-audit"))]
         self.conn
             .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
-        let connection = Connection::open(&path)?;
+        let connection = agentlaw_sqlite::open(&path)?;
         connection.execute_batch(
             "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE;",
         )?;
@@ -1017,7 +1020,7 @@ impl AcquiredHistory {
             // The database lease outlives acquisition files and all component readers.
             self.files.pop();
             let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
-            let conn = Connection::open(&path)?;
+            let conn = agentlaw_sqlite::open(&path)?;
             (path, conn, lease)
         } else {
             let path = PathBuf::from(format!(
@@ -1027,8 +1030,8 @@ impl AcquiredHistory {
             let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI;
-            let conn = Connection::open_with_flags(&path, flags)?;
-            let keeper = Connection::open_with_flags(&path, flags)?;
+            let conn = agentlaw_sqlite::open_with_flags(&path, flags)?;
+            let keeper = agentlaw_sqlite::open_with_flags(&path, flags)?;
             let lease = std::sync::Arc::new(SpoolLease(
                 path.clone(),
                 false,

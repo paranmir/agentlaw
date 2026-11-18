@@ -227,7 +227,7 @@ pub(super) fn packet(
     }
     // Causal maximal shared ancestors are the exact base, not timestamp guesses.
     let connection =
-        rusqlite::Connection::open(lh.path()).map_err(|_| git::io_error("packet base history"))?;
+        agentlaw_sqlite::open(lh.path()).map_err(|_| git::io_error("packet base history"))?;
     let mut base_inputs = Vec::new();
     connection
         .execute(

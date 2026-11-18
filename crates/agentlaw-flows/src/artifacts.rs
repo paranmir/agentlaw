@@ -31,7 +31,7 @@ fn now() -> Result<u64> {
 }
 fn registry(directory: &Path) -> Result<Connection> {
     let connection =
-        Connection::open(directory.join("response-registry.sqlite")).map_err(|_| failure())?;
+        agentlaw_sqlite::open(directory.join("response-registry.sqlite")).map_err(|_| failure())?;
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| failure())?;

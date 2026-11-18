@@ -433,7 +433,7 @@ impl Store {
         baseline.validate_reconciled_source(resolved)?;
         let old = baseline.spool_history()?;
         let new = resolved.spool_history()?;
-        let conn = rusqlite::Connection::open(new.path())?;
+        let conn = agentlaw_sqlite::open(new.path())?;
         conn.execute(
             "ATTACH DATABASE ?1 AS previous",
             [old.path().to_string_lossy().as_ref()],

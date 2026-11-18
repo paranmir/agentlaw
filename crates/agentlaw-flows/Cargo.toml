@@ -3,7 +3,11 @@ name = "agentlaw-flows"
 version.workspace = true
 edition = "2021"
 
+[features]
+write-audit = ["agentlaw-sqlite/write-audit", "agentlaw-storage/write-audit"]
+
 [dependencies]
+agentlaw-sqlite = { path = "../agentlaw-sqlite" }
 agentlaw-contracts = { path = "../agentlaw-contracts" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

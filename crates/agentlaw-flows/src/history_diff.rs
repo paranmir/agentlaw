@@ -136,7 +136,7 @@ fn emit(
     Ok(())
 }
 pub fn write_diff(before: &Path, after: &Path, scratch: &Path, out: &mut impl Write) -> Result<()> {
-    let db = Connection::open(scratch)?;
+    let db = agentlaw_sqlite::open(scratch)?;
     db.execute_batch("PRAGMA temp_store=FILE; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE lines(side INTEGER,ordinal INTEGER,start INTEGER,end INTEGER,digest TEXT,PRIMARY KEY(side,ordinal)); BEGIN")?;
     let a = index(&db, 0, before)?;
     let b = index(&db, 1, after)?;
