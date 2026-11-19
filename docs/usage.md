@@ -232,6 +232,11 @@ A damaged journal can be rebuilt from retained authoritative decisions while
 preserving originals. A missing/corrupt proposal DB needs backup recovery, never
 a successful-looking empty replacement.
 
+A recall, `history_for` or learned-procedure search query is passed to the
+embedding model up to its first 4 MiB and embedded from at most its first 512
+model tokens. When either limit drops part of the query, the result carries a
+`semantic_query_truncated` diagnostic. Lexical search still uses the full query.
+
 Recall candidates group identical clues from the same source into one
 `retrieval_paths` entry. Its `via` array lists every actual discovery channel:
 
