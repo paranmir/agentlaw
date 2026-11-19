@@ -44,7 +44,52 @@ pub enum SemanticError {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefixEmbedding {
+    pub vector: QueryVector,
+    pub truncated: bool,
+}
+
+#[derive(Default)]
+pub struct PieceVectorReuse {
+    _private: (),
+}
+
+pub struct PiecePlan {
+    _private: (),
+}
+
 pub trait SemanticPort: Send + Sync {
+    fn embed_prefix(
+        &self,
+        _text: &str,
+        _control: &RequestControl,
+    ) -> Result<PrefixEmbedding, SemanticError> {
+        Err(SemanticError::Failed(
+            "prefix embedding is not implemented".into(),
+        ))
+    }
+    fn plan_pieces(
+        &self,
+        _records: &[&str],
+        _control: &RequestControl,
+    ) -> Result<PiecePlan, SemanticError> {
+        Err(SemanticError::Failed(
+            "piece planning is not implemented".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _plan: &PiecePlan,
+        _record: usize,
+        _reuse: &PieceVectorReuse,
+        _control: &RequestControl,
+    ) -> Result<Vec<QueryVector>, SemanticError> {
+        Err(SemanticError::Failed(
+            "piece embedding is not implemented".into(),
+        ))
+    }
+
     fn embed_query(
         &self,
         text: &str,

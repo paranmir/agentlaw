@@ -57,3 +57,66 @@ fn query_capacity_and_vector_validation_are_explicit() {
         "actual"
     );
 }
+
+#[test]
+fn running_prefix_shares_original_query_but_not_split_or_a_different_suffix() {
+    let ids = ModelRequestIds::new();
+    let mut queue = QueryQueue::default();
+    let transported = "a".repeat(4 * 1024 * 1024);
+    let original = format!("{transported} first");
+    let different = format!("{transported} second");
+    let prefix = queue
+        .submit_operation(
+            QueryOperation::Prefix,
+            "model",
+            &original,
+            &transported,
+            &ids,
+        )
+        .unwrap();
+    assert_eq!(queue.take(), Some(prefix));
+    // Leave the first work running until both arrivals have registered.
+    assert_eq!(
+        queue.submit_operation(
+            QueryOperation::Prefix,
+            "model",
+            &original,
+            &transported,
+            &ids
+        ),
+        Ok(prefix)
+    );
+    let second = queue
+        .submit_operation(
+            QueryOperation::Prefix,
+            "model",
+            &different,
+            &transported,
+            &ids,
+        )
+        .unwrap();
+    assert_ne!(prefix, second);
+    let split = queue
+        .submit_operation(
+            QueryOperation::Split,
+            "model",
+            "same window",
+            "same window",
+            &ids,
+        )
+        .unwrap();
+    let window_prefix = queue
+        .submit_operation(
+            QueryOperation::Prefix,
+            "model",
+            "same window",
+            "same window",
+            &ids,
+        )
+        .unwrap();
+    assert_ne!(split, window_prefix);
+    assert_eq!(queue.take(), Some(second));
+    assert_eq!(queue.take(), Some(split));
+    assert_eq!(queue.take(), Some(window_prefix));
+    assert_eq!(queue.take(), None);
+}

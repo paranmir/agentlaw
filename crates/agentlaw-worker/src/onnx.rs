@@ -323,19 +323,23 @@ impl OnnxProvider {
         Ok(result)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_assets_are_unavailable() {
-        let p = PathBuf::from("certainly-nonexistent-agentlaw-model.onnx");
-        assert!(matches!(
-            OnnxProvider::load(&ModelAssets {
-                onnx_model: p.clone(),
-                tokenizer_json: p.clone(),
-                runtime_library: p
-            }),
-            Err(EmbeddingError::Unavailable(_))
-        ));
-    }
+#[allow(dead_code)]
+fn embed(
+    _tokenizer: &tokenizers::Tokenizer,
+    _input: &str,
+    _overflow: crate::model_child::Overflow,
+    _infer: impl FnOnce(&tokenizers::Encoding) -> Result<Vec<f32>, EmbeddingError>,
+) -> Result<(Vec<f32>, bool), EmbeddingError> {
+    Err(fail("model input overflow handling is not implemented"))
 }
+
+#[allow(dead_code)]
+fn split(
+    _tokenizer: &tokenizers::Tokenizer,
+    _window: &str,
+) -> Result<Vec<(u32, u32)>, EmbeddingError> {
+    Err(fail("model input splitting is not implemented"))
+}
+
+#[cfg(test)]
+mod tests;

@@ -68,7 +68,12 @@ fn main() {
         let mut transcript = std::fs::OpenOptions::new().create(true).append(true).open(root.join("requests.jsonl")).unwrap();
         writeln!(transcript, "{}", embed["text"]).unwrap();
         let mut vector = vec![0.0_f32; 256]; vector[0] = 1.0;
-        send(&mut output, json!({"Result":{"id":embed["id"],"attempt":embed["attempt"],"result":{"Ok":vector}}}));
+        let result = if embed["overflow"] == "Prefix" {
+            json!({"vector":vector,"truncated":embed["text"] == "token-truncated query"})
+        } else {
+            json!(vector)
+        };
+        send(&mut output, json!({"Result":{"id":embed["id"],"attempt":embed["attempt"],"result":{"Ok":result}}}));
     }
 }
 "#).unwrap();

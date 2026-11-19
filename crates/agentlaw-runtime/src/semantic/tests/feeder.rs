@@ -482,3 +482,116 @@ fn acquired_stream_splits_utf8_deterministically() {
     let (_, again) = source::map_acquired(acquired, ID, false, 5).unwrap();
     assert_eq!(pieces, again.collect::<Result<Vec<_>, _>>().unwrap());
 }
+
+#[test]
+fn oversized_piece_blocks_only_its_revision_until_publication_or_restart() {
+    for publish_revision in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = Store::open(
+            temp.path().join("blocked"),
+            temp.path().join("blocked-local"),
+        )
+        .unwrap();
+        let other =
+            Store::open(temp.path().join("other"), temp.path().join("other-local")).unwrap();
+        let initial = blocked
+            .publish(
+                &uuid::Uuid::new_v4().to_string(),
+                vec![mutation("oversized piece", vec![])],
+            )
+            .unwrap();
+        let other_receipt = other
+            .publish(
+                &uuid::Uuid::new_v4().to_string(),
+                vec![mutation("other binding", vec![])],
+            )
+            .unwrap();
+        let mut config = SemanticConfig::new(temp.path().join("indices"), "config".into());
+        config.dimension = 2;
+        let health = HealthSink::default();
+        let base = Instant::now();
+        let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let time = elapsed.clone();
+        let clock = Arc::new(move || base + Duration::from_secs(time.load(Ordering::SeqCst)));
+        let indexer = SemanticIndexer::start_with_clock(
+            config.clone(),
+            ModelRequestIds::new(),
+            health.clone(),
+            clock.clone(),
+        )
+        .unwrap();
+        indexer
+            .open_binding("blocked", blocked.owned_published_reader())
+            .unwrap();
+        indexer.model_ready("model");
+        let work = wait_work(&indexer);
+        assert_eq!(&*work.text, "oversized piece");
+        indexer.finish(work.id, Err(EmbeddingError::InputTooLong));
+        assert_eq!(indexer.status().next_retry_at, None);
+        assert!(!indexer.status().runnable);
+        assert!(indexer.progress("blocked").unwrap().ack.is_none());
+        assert!(health.snapshot().iter().any(|(component, status)| {
+            component.binding.as_deref() == Some("blocked")
+                && status.reason.as_deref()
+                    == Some(EmbeddingError::InputTooLong.to_string().as_str())
+        }));
+
+        elapsed.store(120, Ordering::SeqCst);
+        assert!(indexer.next_work("model").is_none());
+        indexer
+            .open_binding("binding", other.owned_published_reader())
+            .unwrap();
+        assert_eq!(drive(&indexer, other_receipt.generation), 1);
+        assert!(indexer.progress("blocked").unwrap().ack.is_none());
+
+        if publish_revision {
+            let revision = blocked
+                .publish(
+                    &uuid::Uuid::new_v4().to_string(),
+                    vec![mutation(
+                        "corrected piece",
+                        vec![initial.references[0].observed_version.clone()],
+                    )],
+                )
+                .unwrap();
+            indexer.wake("blocked");
+            let work = wait_work(&indexer);
+            assert_eq!(&*work.text, "corrected piece");
+            indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !indexer
+                .progress("blocked")
+                .unwrap()
+                .ack
+                .is_some_and(|ack| ack.sequence == revision.generation as i64)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "corrected revision never committed"
+                );
+                std::thread::yield_now();
+            }
+            assert!(indexer.shutdown(Duration::from_secs(5)));
+        } else {
+            assert!(indexer.shutdown(Duration::from_secs(5)));
+            let restarted = SemanticIndexer::start_with_clock(
+                config,
+                ModelRequestIds::new(),
+                HealthSink::default(),
+                clock,
+            )
+            .unwrap();
+            restarted
+                .open_binding("blocked", blocked.owned_published_reader())
+                .unwrap();
+            restarted.model_ready("model");
+            let work = wait_work(&restarted);
+            assert_eq!(&*work.text, "oversized piece");
+            restarted.finish(work.id, Err(EmbeddingError::InputTooLong));
+            assert_eq!(restarted.status().next_retry_at, None);
+            assert!(!restarted.status().runnable);
+            assert!(restarted.progress("blocked").unwrap().ack.is_none());
+            assert!(restarted.shutdown(Duration::from_secs(5)));
+        }
+    }
+}

@@ -154,7 +154,27 @@ struct QueryQueue {
     keys: HashMap<(String, [u8; 32]), ModelRequestId>,
     pending: VecDeque<ModelRequestId>,
 }
+#[allow(dead_code)]
+enum QueryOperation {
+    Prefix,
+    Split,
+}
+
 impl QueryQueue {
+    #[allow(dead_code)]
+    fn submit_operation(
+        &mut self,
+        _operation: QueryOperation,
+        _model: &str,
+        _original_text: &str,
+        _transport_text: &str,
+        _ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        Err(QueryError::Failed(
+            "model query operation is not implemented".into(),
+        ))
+    }
+
     fn submit(
         &mut self,
         model: &str,

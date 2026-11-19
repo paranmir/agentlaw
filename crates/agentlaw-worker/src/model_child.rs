@@ -280,3 +280,9 @@ mod tests {
         assert!(read::<Input>(&mut &u32::MAX.to_be_bytes()[..]).is_err());
     }
 }
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum Overflow {
+    Reject,
+    Prefix,
+}

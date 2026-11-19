@@ -888,3 +888,5 @@ impl IndexWorkPort for SemanticIndexer {
         }
     }
 }
+
+mod pieces;

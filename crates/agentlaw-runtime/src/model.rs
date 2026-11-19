@@ -3,7 +3,9 @@
 use crate::host::supervision::StopToken;
 use crate::ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus, HealthSink};
 use agentlaw_contracts::RequestControl;
-use agentlaw_flows::semantic::{QueryVector, SemanticError};
+use agentlaw_flows::semantic::{
+    PiecePlan, PieceVectorReuse, PrefixEmbedding, QueryVector, SemanticError,
+};
 use agentlaw_worker::supervisor::{IndexWorkPort, ModelRequestIds, ModelSupervisor, QueryError};
 use agentlaw_worker::{RuntimeConfig, WorkerState};
 use std::sync::atomic::Ordering;
@@ -41,6 +43,35 @@ impl ModelHandle {
                 cause: "model supervisor not running".into(),
             })),
         }
+    }
+    pub fn embed_prefix(
+        &self,
+        _text: &str,
+        _control: &RequestControl,
+    ) -> Result<PrefixEmbedding, SemanticError> {
+        Err(SemanticError::Failed(
+            "prefix embedding is not implemented".into(),
+        ))
+    }
+    pub fn plan_pieces(
+        &self,
+        _records: &[&str],
+        _control: &RequestControl,
+    ) -> Result<PiecePlan, SemanticError> {
+        Err(SemanticError::Failed(
+            "piece planning is not implemented".into(),
+        ))
+    }
+    pub fn embed_planned(
+        &self,
+        _plan: &PiecePlan,
+        _record: usize,
+        _reuse: &PieceVectorReuse,
+        _control: &RequestControl,
+    ) -> Result<Vec<QueryVector>, SemanticError> {
+        Err(SemanticError::Failed(
+            "piece embedding is not implemented".into(),
+        ))
     }
     pub fn embed_query(
         &self,

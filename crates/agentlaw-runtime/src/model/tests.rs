@@ -447,3 +447,54 @@ fn persisted_backlog_starts_one_model_without_frontend_demand_and_completes_cove
     supervisor.shutdown();
     assert!(indexer.shutdown(Duration::from_secs(10)));
 }
+
+#[test]
+fn prefix_query_caps_transport_at_a_utf8_boundary_and_combines_truncation() {
+    use crate::test_support::{model_assets, model_child_executable, model_transcript};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("assets");
+    let assets = model_assets(&root);
+    let handle = ModelHandle::new();
+    handle.set_warm(true);
+    let health = HealthSink::default();
+    let host = Supervisor::new(health.clone());
+    let worker = handle.clone();
+    let index = Arc::new(PanicOnce {
+        calls: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    });
+    let config = RuntimeConfig {
+        state_dir: temp.path().into(),
+        executable: model_child_executable(),
+        model: Some(assets),
+    };
+    host.spawn(model_id(), move |stop| {
+        run_model_component(
+            config.clone(),
+            index.clone(),
+            ModelRequestIds::new(),
+            health.clone(),
+            worker.clone(),
+            stop,
+        )
+    })
+    .unwrap();
+    wait_for(|| handle.snapshot().state == WorkerState::Ready);
+
+    let limit = 4 * 1024 * 1024;
+    let expected = "x".repeat(limit - 1);
+    let oversized = format!("{expected}한 remainder");
+    let control = RequestControl::default();
+    let result = handle.embed_prefix(&oversized, &control);
+    let short = handle.embed_prefix("token-truncated query", &control);
+    host.shutdown();
+
+    assert!(result.unwrap().truncated);
+    assert!(short.unwrap().truncated);
+    let requests = model_transcript(&root, "requests.jsonl");
+    assert_eq!(requests.len(), 2);
+    let delivered = requests[0].as_str().unwrap();
+    assert_eq!(delivered.len(), limit - 1);
+    assert_eq!(delivered, expected);
+    assert_eq!(requests[1], "token-truncated query");
+}

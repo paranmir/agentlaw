@@ -279,6 +279,16 @@ struct ReadyHistory {
     position: agentlaw_storage::published::SourcePosition,
 }
 impl crate::semantic::SemanticPort for ReadyHistory {
+    fn embed_prefix(
+        &self,
+        text: &str,
+        control: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PrefixEmbedding, crate::semantic::SemanticError> {
+        Ok(crate::semantic::PrefixEmbedding {
+            vector: self.embed_query(text, control)?,
+            truncated: text.split_whitespace().count() > 512,
+        })
+    }
     fn embed_query(
         &self,
         _: &str,
@@ -1014,4 +1024,58 @@ fn read_history(
         },
         request,
     )
+}
+
+#[test]
+fn long_history_query_reports_truncation_with_complete_coverage() {
+    let (temp, store, id, _) = fixture(3);
+    let control_dir = temp.path().join("control");
+    std::fs::create_dir(&control_dir).unwrap();
+    let _writer = crate::control::ControlWriter::open(&control_dir).unwrap();
+    let reader = crate::control::ControlReader::open(&control_dir).unwrap();
+    let source = store.owned_published_reader();
+    let cache = crate::history_cache::HistoryCacheGuards::new();
+    let control = RequestControl::default();
+    let identity = crate::store::StoreIdentity {
+        root: temp.path().join("source"),
+        local: temp.path().into(),
+        user_id: "user".into(),
+        machine_id: "machine".into(),
+        binding_id: "binding".into(),
+        history_limit: 65536,
+        response_limit: 65536,
+        config_file: None,
+    };
+    let ready = ReadyHistory {
+        offer: crate::semantic::OfferResult::Accepted,
+        position: source.read_snapshot().unwrap().position().clone(),
+    };
+    let ctx = crate::store::ReadCtx {
+        identity: &identity,
+        source: &source,
+        control: &reader,
+        semantic: &ready,
+        history_semantic: &ready,
+        history_cache: &cache,
+        request: &control,
+    };
+    let mut query = request(&id);
+    query.history_for = Some(format!("{}cancellation", "unmatchedword ".repeat(599)));
+
+    let response = history(&ctx, &query).unwrap();
+    assert!(!response["match_windows"].as_array().unwrap().is_empty());
+    let codes: Vec<_> = response["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|&&code| code == "semantic_query_truncated")
+            .count(),
+        1,
+    );
+    assert!(!codes.contains(&"semantic_channel_incomplete"));
 }

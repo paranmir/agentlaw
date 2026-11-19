@@ -11,6 +11,7 @@ pub use onnx::{ModelAssets, OnnxProvider};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub const MODEL_ID: &str = "ibm-granite/granite-embedding-311m-multilingual-r2";
+pub const MODEL_INPUT_TOKENS: usize = 512;
 pub const DIMENSIONS: usize = 256;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorkerState {
@@ -38,6 +39,8 @@ pub enum EmbeddingError {
     Failed(String),
     #[error("retryable embedding inference failure: {0}")]
     Retryable(String),
+    #[error("embedding input exceeds the model token limit")]
+    InputTooLong,
     #[error("request cancelled")]
     Cancelled,
 }
