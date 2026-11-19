@@ -123,6 +123,79 @@ pub fn host_resident_bytes() -> Option<u64> {
         None
     }
 }
+use std::sync::{mpsc, Arc};
+
+enum CacheCommand {
+    Save(String, crate::execution::Selection),
+    #[cfg(test)]
+    Flush(mpsc::Sender<()>),
+}
+pub(crate) struct SelectionCache {
+    value: Arc<std::sync::Mutex<Option<(String, crate::execution::Selection)>>>,
+    commands: mpsc::Sender<CacheCommand>,
+}
+impl SelectionCache {
+    pub(crate) fn open(path: std::path::PathBuf) -> Self {
+        let value = Arc::new(std::sync::Mutex::new(None));
+        let loaded = value.clone();
+        let (commands, incoming) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut previous = std::fs::metadata(&path)
+                .ok()
+                .filter(|m| m.len() <= 65536)
+                .and_then(|_| std::fs::read(&path).ok());
+            if let Some(parsed) = previous
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+            {
+                *loaded.lock().unwrap() = Some(parsed);
+            } else {
+                previous = None;
+            }
+            while let Ok(command) = incoming.recv() {
+                match command {
+                    CacheCommand::Save(fingerprint, selection) => {
+                        let item = (fingerprint, selection);
+                        if let Ok(bytes) = serde_json::to_vec(&item) {
+                            if bytes.len() <= 65536 {
+                                if previous.as_ref() == Some(&bytes)
+                                    || std::fs::write(&path, &bytes).is_ok()
+                                {
+                                    previous = Some(bytes);
+                                    *loaded.lock().unwrap() = Some(item);
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(test)]
+                    CacheCommand::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self { value, commands }
+    }
+    pub(crate) fn get(&self) -> Option<(String, crate::execution::Selection)> {
+        self.value.lock().unwrap().clone()
+    }
+    pub(crate) fn save(&self, fingerprint: String, selection: crate::execution::Selection) {
+        let _ = self
+            .commands
+            .send(CacheCommand::Save(fingerprint, selection));
+    }
+    pub(crate) fn accept(&self, fingerprint: String, selection: Selection) {
+        if selection.cacheable {
+            self.save(fingerprint, selection);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        let (tx, rx) = mpsc::channel();
+        self.commands.send(CacheCommand::Flush(tx)).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    }
+}
 pub(crate) fn cached_selection(
     cached: Option<(String, Selection)>,
     fingerprint: Option<&String>,
@@ -140,13 +213,26 @@ pub(crate) struct CpuExecutionSettings {
     pub inter: usize,
 }
 
-#[allow(dead_code)]
-pub(crate) fn fingerprint_with_cpu_settings(
-    _model: &str,
-    _runtime: &std::path::Path,
+pub(crate) fn select_for_launch(
+    hardware_fingerprint: impl FnOnce() -> Option<String>,
+    settings: Option<CpuExecutionSettings>,
+    cached: Option<(String, Selection)>,
+    select: impl FnOnce(Option<&Selection>) -> Selection,
+) -> (Option<String>, Selection) {
+    let hardware = hardware_fingerprint();
+    let fingerprint = match settings {
+        Some(settings) => fingerprint_with_cpu_settings(hardware, settings),
+        None => hardware,
+    };
+    let cached = cached_selection(cached, fingerprint.as_ref());
+    (fingerprint, select(cached.as_ref()))
+}
+
+fn fingerprint_with_cpu_settings(
+    _hardware: Option<String>,
     _settings: CpuExecutionSettings,
 ) -> Option<String> {
-    unimplemented!("CPU execution settings in cache fingerprint")
+    None
 }
 
 #[cfg(test)]

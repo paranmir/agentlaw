@@ -217,3 +217,63 @@ fn split_rechecks_distinct_utf8_ends_after_byte_fallback() {
         );
     }
 }
+
+#[test]
+fn prefix_disables_tokenizer_automatic_truncation() {
+    let mut tokenizer = scalar_tokenizer();
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 8,
+            ..Default::default()
+        }))
+        .unwrap();
+    let query = "ab".repeat(300);
+    assert_eq!(tokenizer.encode(query.as_str(), true).unwrap().len(), 8);
+    assert_prefix(&tokenizer, &query, 601, true);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "observes the native CPU session builder with the pinned ONNX Runtime library"]
+fn cpu_builder_observes_thread_and_batch_settings() {
+    const DLL_SHA: &str = "579b636403983254346a5c1d80bd28f1519cd1e284cd204f8d4ff41f8d711559";
+    let source =
+        PathBuf::from(std::env::var_os("AGENTLAW_ORT_LIBRARY").expect("set AGENTLAW_ORT_LIBRARY"));
+    let tmp = tempfile::tempdir().unwrap();
+    let dll = tmp.path().join("onnxruntime.dll");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(std::fs::read(&source).unwrap())),
+        DLL_SHA
+    );
+    std::fs::copy(source, &dll).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(std::fs::read(&dll).unwrap())),
+        DLL_SHA
+    );
+    ort::init_from(dll.to_string_lossy()).commit().unwrap();
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let cores: usize = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(cores > 0);
+    let (_, settings) = cpu_session_builder().unwrap();
+    assert_eq!(
+        settings,
+        CpuSessionSettings {
+            intra: cores.min(4),
+            inter: Some(1),
+            batch: 1
+        }
+    );
+}

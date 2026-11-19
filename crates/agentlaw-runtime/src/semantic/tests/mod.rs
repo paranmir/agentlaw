@@ -128,8 +128,19 @@ fn drive(indexer: &SemanticIndexer, target: u64) -> usize {
     let mut count = 0;
     loop {
         if let Some(work) = indexer.next_work("model") {
-            count += 1;
-            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+            let result = match work.task {
+                agentlaw_worker::supervisor::IndexTask::Split(text) => IndexResult::Pieces(
+                    (!text.is_empty())
+                        .then_some((0, text.len() as u32))
+                        .into_iter()
+                        .collect(),
+                ),
+                agentlaw_worker::supervisor::IndexTask::Embed(_) => {
+                    count += 1;
+                    IndexResult::Vector(vec![1.0, 0.0])
+                }
+            };
+            indexer.finish(work.id, Ok(result));
         }
         if indexer
             .progress("binding")

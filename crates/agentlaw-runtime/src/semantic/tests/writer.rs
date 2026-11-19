@@ -325,28 +325,56 @@ impl WindowIndex {
 #[test]
 fn split_result_cannot_advance_ack_before_embedding_commits() {
     let f = WindowIndex::new();
-    let before = f.indexer.progress("binding").unwrap().ack;
     let split = WindowIndex::split(&f.indexer);
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let hook = barrier.clone();
-    let once = std::sync::atomic::AtomicBool::new(false);
-    *f.indexer.inner.pre_commit_hook.lock().unwrap() = Some(Arc::new(move || {
-        if !once.swap(true, Ordering::SeqCst) {
-            hook.wait();
-            hook.wait();
+    let saved_ack = || {
+        let active = f.indexer.inner.state.lock().unwrap().schedule.lanes
+            [&LaneKey::current("binding")]
+            .active
+            .clone()
+            .unwrap();
+        VectorFileReadView::open(&active.path, &active.identity)
+            .unwrap()
+            .progress()
+            .ack
+            .clone()
+    };
+    let before = saved_ack();
+    let (checked, checked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    *f.indexer.inner.completion_check_hook.lock().unwrap() = Some(Arc::new(move |done| {
+        if let Some(rx) = release_rx.lock().unwrap().take() {
+            checked.try_send(done).unwrap();
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
         }
     }));
+    f.indexer
+        .inner
+        .pause_pending_ranges
+        .store(true, Ordering::Release);
     WindowIndex::ranges(&f.indexer, split);
-    let after_split = f.indexer.progress("binding").unwrap().ack;
+    let done = checked_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer did not check completion with unconsumed ranges");
+    let next = f.indexer.inner.state.lock().unwrap().schedule.lanes[&LaneKey::current("binding")]
+        .pending_window
+        .as_ref()
+        .map(|window| window.next_range);
+    let after_check = saved_ack();
+    f.indexer
+        .inner
+        .pause_pending_ranges
+        .store(false, Ordering::Release);
+    release.try_send(()).unwrap();
+    assert_eq!(next, Some(0));
+    assert!(!done);
+    assert_eq!(after_check, before);
     let first = WindowIndex::embed(&f.indexer, "first");
     WindowIndex::finish_embed(&f.indexer, first);
-    barrier.wait();
-    let before_commit = f.indexer.progress("binding").unwrap().ack;
-    barrier.wait();
     let second = WindowIndex::embed(&f.indexer, "second");
     WindowIndex::finish_embed(&f.indexer, second);
     assert_eq!(drive(&f.indexer, f.target), 0);
-    assert_eq!((after_split, before_commit), (before.clone(), before));
+
     assert_eq!(f.committed_sections(), ["body:0:0", "body:0:1"]);
     assert!(f.indexer.shutdown(Duration::from_secs(5)));
 }

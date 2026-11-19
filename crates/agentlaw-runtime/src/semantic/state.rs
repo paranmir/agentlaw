@@ -60,6 +60,12 @@ impl Backoff {
     }
 }
 
+#[allow(dead_code)]
+pub(super) struct PendingWindow {
+    pub ranges: Vec<(u32, u32)>,
+    pub next_range: usize,
+}
+
 pub(super) struct Lane {
     pub token: u64,
     pub generation: u64,
@@ -67,6 +73,8 @@ pub(super) struct Lane {
     pub running: HashMap<ModelRequestId, (u64, Piece)>,
     pub results: VecDeque<(Piece, Vec<f32>)>,
     pub committing: usize,
+    #[allow(dead_code)]
+    pub pending_window: Option<PendingWindow>,
     pub retry: Backoff,
     pub retry_piece: Option<(String, String, String)>,
     pub writer_retry: Backoff,
@@ -152,6 +160,7 @@ impl Default for Lane {
             running: HashMap::new(),
             results: VecDeque::new(),
             committing: 0,
+            pending_window: None,
             retry: Backoff::default(),
             retry_piece: None,
             writer_retry: Backoff::default(),

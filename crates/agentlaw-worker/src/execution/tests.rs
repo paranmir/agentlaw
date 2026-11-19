@@ -10,77 +10,61 @@ fn complete_ranges_and_noise() {
 #[test]
 fn cpu_execution_change_invalidates_device_selection_cache() {
     let temp = tempfile::tempdir().unwrap();
-    let runtime = temp.path().join("runtime.dll");
-    std::fs::write(&runtime, b"unchanged native runtime identity").unwrap();
-    let model = "unchanged-model";
-    let new_settings = CpuExecutionSettings {
+    let path = temp.path().join("selection.json");
+    let cache = SelectionCache::open(path.clone());
+    let settings = CpuExecutionSettings {
         version: 2,
         intra: 4,
         inter: 1,
     };
-    let new = fingerprint_with_cpu_settings(model, &runtime, new_settings).unwrap();
-    let old = fingerprint(model, &runtime).unwrap();
-    let same = fingerprint_with_cpu_settings(model, &runtime, new_settings).unwrap();
-    assert_ne!(old, new);
-    assert_eq!(new, same);
-
-    let cache = temp.path().join("selection.json");
-    let initial = Selection {
+    let hardware = || Some("fixed model, runtime, CPU and GPU identity".to_owned());
+    let old = hardware().expect("fixture identity");
+    let previous = Selection {
         cacheable: true,
         backend: ExecutionBackend::Cpu,
         cpu_ns: vec![20; 3],
         gpu_ns: vec![25; 3],
-        reason: "previous CPU timing".into(),
+        reason: "prior setting".into(),
         host_resident_bytes: None,
         gpu_dedicated_bytes: None,
         gpu_shared_bytes: None,
     };
-    std::fs::write(&cache, serde_json::to_vec(&(old, initial)).unwrap()).unwrap();
-    let mut comparisons = 0;
-    let mut start = |key: String| {
-        let saved = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-        if let Some(saved) = cached_selection(Some(saved), Some(&key)) {
-            return saved;
-        }
-        comparisons += 1;
-        let measured = Selection {
-            cacheable: true,
-            backend: ExecutionBackend::Cuda,
-            cpu_ns: vec![20; 3],
-            gpu_ns: vec![10; 3],
-            reason: "new timing".into(),
-            host_resident_bytes: None,
-            gpu_dedicated_bytes: None,
-            gpu_shared_bytes: None,
+    cache.accept(old.clone(), previous.clone());
+    cache.flush();
+    let comparisons = std::cell::Cell::new(0);
+    let start = || {
+        let device = |cached: Option<&Selection>| {
+            if let Some(selection) = cached {
+                return selection.clone();
+            }
+            comparisons.set(comparisons.get() + 1);
+            Selection {
+                cpu_ns: vec![12; 3],
+                gpu_ns: vec![25; 3],
+                reason: "measured".into(),
+                ..previous.clone()
+            }
         };
-        std::fs::write(&cache, serde_json::to_vec(&(key, &measured)).unwrap()).unwrap();
-        measured
+        let (fingerprint, selection) =
+            select_for_launch(hardware, Some(settings), cache.get(), device);
+        if let Some(key) = &fingerprint {
+            cache.accept(key.clone(), selection);
+            cache.flush();
+        }
+        fingerprint
     };
-    assert_eq!(start(new.clone()).backend, ExecutionBackend::Cuda);
-    assert_eq!(start(same).backend, ExecutionBackend::Cuda);
-    assert_eq!(comparisons, 1);
-    assert_ne!(
-        new,
-        fingerprint_with_cpu_settings(
-            model,
-            &runtime,
-            CpuExecutionSettings {
-                intra: 2,
-                ..new_settings
-            }
-        )
-        .unwrap()
+
+    let new = start();
+    assert_eq!(comparisons.get(), 1);
+    assert!(
+        new.is_some(),
+        "launch did not produce a fingerprint for the injected hardware identity and CPU settings"
     );
-    assert_ne!(
-        new,
-        fingerprint_with_cpu_settings(
-            model,
-            &runtime,
-            CpuExecutionSettings {
-                inter: 2,
-                ..new_settings
-            }
-        )
-        .unwrap()
-    );
+    assert_ne!(new.as_deref(), Some(old.as_str()));
+    let (stored, selection): (String, Selection) =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(Some(stored.as_str()), new.as_deref());
+    assert_eq!(selection.cpu_ns, [12; 3]);
+    assert_eq!(start(), new);
+    assert_eq!(comparisons.get(), 1);
 }

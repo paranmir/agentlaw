@@ -492,14 +492,17 @@ fn prefix_query_caps_transport_at_a_utf8_boundary_and_combines_truncation() {
     let control = RequestControl::default();
     let result = handle.embed_prefix(&oversized, &control);
     let short = handle.embed_prefix("token-truncated query", &control);
+    let unchanged = handle.embed_prefix("short query", &control);
     host.shutdown();
 
     assert!(result.unwrap().truncated);
     assert!(short.unwrap().truncated);
+    assert!(!unchanged.unwrap().truncated);
     let requests = model_transcript(&root, "requests.jsonl");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let delivered = requests[0].as_str().unwrap();
     assert_eq!(delivered.len(), limit - 1);
     assert_eq!(delivered, expected);
     assert_eq!(requests[1], "token-truncated query");
+    assert_eq!(requests[2], "short query");
 }

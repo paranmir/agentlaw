@@ -38,7 +38,7 @@ impl ReviewSource for ReadReview<'_, '_, '_> {
         self.exact.reverse_required(ids)
     }
     fn search(&mut self, scopes: &[String], query: &str) -> Result<Channels> {
-        crate::read::preparation_channels(self.ctx, self.exact, query, scopes)
+        crate::read::preparation_channels(self.ctx, self.exact, query, scopes, None)
     }
     fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot> {
         let snapshot = crate::read::snapshot_selected_read(
@@ -192,7 +192,8 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
             .into_iter()
             .map(|scope| format!("procedure:{scope}"))
             .collect();
-        let channels = crate::read::preparation_channels(self.ctx, self.exact, query, &scopes)?;
+        let channels =
+            crate::read::preparation_channels(self.ctx, self.exact, query, &scopes, None)?;
         let ids: Vec<_> = channels
             .hits
             .iter()

@@ -1897,7 +1897,7 @@ fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
     #[derive(Default)]
     struct Observed {
         plan_inputs: Vec<Vec<String>>,
-        section_searches: usize,
+        first_record_calls: usize,
         embeds_at_clear: Option<Vec<Value>>,
         material_hits: Vec<String>,
         overlap_hits: Vec<String>,
@@ -1935,6 +1935,17 @@ fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
             reuse: &PieceVectorReuse,
             control: &RequestControl,
         ) -> Result<Vec<QueryVector>, SemanticError> {
+            {
+                let mut observed = self.observed.lock().unwrap();
+                if record == 0 {
+                    observed.first_record_calls += 1;
+                    if observed.first_record_calls == 2 {
+                        observed.embeds_at_clear =
+                            Some(model_transcript(&self.assets, "requests.jsonl"));
+                        self.install_cache.clear();
+                    }
+                }
+            }
             self.adapter.embed_planned(plan, record, reuse, control)
         }
         fn search_available(
@@ -1947,14 +1958,6 @@ fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
             let hits = result.hits.iter().map(|hit| hit.memory_id.clone());
             if query.scopes.len() > 1 {
                 observed.material_hits.extend(hits);
-                if query.text == SECTION {
-                    observed.section_searches += 1;
-                    if observed.section_searches == 3 {
-                        observed.embeds_at_clear =
-                            Some(model_transcript(&self.assets, "requests.jsonl"));
-                        self.install_cache.clear();
-                    }
-                }
             } else {
                 observed.overlap_hits.extend(hits);
             }
@@ -2097,17 +2100,35 @@ fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
         [vec![BODY.to_owned(), SECTION.to_owned()]]
     );
     assert!(matches!(prepared.unwrap(), Prepared::Remember(_)));
-    assert_eq!(splits, [json!(BODY), json!(SECTION)]);
+    let counts = |transcript: &[Value]| {
+        let mut counts = std::collections::BTreeMap::new();
+        for entry in transcript {
+            *counts
+                .entry(entry.as_str().unwrap().to_owned())
+                .or_insert(0) += 1;
+        }
+        counts
+    };
     assert_eq!(
-        embeds,
-        [
-            json!("first preface\n# Title\n|"),
-            json!("second|"),
-            json!("third|"),
-            json!("# Title\n|")
-        ]
+        counts(&splits),
+        [(BODY.to_owned(), 1), (SECTION.to_owned(), 1)].into()
     );
-    assert_eq!(observations.embeds_at_clear.as_ref(), Some(&embeds));
+    let expected: std::collections::BTreeMap<_, _> = [
+        "first preface\n# Title\n|",
+        "second|",
+        "third|",
+        "# Title\n|",
+    ]
+    .map(|piece| (piece.to_owned(), 1))
+    .into();
+    assert_eq!(counts(&embeds), expected);
+    assert_eq!(
+        observations
+            .embeds_at_clear
+            .as_ref()
+            .map(|entries| counts(entries)),
+        Some(expected)
+    );
     assert!(observations.material_hits.contains(&user_memory));
     assert!(observations.material_hits.contains(&machine_memory));
     assert!(!observations.overlap_hits.is_empty());

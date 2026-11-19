@@ -1033,7 +1033,6 @@ fn long_history_query_diagnostics(ready: bool, partial: bool) {
     };
     struct Model {
         ready: bool,
-        calls: std::sync::atomic::AtomicUsize,
         coverage: SemanticCoverage,
     }
     impl SemanticPort for Model {
@@ -1056,7 +1055,6 @@ fn long_history_query_diagnostics(ready: bool, partial: bool) {
             control: &RequestControl,
         ) -> std::result::Result<PrefixEmbedding, SemanticError> {
             assert!(text.ends_with("cancellation"));
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(PrefixEmbedding {
                 vector: self.embed_query(text, control)?,
                 truncated: true,
@@ -1118,11 +1116,7 @@ fn long_history_query_diagnostics(ready: bool, partial: bool) {
     } else {
         SemanticCoverage::CompleteAt(requested)
     };
-    let model = Model {
-        ready,
-        coverage,
-        calls: Default::default(),
-    };
+    let model = Model { ready, coverage };
     let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,

@@ -37,6 +37,14 @@ pub(super) fn run(
                 }) else {
                     return Ok(false);
                 };
+                #[cfg(test)]
+                if shared
+                    .pause_pending_ranges
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && lane.pending_window.is_some()
+                {
+                    break;
+                }
                 lane.queue.len() + lane.running.len() < shared.config.queue_pieces
             };
             if !room {
@@ -118,6 +126,24 @@ pub(super) fn run(
             )
         };
         shared.changed.notify_all();
+        #[cfg(test)]
+        if matches!(key.kind, WorkKind::Current) {
+            let has_pending = shared
+                .state
+                .lock()
+                .unwrap()
+                .schedule
+                .lanes
+                .get(key)
+                .is_some_and(|lane| lane.pending_window.is_some());
+            if has_pending {
+                let hook = shared.completion_check_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook(done);
+                    continue;
+                }
+            }
+        }
         let needs_marker = done
             && match &completion {
                 Completion::Current(heads) => heads.is_some(),

@@ -99,6 +99,10 @@ struct Shared {
     #[cfg(test)]
     pre_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    pause_pending_ranges: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    completion_check_hook: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    #[cfg(test)]
     post_check_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     readview_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -353,6 +357,10 @@ impl SemanticIndexer {
             model_waker: Mutex::new(None),
             #[cfg(test)]
             pre_commit_hook: Mutex::new(None),
+            #[cfg(test)]
+            pause_pending_ranges: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            completion_check_hook: Mutex::new(None),
             #[cfg(test)]
             post_check_hook: Mutex::new(None),
             #[cfg(test)]

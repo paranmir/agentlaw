@@ -176,7 +176,9 @@ fn close_and_shutdown_wait_for_inflight_read_view() {
 #[test]
 fn rebuilds_v1_current_and_history_before_reclaiming_legacy_files() {
     use agentlaw_flows::semantic::{HistoryIngestHint, HistorySemanticPort, OfferResult};
-    use agentlaw_search::vector_file::{CurrentHeads, VectorFileBatch, VectorFileWriter};
+    use agentlaw_search::vector_file::{
+        CurrentHeads, InventoryCursor, VectorFileBatch, VectorFileWriter,
+    };
     use agentlaw_search::VectorRecord;
     use agentlaw_worker::supervisor::IndexTask;
 
@@ -233,6 +235,13 @@ fn rebuilds_v1_current_and_history_before_reclaiming_legacy_files() {
                     epoch: position.epoch.clone(),
                     sequence: position.sequence as i64,
                 }),
+                inventory: (section == "body:0").then(|| InventoryCursor {
+                    start: SourcePosition {
+                        epoch: position.epoch.clone(),
+                        sequence: position.sequence as i64,
+                    },
+                    completed_identity: format!("memory/{memory}"),
+                }),
                 complete: true,
                 completed_changes: if section == "history:0" {
                     vec![(memory.clone(), change.clone())]
@@ -244,6 +253,22 @@ fn rebuilds_v1_current_and_history_before_reclaiming_legacy_files() {
             .unwrap();
         assert!(writer.contains(&memory, change, section).unwrap());
         writer.checkpoint().unwrap();
+        drop(writer);
+        let view = VectorFileReadView::open(&path, &identity).unwrap();
+        assert!(view.progress().complete);
+        assert_eq!(
+            view.progress().ack.as_ref().unwrap().sequence,
+            position.sequence as i64
+        );
+        assert_eq!(
+            view.progress()
+                .inventory
+                .as_ref()
+                .map(|cursor| cursor.completed_identity.as_str()),
+            (section == "body:0")
+                .then(|| format!("memory/{memory}"))
+                .as_deref()
+        );
         path
     })
     .collect();
@@ -351,6 +376,18 @@ fn rebuilds_v1_current_and_history_before_reclaiming_legacy_files() {
                 .get::<_, String>(0))
                 .unwrap(),
             section
+        );
+        let vector = conn
+            .query_row("SELECT vector FROM vectors", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .unwrap();
+        assert_eq!(
+            vector,
+            [1.0_f32, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
         );
         let view = VectorFileReadView::open(path, &identity).unwrap();
         assert_eq!(

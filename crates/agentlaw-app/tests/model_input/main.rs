@@ -17,13 +17,60 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
     System::{
         JobObjects::*,
-        SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+        SystemServices::{JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, JOB_OBJECT_QUERY},
+        Threading::GetCurrentProcess,
         IO::{CreateIoCompletionPort, GetQueuedCompletionStatus},
     },
 };
 
 const JOB_LIMIT: usize = 12 * 1024 * 1024 * 1024;
 const CHILD_TEST: &str = "real_model_caps_long_inputs_in_a_bounded_cpu_process";
+
+const MODEL_SHA: &str = "f9defdceaaae9d4d4007ad601b05b6e436375e7293e52b74ed1f7a3933c5b26a";
+const TOKENIZER_SHA: &str = "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f";
+const ORT_SHA: &str = "579b636403983254346a5c1d80bd28f1519cd1e284cd204f8d4ff41f8d711559";
+const BODY_SHA: &str = "f69cd5c5ab18b44c226033279bc3dc8af6de910dba3453111ffddfdeb3069772";
+
+fn verified_copy(root: &Path, var: &str, name: &str, expected: &str) -> PathBuf {
+    let source = asset(var);
+    assert_eq!(sha256(&source), expected, "{var}");
+    let target = root.join(name);
+    std::fs::copy(source, &target).unwrap();
+    assert_eq!(sha256(&target), expected, "isolated {name}");
+    target
+}
+
+fn require_test_job() {
+    let name: Vec<u16> = std::env::var("AGENTLAW_MODEL_INPUT_JOB_NAME")
+        .unwrap()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let job = OwnedHandle(unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) });
+    assert!(!job.0.is_null(), "open the specific test-owned Job");
+    let mut member = 0;
+    assert_ne!(
+        unsafe { IsProcessInJob(GetCurrentProcess(), job.0, &mut member) },
+        0
+    );
+    assert_ne!(member, 0, "current process is outside the test-owned Job");
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    assert_ne!(
+        unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    assert_eq!(info.BasicLimitInformation.LimitFlags & flags, flags);
+    assert_eq!(info.ProcessMemoryLimit, JOB_LIMIT);
+}
 
 fn asset(var: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(var).unwrap_or_else(|| panic!("set {var}")))
@@ -56,6 +103,9 @@ fn run(state: &Path, args: &[&str], input: Option<Value>) -> Value {
     let mut child = cmd
         .args(args)
         .env("AGENTLAW_HOME", state)
+        .env_remove("AGENTLAW_ONNX_MODEL")
+        .env_remove("AGENTLAW_TOKENIZER")
+        .env_remove("AGENTLAW_ORT_LIBRARY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -93,33 +143,20 @@ fn check_model() {
     let mut gate = [0];
     std::io::stdin().read_exact(&mut gate).unwrap();
     assert_eq!(gate, [1]);
+    require_test_job();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fixtures");
+    std::fs::create_dir(&root).unwrap();
     let assets = ModelAssets {
-        onnx_model: asset("AGENTLAW_ONNX_MODEL"),
-        tokenizer_json: asset("AGENTLAW_TOKENIZER"),
-        runtime_library: asset("AGENTLAW_ORT_LIBRARY"),
+        onnx_model: verified_copy(&root, "AGENTLAW_ONNX_MODEL", "model.onnx", MODEL_SHA),
+        tokenizer_json: verified_copy(&root, "AGENTLAW_TOKENIZER", "tokenizer.json", TOKENIZER_SHA),
+        runtime_library: verified_copy(&root, "AGENTLAW_ORT_LIBRARY", "onnxruntime.dll", ORT_SHA),
     };
-    let model_sha = sha256(&assets.onnx_model);
-    assert!([
-        "f9defdceaaae9d4d4007ad601b05b6e436375e7293e52b74ed1f7a3933c5b26a",
-        "f1fdd44e7e1ac51f12ab7957c7bd092e064d596c288513bf9d326842f669edee",
-        "75f9f258bf5013f5fe8a4dad61dd0fd16ac0cbaa7a106e3d3f41c2d04a42d541",
-    ]
-    .contains(&model_sha.as_str()));
-    let tokenizer_sha = sha256(&assets.tokenizer_json);
-    assert_eq!(
-        tokenizer_sha,
-        "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f"
-    );
-    let runtime_sha = sha256(&assets.runtime_library);
-
+    // The measurement recorded 74,881 raw tokens for these exact bytes.
+    let body_path = verified_copy(&root, "AGENTLAW_DENSE_BODY", "A-dense-v1.txt", BODY_SHA);
+    let body = std::fs::read_to_string(body_path).unwrap();
+    assert_eq!(body.len(), 113_524);
     let provider = OnnxProvider::load(&assets).unwrap();
-    let physical = sysinfo::System::new()
-        .physical_core_count()
-        .expect("physical core count");
-    assert_eq!(
-        provider.cpu_session_settings().unwrap(),
-        (physical.min(4), 1, 1)
-    );
     let input = "Bound the model input before calling CPU inference.";
     let first = provider.embed(input).unwrap();
     let second = provider.embed(input).unwrap();
@@ -127,7 +164,6 @@ fn check_model() {
     assert_eq!(first.len(), 256);
     drop(provider);
 
-    let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let _cleanup = runtime_cleanup::RuntimeCleanup(state.clone());
     let harness = tmp.path().join("codex");
@@ -137,9 +173,9 @@ fn check_model() {
         &manifest,
         json!({
             "model_build_id":"granite-r2-256-portable-qdq-v1",
-            "onnx_model":{"path":assets.onnx_model,"sha256":model_sha},
-            "tokenizer_json":{"path":assets.tokenizer_json,"sha256":tokenizer_sha},
-            "runtime_library":{"path":assets.runtime_library,"sha256":runtime_sha},
+            "onnx_model":{"path":assets.onnx_model,"sha256":MODEL_SHA},
+            "tokenizer_json":{"path":assets.tokenizer_json,"sha256":TOKENIZER_SHA},
+            "runtime_library":{"path":assets.runtime_library,"sha256":ORT_SHA},
         })
         .to_string(),
     )
@@ -205,8 +241,6 @@ fn check_model() {
         "{recall}"
     );
 
-    let body = format!("{}tail", "\u{1F680}!!".repeat(18_920));
-    assert_eq!(body.len(), 113_524);
     let started = Instant::now();
     let saved = run(
         &state,
@@ -251,12 +285,14 @@ fn check_model() {
 }
 
 #[test]
-#[ignore = "requires release Granite model, tokenizer and CPU ONNX Runtime via AGENTLAW_ONNX_MODEL, AGENTLAW_TOKENIZER and AGENTLAW_ORT_LIBRARY"]
+#[ignore = "requires release Granite model, tokenizer and CPU ONNX Runtime via AGENTLAW_ONNX_MODEL, AGENTLAW_TOKENIZER and AGENTLAW_ORT_LIBRARY, plus the measured body via AGENTLAW_DENSE_BODY"]
 fn real_model_caps_long_inputs_in_a_bounded_cpu_process() {
     if std::env::var_os("AGENTLAW_MODEL_INPUT_JOB_CHILD").is_some() {
         return check_model();
     }
-    let job = OwnedHandle(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
+    let name = format!("Local\\AgentlawModelInput-{}", uuid::Uuid::new_v4());
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let job = OwnedHandle(unsafe { CreateJobObjectW(std::ptr::null(), wide.as_ptr()) });
     assert!(!job.0.is_null());
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     limits.BasicLimitInformation.LimitFlags =
@@ -295,6 +331,7 @@ fn real_model_caps_long_inputs_in_a_bounded_cpu_process() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
         .env("AGENTLAW_MODEL_INPUT_JOB_CHILD", "1")
+        .env("AGENTLAW_MODEL_INPUT_JOB_NAME", name)
         .stdin(Stdio::piped())
         .creation_flags(0x08000000)
         .spawn()
@@ -348,7 +385,7 @@ fn real_model_caps_long_inputs_in_a_bounded_cpu_process() {
         0
     );
     eprintln!(
-        "Job peak private bytes across owned processes: {}",
+        "maximum per-process commit charge recorded by the test Job (bytes): {}",
         limits.PeakProcessMemoryUsed
     );
 }

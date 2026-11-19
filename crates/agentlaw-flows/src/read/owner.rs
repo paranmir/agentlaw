@@ -99,7 +99,7 @@ pub fn search_procedures_filtered(
         })
         .map(|s| format!("procedure:{s}"))
         .collect();
-    let channels = preparation_channels(ctx, exact, query, &scopes)?;
+    let channels = preparation_channels(ctx, exact, query, &scopes, None)?;
     let matched = channels.hits.len();
     let mut results = Vec::new();
     let mut shown = 0;
@@ -321,7 +321,18 @@ pub(crate) fn preparation_channels(
     exact: &mut ExactSnapshot,
     text: &str,
     scopes: &[String],
+    planned: Option<(
+        &crate::semantic::PiecePlan,
+        usize,
+        &crate::semantic::PieceVectorReuse,
+    )>,
 ) -> Result<Channels> {
+    if planned.is_some() {
+        return Err(DomainError::new(
+            "internal_error",
+            "Planned preparation search is not implemented.",
+        ));
+    }
     let vector = match ctx.semantic.embed_query(text, ctx.request) {
         Ok(vector) => Some(vector),
         Err(SemanticError::Cancelled) => {
@@ -354,22 +365,6 @@ pub(crate) fn preparation_channels(
         complete: found.complete,
         diagnostics,
     })
-}
-
-#[allow(dead_code)]
-fn preparation_channels_planned(
-    _ctx: &ReadCtx<'_>,
-    _exact: &mut ExactSnapshot,
-    _text: &str,
-    _scopes: &[String],
-    _plan: &crate::semantic::PiecePlan,
-    _record: usize,
-    _reuse: &crate::semantic::PieceVectorReuse,
-) -> Result<Channels> {
-    Err(DomainError::new(
-        "internal_error",
-        "Planned preparation search is not implemented.",
-    ))
 }
 
 fn connection(ctx: &ReadCtx<'_>, path: Option<&str>) -> Result<Option<String>> {

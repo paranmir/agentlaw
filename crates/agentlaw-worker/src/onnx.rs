@@ -45,6 +45,27 @@ pub struct OnnxProvider {
 fn fail(e: impl std::fmt::Display) -> EmbeddingError {
     EmbeddingError::Failed(e.to_string())
 }
+#[derive(Debug, PartialEq, Eq)]
+struct CpuSessionSettings {
+    intra: usize,
+    inter: Option<usize>,
+    batch: usize,
+}
+
+fn cpu_session_builder(
+) -> Result<(ort::session::builder::SessionBuilder, CpuSessionSettings), EmbeddingError> {
+    let settings = CpuSessionSettings {
+        intra: 1,
+        inter: None,
+        batch: 1,
+    };
+    let builder = Session::builder()
+        .map_err(fail)?
+        .with_intra_threads(settings.intra)
+        .map_err(fail)?;
+    Ok((builder, settings))
+}
+
 impl OnnxProvider {
     /// CPU is already READY when this background-only method is called. Candidate
     /// preparation never replaces the active session before successful warmup/timing.
@@ -163,11 +184,6 @@ impl OnnxProvider {
         }
         report
     }
-    #[doc(hidden)]
-    pub fn cpu_session_settings(&self) -> Result<(usize, usize, usize), EmbeddingError> {
-        Err(fail("CPU session settings observation is not implemented"))
-    }
-
     pub fn load(assets: &ModelAssets) -> Result<Self, EmbeddingError> {
         for p in [
             &assets.onnx_model,
@@ -198,10 +214,8 @@ impl OnnxProvider {
             .commit()
             .map_err(fail)?;
         let tokenizer = tokenizers::Tokenizer::from_file(&assets.tokenizer_json).map_err(fail)?;
-        let session = Session::builder()
-            .map_err(fail)?
-            .with_intra_threads(1)
-            .map_err(fail)?
+        let session = cpu_session_builder()?
+            .0
             .commit_from_file(&assets.onnx_model)
             .map_err(fail)?;
         if session.inputs.iter().any(|i| {

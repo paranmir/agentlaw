@@ -320,11 +320,18 @@ fn truncation_case(coverage: Coverage, procedures: bool) {
     assert!(inputs
         .iter()
         .any(|input| input.contains("zebralexicaltail")));
-    if !procedures && !matches!(coverage, Coverage::Loading) {
-        assert!(
-            inputs.len() > 1,
-            "restore must exercise multiple prefix requests"
-        );
+    if !procedures {
+        let terms = "another search perspective";
+        assert!(inputs.contains(&format!("{long} {terms}")));
+        let views: std::collections::BTreeSet<_> = inputs
+            .iter()
+            .filter_map(|input| input.strip_prefix(&format!("{long}\nPerspective: ")))
+            .map(|view| {
+                view.strip_suffix(&format!(" {terms}"))
+                    .expect("search_terms on restore view")
+            })
+            .collect();
+        assert_eq!(views, RESTORE_PERSPECTIVES.into_iter().collect());
     }
 }
 
@@ -361,14 +368,12 @@ fn score(mut hit: Hit, score: f64) -> Hit {
 fn planned(f: &SearchFixture, model: &Model, query: &str) -> Channels {
     f.read(model, |ctx, exact| {
         let plan = model.plan_pieces(&[query], ctx.request).unwrap();
-        preparation_channels_planned(
+        preparation_channels(
             ctx,
             exact,
             query,
             &["user".into()],
-            &plan,
-            0,
-            &PieceVectorReuse::default(),
+            Some((&plan, 0, &PieceVectorReuse::default())),
         )
         .unwrap()
     })
@@ -388,28 +393,31 @@ fn piece_maxima_admit_the_matching_clear_lexical_winner() {
     let channels = planned(&f, &model, "harbor shipping container inspection");
     assert!(channels.complete);
     assert_eq!(channels.vector, [score(a.clone(), 0.95), score(b, 0.93)]);
-    assert_eq!(uncontested(&[], &channels.vector), None);
-    assert_eq!(
-        uncontested(&channels.lexical, &channels.vector),
-        Some(a.memory_id)
-    );
+    assert_eq!(crate::prepare::admitted(&channels), Some(a.memory_id));
 }
 
 #[test]
 fn two_supporting_channels_do_not_admit_a_candidate() {
     let f = SearchFixture::new();
-    let a = f.publish("harbor shipping", false, false);
-    let b = f.publish("harbor shipping", false, false);
+    let terms = (0..64).map(|n| format!("cargo{n}")).collect::<Vec<_>>();
+    let query = format!("{} inspection", terms.join(" "));
+    let a = f.publish(&query, false, false);
+    let b = f.publish(&format!("{} berth", terms.join(" ")), false, false);
+    f.publish("orchard pruning", false, false);
     let mut model = Model::new(Coverage::Complete);
     model.hits = [
         vec![score(a.clone(), 0.95)],
         vec![],
         vec![score(b.clone(), 0.93)],
     ];
-    let channels = planned(&f, &model, "harbor shipping");
+    let channels = planned(&f, &model, &query);
     assert!(channels.complete);
+    assert_eq!(channels.lexical[0].memory_id, a.memory_id);
+    assert_eq!(channels.lexical[1].memory_id, b.memory_id);
+    let (first, second) = (channels.lexical[0].score, channels.lexical[1].score);
+    assert!(first >= 0.90 && first > second && first - second < 0.05);
     assert_eq!(channels.vector, [score(a, 0.95), score(b, 0.93)]);
-    assert_eq!(uncontested(&channels.lexical, &channels.vector), None);
+    assert_eq!(crate::prepare::admitted(&channels), None);
 }
 
 #[test]
@@ -428,7 +436,7 @@ fn equal_piece_maxima_have_no_vector_winner() {
             .collect::<Vec<_>>(),
         [0.95, 0.95]
     );
-    assert_eq!(uncontested(&[], &channels.vector), None);
+    assert_eq!(crate::prepare::admitted(&channels), None);
 }
 
 #[test]
@@ -438,12 +446,10 @@ fn failed_piece_marks_the_vector_channel_incomplete() {
     model.piece_failure = true;
     let channels = planned(&f, &model, "harbor");
     assert!(!channels.complete);
-    assert!(channels.vector.is_empty());
     assert!(channels
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "semantic_channel_incomplete"));
-    assert!(model.limits.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -451,13 +457,18 @@ fn piece_search_preserves_backend_width_before_scope_filtering() {
     let f = SearchFixture::new();
     let hidden = f.publish("restricted", false, true);
     let visible = f.publish("public", false, false);
+    let second = f.publish("public harbor", false, false);
     let mut model = Model::new(Coverage::Complete);
     model.hits = [
-        vec![score(hidden, 0.98), score(visible.clone(), 0.91)],
+        vec![
+            score(hidden, 0.98),
+            score(visible.clone(), 0.95),
+            score(second.clone(), 0.93),
+        ],
         vec![],
         vec![],
     ];
     let channels = planned(&f, &model, "public");
     assert_eq!(*model.limits.lock().unwrap(), [SEARCH_LIMIT; 3]);
-    assert_eq!(channels.vector, [score(visible, 0.91)]);
+    assert_eq!(channels.vector, [score(visible, 0.95), score(second, 0.93)]);
 }

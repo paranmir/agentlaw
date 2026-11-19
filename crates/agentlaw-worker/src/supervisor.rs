@@ -1,4 +1,5 @@
 //! One serialized owner for model-process transitions. Native inference is never in this process.
+use crate::execution::SelectionCache;
 use crate::{
     model_child::{self, Input, Launch, Output, Result},
     EmbeddingError, RuntimeConfig, WorkerState,
@@ -170,6 +171,7 @@ struct QueryQueue {
 enum QueryOperation {
     Prefix,
     Split,
+    Embed,
 }
 
 impl QueryQueue {
@@ -306,72 +308,6 @@ struct HeldIndex {
     origin: IndexOrigin,
 }
 
-enum CacheCommand {
-    Save(String, crate::execution::Selection),
-    #[cfg(test)]
-    Flush(mpsc::Sender<()>),
-}
-struct SelectionCache {
-    value: Arc<std::sync::Mutex<Option<(String, crate::execution::Selection)>>>,
-    commands: mpsc::Sender<CacheCommand>,
-}
-impl SelectionCache {
-    fn open(path: std::path::PathBuf) -> Self {
-        let value = Arc::new(std::sync::Mutex::new(None));
-        let loaded = value.clone();
-        let (commands, incoming) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut previous = std::fs::metadata(&path)
-                .ok()
-                .filter(|m| m.len() <= 65536)
-                .and_then(|_| std::fs::read(&path).ok());
-            if let Some(parsed) = previous
-                .as_ref()
-                .and_then(|bytes| serde_json::from_slice(bytes).ok())
-            {
-                *loaded.lock().unwrap() = Some(parsed);
-            } else {
-                previous = None;
-            }
-            while let Ok(command) = incoming.recv() {
-                match command {
-                    CacheCommand::Save(fingerprint, selection) => {
-                        let item = (fingerprint, selection);
-                        if let Ok(bytes) = serde_json::to_vec(&item) {
-                            if bytes.len() <= 65536 {
-                                if previous.as_ref() == Some(&bytes)
-                                    || std::fs::write(&path, &bytes).is_ok()
-                                {
-                                    previous = Some(bytes);
-                                    *loaded.lock().unwrap() = Some(item);
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(test)]
-                    CacheCommand::Flush(done) => {
-                        let _ = done.send(());
-                    }
-                }
-            }
-        });
-        Self { value, commands }
-    }
-    fn get(&self) -> Option<(String, crate::execution::Selection)> {
-        self.value.lock().unwrap().clone()
-    }
-    fn save(&self, fingerprint: String, selection: crate::execution::Selection) {
-        let _ = self
-            .commands
-            .send(CacheCommand::Save(fingerprint, selection));
-    }
-    #[cfg(test)]
-    fn flush(&self) {
-        let (tx, rx) = mpsc::channel();
-        self.commands.send(CacheCommand::Flush(tx)).unwrap();
-        rx.recv().unwrap();
-    }
-}
 impl RamWork {
     fn id(&self) -> ModelRequestId {
         match self {
@@ -1015,10 +951,8 @@ fn model_supervision_run(
                         selection,
                     },
                 ) => {
-                    if selection.cacheable {
-                        if let Some(cache) = &cache {
-                            cache.save(fingerprint, selection);
-                        }
+                    if let Some(cache) = &cache {
+                        cache.accept(fingerprint, selection);
                     }
                 }
                 Event::Output(_, Output::Pieces { id, .. }) => {

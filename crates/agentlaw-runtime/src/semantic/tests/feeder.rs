@@ -565,8 +565,10 @@ fn oversized_piece_does_not_retry_and_reports_health() {
             f.indexer.progress("binding").unwrap().ack.is_some(),
             health.iter().any(|(component, state)| {
                 component.binding.as_deref() == Some("binding")
-                    && state.reason.as_deref()
-                        == Some(EmbeddingError::InputTooLong.to_string().as_str())
+                    && state
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("model token limit"))
             })
         ),
         (false, false, false, false, true)
@@ -706,6 +708,7 @@ fn observe_handoff(case: Handoff) {
         model: Some(model_assets(&assets_root)),
     };
     std::fs::create_dir(&worker_config.state_dir).unwrap();
+    std::fs::write(assets_root.join("distinct-vectors"), []).unwrap();
     host.spawn(
         ComponentId {
             binding: None,
@@ -738,6 +741,18 @@ fn observe_handoff(case: Handoff) {
     host.shutdown();
     let prepared = result.unwrap();
     assert_eq!(prepared.len(), 3);
+    let observed = model_transcript(&assets_root, "vectors.jsonl");
+    let observed_vectors: Vec<Vec<f32>> = (0..3)
+        .map(|i| {
+            let text = &body[i * 3..i * 3 + 3];
+            let entry = observed.iter().find(|entry| entry["text"] == text).unwrap();
+            serde_json::from_value(entry["vector"].clone()).unwrap()
+        })
+        .collect();
+    for (vector, recorded) in prepared.iter().zip(&observed_vectors) {
+        assert_eq!(vector.values.as_ref(), recorded.as_slice());
+    }
+    assert_ne!(observed_vectors[0], observed_vectors[2]);
     assert_eq!(
         model_transcript(&assets_root, "splits.jsonl"),
         [json!(body)]
@@ -795,7 +810,7 @@ fn observe_handoff(case: Handoff) {
         let pending = std::sync::Mutex::new(Some(wait_release));
         *indexer.inner.pre_commit_hook.lock().unwrap() = Some(Arc::new(move || {
             if let Some(rx) = pending.lock().unwrap().take() {
-                entered.send(()).unwrap();
+                entered.try_send(()).unwrap();
                 rx.recv_timeout(Duration::from_secs(20)).unwrap();
             }
         }));
@@ -811,7 +826,24 @@ fn observe_handoff(case: Handoff) {
             .expect("cache hit never entered commit");
         let found = indexer.next_work(model);
         let ack = indexer.progress("binding").unwrap().ack;
-        release.send(()).unwrap();
+        let (occupied, next_range, ranges) = {
+            let state = indexer.inner.state.lock().unwrap();
+            let lane = &state.schedule.lanes[&LaneKey::current("binding")];
+            (
+                lane.occupied(),
+                lane.pending_window.as_ref().map(|window| window.next_range),
+                lane.pending_window
+                    .as_ref()
+                    .map(|window| window.ranges.clone()),
+            )
+        };
+        release.try_send(()).unwrap();
+        assert_eq!(occupied, 1);
+        assert_eq!(next_range, Some(1));
+        assert_eq!(
+            ranges.as_ref().and_then(|ranges| ranges.get(1)),
+            Some(&(3, 6))
+        );
         assert!(found.is_none());
         assert!(ack.is_none());
     }
@@ -870,7 +902,7 @@ fn observe_handoff(case: Handoff) {
         let expected = if embedded.iter().any(|text| text == &body[i * 3..i * 3 + 3]) {
             &fresh[..]
         } else {
-            &prepared[i].values[..]
+            &observed_vectors[i][..]
         };
         assert_eq!(vector, expected);
     }
@@ -894,7 +926,7 @@ fn indexer_infers_only_evicted_prepared_pieces() {
     observe_handoff(Handoff::Evicted);
 }
 #[test]
-fn runtime_restart_recomputes_pieces_without_disk_handoff() {
+fn runtime_restart_recomputes_pieces_after_preparation_without_index_files() {
     observe_handoff(Handoff::Restarted);
 }
 #[test]
