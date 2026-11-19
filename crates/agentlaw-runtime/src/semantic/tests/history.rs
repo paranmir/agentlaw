@@ -38,8 +38,8 @@ fn finish_history(
             return texts;
         }
         if let Some(work) = indexer.next_work("model") {
-            texts.push(work.text.to_string());
-            indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+            texts.push(indexed_text(&work).to_owned());
+            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
         }
         assert!(Instant::now() < deadline, "history indexing timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -273,7 +273,7 @@ fn history_offer_capacity_and_current_priority() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let work = indexer.next_work("model").unwrap();
-    assert_eq!(&*work.text, "current");
+    assert_eq!(indexed_text(&work), "current");
     assert!(indexer.shutdown(Duration::from_secs(5)));
 }
 
@@ -351,7 +351,7 @@ fn history_restart_reuses_completed_changes_without_early_ack() {
             }
         }
         if let Some(work) = indexer.next_work("model") {
-            indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
         }
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));

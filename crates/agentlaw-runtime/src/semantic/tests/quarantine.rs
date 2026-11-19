@@ -43,7 +43,7 @@ fn search_corruption_is_reported_only_for_affected_binding() {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(work) = indexer.next_work("model") {
-            indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
         }
         if [("a", ra.generation), ("b", rb.generation)]
             .iter()
@@ -113,7 +113,7 @@ fn search_corruption_is_reported_only_for_affected_binding() {
         hook_barrier.wait();
         hook_barrier.wait();
     }));
-    indexer.finish(pending.id, Ok(vec![1.0, 0.0]));
+    indexer.finish(pending.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
     barrier.wait();
     let search = SemanticSearch::new(indexer.clone(), crate::model::ModelHandle::new());
     let vector = QueryVector {

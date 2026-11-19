@@ -123,14 +123,31 @@ pub fn host_resident_bytes() -> Option<u64> {
         None
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn complete_ranges_and_noise() {
-        assert!(gpu_is_unambiguously_faster(&[11, 12, 13], &[1, 2, 3]));
-        assert!(!gpu_is_unambiguously_faster(&[2, 12, 13], &[1, 2, 3]));
-        assert!(!gpu_is_unambiguously_faster(&[2, 3], &[1, 1]));
-        assert!(!gpu_is_unambiguously_faster(&[3, 4, 5], &[0, 1, 2]));
-    }
+pub(crate) fn cached_selection(
+    cached: Option<(String, Selection)>,
+    fingerprint: Option<&String>,
+) -> Option<Selection> {
+    cached
+        .filter(|(key, _)| Some(key) == fingerprint)
+        .map(|(_, selection)| selection)
 }
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuExecutionSettings {
+    pub version: u32,
+    pub intra: usize,
+    pub inter: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) fn fingerprint_with_cpu_settings(
+    _model: &str,
+    _runtime: &std::path::Path,
+    _settings: CpuExecutionSettings,
+) -> Option<String> {
+    unimplemented!("CPU execution settings in cache fingerprint")
+}
+
+#[cfg(test)]
+mod tests;

@@ -1026,8 +1026,69 @@ fn read_history(
     )
 }
 
-#[test]
-fn long_history_query_reports_truncation_with_complete_coverage() {
+fn long_history_query_diagnostics(ready: bool, partial: bool) {
+    use crate::semantic::{
+        HistoryIngestHint, HistorySemanticPort, OfferResult, PrefixEmbedding, QueryVector,
+        SemanticCandidates, SemanticCoverage, SemanticError, SemanticPort, SemanticQuery,
+    };
+    struct Model {
+        ready: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        coverage: SemanticCoverage,
+    }
+    impl SemanticPort for Model {
+        fn embed_query(
+            &self,
+            _: &str,
+            _: &RequestControl,
+        ) -> std::result::Result<QueryVector, SemanticError> {
+            if !self.ready {
+                return Err(SemanticError::Unavailable("model loading".into()));
+            }
+            Ok(QueryVector {
+                model: "model".into(),
+                values: std::sync::Arc::from([1.0]),
+            })
+        }
+        fn embed_prefix(
+            &self,
+            text: &str,
+            control: &RequestControl,
+        ) -> std::result::Result<PrefixEmbedding, SemanticError> {
+            assert!(text.ends_with("cancellation"));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(PrefixEmbedding {
+                vector: self.embed_query(text, control)?,
+                truncated: true,
+            })
+        }
+        fn search_available(
+            &self,
+            _: SemanticQuery<'_>,
+            _: &RequestControl,
+        ) -> std::result::Result<SemanticCandidates, SemanticError> {
+            unreachable!()
+        }
+    }
+    impl HistorySemanticPort for Model {
+        fn offer(&self, _: HistoryIngestHint) -> OfferResult {
+            OfferResult::Accepted
+        }
+        fn search_available(
+            &self,
+            _: &str,
+            _: &str,
+            _: &QueryVector,
+            _: &[String],
+            _: usize,
+            _: &RequestControl,
+        ) -> std::result::Result<SemanticCandidates, SemanticError> {
+            Ok(SemanticCandidates {
+                hits: vec![],
+                coverage: self.coverage.clone(),
+            })
+        }
+    }
     let (temp, store, id, _) = fixture(3);
     let control_dir = temp.path().join("control");
     std::fs::create_dir(&control_dir).unwrap();
@@ -1046,16 +1107,28 @@ fn long_history_query_reports_truncation_with_complete_coverage() {
         response_limit: 65536,
         config_file: None,
     };
-    let ready = ReadyHistory {
-        offer: crate::semantic::OfferResult::Accepted,
-        position: source.read_snapshot().unwrap().position().clone(),
+    let requested = source.read_snapshot().unwrap().position().clone();
+    let coverage = if partial {
+        let mut available = requested.clone();
+        available.sequence -= 1;
+        SemanticCoverage::Partial {
+            available,
+            requested,
+        }
+    } else {
+        SemanticCoverage::CompleteAt(requested)
+    };
+    let model = Model {
+        ready,
+        coverage,
+        calls: Default::default(),
     };
     let ctx = crate::store::ReadCtx {
         identity: &identity,
         source: &source,
         control: &reader,
-        semantic: &ready,
-        history_semantic: &ready,
+        semantic: &model,
+        history_semantic: &model,
         history_cache: &cache,
         request: &control,
     };
@@ -1075,7 +1148,23 @@ fn long_history_query_reports_truncation_with_complete_coverage() {
             .iter()
             .filter(|&&code| code == "semantic_query_truncated")
             .count(),
-        1,
+        usize::from(ready),
     );
-    assert!(!codes.contains(&"semantic_channel_incomplete"));
+    assert_eq!(
+        codes.contains(&"semantic_channel_incomplete"),
+        partial || !ready
+    );
+}
+
+#[test]
+fn long_history_query_reports_truncation_with_complete_coverage() {
+    long_history_query_diagnostics(true, false);
+}
+#[test]
+fn long_history_query_reports_truncation_with_partial_coverage() {
+    long_history_query_diagnostics(true, true);
+}
+#[test]
+fn long_history_query_loading_model_reports_only_incompleteness() {
+    long_history_query_diagnostics(false, false);
 }

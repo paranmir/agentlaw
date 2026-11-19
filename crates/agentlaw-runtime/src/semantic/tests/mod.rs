@@ -129,7 +129,7 @@ fn drive(indexer: &SemanticIndexer, target: u64) -> usize {
     loop {
         if let Some(work) = indexer.next_work("model") {
             count += 1;
-            indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
         }
         if indexer
             .progress("binding")
@@ -216,7 +216,7 @@ fn race_after_final_check(redirect: bool) {
             hook_barrier.wait();
         }
     }));
-    indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
     barrier.wait();
     let latest = if let Some(destination) = destination {
         let change = uuid::Uuid::new_v4().to_string();
@@ -287,7 +287,7 @@ fn race_after_final_check(redirect: bool) {
         "the barrier must exercise the post-check race"
     );
     drop(db);
-    indexer.finish(next.id, Ok(vec![1.0, 0.0]));
+    indexer.finish(next.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
     drive(&indexer, latest.generation);
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -337,4 +337,11 @@ fn race_after_final_check(redirect: bool) {
     }
     drop(db);
     assert!(indexer.shutdown(Duration::from_secs(5)));
+}
+
+fn indexed_text(work: &IndexWork) -> &str {
+    use agentlaw_worker::supervisor::IndexTask;
+    match &work.task {
+        IndexTask::Embed(text) | IndexTask::Split(text) => text,
+    }
 }

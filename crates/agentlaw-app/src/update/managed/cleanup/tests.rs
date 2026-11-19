@@ -1017,7 +1017,10 @@ fn real_binding_index_fixture(root: &Path) -> (PathBuf, PathBuf) {
             if let Some(work) = indexer.next_work("fixture-model") {
                 let mut vector = vec![0.0; 256];
                 vector[0] = 1.0;
-                indexer.finish(work.id, Ok(vector));
+                indexer.finish(
+                    work.id,
+                    Ok(agentlaw_worker::supervisor::IndexResult::Vector(vector)),
+                );
             }
             assert!(
                 Instant::now() < deadline,

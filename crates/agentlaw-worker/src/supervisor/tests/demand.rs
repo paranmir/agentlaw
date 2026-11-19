@@ -12,7 +12,7 @@ impl IndexWorkPort for FakeRamIndex {
         *self.calls.lock().unwrap() += 1;
         self.work.lock().unwrap().take()
     }
-    fn finish(&self, id: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(&self, id: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {
         self.finished.lock().unwrap().push(id);
     }
     fn status(&self) -> IndexWorkStatus {
@@ -85,7 +85,7 @@ fn idle_supervisor_does_not_create_files_or_start_unconfigured_model() {
         fn next_work(&self, _: &str) -> Option<IndexWork> {
             unreachable!()
         }
-        fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+        fn finish(&self, _: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {
             unreachable!()
         }
         fn status(&self) -> IndexWorkStatus {

@@ -6,7 +6,7 @@ struct TestPort {
     finished: Mutex<
         Option<(
             ModelRequestId,
-            std::result::Result<Vec<f32>, EmbeddingError>,
+            std::result::Result<IndexResult, EmbeddingError>,
         )>,
     >,
 }
@@ -18,7 +18,11 @@ impl IndexWorkPort for TestPort {
         self.work.lock().unwrap().take()
     }
 
-    fn finish(&self, id: ModelRequestId, outcome: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(
+        &self,
+        id: ModelRequestId,
+        outcome: std::result::Result<IndexResult, EmbeddingError>,
+    ) {
         *self.finished.lock().unwrap() = Some((id, outcome));
     }
 
@@ -117,6 +121,7 @@ fn model_handoff_helper() {
                 model_child::write(
                     &mut stdout,
                     &Output::Result {
+                        truncated: false,
                         id,
                         attempt,
                         result: Ok(vector),
@@ -124,6 +129,7 @@ fn model_handoff_helper() {
                 )
                 .unwrap();
             }
+            Input::Split { .. } => unreachable!("legacy fixture received Split"),
             Input::Stop => std::process::exit(0),
         }
     }
@@ -239,21 +245,21 @@ fn index_work_port_crosses_threads_and_records_outcome() {
     let concrete = Arc::new(TestPort {
         work: Mutex::new(Some(IndexWork {
             id: ModelRequestId(42),
-            text: Arc::from("queued text"),
+            task: IndexTask::Embed(Arc::from("queued text")),
         })),
         finished: Mutex::new(None),
     });
     let port: Arc<dyn IndexWorkPort> = concrete.clone();
     std::thread::spawn(move || {
         let work = port.next_work("model").unwrap();
-        assert_eq!(&*work.text, "queued text");
-        port.finish(work.id, Ok(vec![1.0, 2.0]));
+        assert!(matches!(&work.task, IndexTask::Embed(text) if &**text == "queued text"));
+        port.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 2.0])));
     })
     .join()
     .unwrap();
     let finished = concrete.finished.lock().unwrap().take().unwrap();
     assert_eq!(finished.0, ModelRequestId(42));
-    assert_eq!(finished.1.unwrap(), vec![1.0, 2.0]);
+    assert_eq!(finished.1.unwrap(), IndexResult::Vector(vec![1.0, 2.0]));
 }
 
 #[cfg(windows)]
@@ -270,7 +276,7 @@ fn first_model_demand_creates_missing_state_directory_and_reaches_ready() {
         fn next_work(&self, _: &str) -> Option<IndexWork> {
             None
         }
-        fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+        fn finish(&self, _: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {
             unreachable!("this fixture has no indexing work")
         }
         fn status(&self) -> IndexWorkStatus {

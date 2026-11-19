@@ -35,9 +35,15 @@ fn work_is_fifo_and_requires_ready_digest() {
     assert!(!fake.status().awaiting_model);
     assert!(fake.next_work("other").is_none());
     assert_eq!(fake.next_work("model").unwrap().id, a);
-    fake.finish(a, Ok(vec![1.0]));
+    fake.finish(
+        a,
+        Ok(agentlaw_worker::supervisor::IndexResult::Vector(vec![1.0])),
+    );
     assert_eq!(fake.next_work("model").unwrap().id, b);
     assert!(!fake.status().runnable);
     assert_ne!(fake.push("c"), a);
-    assert_eq!(fake.finished(), vec![(a, Ok(vec![1.0]))]);
+    assert_eq!(
+        fake.finished(),
+        vec![(a, Ok(IndexResult::Vector(vec![1.0])))]
+    );
 }

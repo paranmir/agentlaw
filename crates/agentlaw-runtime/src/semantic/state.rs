@@ -240,7 +240,10 @@ impl Schedule {
                 let text: Arc<str> = Arc::from(piece.text.as_str());
                 lane.running.insert(id, (lane.generation, piece));
                 self.last = Some(name.clone());
-                return Some(IndexWork { id, text });
+                return Some(IndexWork {
+                    id,
+                    task: agentlaw_worker::supervisor::IndexTask::Embed(text),
+                });
             }
         }
         None

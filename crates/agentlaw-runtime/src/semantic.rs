@@ -6,6 +6,7 @@ mod history;
 pub mod identity;
 mod pump;
 mod quarantine;
+pub(crate) mod recent_vectors;
 mod search;
 mod source;
 mod state;
@@ -16,7 +17,7 @@ use crate::ports::{ComponentState, HealthSink, RuntimeError, RuntimeResult};
 use agentlaw_search::vector_file::SourcePosition;
 use agentlaw_storage::published::OwnedPublishedReader;
 use agentlaw_worker::supervisor::{
-    IndexWork, IndexWorkPort, IndexWorkStatus, ModelRequestId, ModelRequestIds,
+    IndexResult, IndexWork, IndexWorkPort, IndexWorkStatus, ModelRequestId, ModelRequestIds,
 };
 use agentlaw_worker::EmbeddingError;
 use state::{Lane, LaneKey, Schedule};
@@ -41,6 +42,7 @@ pub struct SemanticConfig {
     pub queue_pieces: usize,
     pub pending_results: usize,
     pub history_lanes: usize,
+    pub(crate) recent_vectors: Arc<recent_vectors::RecentVectors>,
 }
 
 impl SemanticConfig {
@@ -55,6 +57,7 @@ impl SemanticConfig {
             queue_pieces: 256,
             pending_results: 128,
             history_lanes: 32,
+            recent_vectors: Arc::default(),
         }
     }
 }
@@ -796,7 +799,13 @@ impl IndexWorkPort for SemanticIndexer {
         work
     }
 
-    fn finish(&self, id: ModelRequestId, outcome: Result<Vec<f32>, EmbeddingError>) {
+    fn finish(&self, id: ModelRequestId, outcome: Result<IndexResult, EmbeddingError>) {
+        let outcome = outcome.and_then(|result| match result {
+            IndexResult::Vector(vector) => Ok(vector),
+            IndexResult::Pieces(_) => Err(EmbeddingError::Failed(
+                "split completion is not implemented".into(),
+            )),
+        });
         let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut notify_model = false;
         let mut failure = None;

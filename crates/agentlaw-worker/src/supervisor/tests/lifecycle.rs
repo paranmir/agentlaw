@@ -149,7 +149,7 @@ fn failure_backoff_starts_when_slow_spawn_has_finished() {
         fn next_work(&self, _: &str) -> Option<IndexWork> {
             None
         }
-        fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {}
+        fn finish(&self, _: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {}
         fn status(&self) -> IndexWorkStatus {
             IndexWorkStatus {
                 runnable: false,

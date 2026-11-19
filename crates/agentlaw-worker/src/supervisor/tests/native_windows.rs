@@ -266,6 +266,7 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     tx.send(Event::Output(
         old,
         Output::Result {
+            truncated: false,
             id: 2,
             attempt: 1,
             result: Ok(old_vector),
@@ -275,6 +276,7 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     tx.send(Event::Output(
         new,
         Output::Result {
+            truncated: false,
             id: 2,
             attempt: 1,
             result: Ok(new_vector.clone()),
@@ -303,6 +305,7 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     tx.send(Event::Output(
         current.clone(),
         Output::Result {
+            truncated: false,
             id: 3,
             attempt: 1,
             result: Err(EmbeddingError::Failed("bad input".into())),

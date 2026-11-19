@@ -26,6 +26,7 @@ struct State {
 #[derive(Clone)]
 pub struct ModelHandle {
     inner: Arc<Mutex<State>>,
+    _recent_vectors: Arc<crate::semantic::recent_vectors::RecentVectors>,
 }
 impl Default for ModelHandle {
     fn default() -> Self {
@@ -34,7 +35,13 @@ impl Default for ModelHandle {
 }
 impl ModelHandle {
     pub fn new() -> Self {
+        Self::with_recent_vectors(Arc::default())
+    }
+    pub(crate) fn with_recent_vectors(
+        recent_vectors: Arc<crate::semantic::recent_vectors::RecentVectors>,
+    ) -> Self {
         Self {
+            _recent_vectors: recent_vectors,
             inner: Arc::new(Mutex::new(State {
                 supervisor: None,
                 previous: None,

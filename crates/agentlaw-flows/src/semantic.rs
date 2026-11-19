@@ -55,6 +55,7 @@ pub struct PieceVectorReuse {
     _private: (),
 }
 
+#[derive(Default)]
 pub struct PiecePlan {
     _private: (),
 }

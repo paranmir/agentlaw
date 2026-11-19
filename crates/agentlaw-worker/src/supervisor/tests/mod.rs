@@ -285,7 +285,7 @@ impl IndexWorkPort for EmptyRamIndex {
     fn next_work(&self, _: &str) -> Option<IndexWork> {
         panic!("idle index must not be polled")
     }
-    fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(&self, _: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {
         panic!("unexpected index completion")
     }
     fn status(&self) -> IndexWorkStatus {
@@ -313,7 +313,7 @@ impl IndexWorkPort for OneRamIndex {
         }
         work
     }
-    fn finish(&self, id: ModelRequestId, result: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(&self, id: ModelRequestId, result: std::result::Result<IndexResult, EmbeddingError>) {
         self.completed.send((id, result.is_err())).unwrap();
     }
     fn status(&self) -> IndexWorkStatus {
@@ -367,7 +367,7 @@ impl IndexWorkPort for ReviewIndex {
         }
         work
     }
-    fn finish(&self, _: ModelRequestId, _: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(&self, _: ModelRequestId, _: std::result::Result<IndexResult, EmbeddingError>) {
         let _ = self.finished.send(());
         if let Some(rx) = self.release_finish.lock().unwrap().take() {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -412,7 +412,7 @@ impl ReviewFixture {
         let index = Arc::new(ReviewIndex {
             work: Mutex::new(work.then(|| IndexWork {
                 id: ids.next().unwrap(),
-                text: Arc::from("index"),
+                task: IndexTask::Embed(Arc::from("index")),
             })),
             taken: taken_tx,
             finished: finished_tx,
@@ -522,7 +522,11 @@ impl IndexWorkPort for RecheckIndex {
         }
         work
     }
-    fn finish(&self, id: ModelRequestId, outcome: std::result::Result<Vec<f32>, EmbeddingError>) {
+    fn finish(
+        &self,
+        id: ModelRequestId,
+        outcome: std::result::Result<IndexResult, EmbeddingError>,
+    ) {
         self.finish_calls.fetch_add(1, Ordering::SeqCst);
         self.finished
             .send((id, outcome.is_err(), self.digest.lock().unwrap().clone()))
@@ -625,7 +629,7 @@ impl Recheck {
         let index = Arc::new(RecheckIndex {
             work: Mutex::new(work.then(|| IndexWork {
                 id: ids.next().unwrap(),
-                text: Arc::from("index-a"),
+                task: IndexTask::Embed(Arc::from("index-a")),
             })),
             next_gate: Mutex::new(None),
             finish_gate: Mutex::new(None),

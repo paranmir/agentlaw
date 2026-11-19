@@ -40,8 +40,14 @@ fn round_robin_respects_capacity_and_digest() {
     let ids = ModelRequestIds::new();
     let now = Instant::now();
     assert!(schedule.next("other", &ids, 1, now).is_none());
-    assert_eq!(&*schedule.next("model", &ids, 1, now).unwrap().text, "a");
-    assert_eq!(&*schedule.next("model", &ids, 1, now).unwrap().text, "b");
+    assert_eq!(
+        indexed_text(&schedule.next("model", &ids, 1, now).unwrap()),
+        "a"
+    );
+    assert_eq!(
+        indexed_text(&schedule.next("model", &ids, 1, now).unwrap()),
+        "b"
+    );
     assert!(schedule.next("model", &ids, 1, now).is_none());
     schedule
         .lanes
@@ -68,7 +74,7 @@ fn round_robin_alternates_while_both_bindings_have_capacity() {
     let now = Instant::now();
     for expected in ["a", "b", "a", "b"] {
         assert_eq!(
-            &*schedule.next("model", &ids, 3, now).unwrap().text,
+            indexed_text(&schedule.next("model", &ids, 3, now).unwrap()),
             expected
         );
     }

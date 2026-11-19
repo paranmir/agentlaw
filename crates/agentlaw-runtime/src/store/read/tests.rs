@@ -1868,3 +1868,251 @@ fn streamed_exact_result_preserves_body_and_observed_version() {
         reference
     );
 }
+
+#[test]
+fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
+    use crate::host::supervision::Supervisor;
+    use crate::model::{run_model_component, ModelHandle};
+    use crate::ports::{ComponentId, ComponentKind, HealthSink};
+    use crate::semantic::{
+        recent_vectors::RecentVectors, SemanticConfig, SemanticIndexer, SemanticSearch,
+    };
+    use crate::test_support::{
+        model_assets, model_child_executable, model_transcript, FakeIndexWork,
+    };
+    use agentlaw_flows::semantic::{
+        PiecePlan, PieceVectorReuse, QueryVector, SemanticCandidates, SemanticError, SemanticPort,
+        SemanticQuery,
+    };
+    use agentlaw_worker::{
+        supervisor::{IndexResult, IndexTask, IndexWorkPort, ModelRequestIds},
+        RuntimeConfig, WorkerState,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    const BODY: &str = "first preface\n# Title\n|second|third|";
+    const SECTION: &str = "# Title\n|second|third|";
+
+    #[derive(Default)]
+    struct Observed {
+        plan_inputs: Vec<Vec<String>>,
+        section_searches: usize,
+        embeds_at_clear: Option<Vec<Value>>,
+        material_hits: Vec<String>,
+        overlap_hits: Vec<String>,
+    }
+    struct Probe {
+        adapter: SemanticSearch,
+        install_cache: Arc<RecentVectors>,
+        assets: PathBuf,
+        observed: Mutex<Observed>,
+    }
+    impl SemanticPort for Probe {
+        fn embed_query(
+            &self,
+            text: &str,
+            control: &RequestControl,
+        ) -> Result<QueryVector, SemanticError> {
+            self.adapter.embed_query(text, control)
+        }
+        fn plan_pieces(
+            &self,
+            records: &[&str],
+            control: &RequestControl,
+        ) -> Result<PiecePlan, SemanticError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .plan_inputs
+                .push(records.iter().map(|record| (*record).to_owned()).collect());
+            self.adapter.plan_pieces(records, control)
+        }
+        fn embed_planned(
+            &self,
+            plan: &PiecePlan,
+            record: usize,
+            reuse: &PieceVectorReuse,
+            control: &RequestControl,
+        ) -> Result<Vec<QueryVector>, SemanticError> {
+            self.adapter.embed_planned(plan, record, reuse, control)
+        }
+        fn search_available(
+            &self,
+            query: SemanticQuery<'_>,
+            control: &RequestControl,
+        ) -> Result<SemanticCandidates, SemanticError> {
+            let result = self.adapter.search_available(query, control)?;
+            let mut observed = self.observed.lock().unwrap();
+            let hits = result.hits.iter().map(|hit| hit.memory_id.clone());
+            if query.scopes.len() > 1 {
+                observed.material_hits.extend(hits);
+                if query.text == SECTION {
+                    observed.section_searches += 1;
+                    if observed.section_searches == 3 {
+                        observed.embeds_at_clear =
+                            Some(model_transcript(&self.assets, "requests.jsonl"));
+                        self.install_cache.clear();
+                    }
+                }
+            } else {
+                observed.overlap_hits.extend(hits);
+            }
+            Ok(result)
+        }
+    }
+
+    let f = Fixture::new(65_536);
+    let cache = Arc::new(RecentVectors::default());
+    let handle = ModelHandle::with_recent_vectors(cache.clone());
+    let assets = f.dir.path().join("assets");
+    let health = HealthSink::default();
+    let supervisor = Supervisor::new(health.clone());
+    let worker = handle.clone();
+    handle.set_warm(true);
+    let config = RuntimeConfig {
+        model: Some(model_assets(&assets)),
+        executable: model_child_executable(),
+        state_dir: f.dir.path().join("worker"),
+    };
+    std::fs::create_dir(&config.state_dir).unwrap();
+    supervisor
+        .spawn(
+            ComponentId {
+                binding: None,
+                kind: ComponentKind::Model,
+            },
+            move |stop| {
+                run_model_component(
+                    config.clone(),
+                    Arc::new(FakeIndexWork::new()),
+                    ModelRequestIds::new(),
+                    health.clone(),
+                    worker.clone(),
+                    stop,
+                )
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while handle.snapshot().state != WorkerState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "fixture model did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let user_memory = Fixture::id();
+    let machine_memory = Fixture::id();
+    for (id, applicability) in [
+        (&user_memory, json!({"scope":"user"})),
+        (
+            &machine_memory,
+            json!({"scope":"machine", "machine_id":f.identity.machine_id}),
+        ),
+    ] {
+        f.store.publish(&Fixture::id(), vec![Mutation {
+            unit:CurrentUnit { entity_id:id.clone(),entity_type:"memory".into(),state:UnitState::Live { heads:vec![Head {
+                metadata:json!({
+                    "change_id":Fixture::id(),"applicability":applicability,
+                    "origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,
+                    "is_rule":false,"relations":[],"work_targets":[]
+                }),
+                body:"stored match".into(),
+            }] } },
+            expected_versions:vec![], evidence:"scoped fixture".into(),
+        }]).unwrap();
+    }
+    let source = f.store.owned_published_reader();
+    let position = source.read_snapshot().unwrap().position().clone();
+    let mut config = SemanticConfig::new(f.dir.path().join("indices"), "config".into());
+    config.recent_vectors = cache.clone();
+    let indexer =
+        SemanticIndexer::start(config, ModelRequestIds::new(), HealthSink::default()).unwrap();
+    indexer
+        .open_binding(&f.identity.binding_id, source.clone())
+        .unwrap();
+    indexer.model_ready("fixture-model");
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !indexer
+        .progress(&f.identity.binding_id)
+        .is_some_and(|progress| {
+            progress.complete
+                && progress
+                    .ack
+                    .is_some_and(|ack| ack.sequence == position.sequence as i64)
+        })
+    {
+        if let Some(work) = indexer.next_work("fixture-model") {
+            let result = match work.task {
+                IndexTask::Split(text) => IndexResult::Pieces(vec![(0, text.len() as u32)]),
+                IndexTask::Embed(_) => IndexResult::Vector(vector.clone()),
+            };
+            indexer.finish(work.id, Ok(result));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scoped fixture did not finish indexing"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let probe = Probe {
+        adapter: SemanticSearch::new(indexer.clone(), handle),
+        install_cache: cache,
+        assets: assets.clone(),
+        observed: Mutex::default(),
+    };
+    let control_reader = ControlReader::open(&f.identity.local).unwrap();
+    let history_cache = HistoryCacheGuards::new();
+    let control = RequestControl::default();
+    let ctx = ReadCtx {
+        identity: &f.identity,
+        source: &source,
+        control: &control_reader,
+        semantic: &probe,
+        history_semantic: &probe.adapter,
+        history_cache: &history_cache,
+        request: &control,
+    };
+    let guard = source.read_snapshot().unwrap();
+    let mut exact =
+        ExactSnapshot::build(f.registry.pin().unwrap(), &guard, DeltaBudget::default()).unwrap();
+    drop(guard);
+    let request=serde_json::from_value(json!({
+        "memories":[{"operation":"create","what_to_remember":BODY,"applies_to":["user"],"evidence":"new titled proposal"}]
+    })).unwrap();
+    let prepared = agentlaw_flows::prepare::prepare(&ctx, &mut exact, request);
+    let observations = probe.observed.lock().unwrap();
+    let splits = model_transcript(&assets, "splits.jsonl");
+    let embeds = model_transcript(&assets, "requests.jsonl");
+    assert!(indexer.shutdown(Duration::from_secs(5)));
+    supervisor.shutdown();
+
+    assert_eq!(
+        observations.plan_inputs,
+        [vec![BODY.to_owned(), SECTION.to_owned()]]
+    );
+    assert!(matches!(prepared.unwrap(), Prepared::Remember(_)));
+    assert_eq!(splits, [json!(BODY), json!(SECTION)]);
+    assert_eq!(
+        embeds,
+        [
+            json!("first preface\n# Title\n|"),
+            json!("second|"),
+            json!("third|"),
+            json!("# Title\n|")
+        ]
+    );
+    assert_eq!(observations.embeds_at_clear.as_ref(), Some(&embeds));
+    assert!(observations.material_hits.contains(&user_memory));
+    assert!(observations.material_hits.contains(&machine_memory));
+    assert!(!observations.overlap_hits.is_empty());
+    assert!(observations
+        .overlap_hits
+        .iter()
+        .all(|id| id == &user_memory));
+}

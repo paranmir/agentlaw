@@ -8,7 +8,8 @@ use crate::model::ModelHandle;
 use crate::ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus};
 use agentlaw_contracts::RequestControl;
 use agentlaw_flows::semantic::{
-    QueryVector, SemanticCandidates, SemanticCoverage, SemanticError, SemanticPort, SemanticQuery,
+    PiecePlan, PieceVectorReuse, PrefixEmbedding, QueryVector, SemanticCandidates,
+    SemanticCoverage, SemanticError, SemanticPort, SemanticQuery,
 };
 use agentlaw_search::{vector_file::VectorFileReadView, ScopeFilter};
 use std::time::SystemTime;
@@ -33,6 +34,30 @@ impl SemanticSearch {
 }
 
 impl SemanticPort for SemanticSearch {
+    fn embed_prefix(
+        &self,
+        text: &str,
+        control: &RequestControl,
+    ) -> Result<PrefixEmbedding, SemanticError> {
+        self.model.embed_prefix(text, control)
+    }
+    fn plan_pieces(
+        &self,
+        records: &[&str],
+        control: &RequestControl,
+    ) -> Result<PiecePlan, SemanticError> {
+        self.model.plan_pieces(records, control)
+    }
+    fn embed_planned(
+        &self,
+        plan: &PiecePlan,
+        record: usize,
+        reuse: &PieceVectorReuse,
+        control: &RequestControl,
+    ) -> Result<Vec<QueryVector>, SemanticError> {
+        self.model.embed_planned(plan, record, reuse, control)
+    }
+
     fn embed_query(
         &self,
         text: &str,

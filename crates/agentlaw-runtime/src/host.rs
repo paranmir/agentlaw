@@ -133,15 +133,12 @@ fn run_with_clock(
     let health = HealthSink::default();
     health::publish_host(&health, ComponentState::Starting, None);
     let ids = ModelRequestIds::new();
-    let model = ModelHandle::new();
-    let indexer = SemanticIndexer::start(
-        SemanticConfig::new(
-            deps.state.join("worker").join("indices"),
-            INDEX_CONFIG_VERSION.into(),
-        ),
-        ids.clone(),
-        health.clone(),
-    )?;
+    let semantic_config = SemanticConfig::new(
+        deps.state.join("worker").join("indices"),
+        INDEX_CONFIG_VERSION.into(),
+    );
+    let model = ModelHandle::with_recent_vectors(semantic_config.recent_vectors.clone());
+    let indexer = SemanticIndexer::start(semantic_config, ids.clone(), health.clone())?;
     let wake_model = model.clone();
     indexer.set_model_waker(Arc::new(move || wake_model.wake()));
     let semantic = Arc::new(SemanticSearch::new(indexer.clone(), model.clone()));

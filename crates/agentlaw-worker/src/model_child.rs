@@ -21,7 +21,17 @@ pub(crate) struct Launch {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Input {
-    Embed { id: u64, attempt: i64, text: String },
+    Embed {
+        id: u64,
+        attempt: i64,
+        text: String,
+        overflow: Overflow,
+    },
+    Split {
+        id: u64,
+        attempt: i64,
+        text: String,
+    },
     Stop,
 }
 #[derive(Serialize, Deserialize)]
@@ -39,7 +49,13 @@ pub(crate) enum Output {
     Result {
         id: u64,
         attempt: i64,
+        truncated: bool,
         result: std::result::Result<Vec<f32>, EmbeddingError>,
+    },
+    Pieces {
+        id: u64,
+        attempt: i64,
+        result: std::result::Result<Vec<(u32, u32)>, EmbeddingError>,
     },
     Selection {
         fingerprint: Option<String>,
@@ -185,10 +201,7 @@ pub fn run_model_child() -> Result<()> {
         std::thread::spawn(move || {
             let fingerprint =
                 crate::execution::fingerprint(provider.model_digest(), &assets.runtime_library);
-            let cached = launch
-                .cached
-                .filter(|(key, _)| Some(key) == fingerprint.as_ref())
-                .map(|(_, v)| v);
+            let cached = crate::execution::cached_selection(launch.cached, fingerprint.as_ref());
             let selection = provider.select_execution_cached(&assets, cached.as_ref());
             let _ = write(
                 &mut *output.lock().unwrap(),
@@ -201,17 +214,38 @@ pub fn run_model_child() -> Result<()> {
     }
     loop {
         match read::<Input>(&mut input) {
-            Ok(Input::Embed { id, attempt, text }) => {
-                let result = provider.embed(&text);
+            Ok(Input::Embed {
+                id,
+                attempt,
+                text,
+                overflow,
+            }) => {
+                let result = match overflow {
+                    Overflow::Reject => provider.embed(&text),
+                    Overflow::Prefix => Err(EmbeddingError::Failed(
+                        "prefix embedding is not implemented".into(),
+                    )),
+                };
                 write(
                     &mut *output.lock().unwrap(),
                     &Output::Result {
                         id,
                         attempt,
+                        truncated: false,
                         result,
                     },
                 )?;
             }
+            Ok(Input::Split { id, attempt, .. }) => write(
+                &mut *output.lock().unwrap(),
+                &Output::Pieces {
+                    id,
+                    attempt,
+                    result: Err(EmbeddingError::Failed(
+                        "model input splitting is not implemented".into(),
+                    )),
+                },
+            )?,
             Ok(Input::Stop) => break,
             Err(_) => break,
         }
@@ -260,6 +294,7 @@ mod tests {
         for character in ['a', '\0'] {
             let text = character.to_string().repeat(4 * 1024 * 1024);
             let bytes = encode(&Input::Embed {
+                overflow: crate::model_child::Overflow::Reject,
                 id: 1,
                 attempt: 1,
                 text: text.clone(),

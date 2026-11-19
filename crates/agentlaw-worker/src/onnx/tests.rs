@@ -166,3 +166,54 @@ fn split_honors_delimiter_priority_and_keeps_the_short_remainder_whole() {
         assert_eq!(offset as usize, text.len());
     }
 }
+
+#[test]
+fn split_rechecks_distinct_utf8_ends_after_byte_fallback() {
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::normalizers::replace::{Replace, ReplacePattern};
+
+    let vocab: tokenizers::models::bpe::Vocab = [
+        ("[CLS]", 0),
+        ("a", 1),
+        ("b", 2),
+        ("<0xED>", 3),
+        ("<0x95>", 4),
+        ("<0x9C>", 5),
+    ]
+    .into_iter()
+    .map(|(text, id)| (text.to_owned(), id))
+    .collect();
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, vec![])
+        .byte_fallback(true)
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_normalizer(Some(
+        Replace::new(ReplacePattern::Regex("\u{D55C}$".into()), "aaaa").unwrap(),
+    ));
+    tokenizer.with_post_processor(Some(
+        TemplateProcessing::builder()
+            .try_single("[CLS] $A")
+            .unwrap()
+            .special_tokens(vec![("[CLS]", 0)])
+            .build()
+            .unwrap(),
+    ));
+    let window = format!("{}\u{D55C}{}", "a".repeat(508), "b".repeat(12));
+    let whole = tokenizer.encode(&*window, false).unwrap();
+    assert_eq!(&whole.get_ids()[508..511], &[3, 4, 5]);
+    assert_eq!(&whole.get_offsets()[508..511], &[(508, 511); 3]);
+    assert_eq!(tokenizer.encode(&window[..511], true).unwrap().len(), 513);
+    let ranges = split(&tokenizer, &window).unwrap();
+    assert_eq!(ranges, [(0, 508), (508, 523)]);
+    for (start, end) in ranges {
+        assert!(
+            tokenizer
+                .encode(&window[start as usize..end as usize], true)
+                .unwrap()
+                .len()
+                <= 512
+        );
+    }
+}

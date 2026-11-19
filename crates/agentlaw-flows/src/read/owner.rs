@@ -356,6 +356,22 @@ pub(crate) fn preparation_channels(
     })
 }
 
+#[allow(dead_code)]
+fn preparation_channels_planned(
+    _ctx: &ReadCtx<'_>,
+    _exact: &mut ExactSnapshot,
+    _text: &str,
+    _scopes: &[String],
+    _plan: &crate::semantic::PiecePlan,
+    _record: usize,
+    _reuse: &crate::semantic::PieceVectorReuse,
+) -> Result<Channels> {
+    Err(DomainError::new(
+        "internal_error",
+        "Planned preparation search is not implemented.",
+    ))
+}
+
 fn connection(ctx: &ReadCtx<'_>, path: Option<&str>) -> Result<Option<String>> {
     match path {
         None => Ok(None),

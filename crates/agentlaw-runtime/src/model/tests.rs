@@ -13,7 +13,12 @@ impl IndexWorkPort for PanicOnce {
     fn next_work(&self, _: &str) -> Option<IndexWork> {
         None
     }
-    fn finish(&self, _: ModelRequestId, _: Result<Vec<f32>, agentlaw_worker::EmbeddingError>) {}
+    fn finish(
+        &self,
+        _: ModelRequestId,
+        _: Result<agentlaw_worker::supervisor::IndexResult, agentlaw_worker::EmbeddingError>,
+    ) {
+    }
     fn status(&self) -> IndexWorkStatus {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(!self.fail.swap(false, Ordering::SeqCst), "index failed");

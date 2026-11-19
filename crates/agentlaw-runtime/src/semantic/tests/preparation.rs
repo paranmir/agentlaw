@@ -53,7 +53,7 @@ fn preparation_wakes_immediately_on_ack_and_returns_coverage() {
         done_tx.send(result).unwrap();
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    indexer.finish(work.id, Ok(vec![1.0, 0.0]));
+    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
     assert_eq!(
         done_rx
             .recv_timeout(Duration::from_secs(2))

@@ -163,6 +163,11 @@ impl OnnxProvider {
         }
         report
     }
+    #[doc(hidden)]
+    pub fn cpu_session_settings(&self) -> Result<(usize, usize, usize), EmbeddingError> {
+        Err(fail("CPU session settings observation is not implemented"))
+    }
+
     pub fn load(assets: &ModelAssets) -> Result<Self, EmbeddingError> {
         for p in [
             &assets.onnx_model,

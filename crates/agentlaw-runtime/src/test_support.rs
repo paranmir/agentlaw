@@ -53,6 +53,20 @@ fn main() {
     send(&mut output, json!({"Ready":{"model":"fixture-model"}}));
     while let Some(request) = read(&mut input) {
         if request == "Stop" { return; }
+        if let Some(split) = request.get("Split") {
+            let text = split["text"].as_str().unwrap();
+            let mut start = 0;
+            let ranges: Vec<_> = text.split_inclusive('|').map(|piece| {
+                let end = start + piece.len();
+                let ret = (start, end);
+                start = end;
+                ret
+            }).collect();
+            let mut transcript = std::fs::OpenOptions::new().create(true).append(true).open(root.join("splits.jsonl")).unwrap();
+            writeln!(transcript, "{}", split["text"]).unwrap();
+            send(&mut output, json!({"Pieces":{"id":split["id"],"attempt":split["attempt"],"result":{"Ok":ranges}}}));
+            continue;
+        }
         let embed = &request["Embed"];
         if let Ok(trigger) = std::fs::read_to_string(root.join("crash-query")) {
             if embed["text"].as_str().is_some_and(|text| text.contains(&trigger)) {
@@ -68,12 +82,8 @@ fn main() {
         let mut transcript = std::fs::OpenOptions::new().create(true).append(true).open(root.join("requests.jsonl")).unwrap();
         writeln!(transcript, "{}", embed["text"]).unwrap();
         let mut vector = vec![0.0_f32; 256]; vector[0] = 1.0;
-        let result = if embed["overflow"] == "Prefix" {
-            json!({"vector":vector,"truncated":embed["text"] == "token-truncated query"})
-        } else {
-            json!(vector)
-        };
-        send(&mut output, json!({"Result":{"id":embed["id"],"attempt":embed["attempt"],"result":{"Ok":result}}}));
+        let truncated = embed["overflow"] == "Prefix" && embed["text"] == "token-truncated query";
+        send(&mut output, json!({"Result":{"id":embed["id"],"attempt":embed["attempt"],"truncated":truncated,"result":{"Ok":vector}}}));
     }
 }
 "#).unwrap();

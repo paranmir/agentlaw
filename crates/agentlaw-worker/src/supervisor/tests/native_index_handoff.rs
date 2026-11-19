@@ -43,7 +43,7 @@ fn ram_supervisor_returns_running_index_work_on_child_exit() {
     let index = Arc::new(OneRamIndex {
         work: std::sync::Mutex::new(Some(IndexWork {
             id,
-            text: Arc::from("index"),
+            task: IndexTask::Embed(Arc::from("index")),
         })),
         taken: taken_tx,
         completed: completed_tx,
@@ -83,6 +83,7 @@ fn ram_supervisor_returns_running_index_work_on_child_exit() {
     tx.send(Event::Output(
         inc,
         Output::Result {
+            truncated: false,
             id: id.0,
             attempt: 1,
             result: Ok(stale),
@@ -272,6 +273,7 @@ fn held_work_must_not_cross_replacement_after_stop_retry() {
                 .send(Event::Output(
                     new.clone(),
                     Output::Result {
+                        truncated: false,
                         id: 1,
                         attempt: 1,
                         result: Ok(vector()),
@@ -300,6 +302,7 @@ fn finish_panic_must_not_deliver_a_second_conflicting_completion() {
             .send(Event::Output(
                 inc.clone(),
                 Output::Result {
+                    truncated: false,
                     id: 1,
                     attempt: 1,
                     result: Ok(vector()),

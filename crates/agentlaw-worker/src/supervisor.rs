@@ -96,7 +96,19 @@ impl ModelLifecycle {
 #[derive(Debug, Clone)]
 pub struct IndexWork {
     pub id: ModelRequestId,
-    pub text: Arc<str>,
+    pub task: IndexTask,
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexTask {
+    Split(Arc<str>),
+    Embed(Arc<str>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexResult {
+    Pieces(Vec<(u32, u32)>),
+    Vector(Vec<f32>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +126,7 @@ pub trait IndexWorkPort: Send + Sync {
     fn finish(
         &self,
         id: ModelRequestId,
-        outcome: std::result::Result<Vec<f32>, crate::EmbeddingError>,
+        outcome: std::result::Result<IndexResult, crate::EmbeddingError>,
     );
     fn status(&self) -> IndexWorkStatus;
 }
@@ -278,7 +290,7 @@ enum RamWork {
     },
     Index {
         id: ModelRequestId,
-        text: String,
+        task: IndexTask,
         origin: IndexOrigin,
     },
 }
@@ -364,11 +376,6 @@ impl RamWork {
     fn id(&self) -> ModelRequestId {
         match self {
             Self::Query { id, .. } | Self::Index { id, .. } => *id,
-        }
-    }
-    fn text(&self) -> &str {
-        match self {
-            Self::Query { text, .. } | Self::Index { text, .. } => text,
         }
     }
 }
@@ -846,7 +853,7 @@ fn finish_owned_index(
     index: &dyn IndexWorkPort,
     owned: &std::sync::Mutex<std::collections::HashSet<ModelRequestId>>,
     id: ModelRequestId,
-    result: std::result::Result<Vec<f32>, EmbeddingError>,
+    result: std::result::Result<IndexResult, EmbeddingError>,
 ) {
     let was_owned = owned.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
     if was_owned {
@@ -1014,6 +1021,22 @@ fn model_supervision_run(
                         }
                     }
                 }
+                Event::Output(_, Output::Pieces { id, .. }) => {
+                    let id = ModelRequestId(id);
+                    if matches!(&active.running, Some(RamWork::Index { id: running, task: IndexTask::Split(_), .. }) if *running == id)
+                    {
+                        active.running.take();
+                        finish_owned_index(
+                            index.as_ref(),
+                            owned_index,
+                            id,
+                            Err(EmbeddingError::Failed(
+                                "split completion is not implemented".into(),
+                            )),
+                        );
+                        shared.signal.notify();
+                    }
+                }
                 Event::Output(_, Output::Result { id, result, .. }) => {
                     let id = ModelRequestId(id);
                     if active.running.as_ref().is_none_or(|work| work.id() != id) {
@@ -1038,7 +1061,12 @@ fn model_supervision_run(
                                     .map_err(|error| EmbeddingError::Failed(format!("{error:?}")))
                             })
                         };
-                        finish_owned_index(index.as_ref(), owned_index, id, result);
+                        finish_owned_index(
+                            index.as_ref(),
+                            owned_index,
+                            id,
+                            result.map(IndexResult::Vector),
+                        );
                         shared.signal.notify();
                         continue;
                     }
@@ -1300,23 +1328,39 @@ fn model_supervision_run(
                     let work = query.or_else(|| {
                         held_index.take().map(|held| RamWork::Index {
                             id: held.work.id,
-                            text: held.work.text.to_string(),
+                            task: held.work.task,
                             origin: held.origin,
                         })
                     });
                     if let Some(work) = work {
-                        let id = work.id();
-                        let text = work.text().to_owned();
-                        active.running = Some(work);
-                        if active
-                            .input
-                            .send(Input::Embed {
-                                id: id.0,
+                        let id = work.id().0;
+                        let request = match &work {
+                            RamWork::Index {
+                                task: IndexTask::Split(text),
+                                ..
+                            } => Input::Split {
+                                id,
                                 attempt: 1,
-                                text,
-                            })
-                            .is_err()
-                        {
+                                text: text.to_string(),
+                            },
+                            RamWork::Query { text, .. } => Input::Embed {
+                                id,
+                                attempt: 1,
+                                text: text.clone(),
+                                overflow: crate::model_child::Overflow::Reject,
+                            },
+                            RamWork::Index {
+                                task: IndexTask::Embed(text),
+                                ..
+                            } => Input::Embed {
+                                id,
+                                attempt: 1,
+                                text: text.to_string(),
+                                overflow: crate::model_child::Overflow::Reject,
+                            },
+                        };
+                        active.running = Some(work);
+                        if active.input.send(request).is_err() {
                             let _ = events.send(Event::Pipe(
                                 active.incarnation.clone(),
                                 "model input closed".into(),

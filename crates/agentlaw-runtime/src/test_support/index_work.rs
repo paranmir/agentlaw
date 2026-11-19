@@ -1,4 +1,6 @@
-use agentlaw_worker::supervisor::{IndexWork, IndexWorkPort, IndexWorkStatus, ModelRequestId};
+use agentlaw_worker::supervisor::{
+    IndexResult, IndexTask, IndexWork, IndexWorkPort, IndexWorkStatus, ModelRequestId,
+};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -11,7 +13,7 @@ struct WorkState {
     digests: Vec<String>,
     retry: Option<Instant>,
     awaiting: bool,
-    finished: Vec<(ModelRequestId, Result<Vec<f32>, String>)>,
+    finished: Vec<(ModelRequestId, Result<IndexResult, String>)>,
 }
 #[derive(Clone, Default)]
 pub struct FakeRequestIds {
@@ -48,7 +50,7 @@ impl FakeIndexWork {
         let id = self.ids.next();
         s.queue.push_back(IndexWork {
             id,
-            text: text.into(),
+            task: IndexTask::Embed(text.into()),
         });
         id
     }
@@ -61,7 +63,7 @@ impl FakeIndexWork {
     pub fn ready_digests(&self) -> Vec<String> {
         self.state.lock().unwrap().digests.clone()
     }
-    pub fn finished(&self) -> Vec<(ModelRequestId, Result<Vec<f32>, String>)> {
+    pub fn finished(&self) -> Vec<(ModelRequestId, Result<IndexResult, String>)> {
         self.state.lock().unwrap().finished.clone()
     }
 }
@@ -82,7 +84,7 @@ impl IndexWorkPort for FakeIndexWork {
     fn finish(
         &self,
         id: ModelRequestId,
-        outcome: Result<Vec<f32>, agentlaw_worker::EmbeddingError>,
+        outcome: Result<IndexResult, agentlaw_worker::EmbeddingError>,
     ) {
         self.state
             .lock()

@@ -75,6 +75,7 @@ fn query_arriving_during_index_handoff_runs_first() {
         .send(Event::Output(
             inc.clone(),
             Output::Result {
+                truncated: false,
                 id: 2,
                 attempt: 1,
                 result: Ok(vector.clone()),
@@ -91,6 +92,7 @@ fn query_arriving_during_index_handoff_runs_first() {
         .send(Event::Output(
             inc,
             Output::Result {
+                truncated: false,
                 id: 1,
                 attempt: 1,
                 result: Ok(vector),
@@ -127,6 +129,7 @@ fn poisoned_shared_lock_preserves_query_completion_and_stop() {
         .send(Event::Output(
             inc,
             Output::Result {
+                truncated: false,
                 id: 1,
                 attempt: 1,
                 result: Ok(vector()),

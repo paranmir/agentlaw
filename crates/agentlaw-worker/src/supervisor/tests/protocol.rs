@@ -15,6 +15,7 @@ fn model_request_ids_are_shared_and_checked() {
 #[test]
 fn model_protocol_preserves_full_unsigned_request_id() {
     let request = Input::Embed {
+        overflow: crate::model_child::Overflow::Reject,
         id: u64::MAX,
         attempt: 1,
         text: "query".into(),
