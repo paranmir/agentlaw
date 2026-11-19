@@ -26,9 +26,12 @@ struct StreamSource {
 pub(super) struct AcquiredPieces {
     streams: std::vec::IntoIter<StreamSource>,
     current: Option<StreamSource>,
+    windows: Option<Box<dyn Iterator<Item = std::io::Result<String>> + Send>>,
+    #[cfg(test)]
     pending: Vec<u8>,
     section: usize,
     limit: usize,
+    #[cfg(test)]
     empty: bool,
 }
 
@@ -59,9 +62,12 @@ pub(super) fn history_pieces(
     Ok(AcquiredPieces {
         streams: vec![stream].into_iter(),
         current: None,
+        windows: None,
+        #[cfg(test)]
         pending: Vec::new(),
         section: 0,
         limit,
+        #[cfg(test)]
         empty: true,
     })
 }
@@ -132,9 +138,12 @@ pub(super) fn map_acquired(
         AcquiredPieces {
             streams: streams.into_iter(),
             current: None,
+            windows: None,
+            #[cfg(test)]
             pending: Vec::new(),
             section: 0,
             limit,
+            #[cfg(test)]
             empty: true,
         },
     ))
@@ -146,66 +155,101 @@ impl Iterator for AcquiredPieces {
         if self.current.is_none() {
             self.current = self.streams.next();
             self.section = 0;
-            self.empty = true;
+            #[cfg(test)]
+            {
+                self.empty = true;
+            }
         }
         let stream = self.current.as_mut()?;
-        let mut bytes = std::mem::take(&mut self.pending);
-        let mut eof = false;
-        loop {
-            let mut first = [0];
-            match stream.reader.read_exact(&mut first) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    eof = true;
-                    break;
-                }
-                Err(e) => return Some(Err(e.to_string())),
+        if self.limit == super::pieces::WINDOW_BYTES {
+            let windows = self.windows.get_or_insert_with(|| {
+                let reader = std::mem::replace(
+                    &mut stream.reader,
+                    BufReader::new(Box::new(std::io::empty())),
+                );
+                Box::new(super::pieces::read_windows(reader))
+            });
+            if let Some(text) = windows.next() {
+                let section = format!("{}:{}", stream.section, self.section);
+                self.section += 1;
+                return Some(
+                    text.map(|text| Piece {
+                        memory_id: stream.memory_id.clone(),
+                        change_id: stream.change_id.clone(),
+                        section,
+                        scope: stream.scope.clone(),
+                        text,
+                    })
+                    .map_err(|e| e.to_string()),
+                );
             }
-            let width = match first[0] {
-                0..=0x7f => 1,
-                0xc2..=0xdf => 2,
-                0xe0..=0xef => 3,
-                0xf0..=0xf4 => 4,
-                _ => return Some(Err("invalid UTF-8 in acquired body".into())),
-            };
-            let mut scalar = vec![first[0]];
-            scalar.resize(width, 0);
-            if let Err(e) = stream.reader.read_exact(&mut scalar[1..]) {
-                return Some(Err(e.to_string()));
-            }
-            if std::str::from_utf8(&scalar).is_err() {
-                return Some(Err("invalid UTF-8 in acquired body".into()));
-            }
-            if !bytes.is_empty() && bytes.len() + width > self.limit {
-                self.pending = scalar;
-                break;
-            }
-            bytes.extend_from_slice(&scalar);
-            if bytes.len() >= self.limit {
-                break;
-            }
-        }
-        if eof && bytes.is_empty() && !self.empty {
             self.current = None;
+            self.windows = None;
             return self.next();
         }
-        self.empty = false;
-        let text = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(e) => return Some(Err(e.to_string())),
-        };
-        let result = Piece {
-            memory_id: stream.memory_id.clone(),
-            change_id: stream.change_id.clone(),
-            section: format!("{}:{}", stream.section, self.section),
-            scope: stream.scope.clone(),
-            text,
-        };
-        self.section += 1;
-        if eof {
-            self.current = None;
+        #[cfg(not(test))]
+        unreachable!("production indexing always uses model input windows");
+
+        #[cfg(test)]
+        {
+            let mut bytes = std::mem::take(&mut self.pending);
+            let mut eof = false;
+            loop {
+                let mut first = [0];
+                match stream.reader.read_exact(&mut first) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        eof = true;
+                        break;
+                    }
+                    Err(e) => return Some(Err(e.to_string())),
+                }
+                let width = match first[0] {
+                    0..=0x7f => 1,
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => return Some(Err("invalid UTF-8 in acquired body".into())),
+                };
+                let mut scalar = vec![first[0]];
+                scalar.resize(width, 0);
+                if let Err(e) = stream.reader.read_exact(&mut scalar[1..]) {
+                    return Some(Err(e.to_string()));
+                }
+                if std::str::from_utf8(&scalar).is_err() {
+                    return Some(Err("invalid UTF-8 in acquired body".into()));
+                }
+                if !bytes.is_empty() && bytes.len() + width > self.limit {
+                    self.pending = scalar;
+                    break;
+                }
+                bytes.extend_from_slice(&scalar);
+                if bytes.len() >= self.limit {
+                    break;
+                }
+            }
+            if eof && bytes.is_empty() && !self.empty {
+                self.current = None;
+                return self.next();
+            }
+            self.empty = false;
+            let text = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            let result = Piece {
+                memory_id: stream.memory_id.clone(),
+                change_id: stream.change_id.clone(),
+                section: format!("{}:{}", stream.section, self.section),
+                scope: stream.scope.clone(),
+                text,
+            };
+            self.section += 1;
+            if eof {
+                self.current = None;
+            }
+            Some(Ok(result))
         }
-        Some(Ok(result))
     }
 }
 fn scope_token(value: &serde_json::Value) -> Result<String, String> {

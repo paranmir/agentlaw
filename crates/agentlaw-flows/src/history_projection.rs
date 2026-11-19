@@ -480,7 +480,7 @@ fn packet(
     map: &Path,
     out: &mut impl Write,
     maximum: Option<u64>,
-    diagnostic: Option<&Value>,
+    diagnostic: Option<&[Value]>,
 ) -> Work<()> {
     let query = request.history_for.is_some();
     let key = if query {
@@ -525,9 +525,8 @@ fn packet(
     write!(out, "],\"history_map\":")?;
     std::io::copy(&mut File::open(map)?, out)?;
     if let Some(diagnostic) = diagnostic {
-        write!(out, ",\"diagnostics\":[")?;
+        write!(out, ",\"diagnostics\":")?;
         serde_json::to_writer(&mut *out, diagnostic)?;
-        write!(out, "]")?;
     }
     write!(out, "}}")?;
     Ok(())
@@ -723,6 +722,7 @@ fn project_spool(
             );
         }
         let mut diagnostic = None;
+        let mut truncated = false;
         if let (Some(start), Some(end)) = (&request.start_change_id, &request.end_change_id) {
             for id in [start, end] {
                 if db
@@ -762,7 +762,13 @@ fn project_spool(
                 )?;
                 // A newly indexed change can rank ahead of the acquired DAG.
                 // Fetch the bounded candidate set before filtering and limiting.
-                let candidates = semantic.candidates(identity, query, 10_000, control);
+                let candidates = semantic.candidates_with_prefix(
+                    identity,
+                    query,
+                    10_000,
+                    control,
+                    &mut truncated,
+                );
                 control.check()?;
                 let mut channels = vec![candidates_in_history(db, lexical)?];
                 match candidates {
@@ -875,6 +881,11 @@ fn project_spool(
                 );
             }
         }
+        let mut diagnostics: Vec<_> = diagnostic.into_iter().collect();
+        if truncated {
+            diagnostics.push(json!({"code":"semantic_query_truncated","message":"Semantic search used the beginning of the query."}));
+        }
+        let diagnostic = (!diagnostics.is_empty()).then_some(diagnostics);
         if let Some(directory) = &workspace.directory {
             db.execute_batch("CREATE TABLE rendered(window INTEGER,ordinal INTEGER,id TEXT,offset INTEGER,bytes INTEGER);")?;
             return render_disk(
@@ -884,7 +895,7 @@ fn project_spool(
                 request,
                 limit,
                 control,
-                diagnostic.as_ref(),
+                diagnostic.as_deref(),
                 ctx.is_some(),
                 Some(&notice_context),
             );
@@ -933,7 +944,7 @@ fn project_spool(
                 json!({"latest_changes":entries.iter().map(|e| &e.2).collect::<Vec<_>>(),"history_map":map})
             };
             if let Some(diagnostic) = &diagnostic {
-                value["diagnostics"] = json!([diagnostic]);
+                value["diagnostics"] = json!(diagnostic);
             }
             Ok(value)
         };
@@ -978,6 +989,17 @@ trait HistorySemanticChannel {
             "history candidates unavailable".into(),
         ))
     }
+    fn candidates_with_prefix(
+        &self,
+        identity: &str,
+        query: &str,
+        maximum: usize,
+        control: &RequestControl,
+        _truncated: &mut bool,
+    ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
+    {
+        self.candidates(identity, query, maximum, control)
+    }
     fn search(
         &self,
         db: &Connection,
@@ -993,19 +1015,21 @@ struct PortHistorySemantic<'a, 'b> {
     ctx: &'a crate::store::ReadCtx<'b>,
 }
 impl HistorySemanticChannel for PortHistorySemantic<'_, '_> {
-    fn candidates(
+    fn candidates_with_prefix(
         &self,
         identity: &str,
         query: &str,
         maximum: usize,
         control: &RequestControl,
+        truncated: &mut bool,
     ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
     {
-        let vector = self.ctx.semantic.embed_query(query, control)?;
+        let prefix = self.ctx.semantic.embed_prefix(query, control)?;
+        *truncated = prefix.truncated;
         self.ctx.history_semantic.search_available(
             &self.ctx.identity.binding_id,
             identity,
-            &vector,
+            &prefix.vector,
             &["history".into()],
             maximum,
             control,
@@ -1021,7 +1045,7 @@ impl HistorySemanticChannel for PortHistorySemantic<'_, '_> {
         maximum: usize,
         control: &RequestControl,
     ) -> Work<Vec<String>> {
-        self.candidates(identity, query, maximum, control)
+        self.candidates_with_prefix(identity, query, maximum, control, &mut false)
             .map(|result| result.hits.into_iter().map(|hit| hit.change_id).collect())
             .map_err(|_| "semantic search unavailable".into())
     }
@@ -1033,7 +1057,7 @@ fn render_disk(
     request: &HistoryRequest,
     limit: usize,
     control: &RequestControl,
-    diagnostic: Option<&Value>,
+    diagnostic: Option<&[Value]>,
     owned: bool,
     identity: Option<&NoticeContext<'_>>,
 ) -> Work<Value> {

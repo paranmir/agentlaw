@@ -99,7 +99,8 @@ pub fn search_procedures_filtered(
         })
         .map(|s| format!("procedure:{s}"))
         .collect();
-    let channels = preparation_channels(ctx, exact, query, &scopes, None)?;
+    let query = prefix_query(ctx, query.to_owned(), query.to_owned())?;
+    let channels = channels(search_one(ctx, exact, &query, &scopes)?, query.truncated);
     let matched = channels.hits.len();
     let mut results = Vec::new();
     let mut shown = 0;
@@ -138,7 +139,8 @@ enum AcquiredClosure {
 struct PreparedQuery {
     text: String,
     combined: String,
-    vector: Option<QueryVector>,
+    vectors: Option<Vec<QueryVector>>,
+    truncated: bool,
 }
 struct Found {
     hits: Vec<Hit>,
@@ -168,25 +170,38 @@ fn query_texts(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<Vec<Prepare
             Some(terms) => format!("{text} {}", terms.join(" ")),
             None => text.clone(),
         };
-        let vector = match ctx.semantic.embed_query(&combined, ctx.request) {
-            Ok(vector) => Some(vector),
-            Err(SemanticError::Cancelled) => {
-                ctx.request.check()?;
-                return Err(DomainError::new(
-                    "cancelled",
-                    "Query embedding was cancelled.",
-                ));
-            }
-            Err(_) => None,
-        };
-        prepared.push(PreparedQuery {
-            text,
-            combined,
-            vector,
-        });
+        prepared.push(prefix_query(ctx, text, combined)?);
     }
     Ok(prepared)
 }
+
+fn prefix_query(ctx: &ReadCtx<'_>, text: String, combined: String) -> Result<PreparedQuery> {
+    let (vectors, truncated) = match ctx.semantic.embed_prefix(&combined, ctx.request) {
+        Ok(result) => (Some(vec![result.vector]), result.truncated),
+        Err(SemanticError::Cancelled) => {
+            ctx.request.check()?;
+            return Err(DomainError::new(
+                "cancelled",
+                "Query embedding was cancelled.",
+            ));
+        }
+        Err(_) => (None, false),
+    };
+    Ok(PreparedQuery {
+        text,
+        combined,
+        vectors,
+        truncated,
+    })
+}
+
+fn truncated_diagnostic() -> DomainError {
+    DomainError::new(
+        "semantic_query_truncated",
+        "Semantic search used the beginning of the query.",
+    )
+}
+
 fn winner(hits: &[Hit], min: f64, margin: f64) -> Option<&str> {
     let top = hits.first()?;
     if !top.score.is_finite()
@@ -233,34 +248,80 @@ fn search_one(
         let matched = corpus.matched(&query.combined).map_err(search_error)?;
         (lexical, strength, matched)
     };
-    let position = exact.position().clone();
-    let (mut vector, complete) = if let Some(vector) = &query.vector {
-        match ctx.semantic.search_available(
-            SemanticQuery {
-                binding: &ctx.identity.binding_id,
-                scopes,
-                text: &query.combined,
-                vector: Some(vector),
-                limit: SEARCH_LIMIT,
-                source: &position,
-            },
-            ctx.request,
-        ) {
-            Ok(result) => {
-                let complete = matches!(result.coverage, SemanticCoverage::CompleteAt(ref p) if p == &position);
-                (result.hits, complete)
+    let (vector, complete) = match &query.vectors {
+        None => (Vec::new(), false),
+        Some(vectors) => {
+            let mut best = BTreeMap::<String, Hit>::new();
+            let mut complete = true;
+            let mut seen = std::collections::HashSet::new();
+            for vector in vectors {
+                if !seen.insert((vector.model.as_str(), vector.values.as_ptr())) {
+                    continue;
+                }
+                let (hits, covered) = search_vector(ctx, exact, &query.combined, scopes, vector)?;
+                complete &= covered;
+                for hit in hits {
+                    let current = best
+                        .entry(hit.memory_id.clone())
+                        .or_insert_with(|| hit.clone());
+                    if hit.score.total_cmp(&current.score).is_gt() {
+                        *current = hit;
+                    }
+                }
             }
-            Err(SemanticError::Cancelled) => {
-                ctx.request.check()?;
-                return Err(DomainError::new(
-                    "cancelled",
-                    "Semantic search was cancelled.",
-                ));
-            }
-            Err(_) => (vec![], false),
+            let mut hits: Vec<_> = best.into_values().collect();
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.memory_id.cmp(&b.memory_id))
+            });
+            (hits, complete)
         }
-    } else {
-        (vec![], false)
+    };
+    let lexical_ids = lexical.iter().map(|hit| hit.memory_id.clone()).collect();
+    let hits = agentlaw_search::reciprocal_rank_fusion(&[lexical, vector.clone()]);
+    Ok(Found {
+        hits,
+        lexical: strength,
+        vector,
+        lexical_ids,
+        complete,
+        matched,
+    })
+}
+
+fn search_vector(
+    ctx: &ReadCtx<'_>,
+    exact: &ExactSnapshot,
+    text: &str,
+    scopes: &[String],
+    vector: &QueryVector,
+) -> Result<(Vec<Hit>, bool)> {
+    let position = exact.position().clone();
+    let (mut vector, complete) = match ctx.semantic.search_available(
+        SemanticQuery {
+            binding: &ctx.identity.binding_id,
+            scopes,
+            text,
+            vector: Some(vector),
+            limit: SEARCH_LIMIT,
+            source: &position,
+        },
+        ctx.request,
+    ) {
+        Ok(result) => {
+            let complete =
+                matches!(result.coverage, SemanticCoverage::CompleteAt(ref p) if p == &position);
+            (result.hits, complete)
+        }
+        Err(SemanticError::Cancelled) => {
+            ctx.request.check()?;
+            return Err(DomainError::new(
+                "cancelled",
+                "Semantic search was cancelled.",
+            ));
+        }
+        Err(_) => (Vec::new(), false),
     };
     ctx.request.check()?;
     // Never present a stale vector revision as a current result.
@@ -282,7 +343,8 @@ fn search_one(
             .unwrap_or(&hit.memory_id);
         heads.iter().any(|h| {
             if h.entity_id != id
-                || h.observed_version != hit.change_id
+                || (h.observed_version != hit.change_id
+                    && h.metadata["change_id"].as_str() != Some(hit.change_id.as_str()))
                 || (h.entity_type == "learned_procedure") != procedure
             {
                 return false;
@@ -299,21 +361,7 @@ fn search_one(
             scopes.contains(&scope)
         })
     });
-    vector.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.memory_id.cmp(&b.memory_id))
-    });
-    let lexical_ids = lexical.iter().map(|h| h.memory_id.clone()).collect();
-    let hits = agentlaw_search::reciprocal_rank_fusion(&[lexical, vector.clone()]);
-    Ok(Found {
-        hits,
-        lexical: strength,
-        vector,
-        lexical_ids,
-        complete,
-        matched,
-    })
+    Ok((vector, complete))
 }
 
 pub(crate) fn preparation_channels(
@@ -327,44 +375,50 @@ pub(crate) fn preparation_channels(
         &crate::semantic::PieceVectorReuse,
     )>,
 ) -> Result<Channels> {
-    if planned.is_some() {
-        return Err(DomainError::new(
-            "internal_error",
-            "Planned preparation search is not implemented.",
-        ));
-    }
-    let vector = match ctx.semantic.embed_query(text, ctx.request) {
-        Ok(vector) => Some(vector),
-        Err(SemanticError::Cancelled) => {
+    let vectors = match planned
+        .map(|(plan, record, reuse)| ctx.semantic.embed_planned(plan, record, reuse, ctx.request))
+    {
+        Some(Ok(vectors)) => Some(vectors),
+        Some(Err(SemanticError::Cancelled)) => {
             ctx.request.check()?;
             return Err(DomainError::new(
                 "cancelled",
-                "Query embedding was cancelled.",
+                "Piece embedding was cancelled.",
             ));
         }
-        Err(_) => None,
+        _ => None,
     };
     let query = PreparedQuery {
         text: text.to_owned(),
         combined: text.to_owned(),
-        vector,
+        vectors,
+        truncated: false,
     };
-    let found = search_one(ctx, exact, &query, scopes)?;
-    let diagnostics = if found.complete {
-        vec![]
-    } else {
-        vec![DomainError::new(
+    let mut found = search_one(ctx, exact, &query, scopes)?;
+    if !found.complete {
+        found.vector.clear();
+    }
+    Ok(channels(found, false))
+}
+
+fn channels(found: Found, truncated: bool) -> Channels {
+    let mut diagnostics = Vec::new();
+    if !found.complete {
+        diagnostics.push(DomainError::new(
             "semantic_channel_incomplete",
             "Semantic retrieval did not establish a complete view.",
-        )]
-    };
-    Ok(Channels {
+        ));
+    }
+    if truncated {
+        diagnostics.push(truncated_diagnostic());
+    }
+    Channels {
         hits: found.hits,
         lexical: found.lexical,
         vector: found.vector,
         complete: found.complete,
         diagnostics,
-    })
+    }
 }
 
 fn connection(ctx: &ReadCtx<'_>, path: Option<&str>) -> Result<Option<String>> {
@@ -1188,6 +1242,12 @@ fn recall_scoped(
         if !complete {
             diagnostics.push(DomainError::new("semantic_channel_incomplete", "Semantic search did not establish complete coverage; exact and lexical results remain available."));
         }
+        if prepared
+            .iter()
+            .any(|input| input.text == *query && input.truncated)
+        {
+            diagnostics.push(truncated_diagnostic());
+        }
         if found.matched > SEARCH_LIMIT as u64 || found.hits.len() >= SEARCH_LIMIT {
             diagnostics.push(DomainError::new(
                 "candidate_coverage_incomplete",
@@ -1224,6 +1284,13 @@ fn recall_scoped(
     assembled
         .diagnostics
         .retain(|d| !d.message.starts_with("Learned procedure discovery"));
+    let mut reported_truncation = false;
+    assembled.diagnostics.retain(|diagnostic| {
+        if diagnostic.code != "semantic_query_truncated" {
+            return true;
+        }
+        !std::mem::replace(&mut reported_truncation, true)
+    });
     completeness_diagnostics.extend(
         assembled
             .diagnostics

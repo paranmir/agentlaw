@@ -201,7 +201,7 @@ pub fn run_model_child() -> Result<()> {
         std::thread::spawn(move || {
             let (fingerprint, selection) = crate::execution::select_for_launch(
                 || crate::execution::fingerprint(provider.model_digest(), &assets.runtime_library),
-                None,
+                Some(provider.cpu_settings()),
                 launch.cached,
                 |cached| provider.select_execution_cached(&assets, cached),
             );
@@ -222,30 +222,26 @@ pub fn run_model_child() -> Result<()> {
                 text,
                 overflow,
             }) => {
-                let result = match overflow {
-                    Overflow::Reject => provider.embed(&text),
-                    Overflow::Prefix => Err(EmbeddingError::Failed(
-                        "prefix embedding is not implemented".into(),
-                    )),
+                let (result, truncated) = match provider.embed_with(&text, overflow) {
+                    Ok((vector, truncated)) => (Ok(vector), truncated),
+                    Err(error) => (Err(error), false),
                 };
                 write(
                     &mut *output.lock().unwrap(),
                     &Output::Result {
                         id,
                         attempt,
-                        truncated: false,
+                        truncated,
                         result,
                     },
                 )?;
             }
-            Ok(Input::Split { id, attempt, .. }) => write(
+            Ok(Input::Split { id, attempt, text }) => write(
                 &mut *output.lock().unwrap(),
                 &Output::Pieces {
                     id,
                     attempt,
-                    result: Err(EmbeddingError::Failed(
-                        "model input splitting is not implemented".into(),
-                    )),
+                    result: provider.split(&text),
                 },
             )?,
             Ok(Input::Stop) => break,

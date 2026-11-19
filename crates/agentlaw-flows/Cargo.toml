@@ -4,6 +4,7 @@ version.workspace = true
 edition = "2021"
 
 [features]
+test-support = []
 write-audit = ["agentlaw-sqlite/write-audit", "agentlaw-storage/write-audit"]
 
 [dependencies]

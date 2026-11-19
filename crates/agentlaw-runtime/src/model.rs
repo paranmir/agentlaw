@@ -4,7 +4,7 @@ use crate::host::supervision::StopToken;
 use crate::ports::{ComponentId, ComponentKind, ComponentState, ComponentStatus, HealthSink};
 use agentlaw_contracts::RequestControl;
 use agentlaw_flows::semantic::{
-    PiecePlan, PieceVectorReuse, PrefixEmbedding, QueryVector, SemanticError,
+    PiecePlan, PieceRecord, PieceVectorReuse, PrefixEmbedding, QueryVector, SemanticError,
 };
 use agentlaw_worker::supervisor::{IndexWorkPort, ModelRequestIds, ModelSupervisor, QueryError};
 use agentlaw_worker::{RuntimeConfig, WorkerState};
@@ -26,7 +26,7 @@ struct State {
 #[derive(Clone)]
 pub struct ModelHandle {
     inner: Arc<Mutex<State>>,
-    _recent_vectors: Arc<crate::semantic::recent_vectors::RecentVectors>,
+    recent_vectors: Arc<crate::semantic::recent_vectors::RecentVectors>,
 }
 impl Default for ModelHandle {
     fn default() -> Self {
@@ -41,7 +41,7 @@ impl ModelHandle {
         recent_vectors: Arc<crate::semantic::recent_vectors::RecentVectors>,
     ) -> Self {
         Self {
-            _recent_vectors: recent_vectors,
+            recent_vectors: recent_vectors,
             inner: Arc::new(Mutex::new(State {
                 supervisor: None,
                 previous: None,
@@ -53,38 +53,125 @@ impl ModelHandle {
     }
     pub fn embed_prefix(
         &self,
-        _text: &str,
-        _control: &RequestControl,
+        text: &str,
+        control: &RequestControl,
     ) -> Result<PrefixEmbedding, SemanticError> {
-        Err(SemanticError::Failed(
-            "prefix embedding is not implemented".into(),
-        ))
+        let end = text.floor_char_boundary(text.len().min(4 * 1024 * 1024));
+        let (vector, truncated) = self.query(control, |supervisor| {
+            supervisor.embed_prefix(text, &text[..end], &control.cancel)
+        })?;
+        Ok(PrefixEmbedding {
+            vector: map_vector(vector),
+            truncated: truncated || end < text.len(),
+        })
     }
+
     pub fn plan_pieces(
         &self,
-        _records: &[&str],
-        _control: &RequestControl,
+        records: &[&str],
+        control: &RequestControl,
     ) -> Result<PiecePlan, SemanticError> {
-        Err(SemanticError::Failed(
-            "piece planning is not implemented".into(),
-        ))
+        use sha2::{Digest, Sha256};
+        control.check().map_err(|_| SemanticError::Cancelled)?;
+        let mut model = None;
+        let mut planned = Vec::with_capacity(records.len());
+        for &text in records {
+            let mut offset = 0;
+            let mut pieces = Vec::new();
+            for window in crate::semantic::pieces::windows(text) {
+                let (digest, ranges) = self.query(control, |supervisor| {
+                    supervisor.split(window, &control.cancel)
+                })?;
+                if model.as_ref().is_some_and(|expected| *expected != digest) {
+                    return Err(SemanticError::Failed(
+                        "model changed during piece planning".into(),
+                    ));
+                }
+                model.get_or_insert(digest);
+                if !crate::semantic::pieces::valid_ranges(window, &ranges) {
+                    return Err(SemanticError::Failed("invalid model piece ranges".into()));
+                }
+                for (start, end) in ranges {
+                    let range = offset + start as usize..offset + end as usize;
+                    pieces.push((range.clone(), Sha256::digest(text[range].as_bytes()).into()));
+                }
+                offset += window.len();
+            }
+            planned.push(PieceRecord::new(Arc::from(text), pieces));
+        }
+        let model = model
+            .or_else(|| self.snapshot().model_digest)
+            .unwrap_or_default();
+        Ok(PiecePlan::new(model, planned))
     }
+
     pub fn embed_planned(
         &self,
-        _plan: &PiecePlan,
-        _record: usize,
-        _reuse: &PieceVectorReuse,
-        _control: &RequestControl,
+        plan: &PiecePlan,
+        record: usize,
+        reuse: &PieceVectorReuse,
+        control: &RequestControl,
     ) -> Result<Vec<QueryVector>, SemanticError> {
-        Err(SemanticError::Failed(
-            "piece embedding is not implemented".into(),
-        ))
+        control.check().map_err(|_| SemanticError::Cancelled)?;
+        let model = plan.model();
+        if self.snapshot().model_digest.as_deref() != Some(model) {
+            return Err(SemanticError::Failed("piece plan model changed".into()));
+        }
+        let record = plan
+            .record(record)
+            .ok_or_else(|| SemanticError::Failed("missing planned record".into()))?;
+        let mut vectors = Vec::new();
+        for (text, digest) in record.pieces() {
+            control.check().map_err(|_| SemanticError::Cancelled)?;
+            if self.snapshot().model_digest.as_deref() != Some(model) {
+                return Err(SemanticError::Failed("piece plan model changed".into()));
+            }
+            let text = text.ok_or_else(|| SemanticError::Failed("invalid planned range".into()))?;
+            let values = match reuse
+                .get(model, *digest)
+                .or_else(|| self.recent_vectors.get(model, digest))
+            {
+                Some(values) => values,
+                None => {
+                    let vector = self.query(control, |supervisor| {
+                        supervisor.embed_piece(text, &control.cancel)
+                    })?;
+                    if vector.model_digest != model {
+                        return Err(SemanticError::Failed("piece plan model changed".into()));
+                    }
+                    let values: Arc<[f32]> = vector.vector.into();
+                    self.recent_vectors
+                        .insert(model, *digest, values.clone())
+                        .map_err(|error| SemanticError::Failed(error.to_string()))?;
+                    values
+                }
+            };
+            reuse.insert(model, *digest, values.clone());
+            vectors.push(QueryVector {
+                model: model.to_owned(),
+                values,
+            });
+        }
+        Ok(vectors)
     }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn embed_query(
         &self,
         text: &str,
         control: &RequestControl,
     ) -> Result<QueryVector, SemanticError> {
+        self.query(control, |supervisor| {
+            supervisor.embed_piece(text, &control.cancel)
+        })
+        .map(map_vector)
+    }
+
+    fn query<T>(
+        &self,
+        control: &RequestControl,
+        submit: impl FnOnce(&ModelSupervisor) -> Result<T, QueryError>,
+    ) -> Result<T, SemanticError> {
         if control.cancel.load(Ordering::Acquire) {
             return Err(SemanticError::Cancelled);
         }
@@ -98,14 +185,14 @@ impl ModelHandle {
                 }
             }
         };
-        let result = supervisor.embed_query(text, &control.cancel);
+        let result = submit(&supervisor);
         if matches!(&result, Err(QueryError::Unavailable(_)))
             && supervisor.wait_terminated(Duration::ZERO).is_some()
         {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             state.demand = true;
         }
-        result.map(map_vector).map_err(map_error)
+        result.map_err(map_error)
     }
     pub fn snapshot(&self) -> ModelSnapshot {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());

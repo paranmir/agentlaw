@@ -571,7 +571,15 @@ fn run(shared: Arc<Shared>, key: LaneKey, token: u64, source: OwnedPublishedRead
                     while state.history_completed.len() > shared.config.history_lanes {
                         state.history_completed.pop_front();
                     }
+                    let identity = state
+                        .history_completed
+                        .back()
+                        .unwrap()
+                        .active
+                        .identity
+                        .clone();
                     drop(state);
+                    super::identity::reclaim_previous(&shared.config, &identity);
                     shared.changed.notify_all();
                     return;
                 }
@@ -801,7 +809,7 @@ fn change_work(
     memory: &str,
     id: &str,
 ) -> Result<(), String> {
-    let pieces = source::history_pieces(change, shared.config.chunk_bytes)?;
+    let pieces = source::history_pieces(change, shared.config.window_bytes())?;
     let finished = super::batch::run(
         shared,
         key,

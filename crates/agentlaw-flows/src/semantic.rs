@@ -52,32 +52,91 @@ pub struct PrefixEmbedding {
 
 #[derive(Default)]
 pub struct PieceVectorReuse {
-    _private: (),
+    vectors: std::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), Arc<[f32]>>>,
+}
+
+impl PieceVectorReuse {
+    pub fn get(&self, model: &str, digest: [u8; 32]) -> Option<Arc<[f32]>> {
+        self.vectors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(model.to_owned(), digest))
+            .cloned()
+    }
+
+    pub fn insert(&self, model: &str, digest: [u8; 32], vector: Arc<[f32]>) {
+        self.vectors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((model.to_owned(), digest), vector);
+    }
 }
 
 #[derive(Default)]
 pub struct PiecePlan {
-    _private: (),
+    model: String,
+    records: Vec<PieceRecord>,
+}
+
+impl PiecePlan {
+    pub fn new(model: String, records: Vec<PieceRecord>) -> Self {
+        Self { model, records }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn record(&self, index: usize) -> Option<&PieceRecord> {
+        self.records.get(index)
+    }
+}
+
+pub struct PieceRecord {
+    text: Arc<str>,
+    pieces: Vec<(std::ops::Range<usize>, [u8; 32])>,
+}
+
+impl PieceRecord {
+    pub fn new(text: Arc<str>, pieces: Vec<(std::ops::Range<usize>, [u8; 32])>) -> Self {
+        Self { text, pieces }
+    }
+
+    pub fn pieces(&self) -> impl Iterator<Item = (Option<&str>, &[u8; 32])> {
+        self.pieces
+            .iter()
+            .map(|(range, digest)| (self.text.get(range.clone()), digest))
+    }
 }
 
 pub trait SemanticPort: Send + Sync {
     fn embed_prefix(
         &self,
-        _text: &str,
-        _control: &RequestControl,
+        text: &str,
+        control: &RequestControl,
     ) -> Result<PrefixEmbedding, SemanticError> {
-        Err(SemanticError::Failed(
-            "prefix embedding is not implemented".into(),
-        ))
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.embed_query(text, control)
+                .map(|vector| PrefixEmbedding {
+                    vector,
+                    truncated: false,
+                })
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = (text, control);
+            Err(SemanticError::Unavailable(
+                "query embedding unavailable".into(),
+            ))
+        }
     }
     fn plan_pieces(
         &self,
         _records: &[&str],
         _control: &RequestControl,
     ) -> Result<PiecePlan, SemanticError> {
-        Err(SemanticError::Failed(
-            "piece planning is not implemented".into(),
-        ))
+        Err(SemanticError::Failed("piece planning unavailable".into()))
     }
     fn embed_planned(
         &self,
@@ -86,16 +145,20 @@ pub trait SemanticPort: Send + Sync {
         _reuse: &PieceVectorReuse,
         _control: &RequestControl,
     ) -> Result<Vec<QueryVector>, SemanticError> {
-        Err(SemanticError::Failed(
-            "piece embedding is not implemented".into(),
-        ))
+        Err(SemanticError::Failed("piece embedding unavailable".into()))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     fn embed_query(
         &self,
-        text: &str,
-        control: &RequestControl,
-    ) -> Result<QueryVector, SemanticError>;
+        _text: &str,
+        _control: &RequestControl,
+    ) -> Result<QueryVector, SemanticError> {
+        Err(SemanticError::Unavailable(
+            "semantic embedding unavailable".into(),
+        ))
+    }
     fn search_available(
         &self,
         query: SemanticQuery<'_>,

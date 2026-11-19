@@ -154,48 +154,80 @@ pub enum QueryError {
     Failed(String),
 }
 
-struct QueryFlight {
-    key: (String, [u8; 32]),
+type QueryKey = (QueryOperation, String, [u8; 32]);
+
+#[derive(Clone)]
+enum QueryResult {
+    Vector(QueryVector, bool),
+    Pieces(String, Vec<(u32, u32)>),
+}
+
+struct QueryFlight<R> {
+    key: QueryKey,
     text: String,
     waiters: usize,
     running: bool,
-    result: Option<std::result::Result<QueryVector, QueryError>>,
+    result: Option<std::result::Result<R, QueryError>>,
 }
-#[derive(Default)]
-struct QueryQueue {
-    flights: HashMap<ModelRequestId, QueryFlight>,
-    keys: HashMap<(String, [u8; 32]), ModelRequestId>,
+struct QueryQueue<R> {
+    flights: HashMap<ModelRequestId, QueryFlight<R>>,
+    keys: HashMap<QueryKey, ModelRequestId>,
     pending: VecDeque<ModelRequestId>,
 }
-#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum QueryOperation {
     Prefix,
     Split,
     Embed,
 }
 
-impl QueryQueue {
-    #[allow(dead_code)]
-    fn submit_operation(
-        &mut self,
-        _operation: QueryOperation,
-        _model: &str,
-        _original_text: &str,
-        _transport_text: &str,
-        _ids: &ModelRequestIds,
-    ) -> std::result::Result<ModelRequestId, QueryError> {
-        Err(QueryError::Failed(
-            "model query operation is not implemented".into(),
-        ))
+impl<R> Default for QueryQueue<R> {
+    fn default() -> Self {
+        Self {
+            flights: HashMap::new(),
+            keys: HashMap::new(),
+            pending: VecDeque::new(),
+        }
     }
+}
 
+#[cfg(test)]
+impl QueryQueue<QueryVector> {
     fn submit(
         &mut self,
         model: &str,
         text: &str,
         ids: &ModelRequestIds,
     ) -> std::result::Result<ModelRequestId, QueryError> {
-        let key = (model.to_string(), Sha256::digest(text.as_bytes()).into());
+        self.enqueue(QueryOperation::Embed, model, text, text, ids)
+    }
+
+    fn submit_operation(
+        &mut self,
+        operation: QueryOperation,
+        model: &str,
+        original: &str,
+        text: &str,
+        ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        self.enqueue(operation, model, original, text, ids)
+    }
+}
+
+impl<R> QueryQueue<R> {
+    fn enqueue(
+        &mut self,
+        operation: QueryOperation,
+        model: &str,
+        original_text: &str,
+        text: &str,
+        ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        let key = (
+            operation,
+            model.to_string(),
+            Sha256::digest(original_text.as_bytes()).into(),
+        );
         if let Some(id) = self.keys.get(&key) {
             let flight = self.flights.get_mut(id).unwrap();
             flight.waiters += 1;
@@ -244,11 +276,7 @@ impl QueryQueue {
         }
         self.pending.retain(|queued| *queued != id);
     }
-    fn complete(
-        &mut self,
-        id: ModelRequestId,
-        result: std::result::Result<QueryVector, QueryError>,
-    ) {
+    fn complete(&mut self, id: ModelRequestId, result: std::result::Result<R, QueryError>) {
         if let Some(flight) = self.flights.get_mut(&id) {
             if flight.result.is_some() {
                 return;
@@ -267,6 +295,15 @@ impl QueryQueue {
         }
     }
 }
+fn query_error(error: EmbeddingError) -> QueryError {
+    match error {
+        EmbeddingError::Cancelled => QueryError::Cancelled,
+        EmbeddingError::Loading => QueryError::Unavailable("model loading".into()),
+        EmbeddingError::Unavailable(cause) => QueryError::Unavailable(cause),
+        error => QueryError::Failed(error.to_string()),
+    }
+}
+
 fn validate_query_vector(
     model_digest: String,
     vector: Vec<f32>,
@@ -288,6 +325,7 @@ fn validate_query_vector(
 enum RamWork {
     Query {
         id: ModelRequestId,
+        operation: QueryOperation,
         text: String,
     },
     Index {
@@ -320,7 +358,7 @@ struct SupervisorState {
     warm: bool,
     stop: bool,
     loading_demand: bool,
-    queries: QueryQueue,
+    queries: QueryQueue<QueryResult>,
     terminated: Option<String>,
 }
 struct SupervisorShared {
@@ -365,7 +403,7 @@ impl ModelSupervisor {
                 warm: false,
                 stop: false,
                 loading_demand: false,
-                queries: QueryQueue::default(),
+                queries: Default::default(),
                 terminated: None,
             }),
             signal: Arc::new(RamSignal {
@@ -394,11 +432,64 @@ impl ModelSupervisor {
             .snapshot
             .clone()
     }
-    pub fn embed_query(
+    #[cfg(test)]
+    fn embed_query(
         &self,
         text: &str,
         cancelled: &AtomicBool,
     ) -> std::result::Result<QueryVector, QueryError> {
+        self.embed_piece(text, cancelled)
+    }
+
+    pub fn embed_piece(
+        &self,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<QueryVector, QueryError> {
+        self.vector(QueryOperation::Embed, text, text, cancelled)
+            .map(|(vector, _)| vector)
+    }
+
+    pub fn embed_prefix(
+        &self,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(QueryVector, bool), QueryError> {
+        self.vector(QueryOperation::Prefix, original, text, cancelled)
+    }
+
+    pub fn split(
+        &self,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(String, Vec<(u32, u32)>), QueryError> {
+        match self.query(QueryOperation::Split, text, text, cancelled)? {
+            QueryResult::Pieces(model, ranges) => Ok((model, ranges)),
+            _ => Err(QueryError::Failed("expected model piece ranges".into())),
+        }
+    }
+
+    fn vector(
+        &self,
+        operation: QueryOperation,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(QueryVector, bool), QueryError> {
+        match self.query(operation, original, text, cancelled)? {
+            QueryResult::Vector(vector, truncated) => Ok((vector, truncated)),
+            _ => Err(QueryError::Failed("expected model vector".into())),
+        }
+    }
+
+    fn query(
+        &self,
+        operation: QueryOperation,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<QueryResult, QueryError> {
         let mut state = self
             .shared
             .state
@@ -422,7 +513,9 @@ impl ModelSupervisor {
             return Err(QueryError::Unavailable(reason));
         }
         let digest = state.snapshot.model_digest.clone().unwrap();
-        let id = state.queries.submit(&digest, text, &self.ids)?;
+        let id = state
+            .queries
+            .enqueue(operation, &digest, original, text, &self.ids)?;
         self.wake();
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -955,25 +1048,66 @@ fn model_supervision_run(
                         cache.accept(fingerprint, selection);
                     }
                 }
-                Event::Output(_, Output::Pieces { id, .. }) => {
+                Event::Output(
+                    _,
+                    Output::Pieces {
+                        id,
+                        attempt: 1,
+                        result,
+                    },
+                ) => {
                     let id = ModelRequestId(id);
-                    if matches!(&active.running, Some(RamWork::Index { id: running, task: IndexTask::Split(_), .. }) if *running == id)
-                    {
-                        active.running.take();
-                        finish_owned_index(
-                            index.as_ref(),
-                            owned_index,
-                            id,
-                            Err(EmbeddingError::Failed(
-                                "split completion is not implemented".into(),
-                            )),
-                        );
-                        shared.signal.notify();
+                    match &active.running {
+                        Some(RamWork::Index {
+                            id: running,
+                            task: IndexTask::Split(_),
+                            ..
+                        }) if *running == id => {
+                            active.running.take();
+                            finish_owned_index(
+                                index.as_ref(),
+                                owned_index,
+                                id,
+                                result.map(IndexResult::Pieces),
+                            );
+                            shared.signal.notify();
+                        }
+                        Some(RamWork::Query {
+                            id: running,
+                            operation: QueryOperation::Split,
+                            ..
+                        }) if *running == id => {
+                            active.running.take();
+                            let mut state = shared
+                                .state
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            let model = state.snapshot.model_digest.clone().unwrap_or_default();
+                            state.queries.complete(
+                                id,
+                                result
+                                    .map(|ranges| QueryResult::Pieces(model, ranges))
+                                    .map_err(query_error),
+                            );
+                            shared.changed.notify_all();
+                        }
+                        _ => {}
                     }
                 }
-                Event::Output(_, Output::Result { id, result, .. }) => {
+                Event::Output(
+                    _,
+                    Output::Result {
+                        id,
+                        attempt: 1,
+                        result,
+                        truncated,
+                    },
+                ) => {
                     let id = ModelRequestId(id);
-                    if active.running.as_ref().is_none_or(|work| work.id() != id) {
+                    if !matches!(&active.running,
+                        Some(RamWork::Query { id: running, operation: QueryOperation::Prefix | QueryOperation::Embed, .. })
+                        | Some(RamWork::Index { id: running, task: IndexTask::Embed(_), .. }) if *running == id)
+                    {
                         continue;
                     }
                     let work = active.running.take().unwrap();
@@ -1004,17 +1138,10 @@ fn model_supervision_run(
                         shared.signal.notify();
                         continue;
                     }
-                    let result = match result {
-                        Ok(vector) => validate_query_vector(digest, vector),
-                        Err(EmbeddingError::Cancelled) => Err(QueryError::Cancelled),
-                        Err(EmbeddingError::Loading) => {
-                            Err(QueryError::Unavailable("model loading".into()))
-                        }
-                        Err(EmbeddingError::Unavailable(cause)) => {
-                            Err(QueryError::Unavailable(cause))
-                        }
-                        Err(error) => Err(QueryError::Failed(error.to_string())),
-                    };
+                    let result = result
+                        .map_err(query_error)
+                        .and_then(|vector| validate_query_vector(digest, vector))
+                        .map(|vector| QueryResult::Vector(vector, truncated));
                     state.queries.complete(id, result);
                     shared.changed.notify_all();
                 }
@@ -1258,6 +1385,7 @@ fn model_supervision_run(
                     let query = state.queries.take().map(|id| RamWork::Query {
                         id,
                         text: state.queries.flights[&id].text.clone(),
+                        operation: state.queries.flights[&id].key.0,
                     });
                     let work = query.or_else(|| {
                         held_index.take().map(|held| RamWork::Index {
@@ -1277,11 +1405,25 @@ fn model_supervision_run(
                                 attempt: 1,
                                 text: text.to_string(),
                             },
-                            RamWork::Query { text, .. } => Input::Embed {
+                            RamWork::Query {
+                                text,
+                                operation: QueryOperation::Split,
+                                ..
+                            } => Input::Split {
                                 id,
                                 attempt: 1,
                                 text: text.clone(),
-                                overflow: crate::model_child::Overflow::Reject,
+                            },
+                            RamWork::Query {
+                                text, operation, ..
+                            } => Input::Embed {
+                                id,
+                                attempt: 1,
+                                text: text.clone(),
+                                overflow: match operation {
+                                    QueryOperation::Prefix => crate::model_child::Overflow::Prefix,
+                                    _ => crate::model_child::Overflow::Reject,
+                                },
                             },
                             RamWork::Index {
                                 task: IndexTask::Embed(text),

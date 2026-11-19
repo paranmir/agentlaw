@@ -34,6 +34,49 @@ pub fn path(config: &SemanticConfig, identity: &VectorFileIdentity) -> PathBuf {
         .join("vector.sqlite")
 }
 
+/// Retire a recognized previous layout after the replacement has completed.
+pub(super) fn reclaim_previous(config: &SemanticConfig, replacement: &VectorFileIdentity) {
+    if replacement.config != super::INDEX_CONFIG_VERSION {
+        return;
+    }
+    let mut previous = replacement.clone();
+    previous.config = "v1".into();
+    let candidate = path(config, &previous);
+    let Some(directory) = candidate.parent() else {
+        return;
+    };
+    let Some(owned) = inspect_directory(config, directory) else {
+        return;
+    };
+    previous.generation = owned.identity.generation.clone();
+    if owned.identity != previous {
+        return;
+    }
+    // Ownership inspection rejects unknown files, including symlinks and reparse points.
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if generation::file_id(&entry.file_name().to_string_lossy()).is_some()
+            && !matches!(
+                generation::remove_files(&entry.path()),
+                generation::Removal::Removed
+            )
+        {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(directory.join("active-generation"));
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            if generation::temporary_id(&entry.file_name().to_string_lossy()).is_some() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(directory);
+}
+
 pub struct OwnedDirectory {
     pub identity: VectorFileIdentity,
     pub complete: bool,

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 pub use search::SemanticSearch;
 
-pub const INDEX_CONFIG_VERSION: &str = "v1";
+pub const INDEX_CONFIG_VERSION: &str = "v2";
 
 /// Configuration shared by the current and future history index lanes.
 #[derive(Clone, Debug)]
@@ -46,6 +46,18 @@ pub struct SemanticConfig {
 }
 
 impl SemanticConfig {
+    fn window_bytes(&self) -> usize {
+        #[cfg(test)]
+        if self.chunk_bytes != 4096 {
+            return self.chunk_bytes;
+        }
+        pieces::WINDOW_BYTES
+    }
+
+    fn split_windows(&self) -> bool {
+        self.window_bytes() == pieces::WINDOW_BYTES
+    }
+
     pub fn new(indices_root: PathBuf, config_id: String) -> Self {
         Self {
             indices_root,
@@ -794,10 +806,11 @@ impl IndexWorkPort for SemanticIndexer {
 
     fn next_work(&self, digest: &str) -> Option<IndexWork> {
         let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let work = shared.schedule.next(
+        let work = shared.schedule.next_task(
             digest,
             &self.inner.ids,
             self.inner.config.pending_results,
+            self.inner.config.split_windows(),
             (self.inner.clock)(),
         );
         drop(shared);
@@ -808,30 +821,40 @@ impl IndexWorkPort for SemanticIndexer {
     }
 
     fn finish(&self, id: ModelRequestId, outcome: Result<IndexResult, EmbeddingError>) {
-        let outcome = outcome.and_then(|result| match result {
-            IndexResult::Vector(vector) => Ok(vector),
-            IndexResult::Pieces(_) => Err(EmbeddingError::Failed(
-                "split completion is not implemented".into(),
-            )),
-        });
         let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut notify_model = false;
         let mut failure = None;
+        let model = shared.schedule.model.clone();
+        let mut blocked = None;
         for (name, lane) in shared.schedule.lanes.iter_mut() {
             if let Some((generation, piece)) = lane.running.remove(&id) {
                 if generation == lane.generation {
-                    let outcome = outcome.and_then(|vector| {
-                        if vector.len() != self.inner.config.dimension
-                            || vector.iter().any(|x| !x.is_finite())
-                            || !vector.iter().any(|x| *x != 0.0)
+                    lane.work_revision = lane.work_revision.wrapping_add(1);
+                    let split = self.inner.config.split_windows()
+                        && piece.section.matches(':').count() == 1;
+                    let outcome = outcome.and_then(|result| match result {
+                        IndexResult::Pieces(ref ranges)
+                            if split && pieces::valid_ranges(&piece.text, ranges) =>
                         {
-                            Err(EmbeddingError::Failed("invalid embedding vector".into()))
-                        } else {
-                            Ok(vector)
+                            Ok(result)
+                        }
+                        IndexResult::Pieces(_) => {
+                            Err(EmbeddingError::Failed("invalid model piece ranges".into()))
+                        }
+                        IndexResult::Vector(ref vector) => {
+                            if vector.len() != self.inner.config.dimension
+                                || vector.iter().any(|x| !x.is_finite())
+                                || !vector.iter().any(|x| *x != 0.0)
+                                || (split && !cfg!(any(test, feature = "test-support")))
+                            {
+                                Err(EmbeddingError::Failed("invalid embedding vector".into()))
+                            } else {
+                                Ok(result)
+                            }
                         }
                     });
                     match outcome {
-                        Ok(vector) => {
+                        Ok(result) => {
                             if lane.retry_piece.as_ref().is_some_and(|key| {
                                 key.0 == piece.memory_id
                                     && key.1 == piece.change_id
@@ -840,7 +863,18 @@ impl IndexWorkPort for SemanticIndexer {
                                 lane.retry.reset();
                                 lane.retry_piece = None;
                             }
-                            lane.results.push_back((piece, vector));
+                            match result {
+                                IndexResult::Pieces(ranges) => {
+                                    lane.pending_window = Some(state::PendingWindow {
+                                        piece,
+                                        ranges,
+                                        next_range: 0,
+                                    });
+                                }
+                                IndexResult::Vector(vector) => {
+                                    lane.results.push_back((piece, vector.into()));
+                                }
+                            }
                         }
                         Err(error) => {
                             lane.retry_piece = Some((
@@ -848,8 +882,20 @@ impl IndexWorkPort for SemanticIndexer {
                                 piece.change_id.clone(),
                                 piece.section.clone(),
                             ));
-                            lane.queue.push_front(piece);
-                            lane.retry.fail((self.inner.clock)());
+                            if error == EmbeddingError::InputTooLong {
+                                if let Some(model) = model {
+                                    blocked = Some((
+                                        name.clone(),
+                                        (model, piece.memory_id, piece.change_id),
+                                    ));
+                                }
+                                lane.queue.clear();
+                                lane.pending_window = None;
+                                lane.retry.reset();
+                            } else {
+                                lane.queue.push_front(piece);
+                                lane.retry.fail((self.inner.clock)());
+                            }
                             lane.state = ComponentState::Degraded;
                             lane.reason = Some(error.to_string());
                             failure = Some((name.binding.clone(), error.to_string()));
@@ -859,6 +905,14 @@ impl IndexWorkPort for SemanticIndexer {
                 }
                 break;
             }
+        }
+        if let Some((key, revision)) = blocked {
+            shared
+                .schedule
+                .blocked
+                .entry(key)
+                .or_default()
+                .insert(revision);
         }
         drop(shared);
         self.inner.changed.notify_all();
@@ -906,4 +960,4 @@ impl IndexWorkPort for SemanticIndexer {
     }
 }
 
-mod pieces;
+pub(crate) mod pieces;

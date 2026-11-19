@@ -6,6 +6,7 @@ use agentlaw_search::vector_file::{
     CurrentHeads, VectorFileBatch, VectorFileIdentity, VectorFileWriter,
 };
 use agentlaw_search::VectorRecord;
+use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -26,66 +27,146 @@ pub(super) fn run(
     mut pieces: AcquiredPieces,
     mut completion: Completion,
 ) -> Result<bool, String> {
+    let (memory, changes) = match &completion {
+        Completion::Current(Some(heads)) => (heads.memory_id.clone(), heads.change_ids.clone()),
+        Completion::History { memory, change } => (memory.clone(), vec![change.clone()]),
+        Completion::Current(None) => (String::new(), Vec::new()),
+    };
+    let blocked = |schedule: &super::state::Schedule| {
+        schedule.blocked.get(key).is_some_and(|blocked| {
+            blocked.iter().any(|(digest, id, change)| {
+                digest == model && *id == memory && changes.contains(change)
+            })
+        })
+    };
     let mut exhausted = false;
     let mut first_result = None::<Instant>;
     loop {
+        // A Split can finish before the writer reaches its wait, without producing a vector to flush.
+        let observed_work = {
+            let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(lane) = state.schedule.lanes.get(key) else {
+                return Ok(false);
+            };
+            lane.work_revision
+        };
         while !exhausted {
-            let room = {
-                let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(lane) = state.schedule.lanes.get(key).filter(|lane| {
+            let pending_piece = {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                if blocked(&state.schedule) {
+                    exhausted = true;
+                    break;
+                }
+                let Some(lane) = state.schedule.lanes.get_mut(key).filter(|lane| {
                     lane.token == token && lane.generation == generation && !lane.quarantined
                 }) else {
                     return Ok(false);
                 };
-                #[cfg(test)]
-                if shared
-                    .pause_pending_ranges
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    && lane.pending_window.is_some()
-                {
+                if lane.queue.len() + lane.running.len() >= shared.config.queue_pieces {
                     break;
                 }
-                lane.queue.len() + lane.running.len() < shared.config.queue_pieces
+                if let Some(window) = &lane.pending_window {
+                    #[cfg(test)]
+                    if shared
+                        .pause_pending_ranges
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    let Some(&(start, end)) = window.ranges.get(window.next_range) else {
+                        lane.pending_window = None;
+                        continue;
+                    };
+                    Some(Piece {
+                        memory_id: window.piece.memory_id.clone(),
+                        change_id: window.piece.change_id.clone(),
+                        section: format!("{}:{}", window.piece.section, window.next_range),
+                        scope: window.piece.scope.clone(),
+                        text: window.piece.text[start as usize..end as usize].to_owned(),
+                    })
+                } else {
+                    if shared.config.split_windows()
+                        && lane
+                            .queue
+                            .iter()
+                            .chain(lane.running.values().map(|(_, piece)| piece))
+                            .any(|piece| piece.section.matches(':').count() == 1)
+                    {
+                        break;
+                    }
+                    None
+                }
             };
-            if !room {
-                break;
-            }
-            let Some(piece) = pieces.next() else {
+            let from_window = pending_piece.is_some();
+            let piece = match pending_piece {
+                Some(piece) => piece,
+                None => match pieces.next() {
+                    Some(piece) => piece?,
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                },
+            };
+            let split = shared.config.split_windows() && !from_window;
+            let exists = !split
+                && writer
+                    .contains(&piece.memory_id, &piece.change_id, &piece.section)
+                    .map_err(|error| {
+                        pump::vector_failure(
+                            shared,
+                            &key.binding,
+                            token,
+                            generation,
+                            identity,
+                            gate,
+                            error,
+                        )
+                    })?;
+            let cached = if from_window && !exists {
+                shared
+                    .config
+                    .recent_vectors
+                    .get(model, &Sha256::digest(piece.text.as_bytes()).into())
+            } else {
+                None
+            };
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if blocked(&state.schedule) {
                 exhausted = true;
                 break;
-            };
-            let piece: Piece = piece?;
-            if writer
-                .contains(&piece.memory_id, &piece.change_id, &piece.section)
-                .map_err(|error| {
-                    pump::vector_failure(
-                        shared,
-                        &key.binding,
-                        token,
-                        generation,
-                        identity,
-                        gate,
-                        error,
-                    )
-                })?
-            {
-                continue;
             }
-            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(lane) = state.schedule.lanes.get_mut(key).filter(|lane| {
                 lane.token == token && lane.generation == generation && !lane.quarantined
             }) else {
                 return Ok(false);
             };
-            lane.queue.push_back(piece);
+            if cached.is_some() && lane.occupied() >= shared.config.pending_results {
+                break;
+            }
+            if from_window {
+                let Some(window) = lane.pending_window.as_mut() else {
+                    return Ok(false);
+                };
+                window.next_range += 1;
+            }
+            if exists {
+                continue;
+            }
+            if let Some(vector) = cached {
+                lane.results.push_back((piece, vector));
+            } else {
+                lane.queue.push_back(piece);
+            }
             drop(state);
             shared.wake_model();
         }
-        let (records, done, wait, snapshot) = {
+        let (records, done, wait) = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.stopping || state.schedule.model.as_deref() != Some(model) {
                 return Ok(false);
             }
+            let permanently_blocked = blocked(&state.schedule);
             let Some(lane) = state.schedule.lanes.get_mut(key).filter(|lane| {
                 lane.token == token && lane.generation == generation && !lane.quarantined
             }) else {
@@ -95,7 +176,11 @@ pub(super) fn run(
             if !lane.results.is_empty() && first_result.is_none() {
                 first_result = Some(now);
             }
-            let done = exhausted && lane.queue.is_empty() && lane.running.is_empty();
+            let done = exhausted
+                && lane.queue.is_empty()
+                && lane.running.is_empty()
+                && lane.pending_window.is_none()
+                && !permanently_blocked;
             let flush = lane.results.len() >= shared.config.commit_pieces
                 || (done && !lane.results.is_empty())
                 || first_result.is_some_and(|at| {
@@ -109,7 +194,7 @@ pub(super) fn run(
                         change_id: piece.change_id,
                         section: piece.section,
                         scope: piece.scope,
-                        vector,
+                        vector: vector.to_vec(),
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -118,12 +203,7 @@ pub(super) fn run(
             lane.committing += records.len();
             let wait = first_result
                 .map(|at| (at + shared.config.commit_interval).saturating_duration_since(now));
-            (
-                records,
-                done,
-                wait,
-                (lane.queue.len(), lane.running.len(), lane.results.len()),
-            )
+            (records, done, wait)
         };
         shared.changed.notify_all();
         #[cfg(test)]
@@ -240,8 +320,7 @@ pub(super) fn run(
         }) else {
             return Ok(false);
         };
-        if snapshot != (lane.queue.len(), lane.running.len(), lane.results.len()) {
-            drop(state);
+        if observed_work != lane.work_revision {
             continue;
         }
         if let Some(wait) = wait {

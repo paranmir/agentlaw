@@ -136,33 +136,32 @@ pub(crate) struct SelectionCache {
 }
 impl SelectionCache {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
-        let value = Arc::new(std::sync::Mutex::new(None));
-        let loaded = value.clone();
+        use std::io::Read;
+        const MAX_BYTES: u64 = 65_536;
+        let mut previous = std::fs::File::open(&path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() as u64 <= MAX_BYTES).then_some(bytes)
+        });
+        let selection = previous
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok());
+        if selection.is_none() {
+            previous = None;
+        }
+        let value = Arc::new(std::sync::Mutex::new(selection));
         let (commands, incoming) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut previous = std::fs::metadata(&path)
-                .ok()
-                .filter(|m| m.len() <= 65536)
-                .and_then(|_| std::fs::read(&path).ok());
-            if let Some(parsed) = previous
-                .as_ref()
-                .and_then(|bytes| serde_json::from_slice(bytes).ok())
-            {
-                *loaded.lock().unwrap() = Some(parsed);
-            } else {
-                previous = None;
-            }
             while let Ok(command) = incoming.recv() {
                 match command {
                     CacheCommand::Save(fingerprint, selection) => {
                         let item = (fingerprint, selection);
                         if let Ok(bytes) = serde_json::to_vec(&item) {
-                            if bytes.len() <= 65536 {
+                            if bytes.len() as u64 <= MAX_BYTES {
                                 if previous.as_ref() == Some(&bytes)
                                     || std::fs::write(&path, &bytes).is_ok()
                                 {
                                     previous = Some(bytes);
-                                    *loaded.lock().unwrap() = Some(item);
                                 }
                             }
                         }
@@ -180,6 +179,7 @@ impl SelectionCache {
         self.value.lock().unwrap().clone()
     }
     pub(crate) fn save(&self, fingerprint: String, selection: crate::execution::Selection) {
+        *self.value.lock().unwrap() = Some((fingerprint.clone(), selection.clone()));
         let _ = self
             .commands
             .send(CacheCommand::Save(fingerprint, selection));
@@ -205,7 +205,6 @@ pub(crate) fn cached_selection(
         .map(|(_, selection)| selection)
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CpuExecutionSettings {
     pub version: u32,
@@ -229,10 +228,15 @@ pub(crate) fn select_for_launch(
 }
 
 fn fingerprint_with_cpu_settings(
-    _hardware: Option<String>,
-    _settings: CpuExecutionSettings,
+    hardware: Option<String>,
+    settings: CpuExecutionSettings,
 ) -> Option<String> {
-    None
+    hardware.map(|hardware| {
+        format!(
+            "{hardware}:cpu:{}:{}:{}",
+            settings.version, settings.intra, settings.inter
+        )
+    })
 }
 
 #[cfg(test)]

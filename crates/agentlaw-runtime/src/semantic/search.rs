@@ -39,7 +39,15 @@ impl SemanticPort for SemanticSearch {
         text: &str,
         control: &RequestControl,
     ) -> Result<PrefixEmbedding, SemanticError> {
-        self.model.embed_prefix(text, control)
+        let prefix = self.model.embed_prefix(text, control)?;
+        validate_vector(&prefix.vector, self.indexer.inner.config.dimension)?;
+        if self.model.snapshot().model_digest.as_deref() != Some(prefix.vector.model.as_str()) {
+            return Err(SemanticError::Unavailable(
+                "model changed during query embedding".into(),
+            ));
+        }
+        control.check().map_err(|_| SemanticError::Cancelled)?;
+        Ok(prefix)
     }
     fn plan_pieces(
         &self,
@@ -58,12 +66,13 @@ impl SemanticPort for SemanticSearch {
         self.model.embed_planned(plan, record, reuse, control)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn embed_query(
         &self,
         text: &str,
         control: &RequestControl,
     ) -> Result<QueryVector, SemanticError> {
-        self.embed(text, control)
+        self.embed_prefix(text, control).map(|prefix| prefix.vector)
     }
 
     fn search_available(
@@ -386,19 +395,4 @@ pub(super) fn validate_vector(vector: &QueryVector, dimension: usize) -> Result<
         return Err(SemanticError::Failed("invalid query embedding".into()));
     }
     Ok(())
-}
-
-impl SemanticSearch {
-    fn embed(&self, text: &str, control: &RequestControl) -> Result<QueryVector, SemanticError> {
-        control.check().map_err(|_| SemanticError::Cancelled)?;
-        let vector = self.model.embed_query(text, control)?;
-        validate_vector(&vector, self.indexer.inner.config.dimension)?;
-        if self.model.snapshot().model_digest.as_deref() != Some(vector.model.as_str()) {
-            return Err(SemanticError::Unavailable(
-                "model changed during query embedding".into(),
-            ));
-        }
-        control.check().map_err(|_| SemanticError::Cancelled)?;
-        Ok(vector)
-    }
 }

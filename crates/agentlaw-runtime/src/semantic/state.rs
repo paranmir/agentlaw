@@ -4,7 +4,7 @@ use super::source::Piece;
 use crate::ports::ComponentState;
 use agentlaw_search::vector_file::{SourcePosition, VectorFileIdentity};
 use agentlaw_worker::supervisor::{IndexWork, ModelRequestId, ModelRequestIds};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,8 +60,8 @@ impl Backoff {
     }
 }
 
-#[allow(dead_code)]
 pub(super) struct PendingWindow {
+    pub piece: Piece,
     pub ranges: Vec<(u32, u32)>,
     pub next_range: usize,
 }
@@ -69,11 +69,11 @@ pub(super) struct PendingWindow {
 pub(super) struct Lane {
     pub token: u64,
     pub generation: u64,
+    pub work_revision: u64,
     pub queue: VecDeque<Piece>,
     pub running: HashMap<ModelRequestId, (u64, Piece)>,
-    pub results: VecDeque<(Piece, Vec<f32>)>,
+    pub results: VecDeque<(Piece, Arc<[f32]>)>,
     pub committing: usize,
-    #[allow(dead_code)]
     pub pending_window: Option<PendingWindow>,
     pub retry: Backoff,
     pub retry_piece: Option<(String, String, String)>,
@@ -156,6 +156,7 @@ impl Default for Lane {
         Self {
             token: 0,
             generation: 0,
+            work_revision: 0,
             queue: VecDeque::new(),
             running: HashMap::new(),
             results: VecDeque::new(),
@@ -191,6 +192,7 @@ impl Lane {
     pub fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.queue.clear();
+        self.pending_window = None;
         self.running.clear();
         self.results.clear();
         self.committing = 0;
@@ -203,19 +205,34 @@ impl Lane {
     }
 }
 
+type BlockedRevisions = HashSet<(String, String, String)>;
+
 #[derive(Default)]
 pub(super) struct Schedule {
+    pub blocked: BTreeMap<LaneKey, BlockedRevisions>,
     pub model: Option<String>,
     pub lanes: BTreeMap<LaneKey, Lane>,
     pub(super) last: Option<LaneKey>,
 }
 
 impl Schedule {
+    #[cfg(test)]
     pub fn next(
         &mut self,
         digest: &str,
         ids: &ModelRequestIds,
         capacity: usize,
+        now: Instant,
+    ) -> Option<IndexWork> {
+        self.next_task(digest, ids, capacity, false, now)
+    }
+
+    pub fn next_task(
+        &mut self,
+        digest: &str,
+        ids: &ModelRequestIds,
+        capacity: usize,
+        split_windows: bool,
         now: Instant,
     ) -> Option<IndexWork> {
         if self.model.as_deref() != Some(digest) {
@@ -247,12 +264,15 @@ impl Schedule {
                 let id = ids.next()?;
                 let piece = lane.queue.pop_front().unwrap();
                 let text: Arc<str> = Arc::from(piece.text.as_str());
+                let task = if split_windows && piece.section.matches(':').count() == 1 {
+                    agentlaw_worker::supervisor::IndexTask::Split(text)
+                } else {
+                    agentlaw_worker::supervisor::IndexTask::Embed(text)
+                };
                 lane.running.insert(id, (lane.generation, piece));
+                lane.work_revision = lane.work_revision.wrapping_add(1);
                 self.last = Some(name.clone());
-                return Some(IndexWork {
-                    id,
-                    task: agentlaw_worker::supervisor::IndexTask::Embed(text),
-                });
+                return Some(IndexWork { id, task });
             }
         }
         None

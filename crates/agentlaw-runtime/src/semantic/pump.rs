@@ -753,6 +753,10 @@ fn session_run(
             if page_pos.epoch != cursor.start.epoch {
                 return Err("source epoch changed during inventory".into());
             }
+            if cursor.completed_identity.is_empty() {
+                // No identity has been enumerated. Start replay at the actual first page.
+                cursor.start = position(&page_pos)?;
+            }
             for (kind, id) in items {
                 let guard = source.read_snapshot().map_err(|e| e.to_string())?;
                 if guard.position().epoch != cursor.start.epoch {
@@ -1129,6 +1133,7 @@ fn session_run(
         }
         shared.changed.notify_all();
         if caught_up {
+            super::identity::reclaim_previous(&shared.config, identity);
             loop {
                 reclaim(shared, name);
                 let lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1174,7 +1179,7 @@ fn unit_work(
     procedure: bool,
     publication_heads: &mut Vec<CurrentHeads>,
 ) -> Result<bool> {
-    let (heads, pieces) = source::map_acquired(unit, id, procedure, shared.config.chunk_bytes)?;
+    let (heads, pieces) = source::map_acquired(unit, id, procedure, shared.config.window_bytes())?;
     let completed_heads = heads.clone();
     let finished = super::batch::run(
         shared,

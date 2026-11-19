@@ -1,11 +1,12 @@
 //! Write review: pending batches, overlap checks and procedure authoring.
 use crate::read::{procedure_output, Channels};
+use crate::semantic::{PiecePlan, PieceVectorReuse, SemanticError};
 use crate::store::*;
 use crate::*;
 use crate::{context::*, write::*};
 use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 trait ReviewSource {
     fn position(&self) -> Result<agentlaw_storage::published::SourcePosition>;
@@ -13,6 +14,9 @@ trait ReviewSource {
     fn identical_bodies(&self, body: &str) -> Result<Vec<String>>;
     fn related(&self, ids: &[String]) -> Result<Vec<(String, String)>>;
     fn reverse_required(&self, ids: &[String]) -> Result<Vec<String>>;
+    fn select_proposal(&mut self, _index: usize, _body: &str) -> Result<()> {
+        Ok(())
+    }
     fn search(&mut self, scopes: &[String], query: &str) -> Result<Channels>;
     fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot>;
 }
@@ -20,6 +24,9 @@ trait ReviewSource {
 struct ReadReview<'a, 'b, 'c> {
     ctx: &'a ReadCtx<'b>,
     exact: &'c mut crate::exact::ExactSnapshot,
+    plans: &'c mut BTreeMap<usize, Option<PiecePlan>>,
+    reuse: &'c PieceVectorReuse,
+    selected: Option<(usize, usize)>,
 }
 impl ReviewSource for ReadReview<'_, '_, '_> {
     fn position(&self) -> Result<agentlaw_storage::published::SourcePosition> {
@@ -37,8 +44,25 @@ impl ReviewSource for ReadReview<'_, '_, '_> {
     fn reverse_required(&self, ids: &[String]) -> Result<Vec<String>> {
         self.exact.reverse_required(ids)
     }
+    fn select_proposal(&mut self, index: usize, body: &str) -> Result<()> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.plans.entry(index) {
+            let plan = plan_records(self.ctx, &query_records(body))?;
+            entry.insert(plan);
+        }
+        self.selected = Some((index, 0));
+        Ok(())
+    }
+
     fn search(&mut self, scopes: &[String], query: &str) -> Result<Channels> {
-        crate::read::preparation_channels(self.ctx, self.exact, query, scopes, None)
+        let planned = self.selected.as_mut().and_then(|(proposal, record)| {
+            let index = *record;
+            *record += 1;
+            self.plans
+                .get(proposal)?
+                .as_ref()
+                .map(|plan| (plan, index, self.reuse))
+        });
+        crate::read::preparation_channels(self.ctx, self.exact, query, scopes, planned)
     }
     fn snapshot(&self, ids: &[String], procedures: &[String]) -> Result<Snapshot> {
         let snapshot = crate::read::snapshot_selected_read(
@@ -82,6 +106,8 @@ trait Preparation {
 struct ReadPreparation<'a, 'b, 'c> {
     ctx: &'a ReadCtx<'b>,
     exact: &'c mut crate::exact::ExactSnapshot,
+    plans: BTreeMap<usize, Option<PiecePlan>>,
+    reuse: PieceVectorReuse,
 }
 impl Preparation for ReadPreparation<'_, '_, '_> {
     fn identity(&self) -> StoreIdentity {
@@ -150,6 +176,9 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
             &mut ReadReview {
                 ctx: self.ctx,
                 exact: self.exact,
+                plans: &mut self.plans,
+                reuse: &self.reuse,
+                selected: None,
             },
             context,
             proposals,
@@ -165,6 +194,9 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
             &mut ReadReview {
                 ctx: self.ctx,
                 exact: self.exact,
+                plans: &mut self.plans,
+                reuse: &self.reuse,
+                selected: None,
             },
             snapshot,
             prepared,
@@ -192,8 +224,10 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
             .into_iter()
             .map(|scope| format!("procedure:{scope}"))
             .collect();
+        let plan = plan_records(self.ctx, &[query])?;
+        let planned = plan.as_ref().map(|plan| (plan, 0, &self.reuse));
         let channels =
-            crate::read::preparation_channels(self.ctx, self.exact, query, &scopes, None)?;
+            crate::read::preparation_channels(self.ctx, self.exact, query, &scopes, planned)?;
         let ids: Vec<_> = channels
             .hits
             .iter()
@@ -213,6 +247,20 @@ impl Preparation for ReadPreparation<'_, '_, '_> {
     }
 }
 
+fn plan_records(ctx: &ReadCtx<'_>, records: &[&str]) -> Result<Option<PiecePlan>> {
+    match ctx.semantic.plan_pieces(records, ctx.request) {
+        Ok(plan) => Ok(Some(plan)),
+        Err(SemanticError::Cancelled) => {
+            ctx.request.check()?;
+            Err(DomainError::new(
+                "cancelled",
+                "Piece planning was cancelled.",
+            ))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn write_material(
     review: &mut impl ReviewSource,
     context: &RequestContext,
@@ -221,7 +269,7 @@ fn write_material(
     let position = review.position()?;
     let mut ids = BTreeSet::new();
     let mut affected = BTreeSet::new();
-    for p in proposals {
+    for (index, p) in proposals.iter().enumerate() {
         for reference in p
             .parent_refs
             .iter()
@@ -246,6 +294,7 @@ fn write_material(
             }
         }
         if p.operation == Operation::Create || p.applies_to.is_some() {
+            review.select_proposal(index, &p.what_to_remember)?;
             ids.extend(review.identical_bodies(&p.what_to_remember)?);
             for record in query_records(&p.what_to_remember) {
                 ids.extend(
@@ -285,14 +334,16 @@ fn overlap_candidates(
 ) -> Result<(Vec<CurrentState>, Vec<DomainError>)> {
     let mut chosen = BTreeSet::new();
     let mut diagnostics = Vec::new();
-    for (p, scope) in prepared
+    for (index, (p, scope)) in prepared
         .proposals
         .iter()
         .zip(&prepared.resolved_applicability)
+        .enumerate()
     {
         if !requires_overlap(snapshot, p, scope) {
             continue;
         }
+        review.select_proposal(index, &p.what_to_remember)?;
         for record in query_records(&p.what_to_remember) {
             let channels = review.search(&[scope_token(scope)], record)?;
             if let Some(id) = admitted(&channels) {
@@ -353,7 +404,15 @@ pub fn prepare(
     request: RememberRequest,
 ) -> Result<Prepared> {
     ctx.request.check()?;
-    prepare_remember(&mut ReadPreparation { ctx, exact }, request)
+    prepare_remember(
+        &mut ReadPreparation {
+            ctx,
+            exact,
+            plans: BTreeMap::new(),
+            reuse: PieceVectorReuse::default(),
+        },
+        request,
+    )
 }
 
 pub fn prepare_connect(ctx: &ReadCtx<'_>, request: ConnectRequest) -> Result<Prepared> {
