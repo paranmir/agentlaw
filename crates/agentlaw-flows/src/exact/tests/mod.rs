@@ -32,11 +32,11 @@ struct Fixture {
 }
 struct Unavailable;
 impl crate::semantic::SemanticPort for Unavailable {
-    fn embed_query(
+    fn embed_prefix(
         &self,
         _: &str,
         _: &RequestControl,
-    ) -> std::result::Result<crate::semantic::QueryVector, crate::semantic::SemanticError> {
+    ) -> std::result::Result<crate::semantic::PrefixEmbedding, crate::semantic::SemanticError> {
         Err(crate::semantic::SemanticError::Unavailable(
             "fixture".into(),
         ))
@@ -49,6 +49,28 @@ impl crate::semantic::SemanticPort for Unavailable {
     {
         Err(crate::semantic::SemanticError::Unavailable(
             "fixture".into(),
+        ))
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
         ))
     }
 }

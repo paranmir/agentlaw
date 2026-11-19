@@ -31,6 +31,15 @@ fn finish_history(
     search: &SemanticSearch,
     target: &agentlaw_storage::published::SourcePosition,
 ) -> Vec<String> {
+    finish_history_with_piece_bytes(indexer, search, target, usize::MAX)
+}
+
+fn finish_history_with_piece_bytes(
+    indexer: &SemanticIndexer,
+    search: &SemanticSearch,
+    target: &agentlaw_storage::published::SourcePosition,
+    bytes: usize,
+) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut texts = Vec::new();
     loop {
@@ -38,8 +47,16 @@ fn finish_history(
             return texts;
         }
         if let Some(work) = indexer.next_work("model") {
-            texts.push(indexed_text(&work).to_owned());
-            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+            let result = match &work.task {
+                agentlaw_worker::supervisor::IndexTask::Split(text) => {
+                    IndexResult::Pieces(fixture_ranges(text, bytes))
+                }
+                agentlaw_worker::supervisor::IndexTask::Embed(text) => {
+                    texts.push(text.to_string());
+                    IndexResult::Vector(vec![1.0, 0.0])
+                }
+            };
+            indexer.finish(work.id, Ok(result));
         }
         assert!(Instant::now() < deadline, "history indexing timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -308,7 +325,6 @@ fn history_restart_reuses_completed_changes_without_early_ack() {
         .clone();
     let mut config = SemanticConfig::new(temp.path().join("indices"), "config".into());
     config.dimension = 2;
-    config.chunk_bytes = 4;
     config.pending_results = 1;
     config.commit_pieces = 1;
     let indexer = SemanticIndexer::start(
@@ -351,7 +367,15 @@ fn history_restart_reuses_completed_changes_without_early_ack() {
             }
         }
         if let Some(work) = indexer.next_work("model") {
-            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+            let result = match &work.task {
+                agentlaw_worker::supervisor::IndexTask::Split(text) => {
+                    IndexResult::Pieces(fixture_ranges(text, 4))
+                }
+                agentlaw_worker::supervisor::IndexTask::Embed(_) => {
+                    IndexResult::Vector(vec![1.0, 0.0])
+                }
+            };
+            indexer.finish(work.id, Ok(result));
         }
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
@@ -371,7 +395,7 @@ fn history_restart_reuses_completed_changes_without_early_ack() {
         HistorySemanticPort::offer(&search, hint(&target)),
         OfferResult::Queued
     );
-    let work = finish_history(&reopened, &search, &target);
+    let work = finish_history_with_piece_bytes(&reopened, &search, &target, 4);
     assert!(!work.iter().any(|text| text == "firs"));
     let vector = QueryVector {
         model: "model".into(),

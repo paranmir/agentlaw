@@ -27,7 +27,10 @@ pub fn path(config: &SemanticConfig, identity: &VectorFileIdentity) -> PathBuf {
         hash.update(field.as_bytes());
     }
     hash.update((identity.dimension as u64).to_be_bytes());
-    hash.update((config.chunk_bytes as u64).to_be_bytes());
+    if identity.config != super::INDEX_CONFIG_VERSION {
+        // The previous layout included its fixed byte chunk size in its directory key.
+        hash.update(4096_u64.to_be_bytes());
+    }
     config
         .indices_root
         .join(format!("{:x}", hash.finalize()))

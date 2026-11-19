@@ -76,7 +76,7 @@ fn cancelled_without_supervisor_creates_no_demand() {
     let control = RequestControl::default();
     control.cancel.store(true, Ordering::Release);
     assert_eq!(
-        handle.embed_query("cancelled", &control),
+        handle.embed_prefix("cancelled", &control),
         Err(SemanticError::Cancelled)
     );
     assert!(!handle.inner.lock().unwrap().demand);
@@ -97,7 +97,7 @@ fn terminated_supervisor_retains_query_demand() {
     assert!(old.wait_terminated(Duration::from_secs(5)).is_some());
     handle.inner.lock().unwrap().supervisor = Some(old.clone());
     assert!(matches!(
-        handle.embed_query("query", &RequestControl::default()),
+        handle.embed_prefix("query", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     assert!(handle.inner.lock().unwrap().demand);
@@ -135,7 +135,7 @@ fn assert_replacement_receives_demand(handle: ModelHandle, index: Arc<PanicOnce>
 fn absent_supervisor_delivers_demand_to_cold_replacement() {
     let handle = ModelHandle::new();
     assert!(matches!(
-        handle.embed_query("query", &RequestControl::default()),
+        handle.embed_prefix("query", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     assert_replacement_receives_demand(
@@ -293,13 +293,13 @@ fn restart_warm_health_and_shutdown() {
         .unwrap()
         .is_warm());
     assert!(matches!(
-        handle.embed_query("hello", &RequestControl::default()),
+        handle.embed_prefix("hello", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     let cancelled = RequestControl::default();
     cancelled.cancel.store(true, Ordering::Release);
     assert_eq!(
-        handle.embed_query("hello", &cancelled),
+        handle.embed_prefix("hello", &cancelled),
         Err(SemanticError::Cancelled)
     );
     wait_for(|| {
@@ -327,7 +327,7 @@ fn restart_warm_health_and_shutdown() {
     wait_for(|| handle.inner.lock().unwrap().supervisor.is_none());
     assert!(handle.snapshot().cause.unwrap().contains("index failed"));
     assert!(matches!(
-        handle.embed_query("during", &RequestControl::default()),
+        handle.embed_prefix("during", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     wait_for(|| {
@@ -347,7 +347,7 @@ fn restart_warm_health_and_shutdown() {
         .unwrap()
         .is_warm());
     assert!(matches!(
-        handle.embed_query("after", &RequestControl::default()),
+        handle.embed_prefix("after", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     wait_for(|| {
@@ -359,7 +359,7 @@ fn restart_warm_health_and_shutdown() {
     host.shutdown();
     assert!(handle.inner.lock().unwrap().supervisor.is_none());
     assert!(matches!(
-        handle.embed_query("stopped", &RequestControl::default()),
+        handle.embed_prefix("stopped", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     let calls = index.calls.load(Ordering::SeqCst);

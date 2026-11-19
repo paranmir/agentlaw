@@ -9,7 +9,7 @@ fn unavailable_models_do_not_wait_but_ready_does() {
         fake.set_model(model);
         let start = Instant::now();
         assert!(matches!(
-            fake.embed_query("", &control),
+            fake.embed_prefix("", &control),
             Err(SemanticError::Unavailable(_))
         ));
         assert!(start.elapsed() < Duration::from_millis(100));
@@ -17,7 +17,7 @@ fn unavailable_models_do_not_wait_but_ready_does() {
     fake.set_model(FakeModel::Ready);
     fake.set_query_delay(Duration::from_millis(50));
     let start = Instant::now();
-    fake.embed_query("", &control).unwrap();
+    fake.embed_prefix("", &control).unwrap().vector;
     assert!(start.elapsed() >= Duration::from_millis(50));
     // The existing cancellation test checks interruption of a delayed Ready query.
 }
@@ -35,16 +35,16 @@ fn semantic_states_and_history() {
     let control = RequestControl::default();
     fake.set_model(FakeModel::Loading);
     assert_eq!(
-        fake.embed_query("", &control),
+        fake.embed_prefix("", &control),
         Err(SemanticError::Unavailable("model loading".into()))
     );
     fake.set_model(FakeModel::Unavailable("offline".into()));
     assert_eq!(
-        fake.embed_query("", &control),
+        fake.embed_prefix("", &control),
         Err(SemanticError::Unavailable("offline".into()))
     );
     fake.set_model(FakeModel::Ready);
-    let vector = fake.embed_query("", &control).unwrap();
+    let vector = fake.embed_prefix("", &control).unwrap().vector;
     assert_eq!(vector.values.len(), 256);
     assert_eq!(vector.values[0], 1.0);
     let source = position("source", 5);
@@ -122,7 +122,7 @@ fn semantic_cancellation_and_limit() {
     let worker_fake = fake.clone();
     let worker_control = control.clone();
     let start = Instant::now();
-    let worker = std::thread::spawn(move || worker_fake.embed_query("", &worker_control));
+    let worker = std::thread::spawn(move || worker_fake.embed_prefix("", &worker_control));
     std::thread::sleep(Duration::from_millis(30));
     control
         .cancel

@@ -3,7 +3,7 @@
 use super::source::Piece;
 use crate::ports::ComponentState;
 use agentlaw_search::vector_file::{SourcePosition, VectorFileIdentity};
-use agentlaw_worker::supervisor::{IndexWork, ModelRequestId, ModelRequestIds};
+use agentlaw_worker::supervisor::{IndexTask, IndexWork, ModelRequestId, ModelRequestIds};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -66,12 +66,34 @@ pub(super) struct PendingWindow {
     pub next_range: usize,
 }
 
+pub(super) struct QueuedPiece {
+    pub piece: Piece,
+    pub task: IndexTask,
+}
+
+impl QueuedPiece {
+    pub fn new(piece: Piece, split: bool) -> Self {
+        let text = Arc::from(piece.text.as_str());
+        let task = if split {
+            IndexTask::Split(text)
+        } else {
+            IndexTask::Embed(text)
+        };
+        Self { piece, task }
+    }
+
+    pub fn is_split(&self) -> bool {
+        matches!(self.task, IndexTask::Split(_))
+    }
+}
+
 pub(super) struct Lane {
     pub token: u64,
     pub generation: u64,
     pub work_revision: u64,
-    pub queue: VecDeque<Piece>,
-    pub running: HashMap<ModelRequestId, (u64, Piece)>,
+    pub blocked_generation: Option<u64>,
+    pub queue: VecDeque<QueuedPiece>,
+    pub running: HashMap<ModelRequestId, (u64, QueuedPiece)>,
     pub results: VecDeque<(Piece, Arc<[f32]>)>,
     pub committing: usize,
     pub pending_window: Option<PendingWindow>,
@@ -157,6 +179,7 @@ impl Default for Lane {
             token: 0,
             generation: 0,
             work_revision: 0,
+            blocked_generation: None,
             queue: VecDeque::new(),
             running: HashMap::new(),
             results: VecDeque::new(),
@@ -216,23 +239,11 @@ pub(super) struct Schedule {
 }
 
 impl Schedule {
-    #[cfg(test)]
-    pub fn next(
-        &mut self,
-        digest: &str,
-        ids: &ModelRequestIds,
-        capacity: usize,
-        now: Instant,
-    ) -> Option<IndexWork> {
-        self.next_task(digest, ids, capacity, false, now)
-    }
-
     pub fn next_task(
         &mut self,
         digest: &str,
         ids: &ModelRequestIds,
         capacity: usize,
-        split_windows: bool,
         now: Instant,
     ) -> Option<IndexWork> {
         if self.model.as_deref() != Some(digest) {
@@ -262,14 +273,9 @@ impl Schedule {
                     continue;
                 }
                 let id = ids.next()?;
-                let piece = lane.queue.pop_front().unwrap();
-                let text: Arc<str> = Arc::from(piece.text.as_str());
-                let task = if split_windows && piece.section.matches(':').count() == 1 {
-                    agentlaw_worker::supervisor::IndexTask::Split(text)
-                } else {
-                    agentlaw_worker::supervisor::IndexTask::Embed(text)
-                };
-                lane.running.insert(id, (lane.generation, piece));
+                let work = lane.queue.pop_front().unwrap();
+                let task = work.task.clone();
+                lane.running.insert(id, (lane.generation, work));
                 lane.work_revision = lane.work_revision.wrapping_add(1);
                 self.last = Some(name.clone());
                 return Some(IndexWork { id, task });

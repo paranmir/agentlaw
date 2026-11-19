@@ -24,7 +24,12 @@ fn storage_position(p: &SourcePosition) -> Result<StoragePosition> {
         sequence: u64::try_from(p.sequence).map_err(|_| "negative source sequence")?,
     })
 }
-fn report(shared: &Shared, binding: &str, state: ComponentState, reason: Option<String>) {
+pub(super) fn report(
+    shared: &Shared,
+    binding: &str,
+    state: ComponentState,
+    reason: Option<String>,
+) {
     shared.health.publish(
         ComponentId {
             binding: Some(binding.into()),
@@ -711,10 +716,16 @@ fn session_run(
     }
     {
         let mut lock = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = LaneKey::current(name);
+        let blocked = lock
+            .schedule
+            .blocked
+            .get(&key)
+            .is_some_and(|revisions| revisions.iter().any(|(digest, _, _)| digest == model));
         let Some(lane) = lock
             .schedule
             .lanes
-            .get_mut(&LaneKey::current(name))
+            .get_mut(&key)
             .filter(|l| l.token == token && l.generation == generation)
         else {
             return Ok(());
@@ -731,10 +742,13 @@ fn session_run(
                 identity: identity.clone(),
             });
         }
-        lane.state = ComponentState::Busy;
-        lane.reason = None;
         lane.dirty = false;
-        report(shared, name, ComponentState::Busy, None);
+        if !blocked {
+            lane.blocked_generation = None;
+            lane.state = ComponentState::Busy;
+            lane.reason = None;
+            report(shared, name, ComponentState::Busy, None);
+        }
     }
     shared.changed.notify_all();
     if progress.ack.is_none() {
@@ -1179,7 +1193,7 @@ fn unit_work(
     procedure: bool,
     publication_heads: &mut Vec<CurrentHeads>,
 ) -> Result<bool> {
-    let (heads, pieces) = source::map_acquired(unit, id, procedure, shared.config.window_bytes())?;
+    let (heads, pieces) = source::map_acquired(unit, id, procedure)?;
     let completed_heads = heads.clone();
     let finished = super::batch::run(
         shared,

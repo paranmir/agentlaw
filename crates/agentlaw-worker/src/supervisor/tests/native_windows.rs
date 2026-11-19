@@ -202,13 +202,13 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_waiter = cancel.clone();
     let cancelled_waiter = std::thread::spawn(move || {
-        cancelled_waiter_supervisor.embed_query("shared", &cancel_waiter)
+        cancelled_waiter_supervisor.embed_piece("shared", &cancel_waiter)
     });
     let first_waiter = std::thread::spawn(move || {
-        first_waiter_supervisor.embed_query("shared", &AtomicBool::new(false))
+        first_waiter_supervisor.embed_piece("shared", &AtomicBool::new(false))
     });
     let second_waiter = std::thread::spawn(move || {
-        second_waiter_supervisor.embed_query("shared", &AtomicBool::new(false))
+        second_waiter_supervisor.embed_piece("shared", &AtomicBool::new(false))
     });
     wait_for(|| {
         supervisor
@@ -247,7 +247,7 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     wait_for(|| supervisor.snapshot().model_digest.as_deref() == Some("digest-b"));
     let query_supervisor = supervisor.clone();
     let query =
-        std::thread::spawn(move || query_supervisor.embed_query("hello", &AtomicBool::new(false)));
+        std::thread::spawn(move || query_supervisor.embed_piece("hello", &AtomicBool::new(false)));
     wait_for(|| {
         supervisor
             .shared
@@ -288,7 +288,7 @@ fn ram_supervisor_recovers_owned_child_and_discards_old_incarnation_results() {
     assert_eq!(answer.vector, new_vector);
     let query_supervisor = supervisor.clone();
     let invalid = std::thread::spawn(move || {
-        query_supervisor.embed_query("bad input", &AtomicBool::new(false))
+        query_supervisor.embed_piece("bad input", &AtomicBool::new(false))
     });
     wait_for(|| {
         supervisor

@@ -700,6 +700,7 @@ fn project_spool(
         general: ctx.is_some_and(|ctx| ctx.identity.response_limit <= ctx.identity.history_limit),
     };
     let db = &workspace.db;
+    let mut semantic_cancelled = false;
     let work = (|| -> Work<Value> {
         db.execute_batch("CREATE TABLE nodes(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,metadata TEXT,body TEXT,evidence TEXT,parents INTEGER,children INTEGER DEFAULT 0,keynode INTEGER DEFAULT 0); CREATE TABLE edges(child TEXT,parent TEXT,PRIMARY KEY(child,parent)); CREATE INDEX edge_parent ON edges(parent,child); CREATE TABLE selected(window INTEGER,id TEXT,matched INTEGER,PRIMARY KEY(window,id)); BEGIN;")?;
         let mut ordinal = 0u64;
@@ -798,6 +799,10 @@ fn project_spool(
                         if same_epoch {
                             channels.push(candidates_in_history(db, result.hits)?);
                         }
+                    }
+                    Err(crate::semantic::SemanticError::Cancelled) => {
+                        semantic_cancelled = true;
+                        return Err("historical semantic search was cancelled".into());
                     }
                     Err(_) => {
                         diagnostic = Some(
@@ -973,7 +978,13 @@ fn project_spool(
         history_artifact(local, &mut bytes.as_slice(), notice)
     })();
     control.check()?;
-    work.map_err(|_| failure())
+    work.map_err(|_| {
+        if semantic_cancelled {
+            DomainError::new("cancelled", "Historical semantic search was cancelled.")
+        } else {
+            failure()
+        }
+    })
 }
 
 trait HistorySemanticChannel {

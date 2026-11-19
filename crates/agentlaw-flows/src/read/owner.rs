@@ -253,11 +253,7 @@ fn search_one(
         Some(vectors) => {
             let mut best = BTreeMap::<String, Hit>::new();
             let mut complete = true;
-            let mut seen = std::collections::HashSet::new();
             for vector in vectors {
-                if !seen.insert((vector.model.as_str(), vector.values.as_ptr())) {
-                    continue;
-                }
                 let (hits, covered) = search_vector(ctx, exact, &query.combined, scopes, vector)?;
                 complete &= covered;
                 for hit in hits {
@@ -343,8 +339,7 @@ fn search_vector(
             .unwrap_or(&hit.memory_id);
         heads.iter().any(|h| {
             if h.entity_id != id
-                || (h.observed_version != hit.change_id
-                    && h.metadata["change_id"].as_str() != Some(hit.change_id.as_str()))
+                || h.observed_version != hit.change_id
                 || (h.entity_type == "learned_procedure") != procedure
             {
                 return false;
@@ -375,18 +370,35 @@ pub(crate) fn preparation_channels(
         &crate::semantic::PieceVectorReuse,
     )>,
 ) -> Result<Channels> {
-    let vectors = match planned
-        .map(|(plan, record, reuse)| ctx.semantic.embed_planned(plan, record, reuse, ctx.request))
-    {
-        Some(Ok(vectors)) => Some(vectors),
-        Some(Err(SemanticError::Cancelled)) => {
-            ctx.request.check()?;
-            return Err(DomainError::new(
-                "cancelled",
-                "Piece embedding was cancelled.",
-            ));
+    let vectors = match planned {
+        Some((plan, index, reuse)) => {
+            match ctx.semantic.embed_planned(plan, index, reuse, ctx.request) {
+                Ok(vectors) => plan.record(index).and_then(|record| {
+                    let pieces = record.pieces();
+                    if pieces.len() != vectors.len() {
+                        return None;
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    Some(
+                        pieces
+                            .zip(vectors)
+                            .filter_map(|((_, digest), vector)| {
+                                seen.insert(*digest).then_some(vector)
+                            })
+                            .collect(),
+                    )
+                }),
+                Err(SemanticError::Cancelled) => {
+                    ctx.request.check()?;
+                    return Err(DomainError::new(
+                        "cancelled",
+                        "Piece embedding was cancelled.",
+                    ));
+                }
+                Err(_) => None,
+            }
         }
-        _ => None,
+        None => None,
     };
     let query = PreparedQuery {
         text: text.to_owned(),

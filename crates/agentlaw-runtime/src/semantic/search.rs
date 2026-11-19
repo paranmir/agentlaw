@@ -66,15 +66,6 @@ impl SemanticPort for SemanticSearch {
         self.model.embed_planned(plan, record, reuse, control)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn embed_query(
-        &self,
-        text: &str,
-        control: &RequestControl,
-    ) -> Result<QueryVector, SemanticError> {
-        self.embed_prefix(text, control).map(|prefix| prefix.vector)
-    }
-
     fn search_available(
         &self,
         query: SemanticQuery<'_>,

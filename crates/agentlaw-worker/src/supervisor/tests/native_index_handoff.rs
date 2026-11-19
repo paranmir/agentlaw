@@ -120,7 +120,7 @@ fn supervisor_panic_completes_owned_index_and_is_observable() {
     assert_eq!(f.owner.snapshot().state, WorkerState::Failed);
     f.owner.set_warm(true);
     assert!(matches!(
-        f.owner.embed_query("after", &AtomicBool::new(false)),
+        f.owner.embed_piece("after", &AtomicBool::new(false)),
         Err(QueryError::Unavailable(_))
     ));
     assert!(f.close().is_err());
@@ -134,7 +134,7 @@ fn supervisor_panic_completes_held_index() {
     f.ready();
     f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
     let owner = f.owner.clone();
-    let query = std::thread::spawn(move || owner.embed_query("priority", &AtomicBool::new(false)));
+    let query = std::thread::spawn(move || owner.embed_piece("priority", &AtomicBool::new(false)));
     review_until(|| {
         !f.owner
             .shared
@@ -391,7 +391,7 @@ fn coincident_failure_signals_complete_waiters_once_and_keep_one_retry_deadline(
         *f.clock.lock().unwrap() = failure_time + Duration::from_millis(500);
         assert!(matches!(
             f.owner()
-                .embed_query("attach during retry", &AtomicBool::new(false)),
+                .embed_piece("attach during retry", &AtomicBool::new(false)),
             Err(QueryError::Unavailable(_))
         ));
         *f.clock.lock().unwrap() = failure_time + Duration::from_millis(999);

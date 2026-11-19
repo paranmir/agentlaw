@@ -155,18 +155,6 @@ impl ModelHandle {
         Ok(vectors)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn embed_query(
-        &self,
-        text: &str,
-        control: &RequestControl,
-    ) -> Result<QueryVector, SemanticError> {
-        self.query(control, |supervisor| {
-            supervisor.embed_piece(text, &control.cancel)
-        })
-        .map(map_vector)
-    }
-
     fn query<T>(
         &self,
         control: &RequestControl,

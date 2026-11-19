@@ -102,7 +102,7 @@ impl PieceRecord {
         Self { text, pieces }
     }
 
-    pub fn pieces(&self) -> impl Iterator<Item = (Option<&str>, &[u8; 32])> {
+    pub fn pieces(&self) -> impl ExactSizeIterator<Item = (Option<&str>, &[u8; 32])> {
         self.pieces
             .iter()
             .map(|(range, digest)| (self.text.get(range.clone()), digest))
@@ -114,51 +114,19 @@ pub trait SemanticPort: Send + Sync {
         &self,
         text: &str,
         control: &RequestControl,
-    ) -> Result<PrefixEmbedding, SemanticError> {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.embed_query(text, control)
-                .map(|vector| PrefixEmbedding {
-                    vector,
-                    truncated: false,
-                })
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            let _ = (text, control);
-            Err(SemanticError::Unavailable(
-                "query embedding unavailable".into(),
-            ))
-        }
-    }
+    ) -> Result<PrefixEmbedding, SemanticError>;
     fn plan_pieces(
         &self,
-        _records: &[&str],
-        _control: &RequestControl,
-    ) -> Result<PiecePlan, SemanticError> {
-        Err(SemanticError::Failed("piece planning unavailable".into()))
-    }
+        records: &[&str],
+        control: &RequestControl,
+    ) -> Result<PiecePlan, SemanticError>;
     fn embed_planned(
         &self,
-        _plan: &PiecePlan,
-        _record: usize,
-        _reuse: &PieceVectorReuse,
-        _control: &RequestControl,
-    ) -> Result<Vec<QueryVector>, SemanticError> {
-        Err(SemanticError::Failed("piece embedding unavailable".into()))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    fn embed_query(
-        &self,
-        _text: &str,
-        _control: &RequestControl,
-    ) -> Result<QueryVector, SemanticError> {
-        Err(SemanticError::Unavailable(
-            "semantic embedding unavailable".into(),
-        ))
-    }
+        plan: &PiecePlan,
+        record: usize,
+        reuse: &PieceVectorReuse,
+        control: &RequestControl,
+    ) -> Result<Vec<QueryVector>, SemanticError>;
     fn search_available(
         &self,
         query: SemanticQuery<'_>,

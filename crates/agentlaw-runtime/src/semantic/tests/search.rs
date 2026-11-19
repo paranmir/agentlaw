@@ -149,7 +149,7 @@ fn search_completed_index_and_rejects_incompatible_or_missing_vector() {
         Err(SemanticError::Unavailable(_))
     ));
     assert!(matches!(
-        search.embed_query("text", &RequestControl::default()),
+        search.embed_prefix("text", &RequestControl::default()),
         Err(SemanticError::Unavailable(_))
     ));
     assert!(indexer.shutdown(Duration::from_secs(5)));

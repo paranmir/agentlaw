@@ -1043,14 +1043,14 @@ impl QueryGate {
     }
 }
 impl agentlaw_flows::semantic::SemanticPort for QueryGate {
-    fn embed_query(
+    fn embed_prefix(
         &self,
         text: &str,
         control: &RequestControl,
-    ) -> Result<agentlaw_flows::semantic::QueryVector, agentlaw_flows::semantic::SemanticError>
+    ) -> Result<agentlaw_flows::semantic::PrefixEmbedding, agentlaw_flows::semantic::SemanticError>
     {
         self.pause(true);
-        agentlaw_flows::semantic::SemanticPort::embed_query(&self.fake, text, control)
+        agentlaw_flows::semantic::SemanticPort::embed_prefix(&self.fake, text, control)
     }
     fn search_available(
         &self,
@@ -1060,6 +1060,33 @@ impl agentlaw_flows::semantic::SemanticPort for QueryGate {
     {
         self.pause(false);
         agentlaw_flows::semantic::SemanticPort::search_available(&self.fake, query, control)
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<
+        agentlaw_flows::semantic::PiecePlan,
+        agentlaw_flows::semantic::SemanticError,
+    > {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &agentlaw_flows::semantic::PiecePlan,
+        _: usize,
+        _: &agentlaw_flows::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<
+        Vec<agentlaw_flows::semantic::QueryVector>,
+        agentlaw_flows::semantic::SemanticError,
+    > {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 
@@ -1649,12 +1676,12 @@ fn damaged_vector_file_keeps_lexical_source_control_and_other_binding_reads_avai
     }
     let search = SemanticSearch::new(indexer.clone(), model.clone());
     let vector = search
-        .embed_query(
+        .embed_prefix(
             "The model still embeds queries.",
             &RequestControl::default(),
         )
         .unwrap();
-    assert_eq!(vector.values.len(), 256);
+    assert_eq!(vector.vector.values.len(), 256);
     let exact = f
         .query_with_semantic(
             json!({"memory_ids":[id]}),
@@ -1909,12 +1936,12 @@ fn request_reuses_body_and_title_pieces_after_installation_cache_is_cleared() {
         observed: Mutex<Observed>,
     }
     impl SemanticPort for Probe {
-        fn embed_query(
+        fn embed_prefix(
             &self,
             text: &str,
             control: &RequestControl,
-        ) -> Result<QueryVector, SemanticError> {
-            self.adapter.embed_query(text, control)
+        ) -> Result<agentlaw_flows::semantic::PrefixEmbedding, SemanticError> {
+            self.adapter.embed_prefix(text, control)
         }
         fn plan_pieces(
             &self,

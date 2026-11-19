@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 write-audit = ["agentlaw-sqlite/write-audit", "agentlaw-storage/write-audit"]
-test-support = ["agentlaw-flows/test-support"]
+test-support = []
 
 [dependencies]
 agentlaw-sqlite = { path = "../agentlaw-sqlite" }
@@ -27,7 +27,6 @@ time = { version = "0.3", features = ["formatting"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-agentlaw-flows = { path = "../agentlaw-flows", features = ["test-support"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

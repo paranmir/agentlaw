@@ -403,8 +403,17 @@ fn embed(
         if matches!(overflow, crate::model_child::Overflow::Reject) {
             return Err(EmbeddingError::InputTooLong);
         }
-        encoding.truncate(budget, 0, tokenizers::TruncationDirection::Right);
-        encoding.take_overflowing();
+        encoding = tokenizers::Encoding::new(
+            encoding.get_ids()[..budget].to_vec(),
+            encoding.get_type_ids()[..budget].to_vec(),
+            encoding.get_tokens()[..budget].to_vec(),
+            encoding.get_word_ids()[..budget].to_vec(),
+            encoding.get_offsets()[..budget].to_vec(),
+            encoding.get_special_tokens_mask()[..budget].to_vec(),
+            encoding.get_attention_mask()[..budget].to_vec(),
+            Vec::new(),
+            Default::default(),
+        );
     }
     let encoding = tokenizer.post_process(encoding, None, true).map_err(fail)?;
     infer(&encoding).map(|vector| (vector, truncated))

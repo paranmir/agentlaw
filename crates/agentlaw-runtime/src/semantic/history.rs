@@ -809,7 +809,7 @@ fn change_work(
     memory: &str,
     id: &str,
 ) -> Result<(), String> {
-    let pieces = source::history_pieces(change, shared.config.window_bytes())?;
+    let pieces = source::history_pieces(change)?;
     let finished = super::batch::run(
         shared,
         key,

@@ -97,7 +97,8 @@ impl SearchFixture {
             metadata["use_when"] = json!(body);
             metadata["evidence_memory_ids"] = json!([]);
         }
-        self.store
+        let receipt = self
+            .store
             .publish(
                 &uuid::Uuid::new_v4().to_string(),
                 vec![Mutation {
@@ -118,7 +119,7 @@ impl SearchFixture {
             .unwrap();
         Hit {
             memory_id: id,
-            change_id: change,
+            change_id: receipt.references[0].observed_version.clone(),
             score: 0.0,
         }
     }
@@ -178,34 +179,48 @@ impl Model {
     }
 }
 impl SemanticPort for Model {
-    fn embed_query(
-        &self,
-        _: &str,
-        _: &RequestControl,
-    ) -> std::result::Result<QueryVector, SemanticError> {
-        if matches!(self.coverage, Coverage::Loading) {
-            Err(SemanticError::Unavailable("model loading".into()))
-        } else {
-            Ok(Self::vector(1.0))
-        }
-    }
     fn embed_prefix(
         &self,
         text: &str,
-        control: &RequestControl,
+        _: &RequestControl,
     ) -> std::result::Result<PrefixEmbedding, SemanticError> {
         self.prefix_inputs.lock().unwrap().push(text.into());
+        if matches!(self.coverage, Coverage::Loading) {
+            return Err(SemanticError::Unavailable("model loading".into()));
+        }
         Ok(PrefixEmbedding {
-            vector: self.embed_query(text, control)?,
+            vector: Self::vector(1.0),
             truncated: true,
         })
     }
     fn plan_pieces(
         &self,
-        _: &[&str],
+        records: &[&str],
         _: &RequestControl,
     ) -> std::result::Result<PiecePlan, SemanticError> {
-        Ok(PiecePlan::default())
+        use crate::semantic::PieceRecord;
+        use sha2::{Digest, Sha256};
+
+        let records = records
+            .iter()
+            .map(|&text| {
+                let ends = text
+                    .char_indices()
+                    .skip(1)
+                    .map(|(offset, _)| offset)
+                    .take(2)
+                    .chain(std::iter::once(text.len()));
+                let pieces = ends
+                    .scan(0, |start, end| {
+                        let range = *start..end;
+                        *start = end;
+                        Some((range.clone(), Sha256::digest(text[range].as_bytes()).into()))
+                    })
+                    .collect();
+                PieceRecord::new(Arc::from(text), pieces)
+            })
+            .collect();
+        Ok(PiecePlan::new("model".into(), records))
     }
     fn embed_planned(
         &self,
@@ -471,4 +486,24 @@ fn piece_search_preserves_backend_width_before_scope_filtering() {
     let channels = planned(&f, &model, "public");
     assert_eq!(*model.limits.lock().unwrap(), [SEARCH_LIMIT; 3]);
     assert_eq!(channels.vector, [score(visible, 0.95), score(second, 0.93)]);
+}
+
+#[test]
+fn piece_search_rejects_a_hit_with_only_the_source_change_uuid() {
+    let fixture = SearchFixture::new();
+    let current = fixture.publish("harbor inspection", false, false);
+    let mut model = Model::new(Coverage::Complete);
+    let change = fixture.read(&model, |_, exact| {
+        exact.heads(&[current.memory_id.clone()]).unwrap()[0].metadata["change_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    model.hits[0] = vec![Hit {
+        change_id: change,
+        ..current
+    }];
+    let channels = planned(&fixture, &model, "harbor inspection");
+    assert!(channels.complete);
+    assert!(channels.vector.is_empty());
 }

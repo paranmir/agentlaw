@@ -241,7 +241,11 @@ pub fn run_model_child() -> Result<()> {
                 &Output::Pieces {
                     id,
                     attempt,
-                    result: provider.split(&text),
+                    result: if text.len() > crate::PIECE_INPUT_BYTES {
+                        Err(EmbeddingError::Failed("split window exceeds 64 KiB".into()))
+                    } else {
+                        provider.split(&text)
+                    },
                 },
             )?,
             Ok(Input::Stop) => break,

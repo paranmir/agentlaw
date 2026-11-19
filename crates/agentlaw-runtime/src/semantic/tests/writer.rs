@@ -12,7 +12,6 @@ fn restart_reuses_committed_sections_before_ack() {
         .unwrap();
     let mut config = SemanticConfig::new(temp.path().join("indices"), "config".into());
     config.dimension = 2;
-    config.chunk_bytes = 4;
     config.queue_pieces = 1;
     config.pending_results = 1;
     config.commit_pieces = 1;
@@ -26,8 +25,8 @@ fn restart_reuses_committed_sections_before_ack() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     first.model_ready("model");
-    let work = wait_work(&first);
-    first.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    let work = begin_embedding(&first, 4);
+    first.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     let deadline = Instant::now() + Duration::from_secs(20);
     let path = loop {
         if let Ok(mut dirs) = std::fs::read_dir(&config.indices_root) {
@@ -59,6 +58,11 @@ fn restart_reuses_committed_sections_before_ack() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     second.model_ready("model");
+    let split = wait_work(&second);
+    second.finish(
+        split.id,
+        Ok(IndexResult::Pieces(fixture_ranges(indexed_text(&split), 4))),
+    );
     assert_eq!(drive(&second, receipt.generation), 4);
     assert!(second.shutdown(Duration::from_secs(5)));
 }
@@ -114,7 +118,9 @@ fn failure_backoff_does_not_block_another_binding() {
     );
     let work_b = indexer.next_work("model").unwrap();
     assert_eq!(indexed_text(&work_b), "bbb");
-    indexer.finish(work_b.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work_b.id, Ok(fixture_result(&work_b, vec![1.0, 0.0])));
+    let work_b = wait_work(&indexer);
+    indexer.finish(work_b.id, Ok(fixture_result(&work_b, vec![1.0, 0.0])));
     assert!(indexer.progress("a").unwrap().ack.is_none());
     for (now, delay) in [(1, 2), (3, 4), (7, 8), (15, 16), (31, 30), (61, 30)] {
         offset.store(now, Ordering::SeqCst);
@@ -297,7 +303,7 @@ impl WindowIndex {
     }
 
     fn finish_embed(indexer: &SemanticIndexer, work: IndexWork) {
-        indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+        indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     }
 
     fn committed_sections(&self) -> Vec<String> {

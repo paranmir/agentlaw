@@ -36,7 +36,6 @@ pub struct SemanticConfig {
     pub indices_root: PathBuf,
     pub config_id: String,
     pub dimension: usize,
-    pub chunk_bytes: usize,
     pub commit_pieces: usize,
     pub commit_interval: Duration,
     pub queue_pieces: usize,
@@ -46,24 +45,11 @@ pub struct SemanticConfig {
 }
 
 impl SemanticConfig {
-    fn window_bytes(&self) -> usize {
-        #[cfg(test)]
-        if self.chunk_bytes != 4096 {
-            return self.chunk_bytes;
-        }
-        pieces::WINDOW_BYTES
-    }
-
-    fn split_windows(&self) -> bool {
-        self.window_bytes() == pieces::WINDOW_BYTES
-    }
-
     pub fn new(indices_root: PathBuf, config_id: String) -> Self {
         Self {
             indices_root,
             config_id,
             dimension: 256,
-            chunk_bytes: 4096,
             commit_pieces: 64,
             commit_interval: Duration::from_millis(250),
             queue_pieces: 256,
@@ -227,6 +213,13 @@ impl SemanticPreparationHandle {
                 .lanes
                 .get(&LaneKey::current(&self.binding))
                 .ok_or_else(|| SemanticError::Unavailable("binding not open".into()))?;
+            let blocked = lane.state == ComponentState::Degraded
+                && lane.reason.as_deref() == Some(&EmbeddingError::InputTooLong.to_string());
+            if blocked && lane.blocked_generation == Some(lane.generation) {
+                return Err(SemanticError::Unavailable(
+                    EmbeddingError::InputTooLong.to_string(),
+                ));
+            }
             if let Some(repair) = &lane.repair {
                 if awaited_repair.as_ref().is_some_and(|id| id != &repair.id) {
                     return Err(SemanticError::Unavailable(
@@ -260,10 +253,12 @@ impl SemanticPreparationHandle {
                     "semantic repair was interrupted".into(),
                 ));
             }
-            if matches!(
-                lane.state,
-                ComponentState::Degraded | ComponentState::Failed | ComponentState::Stopped
-            ) {
+            if !blocked
+                && matches!(
+                    lane.state,
+                    ComponentState::Degraded | ComponentState::Failed | ComponentState::Stopped
+                )
+            {
                 return Err(SemanticError::Unavailable(
                     lane.reason
                         .clone()
@@ -347,7 +342,6 @@ impl SemanticIndexer {
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> RuntimeResult<Self> {
         if config.dimension == 0
-            || config.chunk_bytes == 0
             || config.commit_pieces == 0
             || config.commit_interval.is_zero()
             || config.queue_pieces == 0
@@ -505,6 +499,10 @@ impl SemanticIndexer {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        state
+            .schedule
+            .blocked
+            .retain(|key, _| key.binding != binding);
         state.sources.remove(binding);
         state
             .history_completed
@@ -810,7 +808,6 @@ impl IndexWorkPort for SemanticIndexer {
             digest,
             &self.inner.ids,
             self.inner.config.pending_results,
-            self.inner.config.split_windows(),
             (self.inner.clock)(),
         );
         drop(shared);
@@ -827,11 +824,12 @@ impl IndexWorkPort for SemanticIndexer {
         let model = shared.schedule.model.clone();
         let mut blocked = None;
         for (name, lane) in shared.schedule.lanes.iter_mut() {
-            if let Some((generation, piece)) = lane.running.remove(&id) {
+            if let Some((generation, work)) = lane.running.remove(&id) {
+                let piece = &work.piece;
                 if generation == lane.generation {
                     lane.work_revision = lane.work_revision.wrapping_add(1);
-                    let split = self.inner.config.split_windows()
-                        && piece.section.matches(':').count() == 1;
+                    let split =
+                        matches!(work.task, agentlaw_worker::supervisor::IndexTask::Split(_));
                     let outcome = outcome.and_then(|result| match result {
                         IndexResult::Pieces(ref ranges)
                             if split && pieces::valid_ranges(&piece.text, ranges) =>
@@ -845,7 +843,7 @@ impl IndexWorkPort for SemanticIndexer {
                             if vector.len() != self.inner.config.dimension
                                 || vector.iter().any(|x| !x.is_finite())
                                 || !vector.iter().any(|x| *x != 0.0)
-                                || (split && !cfg!(any(test, feature = "test-support")))
+                                || split
                             {
                                 Err(EmbeddingError::Failed("invalid embedding vector".into()))
                             } else {
@@ -866,13 +864,13 @@ impl IndexWorkPort for SemanticIndexer {
                             match result {
                                 IndexResult::Pieces(ranges) => {
                                     lane.pending_window = Some(state::PendingWindow {
-                                        piece,
+                                        piece: work.piece,
                                         ranges,
                                         next_range: 0,
                                     });
                                 }
                                 IndexResult::Vector(vector) => {
-                                    lane.results.push_back((piece, vector.into()));
+                                    lane.results.push_back((work.piece, vector.into()));
                                 }
                             }
                         }
@@ -883,17 +881,18 @@ impl IndexWorkPort for SemanticIndexer {
                                 piece.section.clone(),
                             ));
                             if error == EmbeddingError::InputTooLong {
+                                lane.blocked_generation = Some(generation);
                                 if let Some(model) = model {
                                     blocked = Some((
                                         name.clone(),
-                                        (model, piece.memory_id, piece.change_id),
+                                        (model, piece.memory_id.clone(), piece.change_id.clone()),
                                     ));
                                 }
                                 lane.queue.clear();
                                 lane.pending_window = None;
                                 lane.retry.reset();
                             } else {
-                                lane.queue.push_front(piece);
+                                lane.queue.push_front(work);
                                 lane.retry.fail((self.inner.clock)());
                             }
                             lane.state = ComponentState::Degraded;

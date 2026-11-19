@@ -24,7 +24,7 @@ fn closing_discards_outstanding_work_and_allows_reopen() {
     indexer
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
-    indexer.finish(stale.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(stale.id, Ok(fixture_result(&stale, vec![1.0, 0.0])));
     assert_eq!(drive(&indexer, receipt.generation), 1);
     assert!(indexer.shutdown(Duration::from_secs(5)));
 }

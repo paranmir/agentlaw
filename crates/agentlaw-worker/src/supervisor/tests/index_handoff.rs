@@ -224,7 +224,7 @@ fn query_load_handoff_follows_real_child_loading_and_ready() {
     let (tx, rx) = mpsc::channel();
     let query_owner = owner.clone();
     let query = std::thread::spawn(move || {
-        tx.send(query_owner.embed_query("real query", &AtomicBool::new(false)))
+        tx.send(query_owner.embed_piece("real query", &AtomicBool::new(false)))
             .unwrap()
     });
     let result = rx.recv_timeout(Duration::from_secs(10));

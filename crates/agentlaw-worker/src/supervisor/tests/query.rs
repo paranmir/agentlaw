@@ -9,7 +9,7 @@ fn thread_panic_must_fail_waiters_and_clear_ready() {
     let cancelled = cancel.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let query = std::thread::spawn(move || {
-        let outcome = owner.embed_query("pending", &cancelled);
+        let outcome = owner.embed_piece("pending", &cancelled);
         done_tx.send(outcome).unwrap();
     });
     review_until(|| {
@@ -46,7 +46,7 @@ fn query_arriving_during_index_handoff_runs_first() {
     let inc = f.ready();
     f.taken.recv_timeout(Duration::from_secs(5)).unwrap();
     let owner = f.owner.clone();
-    let query = std::thread::spawn(move || owner.embed_query("priority", &AtomicBool::new(false)));
+    let query = std::thread::spawn(move || owner.embed_piece("priority", &AtomicBool::new(false)));
     review_until(|| {
         !f.owner
             .shared

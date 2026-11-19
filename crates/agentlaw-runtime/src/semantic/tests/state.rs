@@ -1,5 +1,5 @@
 use super::super::source::Piece;
-use super::super::state::{Backoff, Schedule};
+use super::super::state::{Backoff, QueuedPiece, Schedule};
 use super::*;
 
 fn piece(text: &str) -> Piece {
@@ -33,22 +33,22 @@ fn round_robin_respects_capacity_and_digest() {
     };
     for name in ["a", "b"] {
         let mut lane = Lane::default();
-        lane.queue.push_back(piece(name));
-        lane.queue.push_back(piece(name));
+        lane.queue.push_back(QueuedPiece::new(piece(name), false));
+        lane.queue.push_back(QueuedPiece::new(piece(name), false));
         schedule.lanes.insert(LaneKey::current(name), lane);
     }
     let ids = ModelRequestIds::new();
     let now = Instant::now();
-    assert!(schedule.next("other", &ids, 1, now).is_none());
+    assert!(schedule.next_task("other", &ids, 1, now).is_none());
     assert_eq!(
-        indexed_text(&schedule.next("model", &ids, 1, now).unwrap()),
+        indexed_text(&schedule.next_task("model", &ids, 1, now).unwrap()),
         "a"
     );
     assert_eq!(
-        indexed_text(&schedule.next("model", &ids, 1, now).unwrap()),
+        indexed_text(&schedule.next_task("model", &ids, 1, now).unwrap()),
         "b"
     );
-    assert!(schedule.next("model", &ids, 1, now).is_none());
+    assert!(schedule.next_task("model", &ids, 1, now).is_none());
     schedule
         .lanes
         .get_mut(&LaneKey::current("a"))
@@ -66,7 +66,7 @@ fn round_robin_alternates_while_both_bindings_have_capacity() {
     for name in ["a", "b"] {
         let mut lane = Lane::default();
         for _ in 0..3 {
-            lane.queue.push_back(piece(name));
+            lane.queue.push_back(QueuedPiece::new(piece(name), false));
         }
         schedule.lanes.insert(LaneKey::current(name), lane);
     }
@@ -74,7 +74,7 @@ fn round_robin_alternates_while_both_bindings_have_capacity() {
     let now = Instant::now();
     for expected in ["a", "b", "a", "b"] {
         assert_eq!(
-            indexed_text(&schedule.next("model", &ids, 3, now).unwrap()),
+            indexed_text(&schedule.next_task("model", &ids, 3, now).unwrap()),
             expected
         );
     }

@@ -24,7 +24,7 @@ fn preparation_wakes_immediately_on_ack_and_returns_coverage() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     indexer.model_ready("model");
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let handle = SemanticSearch::new(indexer.clone(), crate::model::ModelHandle::new())
         .preparation("binding");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -53,7 +53,7 @@ fn preparation_wakes_immediately_on_ack_and_returns_coverage() {
         done_tx.send(result).unwrap();
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(
         done_rx
             .recv_timeout(Duration::from_secs(2))

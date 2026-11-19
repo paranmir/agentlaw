@@ -43,7 +43,7 @@ fn search_corruption_is_reported_only_for_affected_binding() {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(work) = indexer.next_work("model") {
-            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+            indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
         }
         if [("a", ra.generation), ("b", rb.generation)]
             .iter()
@@ -90,7 +90,12 @@ fn search_corruption_is_reported_only_for_affected_binding() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let pending = loop {
         if let Some(work) = indexer.next_work("model") {
-            break work;
+            match &work.task {
+                agentlaw_worker::supervisor::IndexTask::Split(_) => {
+                    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
+                }
+                agentlaw_worker::supervisor::IndexTask::Embed(_) => break work,
+            }
         }
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
@@ -113,7 +118,7 @@ fn search_corruption_is_reported_only_for_affected_binding() {
         hook_barrier.wait();
         hook_barrier.wait();
     }));
-    indexer.finish(pending.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(pending.id, Ok(fixture_result(&pending, vec![1.0, 0.0])));
     barrier.wait();
     let search = SemanticSearch::new(indexer.clone(), crate::model::ModelHandle::new());
     let vector = QueryVector {

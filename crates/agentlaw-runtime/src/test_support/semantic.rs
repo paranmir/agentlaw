@@ -113,7 +113,11 @@ impl FakeSemantic {
     }
 }
 impl SemanticPort for FakeSemantic {
-    fn embed_query(&self, _: &str, control: &RequestControl) -> Result<QueryVector, SemanticError> {
+    fn embed_prefix(
+        &self,
+        _: &str,
+        control: &RequestControl,
+    ) -> Result<agentlaw_flows::semantic::PrefixEmbedding, SemanticError> {
         let (model, delay) = {
             let mut s = self.state.lock().unwrap();
             s.embeds += 1;
@@ -132,9 +136,12 @@ impl SemanticPort for FakeSemantic {
         }
         let mut values = vec![0.0; 256];
         values[0] = 1.0;
-        Ok(QueryVector {
-            model: "fake-model".into(),
-            values: values.into(),
+        Ok(agentlaw_flows::semantic::PrefixEmbedding {
+            vector: QueryVector {
+                model: "fake-model".into(),
+                values: values.into(),
+            },
+            truncated: false,
         })
     }
     fn search_available(
@@ -143,6 +150,33 @@ impl SemanticPort for FakeSemantic {
         control: &RequestControl,
     ) -> Result<SemanticCandidates, SemanticError> {
         self.search(query.source.clone(), query.limit, control)
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<
+        agentlaw_flows::semantic::PiecePlan,
+        agentlaw_flows::semantic::SemanticError,
+    > {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &agentlaw_flows::semantic::PiecePlan,
+        _: usize,
+        _: &agentlaw_flows::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<
+        Vec<agentlaw_flows::semantic::QueryVector>,
+        agentlaw_flows::semantic::SemanticError,
+    > {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 impl HistorySemanticPort for FakeSemantic {

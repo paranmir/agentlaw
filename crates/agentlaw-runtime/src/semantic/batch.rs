@@ -1,6 +1,6 @@
 //! Bounded model work and commit coordination shared by both lane kinds.
 use super::source::{AcquiredPieces, Piece};
-use super::state::{LaneKey, WorkKind};
+use super::state::{LaneKey, QueuedPiece, WorkKind};
 use super::{pump, Shared};
 use agentlaw_search::vector_file::{
     CurrentHeads, VectorFileBatch, VectorFileIdentity, VectorFileWriter,
@@ -32,6 +32,34 @@ pub(super) fn run(
         Completion::History { memory, change } => (memory.clone(), vec![change.clone()]),
         Completion::Current(None) => (String::new(), Vec::new()),
     };
+    if matches!(key.kind, WorkKind::Current) {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .schedule
+            .lanes
+            .get(key)
+            .is_some_and(|lane| lane.token == token && lane.generation == generation)
+        {
+            if let Some(revisions) = state.schedule.blocked.get_mut(key) {
+                revisions.retain(|(_, id, change)| *id != memory || changes.contains(change));
+                let cleared = !revisions.iter().any(|(digest, _, _)| digest == model);
+                if revisions.is_empty() {
+                    state.schedule.blocked.remove(key);
+                }
+                if cleared {
+                    let lane = state.schedule.lanes.get_mut(key).unwrap();
+                    if lane.reason.as_deref()
+                        == Some(&agentlaw_worker::EmbeddingError::InputTooLong.to_string())
+                    {
+                        lane.blocked_generation = None;
+                        lane.state = crate::ports::ComponentState::Busy;
+                        lane.reason = None;
+                        pump::report(shared, &key.binding, lane.state, None);
+                    }
+                }
+            }
+        }
+    }
     let blocked = |schedule: &super::state::Schedule| {
         schedule.blocked.get(key).is_some_and(|blocked| {
             blocked.iter().any(|(digest, id, change)| {
@@ -85,12 +113,11 @@ pub(super) fn run(
                         text: window.piece.text[start as usize..end as usize].to_owned(),
                     })
                 } else {
-                    if shared.config.split_windows()
-                        && lane
-                            .queue
-                            .iter()
-                            .chain(lane.running.values().map(|(_, piece)| piece))
-                            .any(|piece| piece.section.matches(':').count() == 1)
+                    if lane
+                        .queue
+                        .iter()
+                        .chain(lane.running.values().map(|(_, work)| work))
+                        .any(QueuedPiece::is_split)
                     {
                         break;
                     }
@@ -108,7 +135,7 @@ pub(super) fn run(
                     }
                 },
             };
-            let split = shared.config.split_windows() && !from_window;
+            let split = !from_window;
             let exists = !split
                 && writer
                     .contains(&piece.memory_id, &piece.change_id, &piece.section)
@@ -156,7 +183,7 @@ pub(super) fn run(
             if let Some(vector) = cached {
                 lane.results.push_back((piece, vector));
             } else {
-                lane.queue.push_back(piece);
+                lane.queue.push_back(QueuedPiece::new(piece, split));
             }
             drop(state);
             shared.wake_model();
@@ -172,6 +199,17 @@ pub(super) fn run(
             }) else {
                 return Ok(false);
             };
+            if permanently_blocked {
+                lane.blocked_generation = Some(generation);
+                let reason = agentlaw_worker::EmbeddingError::InputTooLong.to_string();
+                if lane.state != crate::ports::ComponentState::Degraded
+                    || lane.reason.as_ref() != Some(&reason)
+                {
+                    lane.state = crate::ports::ComponentState::Degraded;
+                    lane.reason = Some(reason.clone());
+                    pump::report(shared, &key.binding, lane.state, Some(reason));
+                }
+            }
             let now = (shared.clock)();
             if !lane.results.is_empty() && first_result.is_none() {
                 first_result = Some(now);

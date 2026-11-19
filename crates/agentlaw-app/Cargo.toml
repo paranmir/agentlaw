@@ -36,7 +36,6 @@ sysinfo = "0.33"
 libc = "0.2"
 
 [dev-dependencies]
-agentlaw-runtime = { path = "../agentlaw-runtime", features = ["test-support"] }
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]

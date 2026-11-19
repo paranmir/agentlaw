@@ -153,10 +153,10 @@ fn stale_model_result_is_discarded_after_publication() {
         )
         .unwrap();
     indexer.wake("binding");
-    indexer.finish(stale.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(stale.id, Ok(fixture_result(&stale, vec![1.0, 0.0])));
     let fresh = wait_work(&indexer);
     assert_eq!(indexed_text(&fresh), "new");
-    indexer.finish(fresh.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(fresh.id, Ok(fixture_result(&fresh, vec![1.0, 0.0])));
     drive(&indexer, new.generation);
     assert!(indexer.shutdown(Duration::from_secs(5)));
 }
@@ -196,7 +196,7 @@ fn invalidation_after_batch_extraction_before_commit_discards_batch() {
         )
         .unwrap();
     indexer.wake("binding");
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let barrier = Arc::new(Barrier::new(2));
     let at_commit = barrier.clone();
     let once = Arc::new(AtomicBool::new(false));
@@ -207,7 +207,7 @@ fn invalidation_after_batch_extraction_before_commit_discards_batch() {
             at_commit.wait();
         }
     }));
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     barrier.wait();
     let latest = store
         .publish(
@@ -247,7 +247,10 @@ fn invalidation_after_batch_extraction_before_commit_discards_batch() {
         base.generation as i64
     );
     drop(db);
-    indexer.finish(latest_work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(
+        latest_work.id,
+        Ok(fixture_result(&latest_work, vec![1.0, 0.0])),
+    );
     drive(&indexer, latest.generation);
     assert!(indexer.shutdown(Duration::from_secs(5)));
 }
@@ -274,7 +277,6 @@ fn bounded_result_slots_are_returned_after_commit() {
         .unwrap();
     let mut config = SemanticConfig::new(temp.path().join("indices"), "config".into());
     config.dimension = 2;
-    config.chunk_bytes = 2;
     config.pending_results = 1;
     config.commit_pieces = 1;
     let indexer =
@@ -283,11 +285,11 @@ fn bounded_result_slots_are_returned_after_commit() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     indexer.model_ready("model");
-    let first = wait_work(&indexer);
+    let first = begin_embedding(&indexer, 2);
     assert!(indexer.next_work("model").is_none());
-    indexer.finish(first.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(first.id, Ok(fixture_result(&first, vec![1.0, 0.0])));
     let second = wait_work(&indexer);
-    indexer.finish(second.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(second.id, Ok(fixture_result(&second, vec![1.0, 0.0])));
     drive(&indexer, receipt.generation);
     assert!(indexer.shutdown(Duration::from_secs(5)));
 }
@@ -304,7 +306,6 @@ fn failed_inflight_piece_respects_queue_capacity() {
         .unwrap();
     let mut config = SemanticConfig::new(temp.path().join("indices"), "config".into());
     config.dimension = 2;
-    config.chunk_bytes = 2;
     config.queue_pieces = 1;
     config.pending_results = 1;
     let indexer =
@@ -313,7 +314,7 @@ fn failed_inflight_piece_respects_queue_capacity() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     indexer.model_ready("model");
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, 2);
     std::thread::sleep(Duration::from_millis(100));
     {
         let state = indexer.inner.state.lock().unwrap();
@@ -471,15 +472,17 @@ fn acquired_stream_splits_utf8_deterministically() {
         .unwrap();
     let reader = store.owned_published_reader();
     let acquired = reader.read_snapshot().unwrap().acquire_current(ID).unwrap();
-    let (heads, pieces) = source::map_acquired(acquired.clone(), ID, false, 5).unwrap();
+    let (heads, pieces) = source::map_acquired(acquired.clone(), ID, false).unwrap();
     let pieces = pieces.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(heads.change_ids.len(), 1);
     assert_eq!(
         pieces.iter().map(|p| p.text.as_str()).collect::<String>(),
         body
     );
-    assert!(pieces.iter().all(|p| p.text.len() <= 5));
-    let (_, again) = source::map_acquired(acquired, ID, false, 5).unwrap();
+    assert!(pieces.iter().all(|p| fixture_ranges(&p.text, 5)
+        .into_iter()
+        .all(|(start, end)| end - start <= 5)));
+    let (_, again) = source::map_acquired(acquired, ID, false).unwrap();
     assert_eq!(pieces, again.collect::<Result<Vec<_>, _>>().unwrap());
 }
 
@@ -596,7 +599,7 @@ fn oversized_piece_leaves_other_binding_runnable() {
     let work = finish_window(&f.indexer, &wait_work(&f.indexer));
     assert_eq!(indexed_text(&work), "other binding");
     f.indexer
-        .finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+        .finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     let deadline = Instant::now() + Duration::from_secs(20);
     while !f
         .indexer
@@ -626,7 +629,7 @@ fn new_revision_unblocks_oversized_piece() {
     let work = finish_window(&f.indexer, &wait_work(&f.indexer));
     assert_eq!(indexed_text(&work), "corrected piece");
     f.indexer
-        .finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+        .finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(drive(&f.indexer, receipt.generation), 0);
     assert!(f.indexer.shutdown(Duration::from_secs(5)));
 }
@@ -933,4 +936,65 @@ fn runtime_restart_recomputes_pieces_after_preparation_without_index_files() {
 #[test]
 fn model_digest_change_does_not_use_prepared_vectors() {
     observe_handoff(Handoff::DifferentModel);
+}
+
+#[test]
+fn unrelated_publication_preserves_the_block_and_preparation_returns_unavailable() {
+    let f = FailedPiece::new();
+    let source = f.store.owned_published_reader();
+    let blocked_target = source.read_snapshot().unwrap().position().clone();
+    let mut unrelated = mutation("unrelated memory", vec![]);
+    unrelated.unit.entity_id = "22222222-2222-4222-8222-222222222222".into();
+    f.store
+        .publish(&uuid::Uuid::new_v4().to_string(), vec![unrelated])
+        .unwrap();
+    let target = source.read_snapshot().unwrap().position().clone();
+    f.indexer.wake("binding");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.indexer.inner.state.lock().unwrap().schedule.lanes[&LaneKey::current("binding")].dirty {
+        assert!(
+            Instant::now() < deadline,
+            "writer did not reenter after publication"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let handle = SemanticSearch::new(f.indexer.clone(), crate::model::ModelHandle::new())
+        .preparation("binding");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let results = [blocked_target, target].map(|target| {
+            handle.wait_with_snapshot(
+                &target,
+                &RequestControl::default(),
+                || test_snapshot(agentlaw_worker::WorkerState::Ready),
+                Duration::from_millis(10),
+            )
+        });
+        tx.send(results).unwrap();
+    });
+    let reason = EmbeddingError::InputTooLong.to_string();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        [
+            Err(SemanticError::Unavailable(reason.clone())),
+            Err(SemanticError::Unavailable(reason.clone()))
+        ]
+    );
+    waiter.join().unwrap();
+    assert!(f.indexer.next_work("model").is_none());
+    assert!(f.indexer.status().next_retry_at.is_none());
+    assert_eq!(
+        f.indexer.progress("binding").unwrap().reason.as_deref(),
+        Some(reason.as_str())
+    );
+    assert!(f
+        .health
+        .snapshot()
+        .iter()
+        .any(
+            |(component, status)| component.binding.as_deref() == Some("binding")
+                && status.state == ComponentState::Degraded
+                && status.reason.as_deref() == Some(reason.as_str())
+        ));
+    assert!(f.indexer.shutdown(Duration::from_secs(5)));
 }

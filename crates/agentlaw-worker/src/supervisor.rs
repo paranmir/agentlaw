@@ -223,6 +223,13 @@ impl<R> QueryQueue<R> {
         text: &str,
         ids: &ModelRequestIds,
     ) -> std::result::Result<ModelRequestId, QueryError> {
+        let limit = match operation {
+            QueryOperation::Prefix => crate::PREFIX_INPUT_BYTES,
+            QueryOperation::Split | QueryOperation::Embed => crate::PIECE_INPUT_BYTES,
+        };
+        if text.len() > limit {
+            return Err(QueryError::Busy);
+        }
         let key = (
             operation,
             model.to_string(),
@@ -233,7 +240,7 @@ impl<R> QueryQueue<R> {
             flight.waiters += 1;
             return Ok(*id);
         }
-        if self.keys.len() >= 64 || text.len() > 4 * 1024 * 1024 {
+        if self.keys.len() >= 64 {
             return Err(QueryError::Busy);
         }
         let id = ids
@@ -432,15 +439,6 @@ impl ModelSupervisor {
             .snapshot
             .clone()
     }
-    #[cfg(test)]
-    fn embed_query(
-        &self,
-        text: &str,
-        cancelled: &AtomicBool,
-    ) -> std::result::Result<QueryVector, QueryError> {
-        self.embed_piece(text, cancelled)
-    }
-
     pub fn embed_piece(
         &self,
         text: &str,
@@ -927,6 +925,15 @@ fn model_supervision_run(
     let mut held_index: Option<HeldIndex> = None;
     let mut cleanup_at: Option<Instant> = None;
     let mut cache: Option<SelectionCache> = None;
+    if config.model.is_some() {
+        let path = config.state_dir.join("model-execution-selection.json");
+        let events = events.clone();
+        let signal = shared.signal.clone();
+        std::thread::spawn(move || {
+            let _ = events.send(Event::CacheReady(SelectionCache::open(path)));
+            signal.notify();
+        });
+    }
     let mut pending_event = None;
     // Only the most recently retired incarnation can still refine its failure.
     let mut retired_incarnation: Option<String> = None;
@@ -983,10 +990,17 @@ fn model_supervision_run(
             return Ok(());
         }
         while let Some(event) = pending_event.take().or_else(|| incoming.try_recv().ok()) {
-            if matches!(&event, Event::Wake) {
-                shared.wake_pending.store(false, Ordering::Release);
-                continue;
-            }
+            let event = match event {
+                Event::Wake => {
+                    shared.wake_pending.store(false, Ordering::Release);
+                    continue;
+                }
+                Event::CacheReady(loaded) => {
+                    cache = Some(loaded);
+                    continue;
+                }
+                event => event,
+            };
             let Some(active) = child.as_mut() else {
                 if let Event::Output(incarnation, Output::Unavailable { cause }) = event {
                     if retired_incarnation.as_deref() == Some(incarnation.as_str()) {
@@ -1007,13 +1021,13 @@ fn model_supervision_run(
                 | Event::Exit(i)
                 | Event::Pipe(i, _)
                 | Event::ControlLost(i, _) => i,
-                Event::Wake => unreachable!(),
+                Event::Wake | Event::CacheReady(_) => unreachable!(),
             };
             if event_inc != &active.incarnation {
                 continue;
             }
             match event {
-                Event::Wake => unreachable!(),
+                Event::Wake | Event::CacheReady(_) => unreachable!(),
                 Event::Output(
                     _,
                     Output::Hello {
@@ -1308,12 +1322,10 @@ fn model_supervision_run(
             || status.runnable
             || status.awaiting_model
             || status.next_retry_at.is_some_and(|at| at <= now);
-        match lifecycle.action(now, demand, config.model.is_some()) {
+        match lifecycle.action(now, demand, cache.is_some()) {
             LifecycleAction::Start => {
-                let cache = cache.get_or_insert_with(|| {
-                    SelectionCache::open(config.state_dir.join("model-execution-selection.json"))
-                });
-                match start_ram_child(&port, &config, &events, &shared.signal, now, cache.get()) {
+                let cached = cache.as_ref().and_then(SelectionCache::get);
+                match start_ram_child(&port, &config, &events, &shared.signal, now, cached) {
                     Ok(mut active) => {
                         retired_incarnation = None;
                         active.last_control = clock();
@@ -1484,6 +1496,7 @@ fn model_supervision_run(
 }
 enum Event {
     Wake,
+    CacheReady(SelectionCache),
     Output(String, Output),
     Exit(String),
     Pipe(String, String),

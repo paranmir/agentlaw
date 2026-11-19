@@ -715,7 +715,7 @@ impl Recheck {
     ) -> std::thread::JoinHandle<std::result::Result<QueryVector, QueryError>> {
         let owner = self.owner().clone();
         let text = text.to_owned();
-        std::thread::spawn(move || owner.embed_query(&text, &AtomicBool::new(false)))
+        std::thread::spawn(move || owner.embed_piece(&text, &AtomicBool::new(false)))
     }
     fn shutdown(&mut self) -> std::result::Result<(), String> {
         let mut owner = Arc::try_unwrap(self.owner.take().unwrap())

@@ -39,7 +39,7 @@ fn idle_supervisor_does_not_create_files() {
     );
     assert_eq!(supervisor.wait_terminated(Duration::ZERO), None);
     assert!(matches!(
-        supervisor.embed_query("query", &AtomicBool::new(false)),
+        supervisor.embed_piece("query", &AtomicBool::new(false)),
         Err(QueryError::Unavailable(_))
     ));
     supervisor.set_warm(true);

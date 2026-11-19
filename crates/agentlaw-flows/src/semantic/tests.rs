@@ -3,14 +3,20 @@ use super::*;
 struct Ports;
 
 impl SemanticPort for Ports {
-    fn embed_query(&self, _: &str, control: &RequestControl) -> Result<QueryVector, SemanticError> {
+    fn embed_prefix(
+        &self,
+        _: &str,
+        control: &RequestControl,
+    ) -> Result<PrefixEmbedding, SemanticError> {
         control.check().map_err(|_| SemanticError::Cancelled)?;
-        Ok(QueryVector {
-            model: "test".into(),
-            values: Arc::from([1.0]),
+        Ok(crate::semantic::PrefixEmbedding {
+            vector: QueryVector {
+                model: "test".into(),
+                values: Arc::from([1.0]),
+            },
+            truncated: false,
         })
     }
-
     fn search_available(
         &self,
         query: SemanticQuery<'_>,
@@ -24,6 +30,28 @@ impl SemanticPort for Ports {
                 requested: query.source.clone(),
             },
         })
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 
@@ -59,7 +87,7 @@ fn ports_are_object_safe_and_usable_from_a_thread() {
             epoch: Default::default(),
             sequence: Default::default(),
         };
-        let vector = semantic.embed_query("query", &control).unwrap();
+        let vector = semantic.embed_prefix("query", &control).unwrap().vector;
         let query = SemanticQuery {
             binding: "binding",
             scopes: &[],

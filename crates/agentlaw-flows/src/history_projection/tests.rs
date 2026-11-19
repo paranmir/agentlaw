@@ -203,14 +203,17 @@ struct HitHistory<'a> {
     publish: Option<(&'a Store, String, String)>,
 }
 impl crate::semantic::SemanticPort for HitHistory<'_> {
-    fn embed_query(
+    fn embed_prefix(
         &self,
         _: &str,
         _: &RequestControl,
-    ) -> std::result::Result<crate::semantic::QueryVector, crate::semantic::SemanticError> {
-        Ok(crate::semantic::QueryVector {
-            model: "ready".into(),
-            values: std::sync::Arc::from([1.0]),
+    ) -> std::result::Result<crate::semantic::PrefixEmbedding, crate::semantic::SemanticError> {
+        Ok(crate::semantic::PrefixEmbedding {
+            vector: crate::semantic::QueryVector {
+                model: "ready".into(),
+                values: std::sync::Arc::from([1.0]),
+            },
+            truncated: false,
         })
     }
     fn search_available(
@@ -220,6 +223,28 @@ impl crate::semantic::SemanticPort for HitHistory<'_> {
     ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
     {
         unreachable!()
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 impl crate::semantic::HistorySemanticPort for HitHistory<'_> {
@@ -282,23 +307,17 @@ impl crate::semantic::SemanticPort for ReadyHistory {
     fn embed_prefix(
         &self,
         text: &str,
-        control: &RequestControl,
+        _control: &RequestControl,
     ) -> std::result::Result<crate::semantic::PrefixEmbedding, crate::semantic::SemanticError> {
         Ok(crate::semantic::PrefixEmbedding {
-            vector: self.embed_query(text, control)?,
+            vector: crate::semantic::QueryVector {
+                model: "ready".into(),
+                values: std::sync::Arc::from([1.0]),
+            },
             truncated: text.split_whitespace().count() > 512,
         })
     }
-    fn embed_query(
-        &self,
-        _: &str,
-        _: &RequestControl,
-    ) -> std::result::Result<crate::semantic::QueryVector, crate::semantic::SemanticError> {
-        Ok(crate::semantic::QueryVector {
-            model: "ready".into(),
-            values: std::sync::Arc::from([1.0]),
-        })
-    }
+
     fn search_available(
         &self,
         _: crate::semantic::SemanticQuery<'_>,
@@ -306,6 +325,28 @@ impl crate::semantic::SemanticPort for ReadyHistory {
     ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
     {
         unreachable!()
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 impl crate::semantic::HistorySemanticPort for ReadyHistory {
@@ -329,11 +370,11 @@ impl crate::semantic::HistorySemanticPort for ReadyHistory {
     }
 }
 impl crate::semantic::SemanticPort for UnavailableHistory {
-    fn embed_query(
+    fn embed_prefix(
         &self,
         _: &str,
         _: &RequestControl,
-    ) -> std::result::Result<crate::semantic::QueryVector, crate::semantic::SemanticError> {
+    ) -> std::result::Result<crate::semantic::PrefixEmbedding, crate::semantic::SemanticError> {
         Err(crate::semantic::SemanticError::Unavailable(
             "not ready".into(),
         ))
@@ -346,6 +387,28 @@ impl crate::semantic::SemanticPort for UnavailableHistory {
     {
         Err(crate::semantic::SemanticError::Unavailable(
             "not ready".into(),
+        ))
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
         ))
     }
 }
@@ -1036,27 +1099,20 @@ fn long_history_query_diagnostics(ready: bool, partial: bool) {
         coverage: SemanticCoverage,
     }
     impl SemanticPort for Model {
-        fn embed_query(
-            &self,
-            _: &str,
-            _: &RequestControl,
-        ) -> std::result::Result<QueryVector, SemanticError> {
-            if !self.ready {
-                return Err(SemanticError::Unavailable("model loading".into()));
-            }
-            Ok(QueryVector {
-                model: "model".into(),
-                values: std::sync::Arc::from([1.0]),
-            })
-        }
         fn embed_prefix(
             &self,
             text: &str,
-            control: &RequestControl,
+            _: &RequestControl,
         ) -> std::result::Result<PrefixEmbedding, SemanticError> {
             assert!(text.ends_with("cancellation"));
+            if !self.ready {
+                return Err(SemanticError::Unavailable("model loading".into()));
+            }
             Ok(PrefixEmbedding {
-                vector: self.embed_query(text, control)?,
+                vector: QueryVector {
+                    model: "model".into(),
+                    values: std::sync::Arc::from([1.0]),
+                },
                 truncated: true,
             })
         }
@@ -1066,6 +1122,29 @@ fn long_history_query_diagnostics(ready: bool, partial: bool) {
             _: &RequestControl,
         ) -> std::result::Result<SemanticCandidates, SemanticError> {
             unreachable!()
+        }
+
+        fn plan_pieces(
+            &self,
+            _: &[&str],
+            _: &RequestControl,
+        ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError>
+        {
+            Err(crate::semantic::SemanticError::Unavailable(
+                "fixture has no piece planner".into(),
+            ))
+        }
+        fn embed_planned(
+            &self,
+            _: &crate::semantic::PiecePlan,
+            _: usize,
+            _: &crate::semantic::PieceVectorReuse,
+            _: &RequestControl,
+        ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+        {
+            Err(crate::semantic::SemanticError::Unavailable(
+                "fixture has no piece embeddings".into(),
+            ))
         }
     }
     impl HistorySemanticPort for Model {

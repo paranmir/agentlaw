@@ -123,6 +123,41 @@ fn test_snapshot(state: agentlaw_worker::WorkerState) -> crate::model::ModelSnap
     }
 }
 
+fn fixture_ranges(text: &str, bytes: usize) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = text.floor_char_boundary(start.saturating_add(bytes).min(text.len()));
+        if end == start {
+            end += text[start..].chars().next().unwrap().len_utf8();
+        }
+        ranges.push((start as u32, end as u32));
+        start = end;
+    }
+    ranges
+}
+
+fn fixture_result(work: &IndexWork, vector: Vec<f32>) -> IndexResult {
+    match &work.task {
+        agentlaw_worker::supervisor::IndexTask::Split(text) => {
+            IndexResult::Pieces(fixture_ranges(text, usize::MAX))
+        }
+        agentlaw_worker::supervisor::IndexTask::Embed(_) => IndexResult::Vector(vector),
+    }
+}
+
+fn begin_embedding(indexer: &SemanticIndexer, bytes: usize) -> IndexWork {
+    let work = wait_work(indexer);
+    match &work.task {
+        agentlaw_worker::supervisor::IndexTask::Split(text) => {
+            let ranges = fixture_ranges(text, bytes);
+            indexer.finish(work.id, Ok(IndexResult::Pieces(ranges)));
+            wait_work(indexer)
+        }
+        agentlaw_worker::supervisor::IndexTask::Embed(_) => work,
+    }
+}
+
 fn drive(indexer: &SemanticIndexer, target: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut count = 0;
@@ -216,7 +251,7 @@ fn race_after_final_check(redirect: bool) {
         .publish(&uuid::Uuid::new_v4().to_string(), vec![stale_mutation])
         .unwrap();
     indexer.wake("binding");
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = barrier.clone();
     let once = Arc::new(AtomicBool::new(false));
@@ -227,7 +262,7 @@ fn race_after_final_check(redirect: bool) {
             hook_barrier.wait();
         }
     }));
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     barrier.wait();
     let latest = if let Some(destination) = destination {
         let change = uuid::Uuid::new_v4().to_string();
@@ -298,7 +333,7 @@ fn race_after_final_check(redirect: bool) {
         "the barrier must exercise the post-check race"
     );
     drop(db);
-    indexer.finish(next.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(next.id, Ok(fixture_result(&next, vec![1.0, 0.0])));
     drive(&indexer, latest.generation);
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

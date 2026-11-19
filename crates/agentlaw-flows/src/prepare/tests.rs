@@ -11,17 +11,20 @@ enum Ports {
     Incomplete(&'static str),
 }
 impl SemanticPort for Ports {
-    fn embed_query(
+    fn embed_prefix(
         &self,
         _: &str,
         _: &RequestControl,
-    ) -> std::result::Result<QueryVector, SemanticError> {
+    ) -> std::result::Result<crate::semantic::PrefixEmbedding, SemanticError> {
         if let Self::Incomplete(cause) = self {
             return Err(SemanticError::Unavailable((*cause).into()));
         }
-        Ok(QueryVector {
-            model: "test".into(),
-            values: Arc::from([1.0]),
+        Ok(crate::semantic::PrefixEmbedding {
+            vector: QueryVector {
+                model: "test".into(),
+                values: Arc::from([1.0]),
+            },
+            truncated: false,
         })
     }
     fn search_available(
@@ -36,6 +39,28 @@ impl SemanticPort for Ports {
                 requested: q.source.clone(),
             },
         })
+    }
+
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &RequestControl,
+    ) -> std::result::Result<crate::semantic::PiecePlan, crate::semantic::SemanticError> {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece planner".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &crate::semantic::PiecePlan,
+        _: usize,
+        _: &crate::semantic::PieceVectorReuse,
+        _: &RequestControl,
+    ) -> std::result::Result<Vec<crate::semantic::QueryVector>, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "fixture has no piece embeddings".into(),
+        ))
     }
 }
 impl HistorySemanticPort for Ports {

@@ -50,7 +50,7 @@ fn finish_repair(indexer: &SemanticIndexer) -> SemanticRepairProgress {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(work) = indexer.next_work("model") {
-            indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+            indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
         }
         let progress = indexer.repair_progress("binding").unwrap();
         if progress.state != SemanticRepairState::Building {
@@ -89,7 +89,7 @@ fn repair_keeps_old_view_until_reader_finishes_and_wait_target_waits() {
     let (_temp, store, config, indexer, target) = fixture();
     let old = active(&indexer);
     indexer.start_repair("binding").unwrap();
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     assert_eq!(search_once(&indexer, &target).unwrap().hits.len(), 1);
     let handle = SemanticSearch::new(indexer.clone(), crate::model::ModelHandle::new())
         .preparation("binding");
@@ -115,7 +115,7 @@ fn repair_keeps_old_view_until_reader_finishes_and_wait_target_waits() {
     let reader_target = target.clone();
     let reader = std::thread::spawn(move || search_once(&reader_indexer, &reader_target));
     barrier.wait();
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(finish_repair(&indexer).state, SemanticRepairState::Complete);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !indexer.inner.health.snapshot().iter().any(|(id, status)| {
@@ -170,8 +170,8 @@ fn publication_wake_after_activation_does_not_retire_active_generation() {
         hook.wait();
     }));
     indexer.start_repair("binding").unwrap();
-    let work = wait_work(&indexer);
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    let work = begin_embedding(&indexer, usize::MAX);
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     barrier.wait();
     let published = active(&indexer);
     assert!(published.exists());
@@ -366,13 +366,13 @@ fn pointer_replace_failure_preserves_old_view() {
     let pointer = old.parent().unwrap().join("active-generation");
     std::fs::write(&pointer, b"initial").unwrap();
     indexer.start_repair("binding").unwrap();
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(3)
         .open(&pointer)
         .unwrap();
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(finish_repair(&indexer).state, SemanticRepairState::Failed);
     assert_eq!(std::fs::read(&pointer).unwrap(), b"initial");
     assert!(std::fs::read_dir(old.parent().unwrap())
@@ -395,13 +395,13 @@ fn locked_retired_file_is_retried_on_restart() {
     let (_temp, store, config, indexer, _target) = fixture();
     let old = active(&indexer);
     indexer.start_repair("binding").unwrap();
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(3)
         .open(&old)
         .unwrap();
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(finish_repair(&indexer).state, SemanticRepairState::Complete);
     let deadline = Instant::now() + Duration::from_secs(5);
     while indexer
@@ -536,12 +536,12 @@ fn repair_retries_a_real_busy_writer_and_reloads_progress() {
     let (_temp, _store, _config, indexer, target) = fixture();
     let old = active(&indexer);
     indexer.start_repair("binding").unwrap();
-    let work = wait_work(&indexer);
+    let work = begin_embedding(&indexer, usize::MAX);
     let id = indexer.repair_progress("binding").unwrap().generation;
     let shadow = super::super::generation::file(old.parent().unwrap(), &id);
     let db = rusqlite::Connection::open(&shadow).unwrap();
     db.execute_batch("BEGIN IMMEDIATE").unwrap();
-    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let progress = indexer.repair_progress("binding").unwrap();
@@ -576,12 +576,12 @@ fn missing_pointed_generation_rebuilds_without_exposing_empty_view() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     reopened.model_ready("model");
-    let work = wait_work(&reopened);
+    let work = begin_embedding(&reopened, usize::MAX);
     assert!(matches!(
         search_once(&reopened, &target),
         Err(SemanticError::Unavailable(_))
     ));
-    reopened.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    reopened.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(
         finish_repair(&reopened).state,
         SemanticRepairState::Complete
@@ -647,12 +647,12 @@ fn disappeared_pointer_and_initial_file_rebuilds_from_source() {
         .open_binding("binding", store.owned_published_reader())
         .unwrap();
     reopened.model_ready("model");
-    let work = wait_work(&reopened);
+    let work = begin_embedding(&reopened, usize::MAX);
     assert!(matches!(
         search_once(&reopened, &target),
         Err(SemanticError::Unavailable(_))
     ));
-    reopened.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+    reopened.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
     assert_eq!(
         finish_repair(&reopened).state,
         SemanticRepairState::Complete
@@ -673,8 +673,8 @@ fn transition_does_not_hold_state_lock_and_handles_close_or_model_change() {
             hook.wait();
         }));
         indexer.start_repair("binding").unwrap();
-        let work = wait_work(&indexer);
-        indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+        let work = begin_embedding(&indexer, usize::MAX);
+        indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
         barrier.wait();
         assert!(indexer.progress("binding").is_some());
         if close {
@@ -693,7 +693,7 @@ fn transition_does_not_hold_state_lock_and_handles_close_or_model_change() {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 if let Some(work) = indexer.next_work("new-model") {
-                    indexer.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+                    indexer.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
                 }
                 if indexer
                     .progress("binding")
@@ -794,7 +794,7 @@ fn killed_process_at_pointer_and_ram_boundaries_recovers_a_valid_generation() {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(work) = reopened.next_work("model") {
-                reopened.finish(work.id, Ok(IndexResult::Vector(vec![1.0, 0.0])));
+                reopened.finish(work.id, Ok(fixture_result(&work, vec![1.0, 0.0])));
             }
             if reopened.progress("binding").is_some_and(|p| p.complete) {
                 break;
