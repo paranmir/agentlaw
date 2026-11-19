@@ -845,7 +845,8 @@ fn observe_handoff(case: Handoff) {
             Some(&(3, 6))
         );
         assert!(found.is_none());
-        assert!(ack.is_none());
+        // An empty source may already be acknowledged; the held publication must not be.
+        assert!(ack.is_none_or(|ack| ack.sequence < receipt.generation as i64));
     }
 
     let mut embedded = Vec::new();
