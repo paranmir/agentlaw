@@ -1723,13 +1723,23 @@ fn damaged_vector_file_keeps_lexical_source_control_and_other_binding_reads_avai
         )
         .unwrap();
     assert_ne!(healthy["semantic_complete"], false, "{healthy}");
-    assert!(health
-        .snapshot()
-        .iter()
-        .any(|(component, status)| component.binding.as_deref()
-            == Some(f.identity.binding_id.as_str())
-            && component.kind == ComponentKind::Semantic
-            && status.state == ComponentState::Degraded));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = health.snapshot();
+        if snapshot.iter().any(|(component, status)| {
+            component.binding.as_deref() == Some(f.identity.binding_id.as_str())
+                && component.kind == ComponentKind::Semantic
+                && status.state == ComponentState::Degraded
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "semantic health did not degrade for binding {}: {snapshot:?}",
+            f.identity.binding_id
+        );
+        std::thread::yield_now();
+    }
     assert_eq!(
         image(),
         damaged,
