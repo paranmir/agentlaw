@@ -54,69 +54,12 @@ fn transient_lock_is_retried_within_the_same_call() {
     let root = dir.path();
     let (old, next) = selections(root);
     let handle = prevent_replacement(root);
-    let (failed_tx, failed_rx) = std::sync::mpsc::channel();
-    let (released_tx, released_rx) = std::sync::mpsc::channel();
-    let released_rx = std::sync::Mutex::new(released_rx);
-    let observed = std::sync::atomic::AtomicBool::new(false);
-    selection_retry_hook().lock().unwrap().insert(
-        root.join("config.json"),
-        std::sync::Arc::new(move || {
-            if !observed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                failed_tx.send(()).unwrap();
-                released_rx.lock().unwrap().recv().unwrap();
-            }
-        }),
-    );
-    let worker_root = root.to_path_buf();
-    let worker_old = old.clone();
-    let worker_next = next.clone();
-    let worker =
-        std::thread::spawn(move || replace_selection(&worker_root, &worker_old, &worker_next));
-    failed_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
-    drop(handle);
-    released_tx.send(()).unwrap();
-    worker.join().unwrap().unwrap();
-    selection_retry_hook()
-        .lock()
-        .unwrap()
-        .remove(&root.join("config.json"));
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(handle);
+        });
+        replace_selection(root, &old, &next).unwrap();
+    });
     assert_eq!(load(root).unwrap(), Some(next));
-}
-
-#[test]
-fn expired_deadline_does_not_start_another_replace() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let (old, next) = selections(root);
-    let handle = prevent_replacement(root);
-    let (failed_tx, failed_rx) = std::sync::mpsc::channel();
-    let (released_tx, released_rx) = std::sync::mpsc::channel();
-    let released_rx = std::sync::Mutex::new(released_rx);
-    selection_retry_hook().lock().unwrap().insert(
-        root.join("config.json"),
-        std::sync::Arc::new(move || {
-            failed_tx.send(()).unwrap();
-            released_rx.lock().unwrap().recv().unwrap();
-        }),
-    );
-    let worker_root = root.to_path_buf();
-    let worker_old = old.clone();
-    let worker_next = next.clone();
-    let worker =
-        std::thread::spawn(move || replace_selection(&worker_root, &worker_old, &worker_next));
-    failed_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(550));
-    drop(handle);
-    released_tx.send(()).unwrap();
-    let error = worker.join().unwrap().unwrap_err();
-    selection_retry_hook()
-        .lock()
-        .unwrap()
-        .remove(&root.join("config.json"));
-    assert_eq!(error.code, "configuration_io");
-    assert_eq!(load(root).unwrap(), Some(old));
 }

@@ -292,7 +292,7 @@ pub fn replace_selection(root: &Path, expected: &Config, next: &Config) -> Resul
 }
 
 pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
-    use agentlaw_storage::persistence::{Persistence, PlatformPersistence};
+    use agentlaw_storage::persistence::{install_temp_file, is_transient_replace_error};
     use std::io::Write;
     let mut temp = tempfile::NamedTempFile::new_in(root)
         .map_err(|_| DomainError::new("configuration_io", "Cannot prepare the next selection."))?;
@@ -301,50 +301,7 @@ pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
     temp.flush()
         .and_then(|_| temp.as_file().sync_all())
         .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
-    enum StagedSelection {
-        Temporary(tempfile::TempPath),
-        Kept(PathBuf),
-    }
-
-    let mut staged = StagedSelection::Temporary(temp.into_temp_path());
-    let destination = root.join("config.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    // Keep the same complete, synced temporary file across transient failures.
-    for attempt in 0..5 {
-        let kept = match staged {
-            StagedSelection::Temporary(path) => path.keep(),
-            StagedSelection::Kept(path) => Ok(path),
-        };
-        let error = match kept {
-            Ok(path) => {
-                let result = PlatformPersistence.install_replace(&path, &destination);
-                staged = StagedSelection::Kept(path);
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(agentlaw_storage::Error::Io(error)) => error,
-                    Err(error) => std::io::Error::other(error),
-                }
-            }
-            Err(error) => {
-                staged = StagedSelection::Temporary(error.path);
-                error.error
-            }
-        };
-        let transient = retryable_selection_replace(&error);
-        if transient && attempt < 4 && std::time::Instant::now() < deadline {
-            #[cfg(test)]
-            observe_selection_retry(&destination);
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !remaining.is_zero() {
-                std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
-            }
-            if std::time::Instant::now() < deadline {
-                continue;
-            }
-        }
-        if let StagedSelection::Kept(path) = staged {
-            let _ = fs::remove_file(path);
-        }
+    install_temp_file(temp, &root.join("config.json")).map_err(|error| {
         let kind = format!("{:?}", error.kind());
         let raw = error.raw_os_error();
         let mut result = DomainError::new(
@@ -356,41 +313,9 @@ pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
             "raw_os_error": raw,
             "os_error": error.to_string(),
         }));
-        result.retryable = transient;
-        return Err(result);
-    }
-    unreachable!("selection replacement attempts always return")
-}
-
-#[cfg(test)]
-type SelectionRetryHook = std::sync::Arc<dyn Fn() + Send + Sync>;
-#[cfg(test)]
-static SELECTION_RETRY_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, SelectionRetryHook>>,
-> = std::sync::OnceLock::new();
-#[cfg(test)]
-fn selection_retry_hook(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, SelectionRetryHook>> {
-    SELECTION_RETRY_HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-#[cfg(test)]
-fn observe_selection_retry(path: &Path) {
-    let hook = selection_retry_hook().lock().unwrap().get(path).cloned();
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-fn retryable_selection_replace(error: &std::io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(error.raw_os_error(), Some(5 | 32 | 33))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = error;
-        false
-    }
+        result.retryable = is_transient_replace_error(&error);
+        result
+    })
 }
 
 pub fn binding_root(root: &Path, source: &Path) -> Result<PathBuf> {

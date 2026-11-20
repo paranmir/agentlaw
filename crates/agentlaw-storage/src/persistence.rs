@@ -4,8 +4,9 @@ use crate::{Durability, Result};
 use std::fs::File;
 use std::{
     fs::{self, OpenOptions},
-    io::{Seek, SeekFrom, Write},
-    path::Path,
+    io::{self, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 pub trait Persistence {
     fn durability(&self) -> Durability;
@@ -50,20 +51,57 @@ impl Persistence for PlatformPersistence {
     }
 }
 
-/// Install a prepared file using the platform's replacement semantics.
-pub fn install_temp_file(temp: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
-    // Closing the handle and keeping the path must precede rename. On Windows,
-    // keeping the path updates attributes at the temporary name.
-    let path = temp.into_temp_path().keep()?;
-    PlatformPersistence
-        .install_replace(&path, target)
-        .map_err(|error| {
-            let _ = fs::remove_file(&path);
-            match error {
-                crate::Error::Io(error) => error,
-                error => std::io::Error::other(error),
+/// Install a prepared file, retrying transient Windows sharing errors within one deadline.
+pub fn install_temp_file(temp: tempfile::NamedTempFile, target: &Path) -> io::Result<()> {
+    const RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+    enum StagedFile {
+        Temporary(tempfile::TempPath),
+        Kept(PathBuf),
+    }
+
+    // Close the handle before keep updates attributes at the temporary name.
+    let mut staged = StagedFile::Temporary(temp.into_temp_path());
+    let deadline = Instant::now() + RETRY_TIMEOUT;
+    loop {
+        let kept = match staged {
+            StagedFile::Temporary(path) => path.keep(),
+            StagedFile::Kept(path) => Ok(path),
+        };
+        let error = match kept {
+            Ok(path) => {
+                let result = PlatformPersistence.install_replace(&path, target);
+                staged = StagedFile::Kept(path);
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(crate::Error::Io(error)) => error,
+                    Err(error) => io::Error::other(error),
+                }
             }
-        })
+            Err(error) => {
+                staged = StagedFile::Temporary(error.path);
+                error.error
+            }
+        };
+        if is_transient_replace_error(&error) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(RETRY_INTERVAL.min(remaining));
+                if Instant::now() < deadline {
+                    continue;
+                }
+            }
+        }
+        if let StagedFile::Kept(path) = staged {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+}
+
+pub fn is_transient_replace_error(error: &io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 #[cfg(test)]
