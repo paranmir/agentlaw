@@ -49,3 +49,14 @@ impl Persistence for PlatformPersistence {
         Ok(self.durability())
     }
 }
+
+pub fn install_temp_file(_temp: tempfile::NamedTempFile, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("unimplemented"))
+}
+
+pub fn install_temp_path(_temp: &tempfile::TempPath, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("unimplemented"))
+}
+
+#[cfg(test)]
+mod tests;
