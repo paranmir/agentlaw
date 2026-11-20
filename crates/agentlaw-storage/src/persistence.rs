@@ -50,12 +50,20 @@ impl Persistence for PlatformPersistence {
     }
 }
 
-pub fn install_temp_file(_temp: tempfile::NamedTempFile, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other("unimplemented"))
-}
-
-pub fn install_temp_path(_temp: &tempfile::TempPath, _target: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other("unimplemented"))
+/// Install a prepared file using the platform's replacement semantics.
+pub fn install_temp_file(temp: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
+    // Closing the handle and keeping the path must precede rename. On Windows,
+    // keeping the path updates attributes at the temporary name.
+    let path = temp.into_temp_path().keep()?;
+    PlatformPersistence
+        .install_replace(&path, target)
+        .map_err(|error| {
+            let _ = fs::remove_file(&path);
+            match error {
+                crate::Error::Io(error) => error,
+                error => std::io::Error::other(error),
+            }
+        })
 }
 
 #[cfg(test)]

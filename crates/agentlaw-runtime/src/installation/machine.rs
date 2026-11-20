@@ -76,7 +76,8 @@ pub fn name(state: &Path, display_name: &str) -> Result<Machine> {
     tmp.flush()
         .and_then(|_| tmp.as_file().sync_all())
         .map_err(|_| err())?;
-    tmp.persist(state.join("machine.json")).map_err(|_| err())?;
+    agentlaw_storage::persistence::install_temp_file(tmp, &state.join("machine.json"))
+        .map_err(|_| err())?;
     Ok(machine)
 }
 

@@ -127,7 +127,7 @@ impl MaintenanceGate {
         tmp.flush()
             .and_then(|_| tmp.as_file().sync_all())
             .map_err(|_| error("update_maintenance", "Cannot persist the maintenance gate."))?;
-        tmp.persist(&self.path)
+        agentlaw_storage::persistence::install_temp_file(tmp, &self.path)
             .map_err(|_| error("update_maintenance", "Cannot publish the maintenance gate."))?;
         Ok(())
     }

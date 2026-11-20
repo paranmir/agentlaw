@@ -123,7 +123,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     tmp.write_all(&bytes)
         .and_then(|_| tmp.as_file().sync_all())
         .map_err(|_| error("update_io", "Cannot persist an update plan."))?;
-    tmp.persist(path)
+    agentlaw_storage::persistence::install_temp_file(tmp, path)
         .map_err(|_| error("update_io", "Cannot publish an update plan."))?;
     Ok(())
 }

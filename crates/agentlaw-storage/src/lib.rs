@@ -1067,7 +1067,8 @@ fn install_reader(path: &Path, input: &mut impl Read) -> Result<()> {
     std::io::copy(input, &mut f)?;
     f.sync_all()?;
     drop(f);
-    // On Windows Rust rename replaces existing regular files, using MoveFileExW.
+    // On Windows, std::fs::rename replaces the target even while other
+    // handles with delete sharing keep it open.
     use persistence::Persistence;
     persistence::PlatformPersistence.install_replace(&temp, path)?;
     persistence::PlatformPersistence.sync_namespace(parent)?;

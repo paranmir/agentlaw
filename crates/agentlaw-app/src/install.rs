@@ -112,7 +112,7 @@ fn atomic_text(path: &Path, text: &str) -> Result<()> {
     tmp.write_all(text.as_bytes())
         .and_then(|_| tmp.as_file().sync_all())
         .map_err(|_| err("Cannot persist installation output."))?;
-    tmp.persist(path).map_err(|_| {
+    agentlaw_storage::persistence::install_temp_file(tmp, path).map_err(|_| {
         err("Cannot replace installation output; recover using the retained installation journal.")
     })?;
     Ok(())

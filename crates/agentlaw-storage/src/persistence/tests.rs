@@ -1,4 +1,4 @@
-use super::{install_temp_file, install_temp_path};
+use super::install_temp_file;
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
@@ -59,18 +59,4 @@ fn assert_replacement_while_reader_is_open(
 #[test]
 fn install_temp_file_replaces_target_held_open_by_reader() {
     assert_replacement_while_reader_is_open(install_temp_file);
-}
-
-#[test]
-fn install_temp_path_replaces_target_held_open_by_reader() {
-    assert_replacement_while_reader_is_open(|file, target| {
-        let temp = file.into_temp_path();
-        install_temp_path(&temp, target)?;
-        match temp.keep() {
-            Ok(_) => Ok(()),
-            // On Windows keep sets attributes on the old path, which a rename removes.
-            Err(error) if error.error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    });
 }

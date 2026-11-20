@@ -292,6 +292,7 @@ pub fn replace_selection(root: &Path, expected: &Config, next: &Config) -> Resul
 }
 
 pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
+    use agentlaw_storage::persistence::{Persistence, PlatformPersistence};
     use std::io::Write;
     let mut temp = tempfile::NamedTempFile::new_in(root)
         .map_err(|_| DomainError::new("configuration_io", "Cannot prepare the next selection."))?;
@@ -300,14 +301,22 @@ pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
     temp.flush()
         .and_then(|_| temp.as_file().sync_all())
         .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
+    let path = temp
+        .into_temp_path()
+        .keep()
+        .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
     let destination = root.join("config.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     // Keep the same complete, synced temporary file across transient failures.
     for attempt in 0..5 {
-        match temp.persist(&destination) {
-            Ok(_) => return Ok(()),
+        match PlatformPersistence.install_replace(&path, &destination) {
+            Ok(()) => return Ok(()),
             Err(error) => {
-                let transient = retryable_selection_replace(&error.error);
+                let error = match error {
+                    agentlaw_storage::Error::Io(error) => error,
+                    error => std::io::Error::other(error),
+                };
+                let transient = retryable_selection_replace(&error);
                 if transient && attempt < 4 && std::time::Instant::now() < deadline {
                     #[cfg(test)]
                     observe_selection_retry(&destination);
@@ -316,16 +325,16 @@ pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
                         std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
                     }
                     if std::time::Instant::now() < deadline {
-                        temp = error.file;
                         continue;
                     }
                 }
-                let kind = format!("{:?}", error.error.kind());
-                let raw = error.error.raw_os_error();
+                let _ = fs::remove_file(&path);
+                let kind = format!("{:?}", error.kind());
+                let raw = error.raw_os_error();
                 let mut result = DomainError::new(
                     "configuration_io",
-                    format!("Cannot install the next selection. The previous configuration remains selected. OS error: {} (kind: {kind}, raw code: {raw:?}).", error.error),
-                ).with_details(serde_json::json!({"os_error_kind":kind,"raw_os_error":raw,"os_error":error.error.to_string()}));
+                    format!("Cannot install the next selection. The previous configuration remains selected. OS error: {} (kind: {kind}, raw code: {raw:?}).", error),
+                ).with_details(serde_json::json!({"os_error_kind":kind,"raw_os_error":raw,"os_error":error.to_string()}));
                 result.retryable = transient;
                 return Err(result);
             }
