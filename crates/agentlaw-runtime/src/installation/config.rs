@@ -301,44 +301,63 @@ pub fn write_selection(root: &Path, next: &Config) -> Result<()> {
     temp.flush()
         .and_then(|_| temp.as_file().sync_all())
         .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
-    let path = temp
-        .into_temp_path()
-        .keep()
-        .map_err(|_| DomainError::new("configuration_io", "Cannot persist the next selection."))?;
+    enum StagedSelection {
+        Temporary(tempfile::TempPath),
+        Kept(PathBuf),
+    }
+
+    let mut staged = StagedSelection::Temporary(temp.into_temp_path());
     let destination = root.join("config.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     // Keep the same complete, synced temporary file across transient failures.
     for attempt in 0..5 {
-        match PlatformPersistence.install_replace(&path, &destination) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let error = match error {
-                    agentlaw_storage::Error::Io(error) => error,
-                    error => std::io::Error::other(error),
-                };
-                let transient = retryable_selection_replace(&error);
-                if transient && attempt < 4 && std::time::Instant::now() < deadline {
-                    #[cfg(test)]
-                    observe_selection_retry(&destination);
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if !remaining.is_zero() {
-                        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
-                    }
-                    if std::time::Instant::now() < deadline {
-                        continue;
-                    }
+        let kept = match staged {
+            StagedSelection::Temporary(path) => path.keep(),
+            StagedSelection::Kept(path) => Ok(path),
+        };
+        let error = match kept {
+            Ok(path) => {
+                let result = PlatformPersistence.install_replace(&path, &destination);
+                staged = StagedSelection::Kept(path);
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(agentlaw_storage::Error::Io(error)) => error,
+                    Err(error) => std::io::Error::other(error),
                 }
-                let _ = fs::remove_file(&path);
-                let kind = format!("{:?}", error.kind());
-                let raw = error.raw_os_error();
-                let mut result = DomainError::new(
-                    "configuration_io",
-                    format!("Cannot install the next selection. The previous configuration remains selected. OS error: {} (kind: {kind}, raw code: {raw:?}).", error),
-                ).with_details(serde_json::json!({"os_error_kind":kind,"raw_os_error":raw,"os_error":error.to_string()}));
-                result.retryable = transient;
-                return Err(result);
+            }
+            Err(error) => {
+                staged = StagedSelection::Temporary(error.path);
+                error.error
+            }
+        };
+        let transient = retryable_selection_replace(&error);
+        if transient && attempt < 4 && std::time::Instant::now() < deadline {
+            #[cfg(test)]
+            observe_selection_retry(&destination);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+            }
+            if std::time::Instant::now() < deadline {
+                continue;
             }
         }
+        if let StagedSelection::Kept(path) = staged {
+            let _ = fs::remove_file(path);
+        }
+        let kind = format!("{:?}", error.kind());
+        let raw = error.raw_os_error();
+        let mut result = DomainError::new(
+            "configuration_io",
+            format!("Cannot install the next selection. The previous configuration remains selected. OS error: {error} (kind: {kind}, raw code: {raw:?})."),
+        )
+        .with_details(serde_json::json!({
+            "os_error_kind": kind,
+            "raw_os_error": raw,
+            "os_error": error.to_string(),
+        }));
+        result.retryable = transient;
+        return Err(result);
     }
     unreachable!("selection replacement attempts always return")
 }
