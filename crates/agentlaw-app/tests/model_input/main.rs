@@ -258,7 +258,17 @@ fn check_model() {
     let memory_id = saved["results"][0]["memory_ref"]["memory_id"]
         .as_str()
         .unwrap();
-    let store = agentlaw_storage::Store::open(&source, tmp.path().join("probe-local")).unwrap();
+    // Read the runtime's own binding; a fresh local folder is not bound to the existing source.
+    let config = agentlaw_runtime::installation::config::load(&state)
+        .unwrap()
+        .expect("installed configuration");
+    let binding = config.runtime_root(&state).join("canonical");
+    let store = agentlaw_storage::Store::open_read_only_with_coordination(
+        &source,
+        binding,
+        agentlaw_runtime::installation::config::coordination_root(&state),
+    )
+    .unwrap();
     let source_sequence = store
         .owned_published_reader()
         .read_snapshot()
