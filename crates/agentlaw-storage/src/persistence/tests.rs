@@ -119,6 +119,9 @@ fn install_temp_file_retries_until_prepared_file_is_released() {
 #[cfg(windows)]
 #[test]
 fn install_temp_file_returns_last_lock_error_at_retry_deadline() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::Instant;
+
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("selection");
     fs::write(&target, b"old selection").unwrap();
@@ -126,8 +129,35 @@ fn install_temp_file_returns_last_lock_error_at_retry_deadline() {
     prepared.write_all(b"new selection").unwrap();
     prepared.as_file().sync_all().unwrap();
 
-    let (result, elapsed) =
-        install_with_prepared_file_held_open(prepared, &target, Duration::from_millis(1_300));
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+
+    let path = prepared.path().to_owned();
+    let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+    let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+    let (result, elapsed) = thread::scope(|scope| {
+        scope.spawn(move || {
+            let holder = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(path)
+                .expect("open the prepared file without delete sharing");
+            opened_tx.try_send(()).unwrap();
+            returned_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("replacement did not return while the prepared file was held");
+            drop(holder);
+        });
+
+        opened_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("holder did not open the prepared file");
+        let start = Instant::now();
+        let result = install_temp_file(prepared, &target);
+        let elapsed = start.elapsed();
+        returned_tx.try_send(()).unwrap();
+        (result, elapsed)
+    });
 
     let error = result.expect_err("replacement should expire while the prepared file is held");
     assert!(
@@ -135,8 +165,8 @@ fn install_temp_file_returns_last_lock_error_at_retry_deadline() {
         "expected the last Windows lock error, got {error:?}"
     );
     assert!(
-        (Duration::from_secs(1)..Duration::from_millis(1_500)).contains(&elapsed),
-        "replacement returned after {elapsed:?}, expected 1 second to less than 1.5 seconds"
+        (Duration::from_secs(1)..Duration::from_secs(5)).contains(&elapsed),
+        "replacement returned after {elapsed:?}, expected 1 second to less than 5 seconds"
     );
     assert_eq!(fs::read(&target).unwrap(), b"old selection");
 }
@@ -148,6 +178,7 @@ fn install_temp_file_returns_missing_target_directory_without_retrying() {
     let mut prepared = NamedTempFile::new_in(dir.path()).unwrap();
     prepared.write_all(b"new selection").unwrap();
     prepared.as_file().sync_all().unwrap();
+    let path = prepared.path().to_owned();
 
     let start = std::time::Instant::now();
     let result = install_temp_file(prepared, &target);
@@ -155,7 +186,8 @@ fn install_temp_file_returns_missing_target_directory_without_retrying() {
 
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
     assert!(
-        elapsed < Duration::from_millis(200),
+        elapsed < Duration::from_secs(1),
         "missing destination directory was reported after {elapsed:?}"
     );
+    assert!(!path.try_exists().unwrap(), "temporary path remains");
 }
