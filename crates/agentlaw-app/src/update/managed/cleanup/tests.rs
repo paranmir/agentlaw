@@ -1766,3 +1766,84 @@ fn unfinished_update_maintenance_still_blocks_frontend_start_with_completed_clea
     );
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
+
+struct ProcessPathFixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    target: PathBuf,
+    own_exe: PathBuf,
+}
+
+impl ProcessPathFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("previous-bundle");
+        fs::create_dir(&target).unwrap();
+        let own_exe = write_fixture(&root, "current-bundle/agentlaw.exe");
+        Self {
+            _temp: temp,
+            root,
+            target,
+            own_exe,
+        }
+    }
+
+    fn references_target(&self, name: &str, exe: Option<PathBuf>) -> Result<bool> {
+        let processes = [
+            ProcessEntry {
+                pid: 100,
+                name: "agentlaw.exe".into(),
+                exe: Some(self.own_exe.clone()),
+            },
+            ProcessEntry {
+                pid: 101,
+                name: name.into(),
+                exe,
+            },
+        ];
+        processes_reference_path(100, &self.own_exe, &processes, &self.root, &self.target)
+    }
+}
+
+#[test]
+fn agentlaw_process_with_unreadable_executable_defers_cleanup() {
+    let fixture = ProcessPathFixture::new();
+    // Windows can omit the executable path of an exiting Agentlaw frontend.
+    let error = fixture.references_target("Agentlaw.exe", None).unwrap_err();
+    assert_eq!(error.code, "cleanup_deferred");
+}
+
+#[test]
+fn process_with_missing_executable_under_installation_defers_cleanup() {
+    let fixture = ProcessPathFixture::new();
+    let missing = fixture.own_exe.with_file_name("agentlaw-previous.exe");
+    let error = fixture
+        .references_target("agentlaw-previous.exe", Some(missing))
+        .unwrap_err();
+    assert_eq!(error.code, "cleanup_deferred");
+}
+
+#[test]
+fn process_running_from_cleanup_target_references_target() {
+    let fixture = ProcessPathFixture::new();
+    let exe = write_fixture(&fixture.root, "previous-bundle/agentlaw.exe");
+    assert!(fixture
+        .references_target("agentlaw.exe", Some(exe))
+        .unwrap());
+}
+
+#[test]
+fn unrelated_process_with_unreadable_executable_does_not_reference_target() {
+    let fixture = ProcessPathFixture::new();
+    assert!(!fixture.references_target("other.exe", None).unwrap());
+}
+
+#[test]
+fn process_running_outside_cleanup_target_does_not_reference_target() {
+    let fixture = ProcessPathFixture::new();
+    let exe = write_fixture(&fixture.root, "other-bundle/agentlaw.exe");
+    assert!(!fixture
+        .references_target("agentlaw.exe", Some(exe))
+        .unwrap());
+}

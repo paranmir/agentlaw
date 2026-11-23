@@ -312,6 +312,24 @@ fn is_owned_stage(path: &Path, plan: &Plan, entries: &[ManifestEntry]) -> bool {
         })
 }
 
+#[allow(dead_code)]
+struct ProcessEntry {
+    pid: u32,
+    name: String,
+    exe: Option<PathBuf>,
+}
+
+#[allow(dead_code)]
+fn processes_reference_path(
+    _own_pid: u32,
+    _own_exe: &Path,
+    _processes: &[ProcessEntry],
+    _root: &Path,
+    _path: &Path,
+) -> Result<bool> {
+    Err(error("inspection_unknown", "unimplemented"))
+}
+
 fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
