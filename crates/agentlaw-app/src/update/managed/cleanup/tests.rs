@@ -1989,49 +1989,55 @@ fn registered_previous_bundle_is_preserved_by_cleanup() {
     assert!(exe.is_file());
 }
 
+fn write_cleanup_registration(root: &Path, executable: &Path) {
+    let instructions = write_fixture(root, "harness/AGENTS.md");
+    let config = format!("[mcp_servers.agentlaw]\ncommand = {}\n", json!(executable));
+    fs::write(root.join("harness/config.toml"), &config).unwrap();
+    fs::write(
+        root.join("state/harness-codex-fixture.json"),
+        json!({
+            "instructions": instructions,
+            "configuration": config,
+            "executable": executable,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 fn finalizing_update_with_prior_receipt(root: &Path, prior_executable: &Path) -> Plan {
     let mut update = verified_finalizing_update(root);
-    let instructions = write_fixture(root, "harness/AGENTS.md");
-    let config_path = root.join("harness/config.toml");
-    let receipt_path = root.join("state/harness-codex-fixture.json");
-    let write_registration = |exe: &Path| {
-        let config = format!("[mcp_servers.agentlaw]\ncommand = {}\n", json!(exe));
-        fs::write(&config_path, &config).unwrap();
-        fs::write(
-            &receipt_path,
-            json!({
-                "instructions": instructions,
-                "configuration": config,
-                "executable": exe,
-            })
-            .to_string(),
-        )
-        .unwrap();
-    };
-
-    write_registration(prior_executable);
+    write_cleanup_registration(root, prior_executable);
     update.registrations = registration_list(root).unwrap();
     assert_eq!(update.registrations.len(), 1);
-    write_registration(&candidate_executable(&update).unwrap());
+    write_cleanup_registration(root, &candidate_executable(&update).unwrap());
     save(&update).unwrap();
     update
 }
 
 #[cfg(windows)]
-fn check_cleanup_with_mixed_receipt_path_notation(root_is_extended: bool) {
+fn ordinary_fixture_root(extended: &Path) -> PathBuf {
+    let path = extended.to_str().unwrap();
+    if let Some(network) = path.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{network}"));
+    }
+    PathBuf::from(
+        path.strip_prefix(r"\\?\")
+            .expect("canonical Windows fixture root uses the extended prefix"),
+    )
+}
+
+#[cfg(windows)]
+fn mixed_receipt_cleanup_fixture(
+    root_is_extended: bool,
+) -> (tempfile::TempDir, Plan, PathBuf, PathBuf) {
     let temp = managed_cleanup_root();
     let extended = fs::canonicalize(temp.path()).unwrap();
-    let ordinary = Path::new(
-        extended
-            .to_str()
-            .unwrap()
-            .strip_prefix(r"\\?\")
-            .expect("canonical Windows fixture root uses the extended prefix"),
-    );
+    let ordinary = ordinary_fixture_root(&extended);
     let (root, receipt_root) = if root_is_extended {
-        (extended.as_path(), ordinary)
+        (extended.as_path(), ordinary.as_path())
     } else {
-        (ordinary, extended.as_path())
+        (ordinary.as_path(), extended.as_path())
     };
 
     let contents = b"previous runtime fixture";
@@ -2042,20 +2048,30 @@ fn check_cleanup_with_mixed_receipt_path_notation(root_is_extended: bool) {
     fs::write(prior.join(binary_name()), contents).unwrap();
 
     // Finalization rejected the same managed path when its receipt and root used different Windows prefixes.
-    let mut update = finalizing_update_with_prior_receipt(
-        root,
-        &receipt_root.join(&version).join(binary_name()),
-    );
+    let prior_receipt = receipt_root.join(&version).join(binary_name());
+    let update = finalizing_update_with_prior_receipt(root, &prior_receipt);
+    (temp, update, prior, prior_receipt)
+}
+
+#[cfg(windows)]
+fn cleanup_with_empty_process_snapshot(update: &mut Plan) -> Result<()> {
     PROCESS_OBSERVATIONS.with(|observations| {
         assert!(observations
-            .replace(Some((root.to_owned(), Vec::new())))
+            .replace(Some((update.root.clone(), Vec::new())))
             .is_none());
     });
-    let result = cleanup_update_plan(&mut update);
+    let result = cleanup_update_plan(update);
     PROCESS_OBSERVATIONS.with(|observations| {
         observations.take();
     });
-    result.unwrap();
+    result
+}
+
+#[cfg(windows)]
+fn check_cleanup_with_mixed_receipt_path_notation(root_is_extended: bool) {
+    let (_temp, mut update, prior, _) = mixed_receipt_cleanup_fixture(root_is_extended);
+    cleanup_with_empty_process_snapshot(&mut update).unwrap();
+    let root = &update.root;
     let cleanup = cleanup_load(root, update.cleanup_plan_id.as_deref().unwrap()).unwrap();
     assert!(cleanup
         .items
@@ -2088,4 +2104,72 @@ fn cleanup_rejects_prior_receipt_outside_managed_versions() {
     assert_eq!(problem.code, "cleanup_scope");
     assert!(update.cleanup_plan_id.is_none());
     assert!(prior.is_file());
+}
+
+#[cfg(windows)]
+fn assert_prior_version_blocked(update: &mut Plan, prior: &Path) {
+    let problem = cleanup_with_empty_process_snapshot(update).unwrap_err();
+    assert_eq!(problem.code, "cleanup_incomplete");
+    let cleanup = cleanup_load(&update.root, update.cleanup_plan_id.as_deref().unwrap()).unwrap();
+    let item = cleanup
+        .items
+        .iter()
+        .find(|item| item.kind == "version" && item.source == prior)
+        .expect("the prior version is included in the cleanup plan");
+    assert_eq!(item.phase, "blocked_reference");
+    assert!(prior.is_dir());
+    assert!(prior.join(binary_name()).is_file());
+}
+
+#[cfg(windows)]
+fn check_active_receipt_preserves_prior_version(root_is_extended: bool) {
+    let (_temp, mut update, prior, prior_receipt) = mixed_receipt_cleanup_fixture(root_is_extended);
+    write_cleanup_registration(&update.root, &prior_receipt);
+    assert_prior_version_blocked(&mut update, &prior);
+}
+
+#[cfg(windows)]
+#[test]
+fn active_ordinary_receipt_preserves_prior_version_under_extended_root() {
+    check_active_receipt_preserves_prior_version(true);
+}
+
+#[cfg(windows)]
+#[test]
+fn active_extended_receipt_preserves_prior_version_under_ordinary_root() {
+    check_active_receipt_preserves_prior_version(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn unfinished_update_receipts_preserve_prior_version_with_different_path_notation() {
+    for reference_is_after in [false, true] {
+        let (_temp, mut update, prior, _) = mixed_receipt_cleanup_fixture(!reference_is_after);
+        let mut unfinished = completed_update(&update.root, "not-yet-inventoried");
+        unfinished.phase = "prepared".into();
+        unfinished.activation_verified = false;
+        unfinished.recovery_obligations_closed = false;
+        unfinished.cleanup_plan_id = None;
+        unfinished.cleanup_completed = false;
+        unfinished.registrations = update.registrations.clone();
+        if reference_is_after {
+            let current = registration_list(&update.root).unwrap();
+            let registration = &mut unfinished.registrations[0];
+            registration.receipt_after = Some(registration.receipt_before.clone());
+            registration.receipt_before = current[0].receipt_before.clone();
+        }
+        save(&unfinished).unwrap();
+
+        assert_prior_version_blocked(&mut update, &prior);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn normalizes_extended_and_ordinary_unc_paths_to_the_same_share() {
+    let ordinary = Path::new(r"\\server\share\versions\agentlaw.exe");
+    let extended = Path::new(r"\\?\UNC\server\share\versions\agentlaw.exe");
+    assert_eq!(ordinary_fixture_root(extended), ordinary);
+    assert_eq!(normalize_process_path(extended), ordinary);
+    assert_eq!(normalize_process_path(ordinary), ordinary);
 }
