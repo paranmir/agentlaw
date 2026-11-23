@@ -312,22 +312,42 @@ fn is_owned_stage(path: &Path, plan: &Plan, entries: &[ManifestEntry]) -> bool {
         })
 }
 
-#[allow(dead_code)]
 struct ProcessEntry {
     pid: u32,
     name: String,
     exe: Option<PathBuf>,
 }
 
-#[allow(dead_code)]
 fn processes_reference_path(
-    _own_pid: u32,
-    _own_exe: &Path,
-    _processes: &[ProcessEntry],
-    _root: &Path,
-    _path: &Path,
+    own_pid: u32,
+    own_exe: &Path,
+    processes: &[ProcessEntry],
+    root: &Path,
+    path: &Path,
 ) -> Result<bool> {
-    Err(error("inspection_unknown", "unimplemented"))
+    if own_exe.starts_with(path) {
+        return Ok(true);
+    }
+    let mut deferred = None;
+    for process in processes.iter().filter(|process| process.pid != own_pid) {
+        let Some(exe) = &process.exe else {
+            if process.name.to_ascii_lowercase().starts_with("agentlaw") {
+                deferred = Some("An Agentlaw process has an unknown executable path.");
+            }
+            continue;
+        };
+        let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.clone());
+        if exe.starts_with(path) {
+            return Ok(true);
+        }
+        if exe.starts_with(root) && !exe.exists() {
+            deferred = Some("A relevant process path cannot be verified.");
+        }
+    }
+    match deferred {
+        Some(reason) => Err(error("cleanup_deferred", reason)),
+        None => Ok(false),
+    }
 }
 
 fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
@@ -342,17 +362,15 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
             "The cleanup process is absent from the process snapshot.",
         ));
     }
+    let own_exe = std::env::current_exe().map_err(|_| {
+        error(
+            "inspection_unknown",
+            "Cannot identify the cleanup executable.",
+        )
+    })?;
+    let mut entries = Vec::new();
     for (pid, process) in system.processes() {
         if *pid == own {
-            let own_exe = std::env::current_exe().map_err(|_| {
-                error(
-                    "inspection_unknown",
-                    "Cannot identify the cleanup executable.",
-                )
-            })?;
-            if own_exe.starts_with(path) {
-                return Ok(true);
-            }
             continue;
         }
         let executable = process
@@ -362,7 +380,7 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
         #[cfg(target_os = "linux")]
         let executable =
             executable.or_else(|| fs::read_link(format!("/proc/{}/exe", pid.as_u32())).ok());
-        let Some(exe) = executable else {
+        if executable.is_none() {
             #[cfg(target_os = "linux")]
             {
                 let proc = PathBuf::from(format!("/proc/{}", pid.as_u32()));
@@ -379,31 +397,14 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
                     continue;
                 }
             }
-            if process
-                .name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .starts_with("agentlaw")
-            {
-                return Err(error(
-                    "inspection_unknown",
-                    "An Agentlaw process has an unknown executable path.",
-                ));
-            }
-            continue;
-        };
-        let exe = fs::canonicalize(&exe).unwrap_or(exe);
-        if exe.starts_with(path) {
-            return Ok(true);
         }
-        if exe.starts_with(root) && !exe.exists() {
-            return Err(error(
-                "inspection_unknown",
-                "A relevant process path cannot be verified.",
-            ));
-        }
+        entries.push(ProcessEntry {
+            pid: pid.as_u32(),
+            name: process.name().to_string_lossy().into_owned(),
+            exe: executable,
+        });
     }
-    Ok(false)
+    processes_reference_path(own.as_u32(), &own_exe, &entries, root, path)
 }
 
 fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
