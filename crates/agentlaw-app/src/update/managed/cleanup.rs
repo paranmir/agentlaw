@@ -462,6 +462,7 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<ProcessReference>
 }
 
 fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
+    let path = normalize_process_path(path);
     for registration in registration_list(root)? {
         let receipt: Value = agentlaw_contracts::validation::decode_unique(
             &registration.receipt_before,
@@ -475,7 +476,7 @@ fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
         let executable = receipt["executable"]
             .as_str()
             .ok_or_else(|| error("inspection_unknown", "A receipt lacks its executable path."))?;
-        if Path::new(executable).starts_with(path) {
+        if normalize_process_path(Path::new(executable)).starts_with(&path) {
             return Ok(true);
         }
     }
@@ -483,6 +484,7 @@ fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
 }
 
 fn unfinished_work(root: &Path, path: &Path, finishing_plan: Option<&str>) -> Result<bool> {
+    let normalized_path = normalize_process_path(path);
     if root.join("state/install-pending.json").exists() {
         return Ok(true);
     }
@@ -524,10 +526,9 @@ fn unfinished_work(root: &Path, path: &Path, finishing_plan: Option<&str>) -> Re
                                 "An unfinished plan has an invalid registration receipt.",
                             )
                         })?;
-                        if value["executable"]
-                            .as_str()
-                            .is_some_and(|target| Path::new(target).starts_with(path))
-                        {
+                        if value["executable"].as_str().is_some_and(|target| {
+                            normalize_process_path(Path::new(target)).starts_with(&normalized_path)
+                        }) {
                             return Ok(true);
                         }
                     }
@@ -1436,7 +1437,8 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
         paths.push(("previous", previous_bundle(plan)));
         paths.push(("stage", stage(&plan.root, &plan.id)));
         let versions = plan.root.join("state/versions");
-        let candidate = candidate_executable(plan)?;
+        let normalized_versions = normalize_process_path(&versions);
+        let candidate = normalize_process_path(&candidate_executable(plan)?);
         let mut old_versions = BTreeSet::new();
         for registration in &plan.registrations {
             let receipt: Value =
@@ -1450,8 +1452,8 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
             let executable = receipt["executable"].as_str().ok_or_else(|| {
                 error("cleanup_plan_invalid", "A prior receipt has no executable.")
             })?;
-            let executable = PathBuf::from(executable);
-            if executable.parent().and_then(Path::parent) != Some(versions.as_path())
+            let executable = normalize_process_path(Path::new(executable));
+            if executable.parent().and_then(Path::parent) != Some(normalized_versions.as_path())
                 || executable.file_name() != Some(std::ffi::OsStr::new(binary_name()))
             {
                 return Err(error(
@@ -1460,10 +1462,12 @@ pub(super) fn cleanup_update_plan(plan: &mut Plan) -> Result<()> {
                 ));
             }
             if executable != candidate {
-                let directory = executable
+                let version = executable
                     .parent()
+                    .and_then(Path::file_name)
                     .ok_or_else(|| error("cleanup_scope", "Invalid prior runtime."))?;
-                old_versions.insert(directory.to_path_buf());
+                // Persist paths in the same notation as the cleanup plan's root.
+                old_versions.insert(versions.join(version));
             }
         }
         for version in old_versions {
