@@ -312,16 +312,54 @@ fn is_owned_stage(path: &Path, plan: &Plan, entries: &[ManifestEntry]) -> bool {
         })
 }
 
+#[allow(dead_code)]
 struct ProcessEntry {
+    pid: u32,
+    name: String,
+    exe: Option<PathBuf>,
+    exe_exists: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessReference {
+    None,
+    InUse,
+}
+
+#[allow(dead_code)]
+fn processes_reference_path(
+    _own_pid: u32,
+    _own_exe: &Path,
+    _processes: &[ProcessEntry],
+    _root: &Path,
+    _path: &Path,
+) -> Result<ProcessReference> {
+    Err(error("inspection_unknown", "unimplemented"))
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn normalize_process_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_OBSERVATIONS: std::cell::RefCell<Option<(PathBuf, Vec<ProcessEntry>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct LegacyProcessEntry {
     pid: u32,
     name: String,
     exe: Option<PathBuf>,
 }
 
-fn processes_reference_path(
+fn legacy_processes_reference_path(
     own_pid: u32,
     own_exe: &Path,
-    processes: &[ProcessEntry],
+    processes: &[LegacyProcessEntry],
     root: &Path,
     path: &Path,
 ) -> Result<bool> {
@@ -351,6 +389,26 @@ fn processes_reference_path(
 }
 
 fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(result) = PROCESS_OBSERVATIONS.with(|observations| {
+        let observations = observations.borrow();
+        let (target, processes) = observations.as_ref()?;
+        if target != path {
+            return None;
+        }
+        Some(
+            processes_reference_path(
+                std::process::id(),
+                &std::env::current_exe().expect("inspect test executable"),
+                processes,
+                root,
+                path,
+            )
+            .map(|reference| reference == ProcessReference::InUse),
+        )
+    }) {
+        return result;
+    }
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let own = get_current_pid()
@@ -398,13 +456,13 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
                 }
             }
         }
-        entries.push(ProcessEntry {
+        entries.push(LegacyProcessEntry {
             pid: pid.as_u32(),
             name: process.name().to_string_lossy().into_owned(),
             exe: executable,
         });
     }
-    processes_reference_path(own.as_u32(), &own_exe, &entries, root, path)
+    legacy_processes_reference_path(own.as_u32(), &own_exe, &entries, root, path)
 }
 
 fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {

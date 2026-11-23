@@ -1789,17 +1789,24 @@ impl ProcessPathFixture {
         }
     }
 
-    fn references_target(&self, name: &str, exe: Option<PathBuf>) -> Result<bool> {
+    fn references_target(
+        &self,
+        name: &str,
+        exe: Option<PathBuf>,
+        exe_exists: bool,
+    ) -> Result<ProcessReference> {
         let processes = [
             ProcessEntry {
                 pid: 100,
                 name: "agentlaw.exe".into(),
                 exe: Some(self.own_exe.clone()),
+                exe_exists: true,
             },
             ProcessEntry {
                 pid: 101,
                 name: name.into(),
                 exe,
+                exe_exists,
             },
         ];
         processes_reference_path(100, &self.own_exe, &processes, &self.root, &self.target)
@@ -1809,41 +1816,173 @@ impl ProcessPathFixture {
 #[test]
 fn agentlaw_process_with_unreadable_executable_defers_cleanup() {
     let fixture = ProcessPathFixture::new();
-    // Windows can omit the executable path of an exiting Agentlaw frontend.
-    let error = fixture.references_target("Agentlaw.exe", None).unwrap_err();
-    assert_eq!(error.code, "cleanup_deferred");
+    // Missing executable paths were observed, likely from Agentlaw processes running or exiting during an update.
+    assert_eq!(
+        fixture
+            .references_target("Agentlaw.exe", None, false)
+            .unwrap(),
+        ProcessReference::InUse
+    );
 }
 
 #[test]
 fn process_with_missing_executable_under_installation_defers_cleanup() {
     let fixture = ProcessPathFixture::new();
     let missing = fixture.own_exe.with_file_name("agentlaw-previous.exe");
-    let error = fixture
-        .references_target("agentlaw-previous.exe", Some(missing))
-        .unwrap_err();
-    assert_eq!(error.code, "cleanup_deferred");
+    assert_eq!(
+        fixture
+            .references_target("agentlaw-previous.exe", Some(missing), false)
+            .unwrap(),
+        ProcessReference::InUse
+    );
 }
 
 #[test]
 fn process_running_from_cleanup_target_references_target() {
     let fixture = ProcessPathFixture::new();
     let exe = write_fixture(&fixture.root, "previous-bundle/agentlaw.exe");
-    assert!(fixture
-        .references_target("agentlaw.exe", Some(exe))
-        .unwrap());
+    assert_eq!(
+        fixture
+            .references_target("agentlaw.exe", Some(exe), true)
+            .unwrap(),
+        ProcessReference::InUse
+    );
+}
+
+#[test]
+fn process_with_missing_executable_inside_cleanup_target_defers_cleanup() {
+    let fixture = ProcessPathFixture::new();
+    let missing = fixture.target.join("agentlaw.exe");
+    assert_eq!(
+        fixture
+            .references_target("agentlaw.exe", Some(missing), false)
+            .unwrap(),
+        ProcessReference::InUse
+    );
 }
 
 #[test]
 fn unrelated_process_with_unreadable_executable_does_not_reference_target() {
     let fixture = ProcessPathFixture::new();
-    assert!(!fixture.references_target("other.exe", None).unwrap());
+    assert_eq!(
+        fixture.references_target("other.exe", None, false).unwrap(),
+        ProcessReference::None
+    );
 }
 
 #[test]
 fn process_running_outside_cleanup_target_does_not_reference_target() {
     let fixture = ProcessPathFixture::new();
     let exe = write_fixture(&fixture.root, "other-bundle/agentlaw.exe");
-    assert!(!fixture
-        .references_target("agentlaw.exe", Some(exe))
-        .unwrap());
+    assert_eq!(
+        fixture
+            .references_target("agentlaw.exe", Some(exe), true)
+            .unwrap(),
+        ProcessReference::None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn normalizes_both_windows_spellings_of_a_missing_process_executable() {
+    let root = Path::new(r"\\?\C:\agentlaw-fixture");
+    let ordinary = Path::new(r"C:\agentlaw-fixture\previous\agentlaw.exe");
+    let extended = root.join(r"previous\agentlaw.exe");
+    assert_eq!(
+        normalize_process_path(root).join(r"previous\agentlaw.exe"),
+        ordinary
+    );
+    assert_eq!(normalize_process_path(&extended), ordinary);
+    assert_eq!(normalize_process_path(ordinary), ordinary);
+}
+
+fn bundle_cleanup_fixture(root: &Path) -> (Plan, CleanupPlan) {
+    let mut update = verified_finalizing_update(root);
+    let cleanup = cleanup_for_records(
+        root,
+        uuid::Uuid::new_v4().to_string(),
+        vec![
+            ("previous", previous_bundle(&update), "approved"),
+            ("stage", stage(root, &update.id), "approved"),
+        ],
+    );
+    update.cleanup_plan_id = Some(cleanup.id.clone());
+    save(&update).unwrap();
+    cleanup_save(&cleanup).unwrap();
+    (update, cleanup)
+}
+
+#[test]
+fn running_previous_bundle_defers_cleanup_until_the_next_start() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (mut update, cleanup) = bundle_cleanup_fixture(&root);
+    let previous = previous_bundle(&update);
+    let staged = stage(&root, &update.id);
+    PROCESS_OBSERVATIONS.with(|observations| {
+        assert!(observations
+            .replace(Some((
+                previous.clone(),
+                vec![ProcessEntry {
+                    pid: std::process::id().wrapping_add(1),
+                    name: binary_name().into(),
+                    exe: Some(previous.join(binary_name())),
+                    exe_exists: true,
+                }]
+            )))
+            .is_none());
+    });
+    let result = execute_plan_locked(&root, &cleanup.id, Some(&update.id));
+    PROCESS_OBSERVATIONS.with(|observations| {
+        observations.take();
+    });
+    result.unwrap();
+    let saved = cleanup_load(&root, &cleanup.id).unwrap();
+    assert_eq!(
+        (
+            saved.items[0].phase.as_str(),
+            saved.items[1].phase.as_str(),
+            cleanup_complete(&update).unwrap()
+        ),
+        ("cleanup_deferred", "removed", true)
+    );
+    assert!(previous.is_dir());
+    assert!(!staged.exists());
+
+    update.phase = "completed".into();
+    update.cleanup_completed = true;
+    save(&update).unwrap();
+    retry_pending(&root);
+    assert_eq!(
+        cleanup_load(&root, &cleanup.id).unwrap().items[0].phase,
+        "removed"
+    );
+    assert!(!previous.exists());
+}
+
+#[test]
+fn registered_previous_bundle_is_preserved_by_cleanup() {
+    let temp = managed_cleanup_root();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (update, cleanup) = bundle_cleanup_fixture(&root);
+    let previous = previous_bundle(&update);
+    let exe = previous.join(binary_name());
+    let instructions = write_fixture(&root, "harness/AGENTS.md");
+    let config = format!("[mcp_servers.agentlaw]\ncommand = {}\n", json!(exe));
+    fs::write(root.join("harness/config.toml"), &config).unwrap();
+    fs::write(
+        root.join("state/harness-codex-fixture.json"),
+        json!({
+            "instructions":instructions,"configuration":config,"executable":exe,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    execute_plan_locked(&root, &cleanup.id, Some(&update.id)).unwrap();
+    assert_eq!(
+        cleanup_load(&root, &cleanup.id).unwrap().items[0].phase,
+        "blocked_reference"
+    );
+    assert!(exe.is_file());
 }
