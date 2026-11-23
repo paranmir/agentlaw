@@ -312,7 +312,6 @@ fn is_owned_stage(path: &Path, plan: &Plan, entries: &[ManifestEntry]) -> bool {
         })
 }
 
-#[allow(dead_code)]
 struct ProcessEntry {
     pid: u32,
     name: String,
@@ -320,26 +319,59 @@ struct ProcessEntry {
     exe_exists: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessReference {
     None,
     InUse,
 }
 
-#[allow(dead_code)]
 fn processes_reference_path(
-    _own_pid: u32,
-    _own_exe: &Path,
-    _processes: &[ProcessEntry],
-    _root: &Path,
-    _path: &Path,
+    own_pid: u32,
+    own_exe: &Path,
+    processes: &[ProcessEntry],
+    root: &Path,
+    path: &Path,
 ) -> Result<ProcessReference> {
-    Err(error("inspection_unknown", "unimplemented"))
+    let root = normalize_process_path(root);
+    let path = normalize_process_path(path);
+    if normalize_process_path(own_exe).starts_with(&path) {
+        return Ok(ProcessReference::InUse);
+    }
+    for process in processes.iter().filter(|process| process.pid != own_pid) {
+        let in_use = match &process.exe {
+            Some(exe) => {
+                let exe = normalize_process_path(exe);
+                exe.starts_with(&path) || (!process.exe_exists && exe.starts_with(&root))
+            }
+            None => process.name.to_ascii_lowercase().starts_with("agentlaw"),
+        };
+        if in_use {
+            return Ok(ProcessReference::InUse);
+        }
+    }
+    Ok(ProcessReference::None)
 }
 
 #[cfg(windows)]
-#[allow(dead_code)]
+fn normalize_process_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const SEPARATOR: u16 = b'\\' as u16;
+    const EXTENDED_PREFIX: &[u16] = &[SEPARATOR, SEPARATOR, b'?' as u16, SEPARATOR];
+    const UNC_PREFIX: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, SEPARATOR];
+    let wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    let Some(ordinary) = wide.strip_prefix(EXTENDED_PREFIX) else {
+        return path.to_path_buf();
+    };
+    if let Some(network) = ordinary.strip_prefix(UNC_PREFIX) {
+        let mut unc = vec![SEPARATOR, SEPARATOR];
+        unc.extend_from_slice(network);
+        return std::ffi::OsString::from_wide(&unc).into();
+    }
+    std::ffi::OsString::from_wide(ordinary).into()
+}
+
+#[cfg(not(windows))]
 fn normalize_process_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
@@ -350,45 +382,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-struct LegacyProcessEntry {
-    pid: u32,
-    name: String,
-    exe: Option<PathBuf>,
-}
-
-fn legacy_processes_reference_path(
-    own_pid: u32,
-    own_exe: &Path,
-    processes: &[LegacyProcessEntry],
-    root: &Path,
-    path: &Path,
-) -> Result<bool> {
-    if own_exe.starts_with(path) {
-        return Ok(true);
-    }
-    let mut deferred = None;
-    for process in processes.iter().filter(|process| process.pid != own_pid) {
-        let Some(exe) = &process.exe else {
-            if process.name.to_ascii_lowercase().starts_with("agentlaw") {
-                deferred = Some("An Agentlaw process has an unknown executable path.");
-            }
-            continue;
-        };
-        let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.clone());
-        if exe.starts_with(path) {
-            return Ok(true);
-        }
-        if exe.starts_with(root) && !exe.exists() {
-            deferred = Some("A relevant process path cannot be verified.");
-        }
-    }
-    match deferred {
-        Some(reason) => Err(error("cleanup_deferred", reason)),
-        None => Ok(false),
-    }
-}
-
-fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
+fn referenced_by_processes(root: &Path, path: &Path) -> Result<ProcessReference> {
     #[cfg(test)]
     if let Some(result) = PROCESS_OBSERVATIONS.with(|observations| {
         let observations = observations.borrow();
@@ -396,16 +390,13 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
         if target != path {
             return None;
         }
-        Some(
-            processes_reference_path(
-                std::process::id(),
-                &std::env::current_exe().expect("inspect test executable"),
-                processes,
-                root,
-                path,
-            )
-            .map(|reference| reference == ProcessReference::InUse),
-        )
+        Some(processes_reference_path(
+            std::process::id(),
+            &std::env::current_exe().expect("inspect test executable"),
+            processes,
+            root,
+            path,
+        ))
     }) {
         return result;
     }
@@ -428,9 +419,6 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
     })?;
     let mut entries = Vec::new();
     for (pid, process) in system.processes() {
-        if *pid == own {
-            continue;
-        }
         let executable = process
             .exe()
             .filter(|exe| !exe.as_os_str().is_empty())
@@ -456,13 +444,21 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<bool> {
                 }
             }
         }
-        entries.push(LegacyProcessEntry {
+        let canonical = executable
+            .as_ref()
+            .and_then(|exe| fs::canonicalize(exe).ok());
+        let exe_exists = canonical.is_some() || executable.as_ref().is_some_and(|exe| exe.exists());
+        let exe = canonical
+            .or(executable)
+            .map(|exe| normalize_process_path(&exe));
+        entries.push(ProcessEntry {
             pid: pid.as_u32(),
             name: process.name().to_string_lossy().into_owned(),
-            exe: executable,
+            exe,
+            exe_exists,
         });
     }
-    legacy_processes_reference_path(own.as_u32(), &own_exe, &entries, root, path)
+    processes_reference_path(own.as_u32(), &own_exe, &entries, root, path)
 }
 
 fn referenced_by_registrations(root: &Path, path: &Path) -> Result<bool> {
@@ -543,11 +539,11 @@ fn unfinished_work(root: &Path, path: &Path, finishing_plan: Option<&str>) -> Re
 }
 
 fn eligible(root: &Path, kind: &str, path: &Path, finishing_plan: Option<&str>) -> Result<bool> {
-    if unfinished_work(root, path, finishing_plan)?
-        || referenced_by_registrations(root, path)?
-        || referenced_by_processes(root, path)?
-    {
+    if unfinished_work(root, path, finishing_plan)? || referenced_by_registrations(root, path)? {
         return Ok(false);
+    }
+    if referenced_by_processes(root, path)? == ProcessReference::InUse {
+        return Err(error("cleanup_deferred", "An item is in use by a process."));
     }
     if kind == "version" {
         return Ok(true);
