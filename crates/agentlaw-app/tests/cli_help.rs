@@ -1,5 +1,8 @@
 //! Black-box help and argv validation. Every subprocess keeps stdin open until
 //! it exits, and hostile installation fixtures detect accidental state access.
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::RuntimeCleanup;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -100,6 +103,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 }
 
 struct HostileHome {
+    _runtime_cleanup: RuntimeCleanup,
     temp: tempfile::TempDir,
     state: PathBuf,
     original: BTreeMap<PathBuf, Option<Vec<u8>>>,
@@ -116,6 +120,7 @@ impl HostileHome {
         }
         let original = snapshot(temp.path());
         Self {
+            _runtime_cleanup: RuntimeCleanup(state.clone()),
             temp,
             state,
             original,
@@ -204,12 +209,7 @@ fn root_help_aliases_are_json_and_hide_internal_commands() {
                     "{value}"
                 );
             }
-            for private in [
-                "worker-daemon",
-                "model-child",
-                "update apply",
-                "update --confirm-update",
-            ] {
+            for private in ["model-child", "update apply", "update --confirm-update"] {
                 assert!(
                     usages.iter().all(|usage| !usage.contains(private)),
                     "{value}"
@@ -224,12 +224,7 @@ fn root_help_aliases_are_json_and_hide_internal_commands() {
         let text = successful_text(&home.run(&["help", "--format", "text"]), &[]);
         assert!(text.contains("Commands:"), "{text}");
         assert!(text.contains("learned-procedure"), "{text}");
-        for private in [
-            "worker-daemon",
-            "model-child",
-            "update apply",
-            "--confirm-update",
-        ] {
+        for private in ["model-child", "update apply", "--confirm-update"] {
             assert!(!text.contains(private), "{text}");
         }
     }
@@ -345,7 +340,7 @@ fn describe_returns_selected_cli_metadata_and_schema_remains_mcp_metadata() {
     assert_eq!(root["path"], json!([]));
     let children = root["commands"].as_array().expect("public child metadata");
     assert!(children.iter().any(|c| c["name"] == "sync"), "{root}");
-    for private in ["worker-daemon", "model-child"] {
+    for private in ["model-child"] {
         assert!(children.iter().all(|c| c["name"] != private), "{root}");
     }
     let resolve = successful_json(&home.run(&["describe", "sync", "resolve"]));
@@ -546,6 +541,7 @@ fn procedure_argument_errors_keep_stderr_and_stdout_separate() {
 fn equals_value_is_literal_and_end_of_options_does_not_trigger_help() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
+    let _runtime_cleanup = RuntimeCleanup(state.clone());
     let named = successful_json(&run(
         &state,
         temp.path(),

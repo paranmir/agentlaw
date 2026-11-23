@@ -1,0 +1,16 @@
+[package]
+name = "agentlaw-sqlite"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+write-audit = ["rusqlite/hooks"]
+
+[dependencies]
+rusqlite.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

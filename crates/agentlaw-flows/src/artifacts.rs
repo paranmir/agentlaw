@@ -31,7 +31,7 @@ fn now() -> Result<u64> {
 }
 fn registry(directory: &Path) -> Result<Connection> {
     let connection =
-        Connection::open(directory.join("response-registry.sqlite")).map_err(|_| failure())?;
+        agentlaw_sqlite::open(directory.join("response-registry.sqlite")).map_err(|_| failure())?;
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| failure())?;
@@ -193,41 +193,119 @@ pub fn create_from_reader(directory: impl AsRef<Path>, reader: &mut impl Read) -
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn only_expired_registered_owned_files_are_removed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let artifact = create_from_reader(tmp.path(), &mut b"{\"value\":1}".as_slice()).unwrap();
-        assert!(artifact.expires_at_unix_seconds > now().unwrap());
-        let unregistered = tmp.path().join("user-data.json");
-        std::fs::write(&unregistered, "preserve").unwrap();
-        let connection = registry(tmp.path()).unwrap();
-        connection
-            .execute("UPDATE response_artifacts SET expires=0,next_attempt=0", [])
-            .unwrap();
-        let newer = create_from_reader(tmp.path(), &mut b"{}".as_slice()).unwrap();
-        assert_eq!(newer.expired_artifacts_removed, 1);
-        assert!(!artifact.path.exists());
-        assert!(unregistered.exists());
-        assert!(newer.path.exists());
+mod tests;
+
+/// Remove only expired, owned read-delivery files. Call from owner maintenance, not reads.
+pub fn cleanup_read_artifacts(
+    directory: impl AsRef<Path>,
+    as_of: std::time::SystemTime,
+) -> Result<usize> {
+    let directory = match std::fs::canonicalize(directory.as_ref()) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err(failure()),
+    };
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&directory).map_err(|_| failure())? {
+        let entry = entry.map_err(|_| failure())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(tail) = name.strip_prefix("response-") else {
+            continue;
+        };
+        let Some((id, extension)) = tail.rsplit_once('.') else {
+            continue;
+        };
+        if !matches!(extension, "json" | "tmp")
+            || !uuid::Uuid::parse_str(id)
+                .is_ok_and(|u| u.get_version_num() == 4 && u.to_string() == id)
+        {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| failure())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let modified = metadata.modified().map_err(|_| failure())?;
+        if as_of
+            .duration_since(modified)
+            .is_ok_and(|age| age >= std::time::Duration::from_secs(RETENTION_SECONDS))
+        {
+            remove_expired_file(&directory, id, extension).map_err(|_| failure())?;
+            removed += 1;
+        }
     }
-    #[test]
-    fn registered_traversal_cannot_delete_a_user_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("outside.json");
-        std::fs::write(&outside, "preserve").unwrap();
-        let directory = tmp.path().join("responses");
-        std::fs::create_dir(&directory).unwrap();
-        let connection = registry(&directory).unwrap();
-        connection
-            .execute(
-                "INSERT INTO response_artifacts VALUES('../outside',0,0)",
-                [],
-            )
-            .unwrap();
-        let artifact = create_from_reader(&directory, &mut b"{}".as_slice()).unwrap();
-        assert_eq!(artifact.expired_artifacts_removed, 0);
-        assert!(outside.exists());
+    Ok(removed)
+}
+/// Writes an exceptional read result without a registry transaction or fsync.
+pub(crate) struct ReadArtifactWriter {
+    writer: Option<io::BufWriter<File>>,
+    temporary: PathBuf,
+    final_path: PathBuf,
+}
+impl ReadArtifactWriter {
+    pub(crate) fn create(directory: impl AsRef<Path>) -> Result<Self> {
+        std::fs::create_dir_all(directory.as_ref()).map_err(|_| failure())?;
+        let directory = std::fs::canonicalize(directory).map_err(|_| failure())?;
+        let id = uuid::Uuid::new_v4();
+        let temporary = directory.join(format!("response-{id}.tmp"));
+        let final_path = directory.join(format!("response-{id}.json"));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| failure())?;
+        Ok(Self {
+            writer: Some(io::BufWriter::new(file)),
+            temporary,
+            final_path,
+        })
+    }
+    pub(crate) fn finish(mut self) -> Result<Artifact> {
+        let mut writer = self.writer.take().ok_or_else(failure)?;
+        writer.flush().map_err(|_| failure())?;
+        drop(writer);
+        std::fs::rename(&self.temporary, &self.final_path).map_err(|_| failure())?;
+        let metadata = std::fs::metadata(&self.final_path).map_err(|_| failure())?;
+        let bytes = metadata.len();
+        let modified = metadata
+            .modified()
+            .map_err(|_| failure())?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| failure())?
+            .as_secs();
+        let expires = modified
+            .checked_add(RETENTION_SECONDS)
+            .ok_or_else(failure)?;
+        Ok(Artifact {
+            path: self.final_path.clone(),
+            format: "json",
+            bytes,
+            complete: true,
+            access: "runtime_host_filesystem",
+            expires_at_unix_seconds: expires,
+            retention_seconds: RETENTION_SECONDS,
+            expired_artifacts_removed: 0,
+        })
+    }
+}
+impl Write for ReadArtifactWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("writer closed"))?
+            .write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("writer closed"))?
+            .flush()
+    }
+}
+impl Drop for ReadArtifactWriter {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        let _ = std::fs::remove_file(&self.temporary);
     }
 }

@@ -1,14 +1,13 @@
 //! One serialized owner for model-process transitions. Native inference is never in this process.
+use crate::execution::SelectionCache;
 use crate::{
     model_child::{self, Input, Launch, Output, Result},
-    process::{RuntimeConfig, Signal},
-    Broker, EmbeddingError, Job, WorkerState, MODEL_ID,
+    EmbeddingError, RuntimeConfig, WorkerState,
 };
 use fs2::FileExt;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
-    io::Write,
+    collections::{HashMap, VecDeque},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,7 +15,1488 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+/// One number per model computation, issued by the host for both queries and indexing and
+/// never reused. A result carrying an unknown number is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelRequestId(pub u64);
+
+/// Host-lifetime request number source shared by queries and index feeders.
+#[derive(Clone, Default)]
+pub struct ModelRequestIds {
+    counter: Arc<std::sync::Mutex<u64>>,
+}
+impl ModelRequestIds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn next(&self) -> Option<ModelRequestId> {
+        let mut counter = self.counter.lock().unwrap();
+        *counter = counter.checked_add(1)?;
+        Some(ModelRequestId(*counter))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleAction {
+    None,
+    Start,
+}
+
+#[derive(Default)]
+struct ModelLifecycle {
+    child: bool,
+    stopping: bool,
+    failures: u32,
+    retry_at: Option<Instant>,
+    ready_since: Option<Instant>,
+    cause: Option<String>,
+}
+impl ModelLifecycle {
+    fn action(&mut self, now: Instant, demand: bool, configured: bool) -> LifecycleAction {
+        if !demand || !configured {
+            return LifecycleAction::None;
+        }
+        if !self.child && !self.stopping && self.retry_at.is_none_or(|at| now >= at) {
+            return LifecycleAction::Start;
+        }
+        LifecycleAction::None
+    }
+    fn started(&mut self) {
+        self.child = true;
+        self.stopping = false;
+        self.retry_at = None;
+        self.ready_since = None;
+    }
+    fn ready(&mut self, now: Instant) {
+        self.ready_since = Some(now);
+        self.cause = None;
+    }
+    fn exited(&mut self, now: Instant, cause: String) {
+        if self
+            .ready_since
+            .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(60))
+        {
+            self.failures = 0;
+        }
+        self.child = false;
+        self.stopping = false;
+        self.ready_since = None;
+        self.cause = Some(cause);
+        let seconds = (1_u64 << self.failures.min(5)).min(30);
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + Duration::from_secs(seconds));
+    }
+    fn stopped(&mut self) {
+        self.child = false;
+        self.stopping = false;
+        self.ready_since = None;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexWork {
+    pub id: ModelRequestId,
+    pub task: IndexTask,
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexTask {
+    Split(Arc<str>),
+    Embed(Arc<str>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexResult {
+    Pieces(Vec<(u32, u32)>),
+    Vector(Vec<f32>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWorkStatus {
+    pub runnable: bool,
+    pub next_retry_at: Option<Instant>,
+    pub awaiting_model: bool,
+}
+
+/// Implemented by the runtime and called by the model supervisor.
+/// Calls handle RAM values only and must not wait for SQL or files.
+pub trait IndexWorkPort: Send + Sync {
+    fn model_ready(&self, model_digest: &str);
+    fn next_work(&self, model_digest: &str) -> Option<IndexWork>;
+    fn finish(
+        &self,
+        id: ModelRequestId,
+        outcome: std::result::Result<IndexResult, crate::EmbeddingError>,
+    );
+    fn status(&self) -> IndexWorkStatus;
+}
+
+/// A RAM-only view of the current model child.
+#[derive(Clone, Debug)]
+pub struct ModelSnapshot {
+    pub state: WorkerState,
+    pub incarnation: Option<String>,
+    pub model_digest: Option<String>,
+    pub cause: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryVector {
+    pub model_digest: String,
+    pub vector: Vec<f32>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryError {
+    Busy,
+    Unavailable(String),
+    Cancelled,
+    Failed(String),
+}
+
+type QueryKey = (QueryOperation, String, [u8; 32]);
+
+#[derive(Clone)]
+enum QueryResult {
+    Vector(QueryVector, bool),
+    Pieces(String, Vec<(u32, u32)>),
+}
+
+struct QueryFlight<R> {
+    key: QueryKey,
+    text: String,
+    waiters: usize,
+    running: bool,
+    result: Option<std::result::Result<R, QueryError>>,
+}
+struct QueryQueue<R> {
+    flights: HashMap<ModelRequestId, QueryFlight<R>>,
+    keys: HashMap<QueryKey, ModelRequestId>,
+    pending: VecDeque<ModelRequestId>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum QueryOperation {
+    Prefix,
+    Split,
+    Embed,
+}
+
+impl<R> Default for QueryQueue<R> {
+    fn default() -> Self {
+        Self {
+            flights: HashMap::new(),
+            keys: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl QueryQueue<QueryVector> {
+    fn submit(
+        &mut self,
+        model: &str,
+        text: &str,
+        ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        self.enqueue(QueryOperation::Embed, model, text, text, ids)
+    }
+
+    fn submit_operation(
+        &mut self,
+        operation: QueryOperation,
+        model: &str,
+        original: &str,
+        text: &str,
+        ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        self.enqueue(operation, model, original, text, ids)
+    }
+}
+
+impl<R> QueryQueue<R> {
+    fn enqueue(
+        &mut self,
+        operation: QueryOperation,
+        model: &str,
+        original_text: &str,
+        text: &str,
+        ids: &ModelRequestIds,
+    ) -> std::result::Result<ModelRequestId, QueryError> {
+        let limit = match operation {
+            QueryOperation::Prefix => crate::PREFIX_INPUT_BYTES,
+            QueryOperation::Split | QueryOperation::Embed => crate::PIECE_INPUT_BYTES,
+        };
+        if text.len() > limit {
+            return Err(QueryError::Busy);
+        }
+        let key = (
+            operation,
+            model.to_string(),
+            Sha256::digest(original_text.as_bytes()).into(),
+        );
+        if let Some(id) = self.keys.get(&key) {
+            let flight = self.flights.get_mut(id).unwrap();
+            flight.waiters += 1;
+            return Ok(*id);
+        }
+        if self.keys.len() >= 64 {
+            return Err(QueryError::Busy);
+        }
+        let id = ids
+            .next()
+            .ok_or_else(|| QueryError::Failed("model request ID exhausted".into()))?;
+        self.flights.insert(
+            id,
+            QueryFlight {
+                key: key.clone(),
+                text: text.into(),
+                waiters: 1,
+                running: false,
+                result: None,
+            },
+        );
+        self.keys.insert(key, id);
+        self.pending.push_back(id);
+        Ok(id)
+    }
+    fn take(&mut self) -> Option<ModelRequestId> {
+        while let Some(id) = self.pending.pop_front() {
+            if let Some(flight) = self.flights.get_mut(&id) {
+                flight.running = true;
+                return Some(id);
+            }
+        }
+        None
+    }
+    fn release(&mut self, id: ModelRequestId) {
+        if let Some(flight) = self.flights.get_mut(&id) {
+            flight.waiters -= 1;
+            if flight.waiters == 0 && (!flight.running || flight.result.is_some()) {
+                self.remove(id);
+            }
+        }
+    }
+    fn remove(&mut self, id: ModelRequestId) {
+        if let Some(flight) = self.flights.remove(&id) {
+            self.keys.remove(&flight.key);
+        }
+        self.pending.retain(|queued| *queued != id);
+    }
+    fn complete(&mut self, id: ModelRequestId, result: std::result::Result<R, QueryError>) {
+        if let Some(flight) = self.flights.get_mut(&id) {
+            if flight.result.is_some() {
+                return;
+            }
+            flight.result = Some(result);
+            if flight.waiters == 0 {
+                self.remove(id);
+            }
+        }
+    }
+    fn fail_all(&mut self, cause: &str) {
+        self.pending.clear();
+        let ids: Vec<_> = self.flights.keys().copied().collect();
+        for id in ids {
+            self.complete(id, Err(QueryError::Unavailable(cause.into())));
+        }
+    }
+}
+fn query_error(error: EmbeddingError) -> QueryError {
+    match error {
+        EmbeddingError::Cancelled => QueryError::Cancelled,
+        EmbeddingError::Loading => QueryError::Unavailable("model loading".into()),
+        EmbeddingError::Unavailable(cause) => QueryError::Unavailable(cause),
+        error => QueryError::Failed(error.to_string()),
+    }
+}
+
+fn validate_query_vector(
+    model_digest: String,
+    vector: Vec<f32>,
+) -> std::result::Result<QueryVector, QueryError> {
+    if vector.len() != crate::DIMENSIONS
+        || vector.iter().any(|x| !x.is_finite())
+        || !vector.iter().any(|x| *x != 0.0)
+    {
+        return Err(QueryError::Failed(
+            "model returned an invalid vector".into(),
+        ));
+    }
+    Ok(QueryVector {
+        model_digest,
+        vector,
+    })
+}
+
+enum RamWork {
+    Query {
+        id: ModelRequestId,
+        operation: QueryOperation,
+        text: String,
+    },
+    Index {
+        id: ModelRequestId,
+        task: IndexTask,
+        origin: IndexOrigin,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct IndexOrigin {
+    incarnation: String,
+    model_digest: String,
+}
+
+struct HeldIndex {
+    work: IndexWork,
+    origin: IndexOrigin,
+}
+
+impl RamWork {
+    fn id(&self) -> ModelRequestId {
+        match self {
+            Self::Query { id, .. } | Self::Index { id, .. } => *id,
+        }
+    }
+}
+struct SupervisorState {
+    snapshot: ModelSnapshot,
+    warm: bool,
+    stop: bool,
+    loading_demand: bool,
+    queries: QueryQueue<QueryResult>,
+    terminated: Option<String>,
+}
+struct SupervisorShared {
+    state: std::sync::Mutex<SupervisorState>,
+    signal: Arc<RamSignal>,
+    changed: std::sync::Condvar,
+    events: mpsc::Sender<Event>,
+    wake_pending: AtomicBool,
+}
+// Wakeups are sent through the RAM supervisor's event channel.
+struct RamSignal {
+    events: mpsc::Sender<Event>,
+}
+impl RamSignal {
+    fn notify(&self) {
+        let _ = self.events.send(Event::Wake);
+    }
+}
+
+/// Owns one model-child process. The host supplies the shared request ID source.
+pub struct ModelSupervisor {
+    shared: Arc<SupervisorShared>,
+    thread: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+    ids: ModelRequestIds,
+    stop_result: Option<std::result::Result<(), String>>,
+}
+impl ModelSupervisor {
+    pub fn start(
+        config: RuntimeConfig,
+        index: Arc<dyn IndexWorkPort>,
+        ids: ModelRequestIds,
+    ) -> Self {
+        let (events, incoming) = mpsc::channel();
+        let shared = Arc::new(SupervisorShared {
+            state: std::sync::Mutex::new(SupervisorState {
+                snapshot: ModelSnapshot {
+                    state: WorkerState::Stopped,
+                    incarnation: None,
+                    model_digest: None,
+                    cause: None,
+                },
+                warm: false,
+                stop: false,
+                loading_demand: false,
+                queries: Default::default(),
+                terminated: None,
+            }),
+            signal: Arc::new(RamSignal {
+                events: events.clone(),
+            }),
+            changed: std::sync::Condvar::new(),
+            events,
+            wake_pending: AtomicBool::new(false),
+        });
+        let worker = shared.clone();
+        let thread = std::thread::spawn(move || {
+            model_supervision_loop(config, index, worker, NativeProcess, Instant::now, incoming)
+        });
+        Self {
+            shared,
+            thread: Some(thread),
+            ids,
+            stop_result: None,
+        }
+    }
+    pub fn snapshot(&self) -> ModelSnapshot {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .snapshot
+            .clone()
+    }
+    pub fn embed_piece(
+        &self,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<QueryVector, QueryError> {
+        self.vector(QueryOperation::Embed, text, text, cancelled)
+            .map(|(vector, _)| vector)
+    }
+
+    pub fn embed_prefix(
+        &self,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(QueryVector, bool), QueryError> {
+        self.vector(QueryOperation::Prefix, original, text, cancelled)
+    }
+
+    pub fn split(
+        &self,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(String, Vec<(u32, u32)>), QueryError> {
+        match self.query(QueryOperation::Split, text, text, cancelled)? {
+            QueryResult::Pieces(model, ranges) => Ok((model, ranges)),
+            _ => Err(QueryError::Failed("expected model piece ranges".into())),
+        }
+    }
+
+    fn vector(
+        &self,
+        operation: QueryOperation,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<(QueryVector, bool), QueryError> {
+        match self.query(operation, original, text, cancelled)? {
+            QueryResult::Vector(vector, truncated) => Ok((vector, truncated)),
+            _ => Err(QueryError::Failed("expected model vector".into())),
+        }
+    }
+
+    fn query(
+        &self,
+        operation: QueryOperation,
+        original: &str,
+        text: &str,
+        cancelled: &AtomicBool,
+    ) -> std::result::Result<QueryResult, QueryError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(reason) = &state.terminated {
+            return Err(QueryError::Unavailable(reason.clone()));
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(QueryError::Cancelled);
+        }
+        if state.snapshot.state != WorkerState::Ready {
+            state.loading_demand = true;
+            let reason = state
+                .snapshot
+                .cause
+                .clone()
+                .unwrap_or_else(|| "model loading".into());
+            drop(state);
+            self.wake();
+            return Err(QueryError::Unavailable(reason));
+        }
+        let digest = state.snapshot.model_digest.clone().unwrap();
+        let id = state
+            .queries
+            .enqueue(operation, &digest, original, text, &self.ids)?;
+        self.wake();
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                state.queries.release(id);
+                drop(state);
+                self.wake();
+                return Err(QueryError::Cancelled);
+            }
+            if let Some(result) = state
+                .queries
+                .flights
+                .get(&id)
+                .and_then(|q| q.result.clone())
+            {
+                state.queries.release(id);
+                drop(state);
+                self.wake();
+                return result;
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+    }
+    pub fn set_warm(&self, warm: bool) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .warm = warm;
+        self.wake();
+    }
+    /// Test-only observation of the currently applied host lease demand.
+    #[doc(hidden)]
+    pub fn is_warm(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .warm
+    }
+    /// Returns query loading demand retained by this supervisor.
+    pub fn has_query_demand(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .loading_demand
+    }
+    /// Retains query demand when the caller could not submit to a supervisor.
+    pub fn request_load(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.snapshot.state == WorkerState::Ready {
+            return;
+        }
+        state.loading_demand = true;
+        drop(state);
+        self.wake();
+    }
+    pub fn wake(&self) {
+        self.shared.signal.notify();
+        if !self.shared.wake_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.shared.events.send(Event::Wake);
+        }
+    }
+    /// Waits for the supervisor thread to stop, returning its reason when it has terminated.
+    pub fn wait_terminated(&self, timeout: Duration) -> Option<String> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.terminated.is_none())
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.terminated.clone()
+    }
+    /// Signals shutdown without waiting for the supervisor thread.
+    pub fn request_stop(&self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stop = true;
+        self.wake();
+    }
+    pub fn stop(&mut self) -> std::result::Result<(), String> {
+        if let Some(result) = &self.stop_result {
+            return result.clone();
+        }
+        self.request_stop();
+        let result = match self.thread.take() {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| "model supervisor thread panicked".to_string())
+                .and_then(|result| result),
+            None => Ok(()),
+        };
+        self.stop_result = Some(result.clone());
+        result
+    }
+}
+impl Drop for ModelSupervisor {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+struct RamChild {
+    child: OwnedChild,
+    incarnation: String,
+    model_digest: Option<String>,
+    secret: String,
+    control: Option<String>,
+    last_control: Instant,
+    input: mpsc::Sender<Input>,
+    running: Option<RamWork>,
+}
+
+struct RamStartError {
+    cause: String,
+    owned: Option<RamChild>,
+}
+fn failed_ram_start(
+    port: &impl WorkerProcessPort,
+    mut child: OwnedChild,
+    incarnation: String,
+    secret: String,
+    now: Instant,
+    cause: String,
+) -> RamStartError {
+    let owned = if port.stop(&mut child).is_err() {
+        let (input, _) = mpsc::channel();
+        Some(RamChild {
+            child,
+            incarnation,
+            model_digest: None,
+            secret,
+            control: None,
+            last_control: now,
+            input,
+            running: None,
+        })
+    } else {
+        None
+    };
+    RamStartError { cause, owned }
+}
+
+fn start_ram_child(
+    port: &impl WorkerProcessPort,
+    config: &RuntimeConfig,
+    events: &mpsc::Sender<Event>,
+    signal: &Arc<RamSignal>,
+    now: Instant,
+    cached: Option<(String, crate::execution::Selection)>,
+) -> std::result::Result<RamChild, RamStartError> {
+    std::fs::create_dir_all(&config.state_dir).map_err(|error| RamStartError {
+        cause: error.to_string(),
+        owned: None,
+    })?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.state_dir.join("model.lock"))
+        .map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?;
+    lock.try_lock_exclusive().map_err(|error| RamStartError {
+        cause: if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            "previous model child still running".into()
+        } else {
+            error.to_string()
+        },
+        owned: None,
+    })?;
+    FileExt::unlock(&lock).map_err(|error| RamStartError {
+        cause: error.to_string(),
+        owned: None,
+    })?;
+    let incarnation = uuid::Uuid::new_v4().to_string();
+    let secret = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut child = OwnedChild(
+        port.spawn(config).map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?,
+        None,
+    );
+    #[cfg(windows)]
+    {
+        child.1 = Some(kill_on_close_job(&child).map_err(|error| RamStartError {
+            cause: error.to_string(),
+            owned: None,
+        })?);
+    }
+    if let Err(error) = port.observe(&child, incarnation.clone(), events.clone(), Arc::new(|| {})) {
+        return Err(failed_ram_start(
+            port,
+            child,
+            incarnation,
+            secret,
+            now,
+            error.to_string(),
+        ));
+    }
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(failed_ram_start(
+            port,
+            child,
+            incarnation,
+            secret,
+            now,
+            "missing model stdin".into(),
+        ));
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err(failed_ram_start(
+            port,
+            child,
+            incarnation,
+            secret,
+            now,
+            "missing model stdout".into(),
+        ));
+    };
+    let launch = Launch {
+        incarnation: incarnation.clone(),
+        parent_pid: std::process::id(),
+        secret: secret.clone(),
+        state: config.state_dir.clone(),
+        assets: config.model.clone(),
+        cached,
+    };
+    let (input, incoming) = mpsc::channel::<Input>();
+    let tx = events.clone();
+    let notify = signal.clone();
+    let inc = incarnation.clone();
+    std::thread::spawn(move || {
+        let write_result = model_child::write(&mut stdin, &launch).and_then(|()| {
+            while let Ok(message) = incoming.recv() {
+                model_child::write(&mut stdin, &message)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = write_result {
+            let _ = tx.send(Event::Pipe(inc, error.to_string()));
+            notify.notify();
+        }
+    });
+    let tx = events.clone();
+    let notify = signal.clone();
+    let inc = incarnation.clone();
+    std::thread::spawn(move || loop {
+        match model_child::read(&mut stdout) {
+            Ok(output) => {
+                if tx.send(Event::Output(inc.clone(), output)).is_err() {
+                    break;
+                }
+                notify.notify();
+            }
+            Err(error) => {
+                let _ = tx.send(Event::Pipe(inc, error.to_string()));
+                notify.notify();
+                break;
+            }
+        }
+    });
+    Ok(RamChild {
+        child,
+        incarnation,
+        model_digest: None,
+        secret,
+        control: None,
+        last_control: now,
+        input,
+        running: None,
+    })
+}
+
+fn model_supervision_loop(
+    config: RuntimeConfig,
+    index: Arc<dyn IndexWorkPort>,
+    shared: Arc<SupervisorShared>,
+    port: impl WorkerProcessPort,
+    clock: impl Fn() -> Instant,
+    incoming: mpsc::Receiver<Event>,
+) -> std::result::Result<(), String> {
+    let owned_index = std::sync::Mutex::new(std::collections::HashSet::new());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model_supervision_run(
+            config,
+            index.clone(),
+            shared.clone(),
+            port,
+            clock,
+            incoming,
+            &owned_index,
+        )
+    }))
+    .unwrap_or_else(|panic| {
+        let detail = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(format!("model supervisor panicked: {detail}"))
+    });
+    let reason = result
+        .as_ref()
+        .err()
+        .cloned()
+        .unwrap_or_else(|| "model supervisor stopped".into());
+    {
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if result.is_err() {
+            state.snapshot.state = WorkerState::Failed;
+            state.snapshot.cause = Some(reason.clone());
+            state.snapshot.incarnation = None;
+            state.snapshot.model_digest = None;
+        }
+        state.queries.fail_all(&reason);
+        shared.changed.notify_all();
+    }
+    let pending: Vec<_> = owned_index
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .collect();
+    for id in pending {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.finish(id, Err(EmbeddingError::Unavailable(reason.clone())))
+        }));
+    }
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    state.terminated = Some(reason);
+    shared.changed.notify_all();
+    result
+}
+
+fn finish_owned_index(
+    index: &dyn IndexWorkPort,
+    owned: &std::sync::Mutex<std::collections::HashSet<ModelRequestId>>,
+    id: ModelRequestId,
+    result: std::result::Result<IndexResult, EmbeddingError>,
+) {
+    let was_owned = owned.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    if was_owned {
+        index.finish(id, result);
+    }
+}
+
+fn return_stale_held(
+    held: &mut Option<HeldIndex>,
+    child: Option<&RamChild>,
+    index: &dyn IndexWorkPort,
+    owned: &std::sync::Mutex<std::collections::HashSet<ModelRequestId>>,
+) {
+    let stale = held
+        .as_ref()
+        .is_some_and(|held| child.is_none_or(|child| child.incarnation != held.origin.incarnation));
+    if stale {
+        let held = held.take().unwrap();
+        finish_owned_index(
+            index,
+            owned,
+            held.work.id,
+            Err(EmbeddingError::Unavailable(
+                "index work model incarnation ended".into(),
+            )),
+        );
+    }
+}
+
+fn model_supervision_run(
+    config: RuntimeConfig,
+    index: Arc<dyn IndexWorkPort>,
+    shared: Arc<SupervisorShared>,
+    port: impl WorkerProcessPort,
+    clock: impl Fn() -> Instant,
+    incoming: mpsc::Receiver<Event>,
+    owned_index: &std::sync::Mutex<std::collections::HashSet<ModelRequestId>>,
+) -> std::result::Result<(), String> {
+    let events = shared.events.clone();
+    let mut lifecycle = ModelLifecycle::default();
+    let mut child: Option<RamChild> = None;
+    let mut held_index: Option<HeldIndex> = None;
+    let mut cleanup_at: Option<Instant> = None;
+    let mut cache: Option<SelectionCache> = None;
+    if config.model.is_some() {
+        let path = config.state_dir.join("model-execution-selection.json");
+        let events = events.clone();
+        let signal = shared.signal.clone();
+        std::thread::spawn(move || {
+            let _ = events.send(Event::CacheReady(SelectionCache::open(path)));
+            signal.notify();
+        });
+    }
+    let mut pending_event = None;
+    // Only the most recently retired incarnation can still refine its failure.
+    let mut retired_incarnation: Option<String> = None;
+    loop {
+        let stopping = {
+            let state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.stop
+        };
+        if stopping {
+            if let Some(mut active) = child.take() {
+                if let Err(error) = port.stop(&mut active.child) {
+                    let cause = format!("model child termination not confirmed: {error}");
+                    if let Some(RamWork::Index { id, .. }) = active.running.take() {
+                        finish_owned_index(
+                            index.as_ref(),
+                            owned_index,
+                            id,
+                            Err(EmbeddingError::Unavailable(cause.clone())),
+                        );
+                    }
+                    let mut state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    state.queries.fail_all(&cause);
+                    state.snapshot.state = WorkerState::Failed;
+                    state.snapshot.cause = Some(cause.clone());
+                    shared.changed.notify_all();
+                    return Err(cause);
+                }
+                if let Some(RamWork::Index { id, .. }) = active.running.take() {
+                    finish_owned_index(
+                        index.as_ref(),
+                        owned_index,
+                        id,
+                        Err(EmbeddingError::Unavailable(
+                            "model supervisor stopped".into(),
+                        )),
+                    );
+                }
+            }
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.queries.fail_all("model supervisor stopped");
+            state.snapshot.state = WorkerState::Stopped;
+            state.snapshot.incarnation = None;
+            state.snapshot.model_digest = None;
+            shared.changed.notify_all();
+            return Ok(());
+        }
+        while let Some(event) = pending_event.take().or_else(|| incoming.try_recv().ok()) {
+            let event = match event {
+                Event::Wake => {
+                    shared.wake_pending.store(false, Ordering::Release);
+                    continue;
+                }
+                Event::CacheReady(loaded) => {
+                    cache = Some(loaded);
+                    continue;
+                }
+                event => event,
+            };
+            let Some(active) = child.as_mut() else {
+                if let Event::Output(incarnation, Output::Unavailable { cause }) = event {
+                    if retired_incarnation.as_deref() == Some(incarnation.as_str()) {
+                        lifecycle.cause = Some(cause.clone());
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.snapshot.cause = Some(cause);
+                        shared.changed.notify_all();
+                        retired_incarnation = None;
+                    }
+                }
+                continue;
+            };
+            let event_inc = match &event {
+                Event::Output(i, _)
+                | Event::Exit(i)
+                | Event::Pipe(i, _)
+                | Event::ControlLost(i, _) => i,
+                Event::Wake | Event::CacheReady(_) => unreachable!(),
+            };
+            if event_inc != &active.incarnation {
+                continue;
+            }
+            match event {
+                Event::Wake | Event::CacheReady(_) => unreachable!(),
+                Event::Output(
+                    _,
+                    Output::Hello {
+                        incarnation,
+                        control,
+                    },
+                ) if incarnation == active.incarnation => {
+                    active.control = Some(control);
+                }
+                Event::Output(_, Output::Ready { model }) => {
+                    lifecycle.ready(clock());
+                    active.model_digest = Some(model.clone());
+                    let mut state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    state.snapshot.state = WorkerState::Ready;
+                    state.snapshot.model_digest = Some(model.clone());
+                    state.snapshot.cause = None;
+                    state.loading_demand = false;
+                    drop(state);
+                    index.model_ready(&model);
+                }
+                Event::Output(
+                    _,
+                    Output::Selection {
+                        fingerprint: Some(fingerprint),
+                        selection,
+                    },
+                ) => {
+                    if let Some(cache) = &cache {
+                        cache.accept(fingerprint, selection);
+                    }
+                }
+                Event::Output(
+                    _,
+                    Output::Pieces {
+                        id,
+                        attempt: 1,
+                        result,
+                    },
+                ) => {
+                    let id = ModelRequestId(id);
+                    match &active.running {
+                        Some(RamWork::Index {
+                            id: running,
+                            task: IndexTask::Split(_),
+                            ..
+                        }) if *running == id => {
+                            active.running.take();
+                            finish_owned_index(
+                                index.as_ref(),
+                                owned_index,
+                                id,
+                                result.map(IndexResult::Pieces),
+                            );
+                            shared.signal.notify();
+                        }
+                        Some(RamWork::Query {
+                            id: running,
+                            operation: QueryOperation::Split,
+                            ..
+                        }) if *running == id => {
+                            active.running.take();
+                            let mut state = shared
+                                .state
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            let model = state.snapshot.model_digest.clone().unwrap_or_default();
+                            state.queries.complete(
+                                id,
+                                result
+                                    .map(|ranges| QueryResult::Pieces(model, ranges))
+                                    .map_err(query_error),
+                            );
+                            shared.changed.notify_all();
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Output(
+                    _,
+                    Output::Result {
+                        id,
+                        attempt: 1,
+                        result,
+                        truncated,
+                    },
+                ) => {
+                    let id = ModelRequestId(id);
+                    if !matches!(&active.running,
+                        Some(RamWork::Query { id: running, operation: QueryOperation::Prefix | QueryOperation::Embed, .. })
+                        | Some(RamWork::Index { id: running, task: IndexTask::Embed(_), .. }) if *running == id)
+                    {
+                        continue;
+                    }
+                    let work = active.running.take().unwrap();
+                    let mut state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    let digest = state.snapshot.model_digest.clone().unwrap_or_default();
+                    if let RamWork::Index { origin, .. } = work {
+                        drop(state);
+                        let result = if origin.incarnation != active.incarnation {
+                            Err(EmbeddingError::Unavailable(
+                                "index work model changed before completion".into(),
+                            ))
+                        } else {
+                            result.and_then(|vector| {
+                                validate_query_vector(origin.model_digest, vector)
+                                    .map(|value| value.vector)
+                                    .map_err(|error| EmbeddingError::Failed(format!("{error:?}")))
+                            })
+                        };
+                        finish_owned_index(
+                            index.as_ref(),
+                            owned_index,
+                            id,
+                            result.map(IndexResult::Vector),
+                        );
+                        shared.signal.notify();
+                        continue;
+                    }
+                    let result = result
+                        .map_err(query_error)
+                        .and_then(|vector| validate_query_vector(digest, vector))
+                        .map(|vector| QueryResult::Vector(vector, truncated));
+                    state.queries.complete(id, result);
+                    shared.changed.notify_all();
+                }
+                Event::ControlLost(_, cause) => {
+                    let reconnected = active.control.as_ref().is_some_and(|address| {
+                        port.control(address, &active.incarnation, &active.secret, false)
+                            .is_ok()
+                    });
+                    if !reconnected {
+                        let _ = events.send(Event::Pipe(active.incarnation.clone(), cause));
+                        shared.signal.notify();
+                    }
+                }
+                Event::Output(_, Output::Unavailable { cause }) | Event::Pipe(_, cause) => {
+                    let mut old = child.take().unwrap();
+                    let failure_at = clock();
+                    let stopped = port.stop(&mut old.child).is_ok();
+                    let stop_finished_at = clock();
+                    if stopped {
+                        retired_incarnation = Some(old.incarnation.clone());
+                        cleanup_at = None;
+                        if let Some(RamWork::Index { id, .. }) = old.running.take() {
+                            finish_owned_index(
+                                index.as_ref(),
+                                owned_index,
+                                id,
+                                Err(EmbeddingError::Unavailable(cause.clone())),
+                            );
+                        }
+                        if lifecycle.stopping {
+                            lifecycle.stopped();
+                        } else {
+                            lifecycle.exited(failure_at, cause.clone());
+                        }
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.queries.fail_all(&cause);
+                        state.loading_demand = false;
+                        state.snapshot.state = WorkerState::Failed;
+                        state.snapshot.cause = Some(cause);
+                        state.snapshot.model_digest = None;
+                        state.snapshot.incarnation = None;
+                        shared.changed.notify_all();
+                    } else {
+                        lifecycle.exited(failure_at, cause.clone());
+                        lifecycle.child = true;
+                        lifecycle.stopping = true;
+                        cleanup_at = Some(stop_finished_at + Duration::from_secs(1));
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.queries.fail_all(&cause);
+                        state.snapshot.state = WorkerState::Failed;
+                        state.snapshot.cause = Some(cause);
+                        state.snapshot.model_digest = None;
+                        shared.changed.notify_all();
+                        child = Some(old);
+                    }
+                }
+                Event::Exit(_) => {
+                    let mut old = child.take().unwrap();
+                    let observed_at = clock();
+                    let exited = old.child.wait().is_ok();
+                    if exited {
+                        retired_incarnation = Some(old.incarnation.clone());
+                        cleanup_at = None;
+                        let cause = "model child exited".to_string();
+                        if let Some(RamWork::Index { id, .. }) = old.running.take() {
+                            finish_owned_index(
+                                index.as_ref(),
+                                owned_index,
+                                id,
+                                Err(EmbeddingError::Unavailable(cause.clone())),
+                            );
+                        }
+                        if lifecycle.stopping {
+                            lifecycle.stopped();
+                        } else {
+                            lifecycle.exited(observed_at, cause.clone());
+                        }
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.queries.fail_all(&cause);
+                        state.loading_demand = false;
+                        state.snapshot.state = WorkerState::Failed;
+                        state.snapshot.cause = Some(cause);
+                        state.snapshot.model_digest = None;
+                        state.snapshot.incarnation = None;
+                        shared.changed.notify_all();
+                    } else {
+                        child = Some(old);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let warm = {
+            let state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if state.stop {
+                continue;
+            }
+            state.warm
+        };
+        if cleanup_at.is_some_and(|at| clock() >= at) {
+            if let Some(mut active) = child.take() {
+                match port.stop(&mut active.child) {
+                    Ok(()) => {
+                        if let Some(RamWork::Index { id, .. }) = active.running.take() {
+                            finish_owned_index(
+                                index.as_ref(),
+                                owned_index,
+                                id,
+                                Err(EmbeddingError::Unavailable(
+                                    "model child stopped after control failure".into(),
+                                )),
+                            );
+                        }
+                        lifecycle.stopped();
+                        cleanup_at = None;
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.snapshot.incarnation = None;
+                        state.snapshot.model_digest = None;
+                        if lifecycle.cause.is_none() {
+                            state.snapshot.state = WorkerState::Stopped;
+                        }
+                    }
+                    Err(_) => {
+                        child = Some(active);
+                        cleanup_at = Some(clock() + Duration::from_secs(1));
+                    }
+                }
+            } else {
+                cleanup_at = None;
+            }
+        }
+        // A work item can only be dispatched by the incarnation and digest that
+        // supplied it, including when termination succeeds on a later stop retry.
+        return_stale_held(&mut held_index, child.as_ref(), index.as_ref(), owned_index);
+        let status = index.status();
+        let now = clock();
+        let query_demand = {
+            let state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.loading_demand
+                || !state.queries.flights.is_empty()
+                || child.as_ref().is_some_and(|c| c.running.is_some())
+        };
+        let demand = warm
+            || query_demand
+            || held_index.is_some()
+            || status.runnable
+            || status.awaiting_model
+            || status.next_retry_at.is_some_and(|at| at <= now);
+        match lifecycle.action(now, demand, cache.is_some()) {
+            LifecycleAction::Start => {
+                let cached = cache.as_ref().and_then(SelectionCache::get);
+                match start_ram_child(&port, &config, &events, &shared.signal, now, cached) {
+                    Ok(mut active) => {
+                        retired_incarnation = None;
+                        active.last_control = clock();
+                        lifecycle.started();
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.snapshot.state = WorkerState::Loading;
+                        state.snapshot.incarnation = Some(active.incarnation.clone());
+                        child = Some(active);
+                    }
+                    Err(error) => {
+                        let cause = error.cause;
+                        let failure_at = clock();
+                        lifecycle.exited(failure_at, cause.clone());
+                        if let Some(owned) = error.owned {
+                            lifecycle.child = true;
+                            lifecycle.stopping = true;
+                            child = Some(owned);
+                            cleanup_at = Some(failure_at + Duration::from_secs(1));
+                        }
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        state.snapshot.state = WorkerState::Failed;
+                        state.snapshot.cause = Some(cause);
+                    }
+                }
+            }
+            LifecycleAction::None => {}
+        }
+        if let Some(active) = child.as_mut() {
+            if active.running.is_none() {
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if state.snapshot.state == WorkerState::Ready {
+                    let digest = state.snapshot.model_digest.clone().unwrap();
+                    if state.queries.pending.is_empty()
+                        && held_index.is_none()
+                        && (status.runnable || status.next_retry_at.is_some_and(|at| at <= now))
+                    {
+                        drop(state);
+                        held_index = index.next_work(&digest).map(|work| HeldIndex {
+                            work,
+                            origin: IndexOrigin {
+                                incarnation: active.incarnation.clone(),
+                                model_digest: digest.clone(),
+                            },
+                        });
+                        if let Some(held) = &held_index {
+                            owned_index
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .insert(held.work.id);
+                        }
+                        state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    if state.stop {
+                        drop(state);
+                        continue;
+                    }
+                    let query = state.queries.take().map(|id| RamWork::Query {
+                        id,
+                        text: state.queries.flights[&id].text.clone(),
+                        operation: state.queries.flights[&id].key.0,
+                    });
+                    let work = query.or_else(|| {
+                        held_index.take().map(|held| RamWork::Index {
+                            id: held.work.id,
+                            task: held.work.task,
+                            origin: held.origin,
+                        })
+                    });
+                    if let Some(work) = work {
+                        let id = work.id().0;
+                        let request = match &work {
+                            RamWork::Index {
+                                task: IndexTask::Split(text),
+                                ..
+                            } => Input::Split {
+                                id,
+                                attempt: 1,
+                                text: text.to_string(),
+                            },
+                            RamWork::Query {
+                                text,
+                                operation: QueryOperation::Split,
+                                ..
+                            } => Input::Split {
+                                id,
+                                attempt: 1,
+                                text: text.clone(),
+                            },
+                            RamWork::Query {
+                                text, operation, ..
+                            } => Input::Embed {
+                                id,
+                                attempt: 1,
+                                text: text.clone(),
+                                overflow: match operation {
+                                    QueryOperation::Prefix => crate::model_child::Overflow::Prefix,
+                                    _ => crate::model_child::Overflow::Reject,
+                                },
+                            },
+                            RamWork::Index {
+                                task: IndexTask::Embed(text),
+                                ..
+                            } => Input::Embed {
+                                id,
+                                attempt: 1,
+                                text: text.to_string(),
+                                overflow: crate::model_child::Overflow::Reject,
+                            },
+                        };
+                        active.running = Some(work);
+                        if active.input.send(request).is_err() {
+                            let _ = events.send(Event::Pipe(
+                                active.incarnation.clone(),
+                                "model input closed".into(),
+                            ));
+                            shared.signal.notify();
+                        }
+                    }
+                }
+            }
+            if now.saturating_duration_since(active.last_control) >= Duration::from_secs(20) {
+                if let Some(address) = &active.control {
+                    if let Err(error) =
+                        port.control(address, &active.incarnation, &active.secret, false)
+                    {
+                        let _ = events.send(Event::ControlLost(
+                            active.incarnation.clone(),
+                            error.to_string(),
+                        ));
+                        shared.signal.notify();
+                    }
+                }
+                active.last_control = clock();
+            }
+        }
+        let mut until = [
+            if demand { lifecycle.retry_at } else { None },
+            status.next_retry_at,
+            cleanup_at,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|at| *at > now)
+        .min();
+        if let Some(active) = &child {
+            let heartbeat = active.last_control + Duration::from_secs(20);
+            until = Some(until.map_or(heartbeat, |at| at.min(heartbeat)));
+        }
+        pending_event = match until {
+            Some(at) => incoming
+                .recv_timeout(at.saturating_duration_since(clock()))
+                .ok(),
+            None => incoming.recv().ok(),
+        };
+    }
+}
 enum Event {
+    Wake,
+    CacheReady(SelectionCache),
     Output(String, Output),
     Exit(String),
     Pipe(String, String),
@@ -30,7 +1510,7 @@ trait WorkerProcessPort {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()>;
     fn stop(&self, child: &mut Child) -> Result<()>;
     fn control(&self, address: &str, inc: &str, secret: &str, stop: bool) -> Result<Option<u64>>;
@@ -55,11 +1535,11 @@ impl WorkerProcessPort for NativeProcess {
         child: &Child,
         inc: String,
         events: mpsc::Sender<Event>,
-        signal: Arc<Signal>,
+        signal: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         observe_exit(child, move || {
             let _ = events.send(Event::Exit(inc));
-            signal.notify();
+            signal();
         })
     }
     fn stop(&self, child: &mut Child) -> Result<()> {
@@ -151,18 +1631,40 @@ fn observe_exit(child: &Child, notify: impl FnOnce() + Send + 'static) -> Result
 fn observe_exit(_: &Child, _: impl FnOnce() + Send + 'static) -> Result<()> {
     Err("native child exit adapter is unavailable on this platform".into())
 }
-struct Active {
-    child: OwnedChild,
-    inc: String,
-    secret: String,
-    control: Option<String>,
-    job: Option<Job>,
-    ready_since: Option<Instant>,
-    last_control: Instant,
-    unavailable: bool,
-    exited: bool,
+#[cfg(windows)]
+type ChildJob = std::os::windows::io::OwnedHandle;
+#[cfg(not(windows))]
+type ChildJob = ();
+struct OwnedChild(Child, Option<ChildJob>);
+#[cfg(windows)]
+fn kill_on_close_job(child: &Child) -> Result<ChildJob> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let job = unsafe { ChildJob::from_raw_handle(raw) };
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            std::mem::size_of_val(&limits) as u32,
+        )
+    } == 0
+        || unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(job)
 }
-struct OwnedChild(Child);
 impl std::ops::Deref for OwnedChild {
     type Target = Child;
     fn deref(&self) -> &Child {
@@ -182,672 +1684,6 @@ impl Drop for OwnedChild {
         }
     }
 }
-impl Drop for Active {
-    fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-enum Slot {
-    Stopped,
-    Active(Active),
-    Waiting(Instant),
-    Blocked(String),
-}
-struct Recovery {
-    streak: i64,
-    config: String,
-}
-fn now() -> i64 {
-    crate::process::now()
-}
-fn diagnostic(b: &Broker, name: &str, cause: &str) -> Result<()> {
-    b.connection.execute("INSERT INTO diagnostics VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",params![name,cause])?;
-    Ok(())
-}
-pub(crate) fn resolve_diagnostic(
-    b: &mut Broker,
-    name: &str,
-    ready_inc: Option<&str>,
-) -> Result<bool> {
-    let tx = b
-        .connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(inc) = ready_inc {
-        let (current, state): (String, String) =
-            tx.query_row("SELECT incarnation,state FROM worker", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-        if current != inc || state != "ready" {
-            return Ok(false);
-        }
-    }
-    let cause: Option<String> = tx
-        .query_row("SELECT cause FROM diagnostics WHERE name=?1", [name], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    let Some(cause) = cause else {
-        return Ok(false);
-    };
-    tx.execute(
-        "INSERT INTO diagnostics(name,cause) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",
-        params![format!("history:{name}"), serde_json::json!({"detail":cause,"resolved_at_ms":now()}).to_string()],
-    )?;
-    tx.execute("DELETE FROM diagnostics WHERE name=?1", [name])?;
-    tx.commit()?;
-    Ok(true)
-}
-fn heartbeat(port: &impl WorkerProcessPort, b: &Broker, active: &mut Active) -> Result<()> {
-    let address = active.control.as_ref().ok_or("model control unavailable")?;
-    let model = port.control(address, &active.inc, &active.secret, false)?;
-    let broker = crate::execution::host_resident_bytes();
-    let total = broker.zip(model).and_then(|(a, b)| a.checked_add(b));
-    active.last_control = Instant::now();
-    // A diagnostic disk error cannot negate an authenticated live-control proof.
-    let _=diagnostic(b,"worker_resources",&serde_json::json!({"incarnation":active.inc,"observed_ms":now(),"broker_resident_bytes":broker,"model_resident_bytes":model,"combined_resident_bytes":total}).to_string());
-    Ok(())
-}
-fn demand(b: &Broker, config: &str) -> Result<bool> {
-    Ok(b.connection.query_row("SELECT EXISTS(SELECT 1 FROM leases WHERE expires>?1) OR EXISTS(SELECT 1 FROM jobs WHERE durable=1 AND model=(SELECT model FROM worker_model_configs WHERE config=?2) AND state IN('queued','running','retry_wait'))",params![now(),config],|r|r.get(0))?)
-}
-fn fingerprint(c: &RuntimeConfig) -> Result<String> {
-    let mut h = Sha256::new();
-    h.update(serde_json::to_vec(&c.model)?);
-    if let Some(a) = &c.model {
-        for p in [&a.onnx_model, &a.tokenizer_json, &a.runtime_library] {
-            match std::fs::metadata(p) {
-                Ok(m) => {
-                    h.update(m.len().to_le_bytes());
-                    h.update(format!("{:?}", m.modified()).as_bytes());
-                }
-                Err(e) => h.update(e.to_string().as_bytes()),
-            }
-        }
-    }
-    Ok(format!("{:x}", h.finalize()))
-}
-fn lose_claims(b: &mut Broker, inc: &str, cause: &str) -> Result<()> {
-    // This transaction touches only C7 claims/waiters/control state, never source/index ACKs.
-    let tx = b
-        .connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute("INSERT OR IGNORE INTO waiter_failures(job,lease,cause) SELECT w.job,w.lease,?1 FROM waiters w JOIN jobs j ON j.id=w.job WHERE j.state IN('queued','running','retry_wait')",[cause])?;
-    tx.execute("UPDATE jobs SET state='failed',error=?1,payload='' WHERE durable=0 AND state IN('queued','running','retry_wait')",[cause])?;
-    tx.execute("UPDATE jobs SET state='retry_wait',next_attempt=?1,incarnation=NULL,error=?2 WHERE durable=1 AND state='running' AND incarnation=?3",params![now(),cause,inc])?;
-    tx.execute(
-        "UPDATE worker SET state='failed' WHERE incarnation=?1",
-        [inc],
-    )?;
-    tx.commit()?;
-    diagnostic(b, "worker_supervision", cause)
-}
-impl Recovery {
-    fn load(b: &Broker, config: String) -> Result<(Self, Slot)> {
-        let row: Option<(i64, i64, Option<String>)> = b
-            .connection
-            .query_row(
-                "SELECT streak,next_at,blocked FROM worker_recovery WHERE config=?1",
-                [&config],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let (streak, next, blocked) = row.unwrap_or((0, 0, None));
-        let slot = if let Some(f) = blocked {
-            Slot::Blocked(f)
-        } else {
-            Slot::Waiting(
-                Instant::now()
-                    + Duration::from_millis(next.saturating_sub(now()).clamp(0, 300000) as u64),
-            )
-        };
-        Ok((Self { streak, config }, slot))
-    }
-    fn save(&self, b: &Broker, next: i64, blocked: Option<&str>) -> Result<()> {
-        b.connection.execute("INSERT INTO worker_recovery VALUES(?1,?2,?3,?4) ON CONFLICT(config) DO UPDATE SET streak=excluded.streak,next_at=excluded.next_at,blocked=excluded.blocked",params![self.config,self.streak,next,blocked])?;
-        Ok(())
-    }
-    fn failed(&mut self, b: &Broker) -> Result<Slot> {
-        self.streak = self
-            .streak
-            .checked_add(1)
-            .ok_or("worker failure counter overflow")?;
-        let delay = match self.streak {
-            1 => 1000,
-            2 => 2000,
-            _ => 300000,
-        };
-        self.save(
-            b,
-            now()
-                .checked_add(delay)
-                .ok_or("worker retry timestamp overflow")?,
-            None,
-        )?;
-        Ok(Slot::Waiting(
-            Instant::now() + Duration::from_millis(delay as u64),
-        ))
-    }
-}
-fn start(
-    port: &impl WorkerProcessPort,
-    b: &mut Broker,
-    c: &RuntimeConfig,
-    events: &mpsc::Sender<Event>,
-    signal: &Arc<Signal>,
-) -> Result<Active> {
-    let handle = b.reserve_worker_start(MODEL_ID, now())?;
-    if !handle.should_start {
-        return Err("supervisor start reservation already owned".into());
-    }
-    let inc = handle.incarnation;
-    let secret = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let cached = b
-        .connection
-        .query_row(
-            "SELECT fingerprint,report FROM execution_selection ORDER BY rowid DESC LIMIT 1",
-            [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()?
-        .and_then(|(f, j)| serde_json::from_str(&j).ok().map(|v| (f, v)));
-    let mut child = OwnedChild(port.spawn(c)?);
-    b.connection.execute("INSERT INTO diagnostics VALUES('worker_process',?1) ON CONFLICT(name) DO UPDATE SET cause=excluded.cause",[serde_json::json!({"pid":child.id(),"incarnation":inc}).to_string()])?;
-    if let Err(e) = port.observe(&child, inc.clone(), events.clone(), signal.clone()) {
-        let _ = port.stop(&mut child);
-        return Err(e);
-    }
-    let launch = Launch {
-        incarnation: inc.clone(),
-        secret: secret.clone(),
-        state: c.state_dir.clone(),
-        assets: c.model.clone(),
-        cached,
-    };
-    if let Err(e) = model_child::write(child.stdin.as_mut().ok_or("missing child input")?, &launch)
-    {
-        let _ = port.stop(&mut child);
-        return Err(e);
-    }
-    let mut output = child.stdout.take().ok_or("missing child output")?;
-    let events = events.clone();
-    let signal = signal.clone();
-    let observed = inc.clone();
-    std::thread::spawn(move || loop {
-        match model_child::read::<Output>(&mut output) {
-            Ok(message) => {
-                if events
-                    .send(Event::Output(observed.clone(), message))
-                    .is_err()
-                {
-                    break;
-                }
-                signal.notify();
-            }
-            Err(e) => {
-                let _ = events.send(Event::Pipe(observed, e.to_string()));
-                signal.notify();
-                break;
-            }
-        }
-    });
-    b.transition(&inc, WorkerState::Loading, now())?;
-    Ok(Active {
-        child,
-        inc,
-        secret,
-        control: None,
-        job: None,
-        ready_since: None,
-        last_control: Instant::now(),
-        unavailable: false,
-        exited: false,
-    })
-}
-/// Read-only doctor snapshot. Never attaches, launches, mutates schema, or exposes credentials/payloads.
-pub fn inspect_runtime(state: &std::path::Path) -> Result<serde_json::Value> {
-    let path = state.join("broker.sqlite");
-    if !path.exists() {
-        return Ok(serde_json::json!({"present":false}));
-    }
-    let db =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    db.busy_timeout(Duration::from_secs(2))?;
-    db.execute_batch("BEGIN")?;
-    let has = |table: &str| -> rusqlite::Result<bool> {
-        db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-            [table],
-            |r| r.get(0),
-        )
-    };
-    let mut result = serde_json::json!({"present":true});
-    if has("worker")? {
-        result["worker"]=db.query_row("SELECT incarnation,state,model,heartbeat FROM worker",[],|r|Ok(serde_json::json!({"incarnation":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"broker_heartbeat_ms":r.get::<_,i64>(3)?})))?;
-    }
-    if has("worker_recovery")? {
-        let mut s=db.prepare("SELECT config,streak,next_at,blocked FROM worker_recovery ORDER BY next_at DESC LIMIT 64")?;
-        result["recovery"]=s.query_map([],|r|Ok(serde_json::json!({"configuration":r.get::<_,String>(0)?,"failure_streak":r.get::<_,i64>(1)?,"next_restart_ms":r.get::<_,i64>(2)?,"startup_blocked":r.get::<_,Option<String>>(3)?.is_some()})))?.collect::<rusqlite::Result<Vec<_>>>()?.into();
-    }
-    if has("jobs")? {
-        let mut s = db.prepare("SELECT state,durable,COUNT(*) FROM jobs GROUP BY state,durable")?;
-        result["queue"]=s.query_map([],|r|Ok(serde_json::json!({"state":r.get::<_,String>(0)?,"durable":r.get::<_,bool>(1)?,"count":r.get::<_,i64>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?.into();
-    }
-    if has("diagnostics")? {
-        let mut s=db.prepare("SELECT name,cause FROM diagnostics WHERE name IN('worker_supervision','worker_recovery_state','worker_process','worker_resources','model_load','supervisor_fatal','execution_selection','index_background','index_background_status') OR name LIKE 'vector_index:%' ORDER BY name LIMIT 128")?;
-        result["diagnostics"] = s
-            .query_map([], |r| {
-                Ok(serde_json::json!({"name":r.get::<_,String>(0)?,"detail":r.get::<_,String>(1)?}))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into();
-        let mut history=db.prepare("SELECT name,cause FROM diagnostics WHERE name LIKE 'history:%' ORDER BY name LIMIT 128")?;
-        result["diagnostic_history"] = history
-            .query_map([], |r| {
-                let name: String = r.get(0)?;
-                let saved: String = r.get(1)?;
-                let value: serde_json::Value = serde_json::from_str(&saved).unwrap_or_else(|_| serde_json::json!({"detail":saved}));
-                Ok(serde_json::json!({"name":name.trim_start_matches("history:"),"detail":value["detail"],"resolved_at_ms":value["resolved_at_ms"]}))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into();
-    }
-    if has("generation_ack")? {
-        let mut s=db.prepare("SELECT repository,channel,epoch,sequence,index_commit_id FROM generation_ack ORDER BY repository,channel LIMIT 128")?;
-        result["generation_ack_first_128"]=s.query_map([],|r|Ok(serde_json::json!({"repository":r.get::<_,String>(0)?,"channel":r.get::<_,String>(1)?,"epoch":r.get::<_,String>(2)?,"sequence":r.get::<_,i64>(3)?,"commit":r.get::<_,i64>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?.into();
-    }
-    db.execute_batch("ROLLBACK")?;
-    Ok(result)
-}
-pub(crate) fn run(c: RuntimeConfig, stop: Arc<AtomicBool>, signal: Arc<Signal>) -> Result<()> {
-    run_with_port(c, stop, signal, NativeProcess)
-}
-fn initialize(b: &Broker) -> Result<()> {
-    b.connection.execute_batch("CREATE TABLE IF NOT EXISTS diagnostics(name TEXT PRIMARY KEY,cause TEXT NOT NULL);CREATE TABLE IF NOT EXISTS execution_selection(fingerprint TEXT PRIMARY KEY,report TEXT NOT NULL);")?;
-    b.connection.execute_batch("CREATE TABLE IF NOT EXISTS worker_recovery(config TEXT PRIMARY KEY,streak INTEGER NOT NULL,next_at INTEGER NOT NULL,blocked TEXT);CREATE TABLE IF NOT EXISTS worker_model_configs(config TEXT PRIMARY KEY,model TEXT NOT NULL);CREATE TABLE IF NOT EXISTS waiter_failures(job INTEGER NOT NULL,lease TEXT NOT NULL,cause TEXT NOT NULL,PRIMARY KEY(job,lease));")?;
-    Ok(())
-}
-// A private OS-boundary seam: tests still execute the production supervisor,
-// native child, SQLite journal and IPC. No test command or MCP action is exposed.
-fn run_with_port(
-    c: RuntimeConfig,
-    stop: Arc<AtomicBool>,
-    signal: Arc<Signal>,
-    port: impl WorkerProcessPort,
-) -> Result<()> {
-    let mut b = Broker::open(c.state_dir.join("broker.sqlite"), 64)?;
-    initialize(&b)?;
-    let old: String = b
-        .connection
-        .query_row("SELECT incarnation FROM worker", [], |r| r.get(0))?;
-    lose_claims(
-        &mut b,
-        &old,
-        "previous broker ownership ended; unfinished model claims recovered",
-    )?;
-    let config = format!("{:x}", Sha256::digest(serde_json::to_vec(&c.model)?));
-    let (mut recovery, mut slot) = Recovery::load(&b, config)?;
-    let (tx, rx) = mpsc::channel();
-    loop {
-        let observed = signal.version();
-        if stop.load(Ordering::Relaxed) {
-            if let Slot::Active(mut active) = slot {
-                b.connection.execute(
-                    "UPDATE worker SET state='stopping' WHERE incarnation=?1",
-                    [&active.inc],
-                )?;
-                if let Some(address) = &active.control {
-                    let _ = port.control(address, &active.inc, &active.secret, true);
-                }
-                port.stop(&mut active.child)?;
-            }
-            b.connection
-                .execute("UPDATE worker SET state='stopped'", [])?;
-            return Ok(());
-        }
-        for event in rx.try_iter() {
-            let Slot::Active(active) = &mut slot else {
-                continue;
-            };
-            let inc = match &event {
-                Event::Output(i, _)
-                | Event::Exit(i)
-                | Event::Pipe(i, _)
-                | Event::ControlLost(i, _) => i,
-            };
-            if inc != &active.inc {
-                continue;
-            }
-            match event {
-                Event::Output(
-                    _,
-                    Output::Hello {
-                        incarnation,
-                        control,
-                    },
-                ) => {
-                    if incarnation != active.inc {
-                        let _ = tx.send(Event::Pipe(
-                            active.inc.clone(),
-                            "model handshake incarnation mismatch".into(),
-                        ));
-                        signal.notify();
-                        continue;
-                    }
-                    active.control = Some(control);
-                    if let Err(error) = heartbeat(&port, &b, active) {
-                        let _ = tx.send(Event::Pipe(active.inc.clone(), error.to_string()));
-                        signal.notify();
-                        continue;
-                    }
-                }
-                Event::Output(_, Output::Ready { model }) => {
-                    b.connection.execute("INSERT INTO worker_model_configs VALUES(?1,?2) ON CONFLICT(config) DO UPDATE SET model=excluded.model",params![recovery.config,model])?;
-                    b.connection.execute(
-                        "UPDATE worker SET model=?1 WHERE incarnation=?2",
-                        params![model, active.inc],
-                    )?;
-                    b.transition(&active.inc, WorkerState::Ready, now())?;
-                    active.ready_since = Some(Instant::now());
-                    match heartbeat(&port, &b, active) {
-                        Ok(()) => {
-                            let moved = !active.unavailable
-                                && !active.exited
-                                && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?;
-                            diagnostic(
-                                &b,
-                                "worker_recovery_state",
-                                if moved {
-                                    "READY; previous model failure moved to diagnostic_history"
-                                } else {
-                                    "READY"
-                                },
-                            )?;
-                        }
-                        Err(error) => {
-                            let _ =
-                                tx.send(Event::ControlLost(active.inc.clone(), error.to_string()));
-                            diagnostic(
-                                &b,
-                                "worker_recovery_state",
-                                "READY; control verification pending",
-                            )?;
-                        }
-                    }
-                    signal.notify();
-                }
-                Event::Output(_, Output::Unavailable { cause }) => {
-                    active.unavailable = true;
-                    diagnostic(&b, "model_load", &cause)?;
-                    lose_claims(&mut b, &active.inc, &cause)?;
-                    let assets = fingerprint(&c)?;
-                    recovery.save(&b, 0, Some(&assets))?;
-                    signal.notify();
-                }
-                Event::Output(
-                    _,
-                    Output::Selection {
-                        fingerprint,
-                        selection,
-                    },
-                ) => {
-                    diagnostic(
-                        &b,
-                        "execution_selection",
-                        &serde_json::to_string(&selection)?,
-                    )?;
-                    if let Some(key) = fingerprint.filter(|_| selection.cacheable) {
-                        b.connection.execute("INSERT INTO execution_selection VALUES(?1,?2) ON CONFLICT(fingerprint) DO UPDATE SET report=excluded.report",params![key,serde_json::to_string(&selection)?])?;
-                    }
-                }
-                Event::Output(
-                    _,
-                    Output::Result {
-                        id,
-                        attempt,
-                        result,
-                    },
-                ) => {
-                    let Some(job) = active
-                        .job
-                        .as_ref()
-                        .filter(|j| j.id == id && j.attempts == attempt)
-                    else {
-                        continue;
-                    };
-                    match result {
-                        Ok(vector) => match b.complete(job, &vector) {
-                            Ok(()) => {
-                                b.connection.execute("UPDATE jobs SET state='acknowledged',payload='' WHERE id=?1 AND durable=0",[id])?;
-                            }
-                            Err(crate::Error::InvalidState) => {
-                                b.fail(job, "model returned invalid result", false, now())?
-                            }
-                            Err(crate::Error::ObsoleteIncarnation) => {}
-                            Err(error) => return Err(error.into()),
-                        },
-                        Err(e) => b.fail(
-                            job,
-                            &e.to_string(),
-                            matches!(e, EmbeddingError::Retryable(_)) && job.attempts < 8,
-                            now(),
-                        )?,
-                    }
-                    active.job = None;
-                    signal.notify();
-                }
-                Event::ControlLost(_, cause) => {
-                    if heartbeat(&port, &b, active).is_ok() {
-                        if !active.unavailable
-                            && !active.exited
-                            && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?
-                        {
-                            diagnostic(
-                                &b,
-                                "worker_recovery_state",
-                                "READY; previous model failure moved to diagnostic_history",
-                            )?;
-                        }
-                        continue;
-                    }
-                    let _ = tx.send(Event::Pipe(active.inc.clone(), cause));
-                    signal.notify();
-                }
-                Event::Exit(_) => {
-                    active.exited = true; /* Drain ordered stdout results/diagnostics before handling its EOF. */
-                }
-                Event::Pipe(_, _) => {
-                    let Slot::Active(mut ended) = std::mem::replace(&mut slot, Slot::Stopped)
-                    else {
-                        unreachable!()
-                    };
-                    let cause = match event {
-                        Event::Pipe(_, cause) => format!("model IPC ended: {cause}"),
-                        _ => unreachable!(),
-                    };
-                    // EOF alone is not proof of death. The exact owned handle is checked,
-                    // authenticated control is retried, then owned stop+wait must succeed.
-                    if ended.child.try_wait()?.is_none() {
-                        if let Some(address) = &ended.control {
-                            let _ = port.control(address, &ended.inc, &ended.secret, false);
-                            let _ = port.control(address, &ended.inc, &ended.secret, true);
-                        }
-                        port.stop(&mut ended.child)?;
-                    } else {
-                        ended.child.wait()?;
-                    }
-                    if ended.unavailable {
-                        slot = Slot::Blocked(fingerprint(&c)?);
-                    } else {
-                        lose_claims(&mut b, &ended.inc, &cause)?;
-                        slot = recovery.failed(&b)?;
-                    }
-                    signal.notify();
-                }
-            }
-        }
-        if matches!(slot, Slot::Active(_))
-            && b.idle_shutdown_due(now(), 600000)?
-            && !demand(&b, &recovery.config)?
-        {
-            let Slot::Active(mut idle) = std::mem::replace(&mut slot, Slot::Stopped) else {
-                unreachable!()
-            };
-            b.connection.execute(
-                "UPDATE worker SET state='stopping' WHERE incarnation=?1",
-                [&idle.inc],
-            )?;
-            if let Some(address) = &idle.control {
-                let _ = port.control(address, &idle.inc, &idle.secret, true);
-            }
-            port.stop(&mut idle.child)?; // No reservation until exact owned termination completes.
-            b.connection.execute(
-                "UPDATE worker SET state='stopped' WHERE incarnation=?1",
-                [&idle.inc],
-            )?;
-            diagnostic(
-                &b,
-                "worker_recovery_state",
-                "STOPPED after idle grace; broker remains available",
-            )?;
-            signal.notify();
-        }
-        match &mut slot {
-            Slot::Active(active) => {
-                if !active.exited && active.last_control.elapsed() >= Duration::from_secs(10) {
-                    if active.control.is_some() {
-                        if let Err(error) = heartbeat(&port, &b, active) {
-                            let _ = tx.send(Event::ControlLost(
-                                active.inc.clone(),
-                                format!("control reconnect failed: {error}"),
-                            ));
-                            signal.notify();
-                        } else if !active.unavailable
-                            && !active.exited
-                            && resolve_diagnostic(&mut b, "model_load", Some(&active.inc))?
-                        {
-                            diagnostic(
-                                &b,
-                                "worker_recovery_state",
-                                "READY; previous model failure moved to diagnostic_history",
-                            )?;
-                        }
-                    }
-                }
-                if active
-                    .ready_since
-                    .is_some_and(|since| since.elapsed() >= Duration::from_secs(60))
-                    && recovery.streak != 0
-                    && active.last_control.elapsed() < Duration::from_secs(10)
-                {
-                    recovery.streak = 0;
-                    recovery.save(&b, 0, None)?;
-                }
-                if active.ready_since.is_some()
-                    && active.job.is_none()
-                    && !active.unavailable
-                    && !active.exited
-                {
-                    if let Some(job) = b.claim(&active.inc, now())? {
-                        let bytes = match model_child::encode(&Input::Embed {
-                            id: job.id,
-                            attempt: job.attempts,
-                            text: job.payload.clone(),
-                        }) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                b.fail(
-                                    &job,
-                                    &format!("job serialization rejected: {error}"),
-                                    false,
-                                    now(),
-                                )?;
-                                signal.notify();
-                                continue;
-                            }
-                        };
-                        let input = active.child.stdin.as_mut().ok_or("child input closed")?;
-                        let result = input.write_all(&bytes).and_then(|_| input.flush());
-                        active.job = Some(job);
-                        if let Err(error) = result {
-                            let _ = tx.send(Event::Pipe(active.inc.clone(), error.to_string()));
-                            signal.notify();
-                        }
-                    }
-                }
-            }
-            Slot::Blocked(assets) => {
-                if fingerprint(&c)? != *assets {
-                    recovery.save(&b, 0, None)?;
-                    slot = Slot::Waiting(Instant::now());
-                }
-            }
-            Slot::Stopped => {
-                if demand(&b, &recovery.config)? {
-                    slot = Slot::Waiting(Instant::now());
-                }
-            }
-            Slot::Waiting(until) => {
-                if Instant::now() >= *until && demand(&b, &recovery.config)? {
-                    let lock = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(c.state_dir.join("model.lock"))?;
-                    if lock.try_lock_exclusive().is_ok() {
-                        FileExt::unlock(&lock)?;
-                        match start(&port, &mut b, &c, &tx, &signal) {
-                            Ok(active) => slot = Slot::Active(active),
-                            Err(error) => {
-                                diagnostic(&b, "model_load", &error.to_string())?;
-                                b.connection
-                                    .execute("UPDATE worker SET state='failed'", [])?;
-                                slot = recovery.failed(&b)?;
-                            }
-                        }
-                    } else {
-                        diagnostic(&b,"worker_supervision","incumbent model lock remains live; spawn withheld until owned orphan exits")?;
-                        *until = Instant::now() + Duration::from_secs(5);
-                    }
-                }
-            }
-        }
-        // Work/control/retry clocks wake the same state owner; process exit itself uses an OS wait.
-        let mut wait = Duration::from_secs(10);
-        if let Slot::Waiting(until) = &slot {
-            if demand(&b, &recovery.config)? {
-                wait = wait.min(until.saturating_duration_since(Instant::now()));
-            }
-        }
-        if let Slot::Active(active) = &slot {
-            if active.control.is_some() && !active.exited {
-                wait =
-                    wait.min(Duration::from_secs(10).saturating_sub(active.last_control.elapsed()));
-            }
-            if active.job.is_none() && active.ready_since.is_some() {
-                let next:Option<i64>=b.connection.query_row("SELECT MIN(next_attempt) FROM jobs WHERE state='retry_wait' AND model=(SELECT model FROM worker)",[],|r|r.get(0))?;
-                if let Some(next) = next {
-                    wait = wait.min(Duration::from_millis(
-                        next.saturating_sub(now()).max(1) as u64
-                    ));
-                }
-            }
-        }
-        signal.wait(observed, wait.max(Duration::from_millis(1)));
-    }
-}
-
 #[cfg(test)]
-#[path = "supervisor_tests.rs"]
-mod tests;
-
-#[cfg(all(test, windows))]
-#[path = "supervisor_native_tests.rs"]
+#[path = "supervisor/tests/mod.rs"]
 mod native_tests;

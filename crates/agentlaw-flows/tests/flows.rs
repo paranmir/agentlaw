@@ -687,7 +687,10 @@ fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
         .filter_map(|p| p.source_memory_id.as_deref())
         .collect();
     assert_eq!(sources, [B, C]);
-    assert!(c.retrieval_paths.iter().any(|p| p.via == ["active_task"]));
+    assert!(c
+        .retrieval_paths
+        .iter()
+        .any(|p| p.via == ["active_task", "active_working_set"]));
     assert!(c
         .retrieval_paths
         .iter()

@@ -41,6 +41,12 @@ pub struct PublishedReader<'a> {
 pub struct OwnedPublishedReader {
     pub(super) store: Store,
 }
+/// A clean source position protected by a shared source gate.
+pub struct SourceReadGuard<'a> {
+    pub(crate) store: &'a Store,
+    pub(crate) _gate: fs::File,
+    pub(crate) position: SourcePosition,
+}
 impl Clone for OwnedPublishedReader {
     fn clone(&self) -> Self {
         Self {
@@ -53,8 +59,52 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
-    /// Bounded ledger page without loading any current body. Exact acquisitions may
-    /// be newer than this position; consumers replay subsequent pages before ack.
+    /// Construct an isolated import review using the binding's coordinated source.
+    pub fn prepare_import_union(
+        &self,
+        incoming: &Store,
+        root: &std::path::Path,
+        local: &std::path::Path,
+    ) -> Result<Store> {
+        self.store.prepare_import_union(incoming, root, local)
+    }
+    /// Validate a staged review against this binding's current source position.
+    pub fn validate_imported_source(&self, staged: &Store, expected_generation: u64) -> Result<()> {
+        self.store
+            .validate_imported_source(staged, expected_generation)
+    }
+    pub fn with_source_read<T>(
+        &self,
+        read: impl FnOnce(&std::path::Path, u64) -> Result<T>,
+    ) -> Result<T> {
+        self.store.with_source_read(read)
+    }
+    pub fn visit_history_closure(
+        &self,
+        entity_id: &str,
+        visit: impl FnMut(crate::history_spool::SpoolChange) -> Result<()>,
+    ) -> Result<u64> {
+        self.store.visit_history_closure(entity_id, visit)
+    }
+    pub fn visit_current(&self, visit: impl FnMut(CurrentUnit) -> Result<()>) -> Result<u64> {
+        self.store.visit_current(visit)
+    }
+    pub fn acquire_history(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::history_spool::AcquiredHistory> {
+        self.read_snapshot()?.acquire_history(cancel)
+    }
+    pub fn read_snapshot(&self) -> Result<SourceReadGuard<'_>> {
+        let gate = self.store.lock_shared()?;
+        let sequence = self.store.ensure_clean()?;
+        let epoch = self.store.load(&self.store.local.join("source-epoch"))?;
+        Ok(SourceReadGuard {
+            store: &self.store,
+            _gate: gate,
+            position: SourcePosition { epoch, sequence },
+        })
+    }
     pub fn read_published_paths(
         &self,
         after: &SourcePosition,
@@ -63,10 +113,39 @@ impl OwnedPublishedReader {
         if limit == 0 || limit > 1024 {
             return Err(Error::Capacity);
         }
-        let s = &self.store;
-        let _gate = s.lock()?;
-        let generation = s.ensure_clean()?;
-        let epoch: String = s.load(&s.local.join("source-epoch"))?;
+        self.read_snapshot()?.read_published_paths(after, limit)
+    }
+    // These legacy acquisition paths read the epoch before checking the fence.
+    fn read_snapshot_epoch_first(&self) -> Result<SourceReadGuard<'_>> {
+        let gate = self.store.lock_shared()?;
+        let epoch = self.store.load(&self.store.local.join("source-epoch"))?;
+        let sequence = self.store.ensure_clean()?;
+        Ok(SourceReadGuard {
+            store: &self.store,
+            _gate: gate,
+            position: SourcePosition { epoch, sequence },
+        })
+    }
+}
+impl SourceReadGuard<'_> {
+    pub fn position(&self) -> &SourcePosition {
+        &self.position
+    }
+    pub fn validate_read_set(&self, read_set: &crate::ReadSet) -> Result<()> {
+        self.store.validate_read_set_locked(read_set)
+    }
+    /// A bounded ledger page at this guard's pinned source position.
+    pub fn read_published_paths(
+        &self,
+        after: &SourcePosition,
+        limit: u32,
+    ) -> Result<PublishedPaths> {
+        if limit == 0 || limit > 1024 {
+            return Err(Error::Capacity);
+        }
+        let s = self.store;
+        let generation = self.position.sequence;
+        let epoch = self.position.epoch.clone();
         if epoch != after.epoch || after.sequence > generation {
             return Err(Error::CoverageLost);
         }
@@ -76,7 +155,7 @@ impl OwnedPublishedReader {
             .min(generation);
         let mut paths = std::collections::BTreeSet::new();
         if through > after.sequence {
-            let conn = rusqlite::Connection::open_with_flags(
+            let conn = agentlaw_sqlite::open_with_flags(
                 s.local.join("journal.sqlite"),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
@@ -113,10 +192,12 @@ impl OwnedPublishedReader {
         })
     }
     pub fn acquire_current(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store.acquire_current(id)
+        self.store
+            .acquire_kind_locked(id, "memory", self.position.clone())
     }
     pub fn acquire_procedure(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store.acquire_procedure(id)
+        self.store
+            .acquire_kind_locked(id, "procedure", self.position.clone())
     }
     pub fn acquire_closure(
         &self,
@@ -126,13 +207,73 @@ impl OwnedPublishedReader {
         Vec<crate::acquire::AcquiredResolvedCurrent>,
         Vec<String>,
     )> {
-        self.store.acquire_closure(ids)
+        self.store
+            .acquire_closure_locked(ids, self.position.clone())
     }
     pub fn read_current(&self, id: &str) -> Result<CurrentUnit> {
-        self.store.read_current(id)
+        self.store.read_kind(id, "memory")
     }
     pub fn read_procedure(&self, id: &str) -> Result<CurrentUnit> {
-        self.store.read_procedure(id)
+        self.store.read_kind(id, "procedure")
+    }
+    /// Read an owned current unit without duplicating its bodies during decoding.
+    /// Reject before allocating a body when their cumulative size exceeds the budget.
+    pub fn read_current_compact(
+        &self,
+        id: &str,
+        procedure: bool,
+        body_budget: u64,
+    ) -> Result<CurrentUnit> {
+        crate::validate_id(id)?;
+        let kind = if procedure { "procedure" } else { "memory" };
+        let path = self
+            .store
+            .safe_path(&format!("current/{kind}/{}/{}.md", &id[..2], id))?;
+        if !path.exists() {
+            return Err(Error::NotFound(id.into()));
+        }
+        let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+        let unit = crate::codec::read_current_owned(&mut reader, body_budget)?;
+        if unit.entity_id != id {
+            return Err(Error::Corrupt("filename identity".into()));
+        }
+        Ok(unit)
+    }
+    pub fn read_catalog(&self, id: &str) -> Result<serde_json::Value> {
+        self.store.read_catalog_locked(id)
+    }
+    pub fn list_catalog(&self) -> Result<Vec<serde_json::Value>> {
+        self.store.list_catalog_locked()
+    }
+    pub fn read_closure(
+        &self,
+        ids: &[String],
+    ) -> Result<(SourcePosition, Vec<crate::ResolvedCurrent>, Vec<String>)> {
+        self.store.read_closure_locked(ids, self.position.clone())
+    }
+}
+impl OwnedPublishedReader {
+    pub fn acquire_current(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
+        self.read_snapshot_epoch_first()?.acquire_current(id)
+    }
+    pub fn acquire_procedure(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
+        self.read_snapshot_epoch_first()?.acquire_procedure(id)
+    }
+    pub fn acquire_closure(
+        &self,
+        ids: &[String],
+    ) -> Result<(
+        SourcePosition,
+        Vec<crate::acquire::AcquiredResolvedCurrent>,
+        Vec<String>,
+    )> {
+        self.read_snapshot_epoch_first()?.acquire_closure(ids)
+    }
+    pub fn read_current(&self, id: &str) -> Result<CurrentUnit> {
+        self.read_snapshot()?.read_current(id)
+    }
+    pub fn read_procedure(&self, id: &str) -> Result<CurrentUnit> {
+        self.read_snapshot()?.read_procedure(id)
     }
     /// Cursor is `memory/<uuid>` or `procedure/<uuid>`. Filename discovery does not
     /// retain a source gate across consumer work; replay the ledger from the first page's position.
@@ -205,7 +346,14 @@ impl OwnedPublishedReader {
         &self,
         ids: &[String],
     ) -> Result<(SourcePosition, Vec<crate::ResolvedCurrent>, Vec<String>)> {
-        self.store.read_closure(ids)
+        self.read_snapshot_epoch_first()?.read_closure(ids)
+    }
+    pub fn read_catalog(&self, id: &str) -> Result<serde_json::Value> {
+        crate::validate_id(id)?;
+        self.read_snapshot()?.read_catalog(id)
+    }
+    pub fn list_catalog(&self) -> Result<Vec<serde_json::Value>> {
+        self.read_snapshot()?.list_catalog()
     }
 }
 impl PublishedChangeSource for OwnedPublishedReader {
@@ -265,7 +413,7 @@ impl PublishedChangeSource for PublishedReader<'_> {
                 changes: vec![],
             });
         }
-        let conn = rusqlite::Connection::open_with_flags(
+        let conn = agentlaw_sqlite::open_with_flags(
             s.local.join("journal.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )

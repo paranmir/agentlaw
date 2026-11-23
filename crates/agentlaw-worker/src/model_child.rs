@@ -1,4 +1,5 @@
 //! Private model execution boundary. This process never publishes source or index data.
+pub(crate) use crate::util::Result;
 use crate::{EmbeddingError, EmbeddingProvider, ModelAssets, OnnxProvider};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -9,10 +10,10 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
-pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Launch {
     pub incarnation: String,
+    pub parent_pid: u32,
     pub secret: String,
     pub state: PathBuf,
     pub assets: Option<ModelAssets>,
@@ -20,7 +21,17 @@ pub(crate) struct Launch {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Input {
-    Embed { id: i64, attempt: i64, text: String },
+    Embed {
+        id: u64,
+        attempt: i64,
+        text: String,
+        overflow: Overflow,
+    },
+    Split {
+        id: u64,
+        attempt: i64,
+        text: String,
+    },
     Stop,
 }
 #[derive(Serialize, Deserialize)]
@@ -36,9 +47,15 @@ pub(crate) enum Output {
         cause: String,
     },
     Result {
-        id: i64,
+        id: u64,
         attempt: i64,
+        truncated: bool,
         result: std::result::Result<Vec<f32>, EmbeddingError>,
+    },
+    Pieces {
+        id: u64,
+        attempt: i64,
+        result: std::result::Result<Vec<(u32, u32)>, EmbeddingError>,
     },
     Selection {
         fingerprint: Option<String>,
@@ -96,7 +113,7 @@ pub fn run_model_child() -> Result<()> {
         .create(true)
         .truncate(false)
         .open(launch.state.join("model.lock"))?;
-    lock.try_lock_exclusive()?; // A surviving incumbent, including orphan grace, prevents double loading.
+    lock.try_lock_exclusive()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let output = Arc::new(Mutex::new(std::io::stdout()));
     write(
@@ -108,15 +125,24 @@ pub fn run_model_child() -> Result<()> {
     )?;
     let heartbeat = Arc::new((Mutex::new(Instant::now()), Condvar::new()));
     let clock = heartbeat.clone();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let parent = launch.parent_pid;
     std::thread::spawn(move || {
         let (time, wake) = &*clock;
         let mut last = time.lock().unwrap();
         loop {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if unsafe { libc::getppid() } as u32 != parent {
+                std::process::exit(0);
+            }
             let remaining = Duration::from_secs(60).saturating_sub(last.elapsed());
             if remaining.is_zero() {
                 std::process::exit(0);
             }
-            last = wake.wait_timeout(last, remaining).unwrap().0;
+            last = wake
+                .wait_timeout(last, remaining.min(Duration::from_millis(100)))
+                .unwrap()
+                .0;
         }
     });
     let incarnation = launch.incarnation.clone();
@@ -173,13 +199,12 @@ pub fn run_model_child() -> Result<()> {
         let provider = provider.clone();
         let output = output.clone();
         std::thread::spawn(move || {
-            let fingerprint =
-                crate::execution::fingerprint(provider.model_digest(), &assets.runtime_library);
-            let cached = launch
-                .cached
-                .filter(|(key, _)| Some(key) == fingerprint.as_ref())
-                .map(|(_, v)| v);
-            let selection = provider.select_execution_cached(&assets, cached.as_ref());
+            let (fingerprint, selection) = crate::execution::select_for_launch(
+                || crate::execution::fingerprint(provider.model_digest(), &assets.runtime_library),
+                Some(provider.cpu_settings()),
+                launch.cached,
+                |cached| provider.select_execution_cached(&assets, cached),
+            );
             let _ = write(
                 &mut *output.lock().unwrap(),
                 &Output::Selection {
@@ -191,22 +216,40 @@ pub fn run_model_child() -> Result<()> {
     }
     loop {
         match read::<Input>(&mut input) {
-            Ok(Input::Embed { id, attempt, text }) => {
-                let result = provider.embed(&text);
+            Ok(Input::Embed {
+                id,
+                attempt,
+                text,
+                overflow,
+            }) => {
+                let (result, truncated) = match provider.embed_with(&text, overflow) {
+                    Ok((vector, truncated)) => (Ok(vector), truncated),
+                    Err(error) => (Err(error), false),
+                };
                 write(
                     &mut *output.lock().unwrap(),
                     &Output::Result {
                         id,
                         attempt,
+                        truncated,
                         result,
                     },
                 )?;
             }
+            Ok(Input::Split { id, attempt, text }) => write(
+                &mut *output.lock().unwrap(),
+                &Output::Pieces {
+                    id,
+                    attempt,
+                    result: if text.len() > crate::PIECE_INPUT_BYTES {
+                        Err(EmbeddingError::Failed("split window exceeds 64 KiB".into()))
+                    } else {
+                        provider.split(&text)
+                    },
+                },
+            )?,
             Ok(Input::Stop) => break,
-            Err(_) => {
-                // Lost broker pipe: retain model only for the bounded orphan grace.
-                std::thread::park();
-            }
+            Err(_) => break,
         }
     }
     Ok(())
@@ -243,33 +286,10 @@ pub(crate) fn control(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn every_admitted_job_survives_json_framing_including_escape_expansion() {
-        // The broker admits 4 MiB of UTF-8, not 4 MiB of JSON. This is a transport
-        // round trip, not an embedding-quality dataset or a copied encoder.
-        for character in ['a', '\0'] {
-            let text = character.to_string().repeat(4 * 1024 * 1024);
-            let bytes = encode(&Input::Embed {
-                id: 1,
-                attempt: 1,
-                text: text.clone(),
-            })
-            .expect("broker-admitted input must fit the private transport");
-            let Input::Embed { text: actual, .. } = read(&mut &bytes[..]).unwrap() else {
-                panic!("input changed its meaning in transit");
-            };
-            assert_eq!(actual, text);
-        }
-    }
-
-    #[test]
-    fn truncated_and_oversized_frames_are_errors_not_empty_messages() {
-        assert!(read::<Input>(&mut &[0, 0, 0][..]).is_err());
-        assert!(read::<Input>(&mut &[0, 0, 0, 9, b'{'][..]).is_err());
-        // Header alone must reject the allocation, without reading/allocating the body.
-        assert!(read::<Input>(&mut &u32::MAX.to_be_bytes()[..]).is_err());
-    }
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum Overflow {
+    Reject,
+    Prefix,
 }

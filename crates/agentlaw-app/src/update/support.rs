@@ -99,7 +99,7 @@ fn record_dismissal(account: u64) -> Result<()> {
     temp.write_all(&bytes)
         .and_then(|_| temp.as_file().sync_all())
         .map_err(|_| error("Cannot persist local support preference state."))?;
-    temp.persist(path)
+    agentlaw_storage::persistence::install_temp_file(temp, &path)
         .map_err(|_| error("Cannot publish local support preference state."))?;
     Ok(())
 }

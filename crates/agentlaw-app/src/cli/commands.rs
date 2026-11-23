@@ -56,7 +56,7 @@ pub(crate) enum Command {
     )]
     Install(InstallArgs),
     /// Diagnose the selected installation and memory store.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Recover recorded publication and rebuild derived generations.
     Repair,
     /// Inspect and change delivery settings.
@@ -106,9 +106,17 @@ pub(crate) enum Command {
         command: ShareCommand,
     },
     #[command(hide = true)]
-    WorkerDaemon(WorkerDaemonArgs),
-    #[command(hide = true)]
     ModelChild,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Show runtime health without running a source audit (the default).
+    #[arg(long, conflicts_with = "audit")]
+    pub health: bool,
+    /// Also audit the source and local database integrity.
+    #[arg(long)]
+    pub audit: bool,
 }
 
 #[derive(Debug, Args)]
@@ -427,18 +435,6 @@ pub(crate) enum ProcedureFormat {
     Table,
 }
 
-impl From<InventoryArgs> for agentlaw_app::inventory::Options {
-    fn from(args: InventoryArgs) -> Self {
-        Self {
-            output: args.output,
-            scope: args.scope.map(|scope| scope.as_str().to_owned()),
-            project: args.project,
-            machine: args.machine,
-            table: args.format == ProcedureFormat::Table,
-        }
-    }
-}
-
 #[derive(Debug, Args)]
 pub(crate) struct ProcedureSearchArgs {
     #[arg(long, value_name = "TEXT")]
@@ -605,6 +601,8 @@ pub(crate) struct ShareFetchArgs {
 pub(crate) enum ImportCommand {
     /// Prepare an isolated review workspace for an immutable commit.
     Prepare(ImportPrepareArgs),
+    /// List imports and their current review status.
+    List,
     /// Inspect a returned isolated import.
     Inspect(ImportRefArgs),
     /// Execute an Agentlaw request within an isolated import workspace.
@@ -660,18 +658,6 @@ pub(crate) struct ImportPublishArgs {
     pub resolution: String,
     #[arg(long)]
     pub user_confirmed: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct WorkerDaemonArgs {
-    #[arg(long, value_name = "PATH")]
-    pub state_dir: PathBuf,
-    #[arg(long, value_name = "PATH", requires_all = ["tokenizer", "ort_library"])]
-    pub model: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires_all = ["model", "ort_library"])]
-    pub tokenizer: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires_all = ["model", "tokenizer"])]
-    pub ort_library: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -741,7 +727,6 @@ mod tests {
             vec!["sync", "resolve", "--help"],
             vec!["share", "import", "publish", "-h"],
             vec!["store", "create", "--help"],
-            vec!["worker-daemon", "--help"],
         ] {
             assert_eq!(parse(&args).unwrap_err().kind(), ErrorKind::DisplayHelp);
         }
@@ -806,7 +791,6 @@ mod tests {
                 "r",
                 "--user-confirmed",
             ],
-            vec!["worker-daemon", "--state-dir", "state", "--model", "model"],
             vec!["update", "--confirm-update", "p", "check"],
             vec!["update", "status"],
             vec!["mcp", "serve"],

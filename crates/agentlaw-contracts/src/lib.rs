@@ -1,8 +1,10 @@
 //! Shared, typed transport contracts. Parsing validates the executable schema.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod request_control;
+pub use request_control::RequestControl;
 pub mod validation;
-mod wire;
+pub mod wire;
 pub const INPUT_SCHEMA: &str =
     include_str!("../../../docs/design/contracts/agentlaw-input.schema.json");
 

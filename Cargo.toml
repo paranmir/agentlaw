@@ -1,17 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/agentlaw-sqlite",
   "crates/agentlaw-contracts",
   "crates/agentlaw-storage",
   "crates/agentlaw-search",
   "crates/agentlaw-worker",
   "crates/agentlaw-flows",
+  "crates/agentlaw-runtime",
   "crates/agentlaw-app",
   "crates/agentlaw-launcher",
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 publish = false
 
@@ -29,3 +31,8 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The installation build identity hashes the whole executable; keep hashing
+# fast in debug builds, whose executables are large and unoptimized.
+[profile.dev.package.sha2]
+opt-level = 3

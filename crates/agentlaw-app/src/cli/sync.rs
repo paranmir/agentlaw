@@ -1,8 +1,9 @@
 //! Typed CLI input adaptation; the sync domain owns validation and execution.
 
 use super::commands::{SyncCommand, SyncMutationArgs, SyncPolicyCommand};
-use agentlaw_app::{config, machine, sync};
-use agentlaw_contracts::{DomainError, Request, Result};
+use agentlaw_app::{config, frontend::RuntimeBackend, Backend};
+use agentlaw_contracts::{DomainError, Result};
+use agentlaw_runtime::protocol::AdminCommand;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -45,17 +46,18 @@ pub(super) fn execute(command: SyncCommand) -> Result<Value> {
         SyncCommand::Hold(args) => mutation_input("hold", args),
         SyncCommand::Cancel(args) => mutation_input("cancel", args),
         SyncCommand::AcceptFindings(args) => {
-            sync::require_sharing_confirmation(args.confirm_sharing)?;
-            let (store, local) = super::dispatch::selected_store()?;
-            return sync::accept_findings(
-                &store,
-                &local,
-                &config::state_root()?,
-                &args.operation,
-                &args.candidate,
-                &args.findings_digest,
-                args.confirm_sharing,
-            );
+            if !args.confirm_sharing {
+                return Err(DomainError::new(
+                    "sharing_choice_required",
+                    "User approval of these exact sensitive findings is required.",
+                ));
+            }
+            return super::general::runtime_admin(AdminCommand::SyncAcceptFindings {
+                operation: args.operation,
+                candidate: args.candidate,
+                findings_digest: args.findings_digest,
+                confirm_sharing: args.confirm_sharing,
+            });
         }
         SyncCommand::Policy { command } => return execute_policy(command),
     };
@@ -63,30 +65,9 @@ pub(super) fn execute(command: SyncCommand) -> Result<Value> {
     // selected store or machine identity.
     let request =
         agentlaw_contracts::parse_request(&json!({"action":"sync","sync":input}).to_string())?;
-    let Request::Sync(request) = request else {
-        return Err(DomainError::new(
-            "invalid_input",
-            "Expected a sync request.",
-        ));
-    };
-    let (store, local) = super::dispatch::selected_store()?;
     let state = config::state_root()?;
-    let selection = config::load(&state)?.ok_or_else(|| {
-        DomainError::new(
-            "memory_store_connection_required",
-            "Connect a memory store before syncing.",
-        )
-    })?;
-    let identity = machine::load_or_create(&state)?;
-    sync::call(
-        &store,
-        &local,
-        &state,
-        &selection.user_id,
-        &identity.machine_id,
-        request,
-        super::dispatch::cli_control(),
-    )
+    agentlaw_app::update::managed::check_frontend_start(&state)?;
+    RuntimeBackend::new(state, false)?.call_with_control(request, super::dispatch::cli_control())
 }
 
 fn mutation_input(command: &str, args: SyncMutationArgs) -> Value {
@@ -101,16 +82,18 @@ fn mutation_input(command: &str, args: SyncMutationArgs) -> Value {
 fn execute_policy(command: SyncPolicyCommand) -> Result<Value> {
     match command {
         SyncPolicyCommand::Propose(args) => {
-            let (store, local) = super::dispatch::selected_store()?;
-            agentlaw_contracts::to_value(sync::propose_policy(
-                &store,
-                &local,
-                &args.remote,
-                &args.target_ref,
-            )?)
+            super::general::runtime_admin(AdminCommand::SyncPolicyPropose {
+                remote: args.remote,
+                target_ref: args.target_ref,
+            })
         }
         SyncPolicyCommand::Configure(args) => {
-            sync::require_delegation_confirmation(args.confirm_delegation)?;
+            if !args.confirm_delegation {
+                return Err(DomainError::new(
+                    "delegation_confirmation_required",
+                    "The user must explicitly activate this continuing local delegation.",
+                ));
+            }
             let text = super::input::read_file(&args.file).map_err(|error| {
                 let stage = match error.code.as_str() {
                     "input_unreadable" => "sync record read",
@@ -122,9 +105,23 @@ fn execute_policy(command: SyncPolicyCommand) -> Result<Value> {
                     format!("Git {stage} failed; local memory was preserved."),
                 )
             })?;
-            let policy = sync::prepare_policy_configuration(&text, args.confirm_delegation)?;
-            let (store, local) = super::dispatch::selected_store()?;
-            sync::configure_prepared_policy(&config::state_root()?, &store, &local, policy)
+            let record = agentlaw_contracts::validation::decode_unique(&text).map_err(|_| {
+                DomainError::new(
+                    "git_io",
+                    "Git sync record decode failed; local memory was preserved.",
+                )
+            })?;
+            serde_json::from_value::<agentlaw_runtime::git::sync::DelegationPolicy>(record.clone())
+                .map_err(|_| {
+                    DomainError::new(
+                        "git_io",
+                        "Git sync record decode failed; local memory was preserved.",
+                    )
+                })?;
+            super::general::runtime_admin(AdminCommand::SyncPolicyConfigure {
+                record,
+                confirm_delegation: args.confirm_delegation,
+            })
         }
     }
 }

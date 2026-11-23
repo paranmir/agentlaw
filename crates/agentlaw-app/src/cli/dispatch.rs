@@ -1,16 +1,13 @@
 //! Typed command execution. Resource acquisition starts at this boundary.
 
 use super::{
-    commands::{
-        Command, HelpFormat, McpCommand, SupportCommand, UpdateArgs, UpdateCommand,
-        WorkerDaemonArgs,
-    },
+    commands::{Command, HelpFormat, McpCommand, SupportCommand, UpdateArgs, UpdateCommand},
     general, help, input, procedure, share, sync,
 };
-use agentlaw_app::{config, installed::InstalledBackend, Backend};
+use agentlaw_app::{config, frontend::RuntimeBackend, Backend};
 use agentlaw_contracts::{DomainError, Result};
 use serde_json::Value;
-use std::{io, path::PathBuf};
+use std::io;
 
 pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
     let value = match command {
@@ -30,7 +27,9 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
         Command::Schema => agentlaw_app::schema(),
         Command::Call(_) => {
             let request = agentlaw_contracts::parse_request(&input::read_stdin()?)?;
-            InstalledBackend::start()?.call_with_control(request, cli_control())?
+            let state = config::state_root()?;
+            agentlaw_app::update::managed::check_frontend_start(&state)?;
+            RuntimeBackend::new(state, false)?.call_with_control(request, cli_control())?
         }
         Command::Mcp {
             command: McpCommand::Serve(args),
@@ -43,7 +42,7 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             }
             let state = config::state_root()?;
             agentlaw_app::update::managed::check_frontend_start(&state)?;
-            let backend = InstalledBackend::start()?;
+            let backend = RuntimeBackend::new(state.clone(), true)?;
             let advisor = agentlaw_app::update::Advisor::new(state);
             agentlaw_app::transport::serve_with_advisor(
                 io::BufReader::new(io::stdin()),
@@ -58,9 +57,26 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
             command: SupportCommand::Star(args),
         } => agentlaw_app::update::support::star(args.ask_again)?,
         Command::Install(args) => general::install(args)?,
-        Command::Doctor => agentlaw_app::diagnostics::doctor(&config::state_root()?)?,
+        Command::Doctor(args) => {
+            let mode = if args.audit {
+                agentlaw_app::diagnostics::DoctorMode::Audit
+            } else {
+                agentlaw_app::diagnostics::DoctorMode::Health
+            };
+            if args.audit {
+                general::with_admin_progress(|control| {
+                    agentlaw_app::diagnostics::doctor_with_control(
+                        &config::state_root()?,
+                        mode,
+                        control,
+                    )
+                })?
+            } else {
+                agentlaw_app::diagnostics::doctor(&config::state_root()?, mode)?
+            }
+        }
         Command::Repair => {
-            agentlaw_app::diagnostics::repair(&config::state_root()?, cli_control())?
+            general::runtime_admin(agentlaw_runtime::protocol::AdminCommand::Repair)?
         }
         Command::Config { command } => general::config(command)?,
         Command::Machine { command } => general::machine(command)?,
@@ -70,16 +86,6 @@ pub(crate) fn execute(command: Command) -> Result<Option<Value>> {
         Command::Continuity { command } => general::continuity(command)?,
         Command::Sync { command } => sync::execute(command)?,
         Command::Share { command } => share::execute(command)?,
-        Command::WorkerDaemon(args) => {
-            let configuration = worker_configuration(args)?;
-            agentlaw_worker::run_daemon(configuration).map_err(|_| {
-                DomainError::new(
-                    "worker_failed",
-                    "Embedding worker terminated with an error.",
-                )
-            })?;
-            return Ok(None);
-        }
         Command::ModelChild => {
             agentlaw_worker::run_model_child().map_err(|_| {
                 DomainError::new("model_child_failed", "The private model child failed.")
@@ -109,49 +115,6 @@ fn update(args: UpdateArgs) -> Result<Value> {
     }
 }
 
-fn worker_configuration(args: WorkerDaemonArgs) -> Result<agentlaw_worker::RuntimeConfig> {
-    if !args.state_dir.is_absolute()
-        || args
-            .model
-            .iter()
-            .chain(args.tokenizer.iter())
-            .chain(args.ort_library.iter())
-            .any(|path| !path.is_absolute())
-    {
-        return Err(DomainError::new(
-            "invalid_arguments",
-            "Worker paths must be absolute.",
-        ));
-    }
-    let model = match (args.model, args.tokenizer, args.ort_library) {
-        (None, None, None) => None,
-        (Some(onnx_model), Some(tokenizer_json), Some(runtime_library)) => {
-            Some(agentlaw_worker::ModelAssets {
-                onnx_model,
-                tokenizer_json,
-                runtime_library,
-            })
-        }
-        _ => {
-            return Err(DomainError::new(
-                "invalid_arguments",
-                "Supply all three model artifact paths together.",
-            ))
-        }
-    };
-    let executable = std::env::current_exe().map_err(|_| {
-        DomainError::new(
-            "worker_unavailable",
-            "Could not locate the worker executable.",
-        )
-    })?;
-    Ok(agentlaw_worker::RuntimeConfig {
-        state_dir: args.state_dir,
-        executable,
-        model,
-    })
-}
-
 pub(super) fn cli_control() -> agentlaw_flows::RequestControl {
     let last = std::sync::Mutex::new(String::new());
     agentlaw_flows::RequestControl::new(
@@ -168,28 +131,4 @@ pub(super) fn cli_control() -> agentlaw_flows::RequestControl {
             eprintln!("agentlaw: {phase}");
         },
     )
-}
-
-pub(super) fn selected_store() -> Result<(agentlaw_storage::Store, PathBuf)> {
-    let state = config::state_root()?;
-    let selected = config::load(&state)?.ok_or_else(|| {
-        DomainError::new(
-            "memory_store_connection_required",
-            "Connect a memory store before using operating commands.",
-        )
-    })?;
-    let local = selected.runtime_root(&state);
-    config::require_existing_binding(&state, &selected)?;
-    let store = agentlaw_storage::Store::open_with_coordination(
-        &selected.memory_store_path,
-        local.join("canonical"),
-        config::coordination_root(&state),
-    )
-    .map_err(|_| {
-        DomainError::new(
-            "source_unavailable",
-            "The selected source needs diagnosis or recovery; no Git operation was performed.",
-        )
-    })?;
-    Ok((store, local))
 }

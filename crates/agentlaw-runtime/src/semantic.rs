@@ -1,0 +1,962 @@
+//! Semantic index writer, feeder and search port.
+
+mod batch;
+mod generation;
+mod history;
+pub mod identity;
+mod pump;
+mod quarantine;
+pub(crate) mod recent_vectors;
+mod search;
+mod source;
+mod state;
+#[cfg(test)]
+mod tests;
+
+use crate::ports::{ComponentState, HealthSink, RuntimeError, RuntimeResult};
+use agentlaw_search::vector_file::SourcePosition;
+use agentlaw_storage::published::OwnedPublishedReader;
+use agentlaw_worker::supervisor::{
+    IndexResult, IndexWork, IndexWorkPort, IndexWorkStatus, ModelRequestId, ModelRequestIds,
+};
+use agentlaw_worker::EmbeddingError;
+use state::{Lane, LaneKey, Schedule};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+pub use search::SemanticSearch;
+
+pub const INDEX_CONFIG_VERSION: &str = "v2";
+
+/// Configuration shared by the current and future history index lanes.
+#[derive(Clone, Debug)]
+pub struct SemanticConfig {
+    pub indices_root: PathBuf,
+    pub config_id: String,
+    pub dimension: usize,
+    pub commit_pieces: usize,
+    pub commit_interval: Duration,
+    pub queue_pieces: usize,
+    pub pending_results: usize,
+    pub history_lanes: usize,
+    pub(crate) recent_vectors: Arc<recent_vectors::RecentVectors>,
+}
+
+impl SemanticConfig {
+    pub fn new(indices_root: PathBuf, config_id: String) -> Self {
+        Self {
+            indices_root,
+            config_id,
+            dimension: 256,
+            commit_pieces: 64,
+            commit_interval: Duration::from_millis(250),
+            queue_pieces: 256,
+            pending_results: 128,
+            history_lanes: 32,
+            recent_vectors: Arc::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SemanticProgress {
+    pub model_digest: Option<String>,
+    pub ack: Option<SourcePosition>,
+    pub complete: bool,
+    pub queued_pieces: usize,
+    pub state: ComponentState,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticRepairState {
+    Building,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct SemanticRepairProgress {
+    pub generation: String,
+    pub state: SemanticRepairState,
+    pub ack: Option<SourcePosition>,
+    pub reason: Option<String>,
+}
+
+struct Shared {
+    config: SemanticConfig,
+    ids: ModelRequestIds,
+    health: HealthSink,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    state: Mutex<SharedState>,
+    changed: Arc<Condvar>,
+    threads: Mutex<Vec<(String, JoinHandle<()>)>>,
+    model_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pre_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pause_pending_ranges: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    completion_check_hook: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    #[cfg(test)]
+    post_check_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    readview_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    history_init_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    repair_validation_hook: Mutex<Option<Arc<dyn Fn(&std::path::Path) + Send + Sync>>>,
+    #[cfg(test)]
+    repair_transition_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    repair_published_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    reclaim_busy_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    reclaim_decision_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Shared {
+    fn wake_model(&self) {
+        let wake = self
+            .model_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+}
+
+#[derive(Default)]
+struct SharedState {
+    schedule: Schedule,
+    next_token: u64,
+    stopping: bool,
+    closing: std::collections::BTreeSet<String>,
+    retiring_readers: Vec<(String, Arc<state::Readers>)>,
+    quarantined: Vec<(agentlaw_search::vector_file::VectorFileIdentity, String)>,
+    sources: std::collections::BTreeMap<String, OwnedPublishedReader>,
+    history_completed: std::collections::VecDeque<history::Completed>,
+}
+
+#[derive(Clone)]
+pub struct SemanticIndexer {
+    inner: Arc<Shared>,
+    _owner: Arc<Owner>,
+}
+
+/// Binding-scoped preparation facade.
+#[derive(Clone)]
+pub struct SemanticPreparationHandle {
+    indexer: SemanticIndexer,
+    binding: String,
+    model: crate::model::ModelHandle,
+}
+
+impl SemanticPreparationHandle {
+    pub fn wake(&self) {
+        self.indexer.wake(&self.binding);
+    }
+
+    pub fn wait_target(
+        &self,
+        target: &agentlaw_storage::published::SourcePosition,
+        control: &agentlaw_contracts::RequestControl,
+    ) -> Result<agentlaw_flows::semantic::SemanticCoverage, agentlaw_flows::semantic::SemanticError>
+    {
+        self.wait_with_snapshot(
+            target,
+            control,
+            || self.model.snapshot(),
+            Duration::from_millis(100),
+        )
+    }
+
+    fn wait_with_snapshot(
+        &self,
+        target: &agentlaw_storage::published::SourcePosition,
+        control: &agentlaw_contracts::RequestControl,
+        mut snapshot: impl FnMut() -> crate::model::ModelSnapshot,
+        interval: Duration,
+    ) -> Result<agentlaw_flows::semantic::SemanticCoverage, agentlaw_flows::semantic::SemanticError>
+    {
+        use agentlaw_flows::semantic::{SemanticCoverage, SemanticError};
+        use agentlaw_worker::WorkerState;
+        control.phase("semantic_preparation");
+        let mut reported_ack = None;
+        let mut awaited_repair: Option<String> = None;
+        loop {
+            control.check().map_err(|_| SemanticError::Cancelled)?;
+            let model = snapshot();
+            match model.state {
+                WorkerState::Starting | WorkerState::Loading | WorkerState::Ready => {}
+                WorkerState::Stopped | WorkerState::Failed | WorkerState::Stopping => {
+                    return Err(SemanticError::Unavailable(
+                        model
+                            .cause
+                            .unwrap_or_else(|| format!("model is {:?}", model.state)),
+                    ));
+                }
+            }
+            let state = self
+                .indexer
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let lane = state
+                .schedule
+                .lanes
+                .get(&LaneKey::current(&self.binding))
+                .ok_or_else(|| SemanticError::Unavailable("binding not open".into()))?;
+            let blocked = lane.state == ComponentState::Degraded
+                && lane.reason.as_deref() == Some(&EmbeddingError::InputTooLong.to_string());
+            if blocked && lane.blocked_generation == Some(lane.generation) {
+                return Err(SemanticError::Unavailable(
+                    EmbeddingError::InputTooLong.to_string(),
+                ));
+            }
+            if let Some(repair) = &lane.repair {
+                if awaited_repair.as_ref().is_some_and(|id| id != &repair.id) {
+                    return Err(SemanticError::Unavailable(
+                        "semantic repair was superseded".into(),
+                    ));
+                }
+                match repair.state {
+                    SemanticRepairState::Building => {
+                        awaited_repair = Some(repair.id.clone());
+                        drop(
+                            self.indexer
+                                .inner
+                                .changed
+                                .wait_timeout(state, interval)
+                                .unwrap_or_else(|e| e.into_inner()),
+                        );
+                        continue;
+                    }
+                    SemanticRepairState::Failed => {
+                        return Err(SemanticError::Unavailable(
+                            repair
+                                .reason
+                                .clone()
+                                .unwrap_or_else(|| "semantic repair failed".into()),
+                        ))
+                    }
+                    SemanticRepairState::Complete => {}
+                }
+            } else if awaited_repair.is_some() {
+                return Err(SemanticError::Unavailable(
+                    "semantic repair was interrupted".into(),
+                ));
+            }
+            if !blocked
+                && matches!(
+                    lane.state,
+                    ComponentState::Degraded | ComponentState::Failed | ComponentState::Stopped
+                )
+            {
+                return Err(SemanticError::Unavailable(
+                    lane.reason
+                        .clone()
+                        .unwrap_or_else(|| format!("semantic index is {:?}", lane.state)),
+                ));
+            }
+            if let Some(active) = &lane.active {
+                if active.identity.epoch != target.epoch {
+                    return Err(SemanticError::Unavailable("source epoch mismatch".into()));
+                }
+            }
+            if let Some(ack) = &lane.ack {
+                if ack.epoch != target.epoch {
+                    return Err(SemanticError::Unavailable("source epoch mismatch".into()));
+                }
+                if reported_ack.as_ref() != Some(ack) {
+                    reported_ack = Some(ack.clone());
+                    drop(state);
+                    control.phase("semantic_preparation_progress");
+                    continue;
+                }
+                let sequence = u64::try_from(ack.sequence)
+                    .map_err(|_| SemanticError::Unavailable("negative index position".into()))?;
+                if model.state == WorkerState::Ready
+                    && model.model_digest.as_deref() == state.schedule.model.as_deref()
+                    && model.model_digest.is_some()
+                    && lane.complete
+                    && sequence >= target.sequence
+                {
+                    return Ok(SemanticCoverage::CompleteAt(
+                        agentlaw_storage::published::SourcePosition {
+                            epoch: ack.epoch.clone(),
+                            sequence,
+                        },
+                    ));
+                }
+            }
+            let (_state, _) = self
+                .indexer
+                .inner
+                .changed
+                .wait_timeout(state, interval)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct Owner(Weak<Shared>);
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.upgrade() {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.stopping = true;
+            state.schedule.lanes.clear();
+            drop(state);
+            shared.changed.notify_all();
+            let mut threads = shared.threads.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, thread) in threads.drain(..) {
+                if thread.thread().id() != std::thread::current().id() {
+                    let _ = thread.join();
+                }
+            }
+        }
+    }
+}
+
+impl SemanticIndexer {
+    pub fn start(
+        config: SemanticConfig,
+        ids: ModelRequestIds,
+        health: HealthSink,
+    ) -> RuntimeResult<Self> {
+        Self::start_with_clock(config, ids, health, Arc::new(Instant::now))
+    }
+
+    /// The clock is injectable so retry deadlines can be exercised deterministically.
+    pub fn start_with_clock(
+        config: SemanticConfig,
+        ids: ModelRequestIds,
+        health: HealthSink,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> RuntimeResult<Self> {
+        if config.dimension == 0
+            || config.commit_pieces == 0
+            || config.commit_interval.is_zero()
+            || config.queue_pieces == 0
+            || config.pending_results == 0
+            || config.config_id.is_empty()
+        {
+            return Err(RuntimeError::Protocol(
+                "invalid semantic configuration".into(),
+            ));
+        }
+        let inner = Arc::new(Shared {
+            config,
+            ids,
+            health,
+            clock,
+            state: Mutex::new(SharedState::default()),
+            changed: Arc::new(Condvar::new()),
+            threads: Mutex::new(Vec::new()),
+            model_waker: Mutex::new(None),
+            #[cfg(test)]
+            pre_commit_hook: Mutex::new(None),
+            #[cfg(test)]
+            pause_pending_ranges: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            completion_check_hook: Mutex::new(None),
+            #[cfg(test)]
+            post_check_hook: Mutex::new(None),
+            #[cfg(test)]
+            readview_hook: Mutex::new(None),
+            #[cfg(test)]
+            history_init_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_validation_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_transition_hook: Mutex::new(None),
+            #[cfg(test)]
+            repair_published_hook: Mutex::new(None),
+            #[cfg(test)]
+            reclaim_busy_hook: Mutex::new(None),
+            #[cfg(test)]
+            reclaim_decision_hook: Mutex::new(None),
+        });
+        let dispatcher = inner.clone();
+        let thread = std::thread::Builder::new()
+            .name("semantic-history-dispatch".into())
+            .spawn(move || history::dispatch(dispatcher))
+            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+        inner
+            .threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((String::new(), thread));
+        Ok(Self {
+            _owner: Arc::new(Owner(Arc::downgrade(&inner))),
+            inner,
+        })
+    }
+
+    /// Connects the host's model wake signal after the supervisor is started.
+    pub fn set_model_waker(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .model_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(wake);
+        self.inner.wake_model();
+    }
+
+    pub fn open_binding(&self, binding: &str, source: OwnedPublishedReader) -> RuntimeResult<()> {
+        if binding.is_empty() {
+            return Err(RuntimeError::Protocol("empty binding".into()));
+        }
+        let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.stopping {
+            return Err(RuntimeError::Unavailable("semantic indexer stopped".into()));
+        }
+        if shared
+            .schedule
+            .lanes
+            .contains_key(&LaneKey::current(binding))
+        {
+            return Err(RuntimeError::Protocol("binding already open".into()));
+        }
+        if shared.closing.contains(binding) {
+            return Err(RuntimeError::Unavailable("binding is closing".into()));
+        }
+        shared.next_token = shared
+            .next_token
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Capacity("binding token exhausted".into()))?;
+        let token = shared.next_token;
+        let lane = Lane {
+            token,
+            ..Lane::default()
+        };
+        *lane.readers.wake.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&self.inner));
+        shared
+            .schedule
+            .lanes
+            .insert(LaneKey::current(binding), lane);
+        shared.sources.insert(binding.to_owned(), source.clone());
+        let inner = self.inner.clone();
+        let name = binding.to_owned();
+        let handle = std::thread::Builder::new()
+            .name("semantic-index".into())
+            .spawn(move || pump::run(inner, name, token, source));
+        match handle {
+            Ok(handle) => self
+                .inner
+                .threads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((binding.to_owned(), handle)),
+            Err(error) => {
+                shared.schedule.lanes.remove(&LaneKey::current(binding));
+                shared.sources.remove(binding);
+                return Err(RuntimeError::Unavailable(error.to_string()));
+            }
+        }
+        drop(shared);
+        self.inner.changed.notify_all();
+        self.inner.wake_model();
+        Ok(())
+    }
+
+    pub fn close_binding(&self, binding: &str) {
+        let _ = self.close_binding_checked(binding);
+    }
+
+    pub fn close_binding_checked(&self, binding: &str) -> RuntimeResult<()> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(lane) = state.schedule.lanes.remove(&LaneKey::current(binding)) else {
+            while state.closing.contains(binding) {
+                state = self
+                    .inner
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            return Ok(());
+        };
+        lane.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        let history_keys: Vec<_> = state
+            .schedule
+            .lanes
+            .keys()
+            .filter(|key| key.binding == binding)
+            .cloned()
+            .collect();
+        for key in history_keys {
+            if let Some(lane) = state.schedule.lanes.remove(&key) {
+                lane.cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        state
+            .schedule
+            .blocked
+            .retain(|key, _| key.binding != binding);
+        state.sources.remove(binding);
+        state
+            .history_completed
+            .retain(|item| item.binding != binding);
+        let readers = lane.readers;
+        state
+            .retiring_readers
+            .push((binding.to_owned(), readers.clone()));
+        let binding_readers: Vec<_> = state
+            .retiring_readers
+            .iter()
+            .filter(|(name, _)| name == binding)
+            .map(|(_, readers)| readers.clone())
+            .collect();
+        state.closing.insert(binding.to_owned());
+        let handles = {
+            let mut threads = self.inner.threads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            while let Some(index) = threads.iter().position(|(name, _)| name == binding) {
+                handles.push(threads.swap_remove(index).1);
+            }
+            handles
+        };
+        drop(state);
+        self.inner.changed.notify_all();
+        for readers in &binding_readers {
+            let mut count = readers.count.lock().unwrap_or_else(|e| e.into_inner());
+            while *count != 0 {
+                count = readers
+                    .changed
+                    .wait(count)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let mut deferred = false;
+        let mut failed = false;
+        for handle in handles {
+            if handle.thread().id() == std::thread::current().id() {
+                deferred = true;
+                let inner = self.inner.clone();
+                let binding = binding.to_owned();
+                std::thread::spawn(move || {
+                    let _ = handle.join();
+                    inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .closing
+                        .remove(&binding);
+                    inner.changed.notify_all();
+                });
+                continue;
+            }
+            if handle.join().is_err() {
+                failed = true;
+            }
+        }
+        if deferred {
+            return Err(RuntimeError::Unavailable(
+                "Semantic shutdown is still in progress.".into(),
+            ));
+        }
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closing
+            .remove(binding);
+        self.inner.changed.notify_all();
+        self.inner.health.publish(
+            crate::ports::ComponentId {
+                binding: Some(binding.to_owned()),
+                kind: crate::ports::ComponentKind::Semantic,
+            },
+            crate::ports::ComponentStatus {
+                state: ComponentState::Stopped,
+                observed_at: std::time::SystemTime::now(),
+                reason: None,
+            },
+        );
+        if failed {
+            Err(RuntimeError::Unavailable(
+                "Semantic worker terminated unexpectedly.".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn wake(&self, binding: &str) {
+        let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lane) = shared.schedule.lanes.get_mut(&LaneKey::current(binding)) {
+            if !lane.quarantined {
+                lane.invalidate();
+                lane.dirty = true;
+            }
+        }
+        drop(shared);
+        self.inner.changed.notify_all();
+    }
+
+    pub fn progress(&self, binding: &str) -> Option<SemanticProgress> {
+        let shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let lane = shared.schedule.lanes.get(&LaneKey::current(binding))?;
+        Some(SemanticProgress {
+            model_digest: shared.schedule.model.clone(),
+            ack: lane.ack.clone(),
+            complete: lane.complete,
+            queued_pieces: lane.queue.len(),
+            state: lane.state,
+            reason: lane.reason.clone(),
+        })
+    }
+
+    /// Starts a binding-local rebuild without exposing its partial results.
+    pub fn start_repair(&self, binding: &str) -> RuntimeResult<()> {
+        let gate = {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .schedule
+                .lanes
+                .get(&LaneKey::current(binding))
+                .ok_or_else(|| RuntimeError::Unavailable("binding not open".into()))?
+                .io_gate
+                .clone()
+        };
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopping {
+            return Err(RuntimeError::Unavailable("semantic indexer stopped".into()));
+        }
+        let lane = state
+            .schedule
+            .lanes
+            .get_mut(&LaneKey::current(binding))
+            .filter(|lane| Arc::ptr_eq(&lane.io_gate, &gate))
+            .ok_or_else(|| RuntimeError::Unavailable("binding not open".into()))?;
+        if (lane.active.is_none() || !lane.complete)
+            && !lane.quarantined
+            && !lane.active_quarantined
+        {
+            return Err(RuntimeError::Unavailable(
+                "complete semantic index unavailable".into(),
+            ));
+        }
+        if lane
+            .repair
+            .as_ref()
+            .is_some_and(|r| r.state == SemanticRepairState::Building)
+        {
+            return Err(RuntimeError::Unavailable(
+                "semantic repair already running".into(),
+            ));
+        }
+        lane.invalidate();
+        lane.quarantined = false;
+        lane.repair = Some(state::Repair {
+            id: uuid::Uuid::new_v4().to_string(),
+            state: SemanticRepairState::Building,
+            published: false,
+            ack: None,
+            reason: None,
+        });
+        lane.dirty = true;
+        drop(state);
+        self.inner.changed.notify_all();
+        self.inner.wake_model();
+        Ok(())
+    }
+
+    pub fn repair_progress(&self, binding: &str) -> Option<SemanticRepairProgress> {
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let repair = state
+            .schedule
+            .lanes
+            .get(&LaneKey::current(binding))?
+            .repair
+            .as_ref()?;
+        Some(SemanticRepairProgress {
+            generation: repair.id.clone(),
+            state: repair.state.clone(),
+            ack: repair.ack.clone(),
+            reason: repair.reason.clone(),
+        })
+    }
+
+    pub fn shutdown(&self, timeout: Duration) -> bool {
+        self.inner
+            .model_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let (bindings, readers) = {
+            let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            shared.stopping = true;
+            let bindings: Vec<_> = shared
+                .schedule
+                .lanes
+                .keys()
+                .map(|key| key.binding.clone())
+                .collect();
+            let readers: Vec<_> = shared
+                .schedule
+                .lanes
+                .iter()
+                .map(|(key, lane)| (key.binding.clone(), lane.readers.clone()))
+                .collect();
+            for lane in shared.schedule.lanes.values() {
+                lane.cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            shared.sources.clear();
+            shared.history_completed.clear();
+            shared.retiring_readers.extend(readers);
+            let readers = shared.retiring_readers.clone();
+            shared.schedule.lanes.clear();
+            (bindings, readers)
+        };
+        for binding in bindings {
+            self.inner.health.publish(
+                crate::ports::ComponentId {
+                    binding: Some(binding),
+                    kind: crate::ports::ComponentKind::Semantic,
+                },
+                crate::ports::ComponentStatus {
+                    state: ComponentState::Stopped,
+                    observed_at: std::time::SystemTime::now(),
+                    reason: None,
+                },
+            );
+        }
+        self.inner.changed.notify_all();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        for (_, readers) in readers {
+            let mut count = readers.count.lock().unwrap_or_else(|e| e.into_inner());
+            while *count != 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                count = readers
+                    .changed
+                    .wait_timeout(count, remaining)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+        let mut threads = self.inner.threads.lock().unwrap_or_else(|e| e.into_inner());
+        while threads.iter().any(|(_, h)| !h.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        let joined = threads
+            .drain(..)
+            .map(|(_, h)| h.join().is_ok())
+            .collect::<Vec<_>>();
+        drop(threads);
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.closing.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            state = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        joined.into_iter().all(|ok| ok)
+    }
+}
+
+impl IndexWorkPort for SemanticIndexer {
+    fn model_ready(&self, digest: &str) {
+        let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.schedule.model.as_deref() != Some(digest) {
+            shared.schedule.model = Some(digest.to_owned());
+            for lane in shared.schedule.lanes.values_mut() {
+                lane.invalidate();
+                lane.dirty = true;
+                lane.ack = None;
+                lane.complete = false;
+                lane.active = None;
+                lane.repair = None;
+                lane.cleaned_dir = None;
+                lane.quarantined = false;
+                lane.active_quarantined = false;
+            }
+        }
+        drop(shared);
+        self.inner.changed.notify_all();
+    }
+
+    fn next_work(&self, digest: &str) -> Option<IndexWork> {
+        let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let work = shared.schedule.next_task(
+            digest,
+            &self.inner.ids,
+            self.inner.config.pending_results,
+            (self.inner.clock)(),
+        );
+        drop(shared);
+        if work.is_some() {
+            self.inner.changed.notify_all();
+        }
+        work
+    }
+
+    fn finish(&self, id: ModelRequestId, outcome: Result<IndexResult, EmbeddingError>) {
+        let mut shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notify_model = false;
+        let mut failure = None;
+        let model = shared.schedule.model.clone();
+        let mut blocked = None;
+        for (name, lane) in shared.schedule.lanes.iter_mut() {
+            if let Some((generation, work)) = lane.running.remove(&id) {
+                let piece = &work.piece;
+                if generation == lane.generation {
+                    lane.work_revision = lane.work_revision.wrapping_add(1);
+                    let split =
+                        matches!(work.task, agentlaw_worker::supervisor::IndexTask::Split(_));
+                    let outcome = outcome.and_then(|result| match result {
+                        IndexResult::Pieces(ref ranges)
+                            if split && pieces::valid_ranges(&piece.text, ranges) =>
+                        {
+                            Ok(result)
+                        }
+                        IndexResult::Pieces(_) => {
+                            Err(EmbeddingError::Failed("invalid model piece ranges".into()))
+                        }
+                        IndexResult::Vector(ref vector) => {
+                            if vector.len() != self.inner.config.dimension
+                                || vector.iter().any(|x| !x.is_finite())
+                                || !vector.iter().any(|x| *x != 0.0)
+                                || split
+                            {
+                                Err(EmbeddingError::Failed("invalid embedding vector".into()))
+                            } else {
+                                Ok(result)
+                            }
+                        }
+                    });
+                    match outcome {
+                        Ok(result) => {
+                            if lane.retry_piece.as_ref().is_some_and(|key| {
+                                key.0 == piece.memory_id
+                                    && key.1 == piece.change_id
+                                    && key.2 == piece.section
+                            }) {
+                                lane.retry.reset();
+                                lane.retry_piece = None;
+                            }
+                            match result {
+                                IndexResult::Pieces(ranges) => {
+                                    lane.pending_window = Some(state::PendingWindow {
+                                        piece: work.piece,
+                                        ranges,
+                                        next_range: 0,
+                                    });
+                                }
+                                IndexResult::Vector(vector) => {
+                                    lane.results.push_back((work.piece, vector.into()));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            lane.retry_piece = Some((
+                                piece.memory_id.clone(),
+                                piece.change_id.clone(),
+                                piece.section.clone(),
+                            ));
+                            if error == EmbeddingError::InputTooLong {
+                                lane.blocked_generation = Some(generation);
+                                if let Some(model) = model {
+                                    blocked = Some((
+                                        name.clone(),
+                                        (model, piece.memory_id.clone(), piece.change_id.clone()),
+                                    ));
+                                }
+                                lane.queue.clear();
+                                lane.pending_window = None;
+                                lane.retry.reset();
+                            } else {
+                                lane.queue.push_front(work);
+                                lane.retry.fail((self.inner.clock)());
+                            }
+                            lane.state = ComponentState::Degraded;
+                            lane.reason = Some(error.to_string());
+                            failure = Some((name.binding.clone(), error.to_string()));
+                            notify_model = true;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if let Some((key, revision)) = blocked {
+            shared
+                .schedule
+                .blocked
+                .entry(key)
+                .or_default()
+                .insert(revision);
+        }
+        drop(shared);
+        self.inner.changed.notify_all();
+        if let Some((name, reason)) = failure {
+            self.inner.health.publish(
+                crate::ports::ComponentId {
+                    binding: Some(name),
+                    kind: crate::ports::ComponentKind::Semantic,
+                },
+                crate::ports::ComponentStatus {
+                    state: ComponentState::Degraded,
+                    observed_at: std::time::SystemTime::now(),
+                    reason: Some(reason),
+                },
+            );
+        }
+        if notify_model {
+            self.inner.wake_model();
+        }
+    }
+
+    fn status(&self) -> IndexWorkStatus {
+        let shared = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (self.inner.clock)();
+        let runnable = shared.schedule.model.is_some()
+            && shared.schedule.lanes.values().any(|lane| {
+                !lane.quarantined
+                    && !lane.queue.is_empty()
+                    && lane.occupied() < self.inner.config.pending_results
+                    && lane.retry.ready(now)
+            });
+        let next_retry_at = shared
+            .schedule
+            .lanes
+            .values()
+            .filter(|lane| !lane.quarantined && !lane.queue.is_empty())
+            .filter_map(|lane| lane.retry.until)
+            .min();
+        IndexWorkStatus {
+            runnable,
+            next_retry_at,
+            awaiting_model: shared.schedule.model.is_none()
+                && shared.schedule.lanes.values().any(|lane| !lane.quarantined),
+        }
+    }
+}
+
+pub(crate) mod pieces;

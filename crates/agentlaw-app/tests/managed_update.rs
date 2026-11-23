@@ -1,5 +1,8 @@
 //! Managed update subprocess tests use only temporary roots and owned processes.
 use fs2::FileExt;
+#[path = "../../../tests/support/runtime_cleanup.rs"]
+mod runtime_cleanup;
+use runtime_cleanup::{OwnedStaticChild, RuntimeCleanup};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -53,28 +56,32 @@ fn run(binary: &Path, state: &Path, args: &[&str]) -> Value {
             Err(error) => panic!("Could not start {}: {error}", binary.display()),
         }
     }
-    let mut child = child.expect("bounded executable-busy retry");
-    let stdout = child.stdout.take().unwrap();
+    let mut child = OwnedStaticChild(child.expect("bounded executable-busy retry"));
+    let stdout = child.0.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = Vec::new();
         let _ = BufReader::new(stdout).read_until(b'\n', &mut line);
         let _ = send.send(line);
     });
-    let status = child.wait().unwrap();
-    let line = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed update command timed out: {args:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let line = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("managed update stdout did not close");
     let value: Value =
         serde_json::from_slice(&line).unwrap_or_else(|_| panic!("Invalid CLI output: {line:?}"));
     assert!(status.success(), "{value}");
     value
-}
-
-struct OwnedStaticChild(Child);
-impl Drop for OwnedStaticChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 fn static_output(binary: &Path, state: &Path, cwd: &Path, args: &[&str]) -> Output {
@@ -231,13 +238,77 @@ impl Drop for McpClient {
     }
 }
 
+// The broker outlives its clients by design. Own every process launched from
+// this fixture's private installation, even if fixture setup or a test panics.
+struct ManagedTemp {
+    _temp: Option<tempfile::TempDir>,
+    root: PathBuf,
+}
+
+impl Drop for ManagedTemp {
+    fn drop(&mut self) {
+        use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut system = System::new();
+            system.refresh_processes(ProcessesToUpdate::All, true);
+            let owned: Vec<_> = system
+                .processes()
+                .values()
+                .filter(|process| {
+                    !matches!(
+                        process.status(),
+                        ProcessStatus::Zombie | ProcessStatus::Dead
+                    ) && process.exe().is_some_and(|exe| {
+                        fs::canonicalize(exe)
+                            .unwrap_or_else(|_| exe.to_path_buf())
+                            .starts_with(&self.root)
+                    })
+                })
+                .collect();
+            if owned.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let pids: Vec<_> = owned.iter().map(|process| process.pid()).collect();
+                if !std::thread::panicking() {
+                    panic!("fixture processes did not exit: {pids:?}");
+                }
+                eprintln!("fixture processes did not exit: {pids:?}");
+                return;
+            }
+            for process in owned {
+                process.kill();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(temp) = self._temp.take() {
+            let path = temp.path().to_path_buf();
+            let result = temp.close();
+            if !std::thread::panicking() {
+                result.expect("fixture temporary installation was not removed");
+                assert!(
+                    !path.exists(),
+                    "fixture temporary installation remains: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+static FIXTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
-    _temp: tempfile::TempDir,
+    _runtime_cleanup: RuntimeCleanup,
+    _temp: ManagedTemp,
     root: PathBuf,
     state: PathBuf,
     host: PathBuf,
     helper: PathBuf,
     id: String,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -245,6 +316,9 @@ impl Fixture {
     }
 
     fn with_old_binary(old_binary: Option<&Path>) -> Self {
+        let serial = FIXTURE_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("managed");
         let state = root.join("state");
@@ -259,8 +333,13 @@ impl Fixture {
         )
         .unwrap();
         let root = fs::canonicalize(root).unwrap();
+        let temp = ManagedTemp {
+            _temp: Some(temp),
+            root: root.clone(),
+        };
         let state = root.join("state");
         let bin = root.join("bin");
+        let runtime_cleanup = RuntimeCleanup(state.clone());
         let source = Path::new(env!("CARGO_BIN_EXE_agentlaw"));
         let old = bin.join(binary_name());
         fs::copy(old_binary.unwrap_or(source), &old).unwrap();
@@ -306,7 +385,7 @@ impl Fixture {
         fs::write(unpacked.join("LICENSE.agentlaw"), b"new-license").unwrap();
         let receipt_value: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
         let helper = PathBuf::from(receipt_value["executable"].as_str().unwrap());
-        let memory = temp.path().join("memory");
+        let memory = temp._temp.as_ref().unwrap().path().join("memory");
         assert_eq!(
             run(
                 &old,
@@ -321,6 +400,7 @@ impl Fixture {
             )["created"],
             true
         );
+        runtime_cleanup.shutdown();
         fs::write(staged.join("launcher.asset"), b"pinned launcher asset").unwrap();
         let archive_name = if cfg!(windows) {
             "agentlaw-x86_64-pc-windows-msvc.zip"
@@ -366,12 +446,14 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            _runtime_cleanup: runtime_cleanup,
             _temp: temp,
             root,
             state,
             host,
             helper,
             id,
+            _serial: serial,
         }
     }
     fn apply(&self) -> Value {
@@ -392,6 +474,20 @@ impl Fixture {
 #[test]
 fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
     let fixture = Fixture::new();
+    let old_install = fixture
+        .state
+        .join(format!("install-completed-{}.json", uuid::Uuid::new_v4()));
+    fs::write(&old_install, br#"{"targets":[]}"#).unwrap();
+    let current_install = fixture
+        .state
+        .join(format!("install-completed-{}.json", uuid::Uuid::new_v4()));
+    fs::write(
+        &current_install,
+        serde_json::to_vec(&json!({"targets":[],"update_plan_id":fixture.id})).unwrap(),
+    )
+    .unwrap();
+    let legacy = fixture.state.join("update-check.json");
+    fs::write(&legacy, b"legacy fixture").unwrap();
     let memory_format = fixture.root.parent().unwrap().join("memory/format.md");
     let original_memory = fs::read(&memory_format).unwrap();
     let previous = fixture.root.join(format!(".bin-previous-{}", fixture.id));
@@ -404,6 +500,26 @@ fn candidate_finishes_replacement_probe_and_exact_cleanup_before_restart() {
     assert_eq!(complete["recovery_obligations_closed"], true);
     assert!(!previous.exists());
     assert!(!stage.exists());
+    assert!(!old_install.exists());
+    assert!(current_install.exists());
+    assert!(
+        fs::read_dir(&fixture.state)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("install-completed-")
+                    && fs::read(entry.path())
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|value| value["update_plan_id"] == fixture.id)
+            }),
+        "the current update's installation record was not retained"
+    );
+    assert!(
+        !legacy.exists(),
+        "the previous update-check result is an operating file to delete"
+    );
     assert!(!fixture.state.join("update-maintenance.json").exists());
     assert_eq!(fs::read(memory_format).unwrap(), original_memory);
     assert!(complete["activation"] == "verified");
@@ -422,6 +538,264 @@ fn maintenance_drains_an_open_mcp_before_replacing_bundle() {
         active.child.try_wait().unwrap().is_some(),
         "old MCP stayed alive after the update"
     );
+}
+
+#[test]
+fn update_stops_running_runtime_before_replacement() {
+    let fixture = Fixture::new();
+    let mut host = OwnedStaticChild(
+        Command::new(&fixture.helper)
+            .arg("runtime-host")
+            .env("AGENTLAW_HOME", &fixture.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.state.join("service/endpoint.json").exists() {
+        assert!(
+            host.0.try_wait().unwrap().is_none(),
+            "runtime exited before startup"
+        );
+        assert!(Instant::now() < deadline, "runtime did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let start = Instant::now();
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(start.elapsed() < Duration::from_secs(60));
+    assert!(
+        host.0.try_wait().unwrap().is_some(),
+        "runtime survived replacement"
+    );
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn runtime_shutdown_fixture() {
+    let Some(role) = std::env::var_os("AGENTLAW_UPDATE_RUNTIME_FIXTURE") else {
+        return;
+    };
+    use agentlaw_runtime::{installation::owner::OwnerLock, protocol::*, transport};
+    let state = PathBuf::from(std::env::var_os("AGENTLAW_UPDATE_RUNTIME_STATE").unwrap());
+    let _lock = OwnerLock::try_acquire(&state).unwrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    fs::write(state.join("fixture-owner-ready"), b"ready").unwrap();
+    let until = Instant::now() + Duration::from_secs(120);
+    let wait_file = |name: &str| {
+        while !state.join(name).exists() {
+            assert!(Instant::now() < until, "fixture signal deadline: {name}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    if role == "late" {
+        wait_file("fixture-publish");
+    }
+    transport::write_endpoint(
+        &state,
+        &transport::Endpoint {
+            protocol: PROTOCOL_VERSION,
+            installation_build: "fixture-other-build".into(),
+            control: address,
+            data: address,
+            secret: "a".repeat(64),
+            pid: std::process::id(),
+        },
+    )
+    .unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    let _: Hello = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();
+    fs::write(state.join("fixture-hello"), b"received").unwrap();
+    if role == "silent" {
+        wait_file("fixture-release");
+        return;
+    }
+    if role == "stopping" {
+        transport::send(&mut stream, &HelloReply::Stopping, MAX_CONTROL_REPLY_BYTES).unwrap();
+        wait_file("fixture-release");
+        return;
+    }
+    transport::send(&mut stream, &HelloReply::Accepted, MAX_CONTROL_REPLY_BYTES).unwrap();
+    let request: ControlRequest = transport::receive(&mut stream, MAX_CONTROL_FRAME_BYTES).unwrap();
+    assert!(matches!(request, ControlRequest::Shutdown { .. }));
+    fs::write(state.join("fixture-shutdown"), b"received").unwrap();
+    transport::send(
+        &mut stream,
+        &ControlReply::ShutdownAccepted,
+        MAX_CONTROL_REPLY_BYTES,
+    )
+    .unwrap();
+}
+
+fn start_shutdown_fixture(fixture: &Fixture, role: &str) -> OwnedStaticChild {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "runtime_shutdown_fixture", "--nocapture"])
+        .env("AGENTLAW_UPDATE_RUNTIME_FIXTURE", role)
+        .env("AGENTLAW_UPDATE_RUNTIME_STATE", &fixture.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut helper = OwnedStaticChild(child);
+    wait_for_update_fixture(
+        &mut helper,
+        || fixture.state.join("fixture-owner-ready").exists(),
+        Duration::from_secs(10),
+    );
+    helper
+}
+
+fn wait_for_update_fixture(
+    child: &mut OwnedStaticChild,
+    mut predicate: impl FnMut() -> bool,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "fixture process exited prematurely"
+        );
+        assert!(Instant::now() < deadline, "fixture deadline elapsed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn start_fixture_update(fixture: &Fixture) -> OwnedStaticChild {
+    OwnedStaticChild(
+        Command::new(&fixture.helper)
+            .args([
+                "update",
+                "apply",
+                &fixture.id,
+                "--root",
+                fixture.root.to_str().unwrap(),
+            ])
+            .env("AGENTLAW_HOME", &fixture.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn finish_fixture_update(
+    child: &mut OwnedStaticChild,
+    timeout: Duration,
+) -> (std::process::ExitStatus, Value) {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "updater did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut stdout = child.0.stdout.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = send.send(bytes);
+    });
+    let bytes = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("updater stdout did not close");
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[test]
+fn update_waits_for_runtime_already_stopping() {
+    let fixture = Fixture::new();
+    let mut owner = start_shutdown_fixture(&fixture, "stopping");
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("service/endpoint.json").exists(),
+        Duration::from_secs(10),
+    );
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("fixture-hello").exists(),
+        Duration::from_secs(20),
+    );
+    assert!(
+        update.0.try_wait().unwrap().is_none(),
+        "update did not wait for owner"
+    );
+    assert!(agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+    fs::write(fixture.state.join("fixture-release"), b"release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while owner.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(60));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn update_waits_for_owner_to_publish_then_requests_shutdown() {
+    let fixture = Fixture::new();
+    let mut owner = start_shutdown_fixture(&fixture, "late");
+    assert!(!fixture.state.join("service/endpoint.json").exists());
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut update,
+        || fixture.state.join("update-maintenance.json").exists(),
+        Duration::from_secs(20),
+    );
+    assert!(owner.0.try_wait().unwrap().is_none());
+    assert!(update.0.try_wait().unwrap().is_none());
+    fs::write(fixture.state.join("fixture-publish"), b"publish").unwrap();
+    wait_for_update_fixture(
+        &mut update,
+        || fixture.state.join("fixture-shutdown").exists(),
+        Duration::from_secs(20),
+    );
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(60));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert!(owner.0.try_wait().unwrap().is_some());
+    assert!(!agentlaw_runtime::installation::owner::owner_alive(&fixture.state).unwrap());
+}
+
+#[test]
+fn unresponsive_runtime_prevents_update_replacement() {
+    let fixture = Fixture::new();
+    let binary = fixture.root.join("bin").join(binary_name());
+    let before = hash(&binary);
+    let mut owner = start_shutdown_fixture(&fixture, "silent");
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("service/endpoint.json").exists(),
+        Duration::from_secs(10),
+    );
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut owner,
+        || fixture.state.join("fixture-hello").exists(),
+        Duration::from_secs(20),
+    );
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(110));
+    assert!(!status.success(), "{result}");
+    let details = result.to_string().to_lowercase();
+    assert!(
+        details.contains("unresponsive")
+            || details.contains("timeout")
+            || details.contains("timed out"),
+        "{result}"
+    );
+    assert_eq!(hash(&binary), before);
+    assert!(owner.0.try_wait().unwrap().is_none());
+    fs::write(fixture.state.join("fixture-release"), b"release").unwrap();
 }
 
 #[test]
@@ -833,4 +1207,336 @@ fn harness_drift_stops_before_publication_and_reopens_old_startup() {
         .join(format!(".bin-previous-{}", fixture.id))
         .exists());
     assert!(!fixture.state.join("update-maintenance.json").exists());
+}
+
+// A native placeholder fixture lets bundle validation run before the production
+// worker binary is replaced. Its process behavior is checked separately in worker tests.
+fn placeholder_bundle_executable() -> PathBuf {
+    static BUILD: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = BUILD.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("placeholder.rs");
+        fs::write(
+            &source,
+            r#"fn main() {
+    eprintln!("agentlaw-worker is no longer used");
+    std::process::exit(1);
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .arg("--crate-name=placeholder_fixture")
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.path().join(worker_name()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "placeholder fixture compilation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir
+    });
+    dir.path().join(worker_name())
+}
+
+fn pin_worker_bundle_entries(fixture: &Fixture, candidate: &Path) {
+    // The copied test runner is a real native executable with the old-daemon fixture route.
+    // It survives deletion of the production daemon implementation.
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        fixture.root.join("bin").join(worker_name()),
+    )
+    .unwrap();
+    let staged = fixture
+        .root
+        .join(format!(".update-{}", fixture.id))
+        .join("unpacked");
+    fs::copy(candidate, staged.join(worker_name())).unwrap();
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["bin_before_hashes"][worker_name()] =
+        json!(hash(&fixture.root.join("bin").join(worker_name())));
+    plan["bundle_hashes"][worker_name()] = json!(hash(&staged.join(worker_name())));
+    fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+}
+
+#[test]
+fn old_daemon_drain_fixture() {
+    let Some(state) = std::env::var_os("AGENTLAW_OLD_DAEMON_FIXTURE_STATE") else {
+        return;
+    };
+    let state = PathBuf::from(state);
+    let worker = state.join("worker");
+    fs::create_dir_all(&worker).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(worker.join("daemon.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        worker.join("endpoint.json"),
+        serde_json::to_vec(&json!({
+            "protocol_version":2,"pid":std::process::id(),
+            "incarnation":uuid::Uuid::new_v4().to_string(),
+            "address":endpoint.local_addr().unwrap().to_string(),
+            "secret":"a".repeat(64),"config":"legacy-test-fixture"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(state.join("fixture-old-daemon-ready"), b"ready").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "old daemon did not receive the drain marker"
+        );
+        if let Ok(bytes) = fs::read(state.join("update-maintenance.json")) {
+            if serde_json::from_slice::<Value>(&bytes).is_ok_and(|marker| marker["drain"] == true) {
+                fs::write(state.join("fixture-old-daemon-drain-seen"), bytes).unwrap();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // An owned exit gate proves the updater waits for actual exit after requesting drain.
+    while !state.join("fixture-old-daemon-release").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "old daemon exit gate was not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(endpoint);
+    drop(lock);
+}
+
+#[test]
+fn update_drains_old_worker_daemon_and_waits_for_its_exit_before_completing() {
+    let fixture = Fixture::new();
+    pin_worker_bundle_entries(&fixture, &placeholder_bundle_executable());
+    let mut command = Command::new(fixture.root.join("bin").join(worker_name()));
+    command
+        .args(["--exact", "old_daemon_drain_fixture", "--nocapture"])
+        .env("AGENTLAW_OLD_DAEMON_FIXTURE_STATE", &fixture.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut daemon = OwnedStaticChild(command.spawn().unwrap());
+    wait_for_update_fixture(
+        &mut daemon,
+        || fixture.state.join("fixture-old-daemon-ready").is_file(),
+        Duration::from_secs(10),
+    );
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.state.join("worker/daemon.lock"))
+        .unwrap();
+    assert!(
+        lock.try_lock_exclusive().is_err(),
+        "old daemon must own its lifetime lock"
+    );
+    drop(lock);
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(fixture.state.join("worker/endpoint.json")).unwrap())
+            .unwrap();
+    assert_eq!(endpoint["pid"], daemon.0.id());
+    let mut update = start_fixture_update(&fixture);
+    wait_for_update_fixture(
+        &mut daemon,
+        || {
+            fixture
+                .state
+                .join("fixture-old-daemon-drain-seen")
+                .is_file()
+        },
+        Duration::from_secs(30),
+    );
+    let drain: Value = serde_json::from_slice(
+        &fs::read(fixture.state.join("fixture-old-daemon-drain-seen")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(drain["drain"], true);
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert!(
+        update.0.try_wait().unwrap().is_none(),
+        "update completed before the old daemon exited"
+    );
+    fs::write(fixture.state.join("fixture-old-daemon-release"), b"exit").unwrap();
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(90));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    assert!(
+        daemon
+            .0
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| status.success()),
+        "old daemon survived completed update"
+    );
+    assert_eq!(
+        hash(&fixture.root.join("bin").join(worker_name())),
+        hash(&placeholder_bundle_executable())
+    );
+}
+
+#[test]
+fn old_worker_bundle_and_its_pinned_recovery_plan_remain_valid() {
+    let fixture = Fixture::new();
+    pin_worker_bundle_entries(&fixture, &std::env::current_exe().unwrap());
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    // Resuming the durable plan exercises validation of a previously published old layout.
+    let recovered = fixture.apply();
+    assert_eq!(recovered["status"], "completed", "{recovered}");
+    assert_eq!(recovered["bundle"], "installed_and_verified", "{recovered}");
+}
+
+#[test]
+fn placeholder_worker_bundle_and_its_pinned_recovery_plan_validate() {
+    let fixture = Fixture::new();
+    let placeholder = placeholder_bundle_executable();
+    pin_worker_bundle_entries(&fixture, &placeholder);
+    let result = fixture.apply();
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["bundle"], "installed_and_verified", "{result}");
+    assert_eq!(
+        hash(&fixture.root.join("bin").join(worker_name())),
+        hash(&placeholder)
+    );
+    let recovered = fixture.apply();
+    assert_eq!(recovered["status"], "completed", "{recovered}");
+    assert_eq!(recovered["bundle"], "installed_and_verified", "{recovered}");
+}
+
+#[test]
+fn bundle_missing_worker_entry_is_rejected_without_replacing_the_old_installation() {
+    let fixture = Fixture::new();
+    let staged = fixture
+        .root
+        .join(format!(".update-{}", fixture.id))
+        .join("unpacked");
+    fs::rename(
+        staged.join(worker_name()),
+        fixture.root.parent().unwrap().join("omitted-worker"),
+    )
+    .unwrap();
+    let path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let mut plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["bundle_hashes"]
+        .as_object_mut()
+        .unwrap()
+        .remove(worker_name());
+    fs::write(path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let before = snapshot(&fixture.root.join("bin"));
+    let mut update = start_fixture_update(&fixture);
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(30));
+    assert!(!status.success(), "{result}");
+    assert_eq!(result["code"], "update_drift", "{result}");
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incomplete")),
+        "{result}"
+    );
+    assert_eq!(snapshot(&fixture.root.join("bin")), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn update_completes_with_busy_operating_file_pending_and_startup_retries_only_that_file() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let busy = fixture.state.join("worker/component-busy.json");
+    fs::create_dir_all(busy.parent().unwrap()).unwrap();
+    fs::write(&busy, b"previous-version component state").unwrap();
+    // Permit reads and writes but deny deletion, as a real Windows user does
+    // when another process still has the old file open.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&busy)
+        .unwrap();
+    let mut update = start_fixture_update(&fixture);
+    let (status, result) = finish_fixture_update(&mut update, Duration::from_secs(90));
+    assert!(status.success(), "{result}");
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["cleanup"], "completed", "{result}");
+    assert!(
+        busy.exists(),
+        "a Windows sharing violation must leave the file pending"
+    );
+    let plan_path = fixture
+        .state
+        .join("update-plans")
+        .join(format!("{}.json", fixture.id));
+    let plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(plan["cleanup_completed"], true);
+    let cleanup_id = plan["cleanup_plan_id"].as_str().unwrap();
+    let cleanup_path = fixture
+        .state
+        .join("cleanup-plans")
+        .join(format!("{cleanup_id}.json"));
+    let cleanup: Value = serde_json::from_slice(&fs::read(&cleanup_path).unwrap()).unwrap();
+    assert!(
+        cleanup["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == json!(busy) && item["phase"] == "cleanup_deferred"),
+        "completed update must report the busy deletion as pending: {cleanup}"
+    );
+    drop(held);
+    let added_later = fixture
+        .state
+        .join("worker/component-created-after-update.json");
+    fs::write(&added_later, b"not approved by the update inventory").unwrap();
+    let runtime = fixture.root.join("bin").join(binary_name());
+    let mut frontend = McpClient::new(&runtime, &fixture.state);
+    let recall =
+        frontend.call(json!({"action":"recall","recall":{"recall_for":"verify startup retries"}}));
+    assert_eq!(recall["isError"], false, "{recall}");
+    assert!(
+        !busy.exists(),
+        "runtime startup did not retry the recorded deletion"
+    );
+    assert_eq!(
+        fs::read(&added_later).unwrap(),
+        b"not approved by the update inventory",
+        "runtime startup must not perform a fresh operating-file inventory"
+    );
+    let retried: Value = serde_json::from_slice(&fs::read(&cleanup_path).unwrap()).unwrap();
+    assert!(
+        retried["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source"] == json!(busy) && item["phase"] == "removed"),
+        "{retried}"
+    );
+    assert!(!retried["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["source"] == json!(added_later)));
 }

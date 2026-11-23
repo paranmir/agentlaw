@@ -1,4 +1,4 @@
-//! Explicit C6 journal replacement from bound durable receipts. Originals and
+//! Explicit journal replacement from bound durable receipts. Originals and
 //! pending recovery material are retained; a damaged proposal DB is not guessed.
 use super::*;
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,7 +35,12 @@ impl Store {
         };
         store.check_local_binding(false)?;
         let admission = store.admission_lock()?;
-        let gate = store.lock()?;
+        let gate = store.lock_unchecked()?;
+        // The gate excludes source readers while the active writer is closed,
+        // the original bytes are backed up, and the replacement is installed.
+        let journal_writer = journal::pause(&store.local);
+        #[cfg(test)]
+        journal::after_repair_pause(&store.local);
         store.validate_format()?;
         store.resume_journal_repair_locked()?;
         let fence = store.fence()?;
@@ -125,6 +130,7 @@ impl Store {
         store.resume_journal_repair_locked()?;
         store.recover_locked()?;
         let final_generation = store.ensure_clean()?;
+        journal_writer.resume()?;
         drop(gate);
         drop(admission);
         let canonical_audit = store.audit_source()?;
@@ -150,6 +156,7 @@ impl Store {
         if !marker.exists() {
             return Ok(());
         }
+        let journal_writer = journal::pause(&self.local);
         let plan: RepairPlan = self.load(&marker)?;
         validate_id(&plan.repair_id)?;
         let dir = self.local.join("journal-repairs").join(&plan.repair_id);
@@ -192,6 +199,7 @@ impl Store {
         fs::remove_file(marker)?;
         use persistence::Persistence;
         persistence::PlatformPersistence.sync_namespace(&self.local)?;
+        journal_writer.resume()?;
         Ok(())
     }
 }

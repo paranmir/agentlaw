@@ -125,6 +125,17 @@ impl Store {
             epoch: self.load(&self.local.join("source-epoch"))?,
             sequence: self.ensure_clean()?,
         };
+        self.acquire_closure_locked(ids, position)
+    }
+    pub(super) fn acquire_closure_locked(
+        &self,
+        ids: &[String],
+        position: published::SourcePosition,
+    ) -> Result<(
+        published::SourcePosition,
+        Vec<AcquiredResolvedCurrent>,
+        Vec<String>,
+    )> {
         let mut queue = std::collections::VecDeque::from(ids.to_vec());
         let mut visited = BTreeSet::new();
         let mut resolved = BTreeSet::new();

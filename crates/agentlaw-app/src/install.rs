@@ -112,7 +112,7 @@ fn atomic_text(path: &Path, text: &str) -> Result<()> {
     tmp.write_all(text.as_bytes())
         .and_then(|_| tmp.as_file().sync_all())
         .map_err(|_| err("Cannot persist installation output."))?;
-    tmp.persist(path).map_err(|_| {
+    agentlaw_storage::persistence::install_temp_file(tmp, path).map_err(|_| {
         err("Cannot replace installation output; recover using the retained installation journal.")
     })?;
     Ok(())
@@ -391,16 +391,27 @@ struct Replacement {
 #[derive(Serialize, Deserialize)]
 struct InstallJournal {
     targets: Vec<Replacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    update_plan_id: Option<String>,
 }
-fn recover_journal(state: &Path) -> Result<()> {
+fn recover_journal(state: &Path, update_plan_id: Option<&str>) -> Result<()> {
     let path = state.join("install-pending.json");
     let Some(raw) = read_optional(&path)? else {
         return Ok(());
     };
-    let journal: InstallJournal = serde_json::from_value(
+    let mut journal: InstallJournal = serde_json::from_value(
         agentlaw_contracts::validation::decode_unique(&raw)?,
     )
     .map_err(|_| err("Installation recovery journal is invalid; preserve it for diagnosis."))?;
+    if journal
+        .update_plan_id
+        .as_deref()
+        .is_some_and(|owner| Some(owner) != update_plan_id)
+    {
+        return Err(err(
+            "The installation recovery journal belongs to another update.",
+        ));
+    }
     // Validate every compare-and-swap precondition before replacing any target.
     for r in &journal.targets {
         let current = read_optional(&r.path)?;
@@ -408,10 +419,18 @@ fn recover_journal(state: &Path) -> Result<()> {
             return Err(err("Settings changed since interrupted installation. No recovery overwrite was attempted; inspect install-pending.json."));
         }
     }
-    for r in journal.targets {
+    for r in &journal.targets {
         if read_optional(&r.path)?.as_deref() != Some(&r.after) {
             atomic_text(&r.path, &r.after)?;
         }
+    }
+    if journal.update_plan_id.is_none() && update_plan_id.is_some() {
+        journal.update_plan_id = update_plan_id.map(str::to_owned);
+        atomic_text(
+            &path,
+            &serde_json::to_string_pretty(&journal)
+                .map_err(|_| err("Cannot encode installation recovery journal."))?,
+        )?;
     }
     fs::rename(
         &path,
@@ -444,6 +463,7 @@ pub(crate) fn lock_install_state(state: &Path) -> Result<fs::File> {
 /// The caller already owns update.lock and install.lock, in that order.
 pub(crate) fn apply_pinned_registration_locked(
     state: &Path,
+    update_plan_id: &str,
     expected: &[(PathBuf, String, String)],
     candidate: &Path,
     executable: &Path,
@@ -508,12 +528,15 @@ pub(crate) fn apply_pinned_registration_locked(
             .collect();
         atomic_text(
             &journal_path,
-            &serde_json::to_string_pretty(&InstallJournal { targets })
-                .map_err(|_| err("Cannot encode installation recovery journal."))?,
+            &serde_json::to_string_pretty(&InstallJournal {
+                targets,
+                update_plan_id: Some(update_plan_id.to_owned()),
+            })
+            .map_err(|_| err("Cannot encode installation recovery journal."))?,
         )?;
     }
     if journal_path.exists() {
-        recover_journal(state)?;
+        recover_journal(state, Some(update_plan_id))?;
     }
     for (path, _, after) in expected {
         if read_optional(path)?.as_deref() != Some(after.as_str()) {
@@ -582,7 +605,7 @@ pub fn install(
         .open(state.join("install.lock"))
         .map_err(|_| err("Cannot lock installation state."))?;
     fs2::FileExt::lock_exclusive(&lock).map_err(|_| err("Cannot coordinate installation."))?;
-    recover_journal(state)?;
+    recover_journal(state, None)?;
     let receipt = state.join(format!(
         "harness-{}-{}.json",
         harness.name(),
@@ -665,10 +688,13 @@ pub fn install(
     });
     atomic_text(
         &state.join("install-pending.json"),
-        &serde_json::to_string_pretty(&InstallJournal { targets })
-            .map_err(|_| err("Cannot encode installation recovery journal."))?,
+        &serde_json::to_string_pretty(&InstallJournal {
+            targets,
+            update_plan_id: None,
+        })
+        .map_err(|_| err("Cannot encode installation recovery journal."))?,
     )?;
-    recover_journal(state)?;
+    recover_journal(state, None)?;
     let machine = crate::machine::load_or_create(state)?;
     Ok(
         json!({"status":"installed","harness":harness.name(),"executable":executable,"config_path":config,"instructions_path":instructions,"machine_id":machine.machine_id,"semantic_model_configured":installed_assets(state)?.is_some(),"next_action":"Start a new harness session and verify agentlaw tool discovery and these instructions. Installation does not create a project binding or prove model compliance. If no model bundle was supplied, lexical recall remains available with an explicit semantic-unavailable diagnostic."}),
@@ -676,117 +702,4 @@ pub fn install(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn generated_bootstrap_matches_accepted_contract() {
-        let guidance = super::super::GUIDANCE.replace("\r\n", "\n");
-        let accepted = guidance
-            .split_once("## Bootstrap")
-            .unwrap()
-            .1
-            .split_once("```text\n")
-            .unwrap()
-            .1
-            .split_once("\n```")
-            .unwrap()
-            .0;
-        let expected = accepted
-            .replace(
-                "{state_assignment}",
-                if cfg!(windows) {
-                    "$env:AGENTLAW_HOME='state'"
-                } else {
-                    "AGENTLAW_HOME='state'"
-                },
-            )
-            .replace(
-                "{invocation}",
-                if cfg!(windows) {
-                    "& 'agentlaw'"
-                } else {
-                    "'agentlaw'"
-                },
-            );
-        let generated = bootstrap(Path::new("agentlaw"), Path::new("state"));
-        let body = generated
-            .split_once("## Agentlaw memory\n\n")
-            .unwrap()
-            .1
-            .split_once(&format!("\n{END}"))
-            .unwrap()
-            .0;
-        assert_eq!(body, expected);
-    }
-    #[test]
-    fn instruction_replacement_preserves_user_text_and_refuses_ambiguous_markers() {
-        let first = upsert_bootstrap("User rules\n", &format!("{BEGIN}\nold\n{END}")).unwrap();
-        let second = upsert_bootstrap(&first, &format!("{BEGIN}\nnew\n{END}")).unwrap();
-        assert!(same_owned_bootstrap(
-            &second,
-            &format!("Unrelated user rule\n{second}")
-        ));
-        assert!(!same_owned_bootstrap(
-            &second,
-            &second.replace("new", "changed")
-        ));
-        assert!(!same_owned_bootstrap(
-            &second,
-            &format!("{second}\n{BEGIN}")
-        ));
-        assert!(second.starts_with("User rules\n"));
-        assert_eq!(second.matches(BEGIN).count(), 1);
-        assert!(!second.contains("old"));
-        assert!(upsert_bootstrap(BEGIN, "x").is_err());
-    }
-    #[test]
-    fn config_preserves_other_servers_and_requires_ownership() {
-        let d = tempfile::tempdir().unwrap();
-        let exe = d.path().join("app.exe");
-        let old = "model = 'keep'\n[mcp_servers.other]\ncommand = 'other'\n";
-        let text = configuration(Harness::Codex, old, &exe, d.path(), false).unwrap();
-        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(doc["model"].as_str(), Some("keep"));
-        assert_eq!(
-            doc["mcp_servers"]["other"]["command"].as_str(),
-            Some("other")
-        );
-        assert!(configuration(Harness::Codex, &text, &exe, d.path(), false).is_err());
-        assert!(configuration(Harness::Codex, &text, &exe, d.path(), true).is_ok());
-        let json = configuration(
-            Harness::OhMyPi,
-            "{\"mcpServers\":{\"other\":{\"command\":\"keep\"}}}",
-            &exe,
-            d.path(),
-            false,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["mcpServers"]["other"]["command"], "keep");
-    }
-    #[test]
-    fn interrupted_install_resumes_without_overwriting_new_user_edits() {
-        let d = tempfile::tempdir().unwrap();
-        let target = d.path().join("AGENTS.md");
-        fs::write(&target, "before").unwrap();
-        atomic_text(
-            &d.path().join("install-pending.json"),
-            &serde_json::to_string(&InstallJournal {
-                targets: vec![Replacement {
-                    path: target.clone(),
-                    before: Some("before".into()),
-                    after: "after".into(),
-                }],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(&target, "user changed").unwrap();
-        assert!(recover_journal(d.path()).is_err());
-        assert_eq!(fs::read_to_string(&target).unwrap(), "user changed");
-        fs::write(&target, "before").unwrap();
-        recover_journal(d.path()).unwrap();
-        assert_eq!(fs::read_to_string(&target).unwrap(), "after");
-        assert!(!d.path().join("install-pending.json").exists());
-    }
-}
+mod tests;

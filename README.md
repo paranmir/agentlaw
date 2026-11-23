@@ -37,7 +37,7 @@ The same flow works for preferences, project decisions, reusable procedures, and
 - **See how an answer changed.** Inspect the history and evidence behind a memory.
 - **Own the source.** Current memories are Markdown documents. You choose the local store and can share its source through explicit Git operations.
 
-Agentlaw connects to an existing harness through one MCP tool. Its CLI uses the same memory operations. Codex has a configuration adapter; an Oh My Pi adapter is also implemented. See [verification](docs/verification.md) for the environments tested so far.
+Agentlaw connects to an existing harness through one MCP tool. Its CLI uses the same memory operations. Codex has a configuration adapter; an Oh My Pi adapter is also implemented. See the [installation guide](docs/installation.md#set-up-memory-and-a-harness) for setup and harness compatibility limits.
 
 ## Get started
 
@@ -87,7 +87,6 @@ Agentlaw stores the current memory separately from its change history. Search in
 - [Everyday memory use, history, sharing, and updates](docs/usage.md)
 - [Agentlaw usage skill](skills/agentlaw/SKILL.md)
 - [Public tool schema and examples](docs/design/contracts/agentlaw-tool.schema.json)
-- [What has been verified](docs/verification.md)
 
 ## Development
 
@@ -98,7 +97,7 @@ cargo fmt --all -- --check
 cargo test --locked --workspace --no-fail-fast
 ~~~
 
-Real-model tests need local model and runtime assets and are opt-in; see [verification](docs/verification.md). The [candidate workflow](.github/workflows/release.yml) tests and packages each PR once. After a version-changing PR merges, the [publisher](.github/workflows/publish.yml) verifies and releases those same files without rerunning tests or rebuilding. See [release operation and recovery](docs/releasing.md).
+Real-model tests are opt-in and require local [model and runtime assets](crates/agentlaw-worker/ARTIFACTS.md).
 
 ## Security and license
 

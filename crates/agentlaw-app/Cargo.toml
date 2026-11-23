@@ -8,8 +8,12 @@ publish.workspace = true
 name = "agentlaw"
 path = "src/main.rs"
 
+[features]
+write-audit = ["agentlaw-runtime/write-audit"]
+
 [dependencies]
 agentlaw-contracts = { path = "../agentlaw-contracts" }
+agentlaw-runtime = { path = "../agentlaw-runtime" }
 agentlaw-storage = { path = "../agentlaw-storage" }
 agentlaw-flows = { path = "../agentlaw-flows" }
 agentlaw-worker = { path = "../agentlaw-worker" }
@@ -35,7 +39,7 @@ libc = "0.2"
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_IO", "Win32_System_SystemServices", "Win32_Security"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

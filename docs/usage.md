@@ -6,24 +6,6 @@ the same input contract. Runtime does not replace the agent's semantic judgment
 or the user's decisions.
 
 For installation and harness setup, see the [installation guide](installation.md).
-For tested behavior and current gaps, see [verification](verification.md).
-
-## Modules and source of truth
-
-| Crate | Responsibility |
-|---|---|
-| agentlaw-contracts | Shared types, schema, validation and LLM-facing guidance |
-| agentlaw-flows | Project context, recall, write/review, procedures and history |
-| agentlaw-storage | Complete current Markdown, lossless history, publication/recovery |
-| agentlaw-search | BM25, vector candidates, RRF, scope filters and generations |
-| agentlaw-worker | Shared broker, model lifecycle, durable jobs and index acknowledgment |
-| agentlaw-app | MCP/CLI, explicit installation, configuration and Git operations |
-
-The [README](../README.md#how-the-pieces-fit) introduces the user-facing pieces.
-Current memory is directly readable Markdown: reading it does not replay every
-past change. History retains causal changes separately. Indexes and embeddings
-are rebuildable; unpublished proposals and recovery decisions are not disposable
-caches. Git synchronization is explicit, not a condition of memory-write success.
 
 ## CLI help and input
 
@@ -66,24 +48,6 @@ before application resources open. Installation model manifests/assets and
 export files keep their existing limits. CLI syntax checks do not replace domain
 validation. Existing result/error streams remain intact; procedure inventory/search
 still stream JSONL or tables and diagnostics.
-
-## Build
-
-```powershell
-cargo check --workspace
-cargo build --workspace
-.\target\debug\agentlaw.exe --help
-.\target\debug\agentlaw.exe schema
-```
-
-The development Windows machine uses Rust/Cargo 1.98.1 and LLVM-MinGW on the user
-PATH, target `stable-x86_64-pc-windows-gnullvm`. Ignored `.tools/` files are local
-build/download assets, not a distributable installer. Installed Rust execution
-does not need a project Python environment.
-
-The default regression command is
-`cargo test --workspace --no-fail-fast`. Real-model tests require explicit assets;
-see [model artifacts](../crates/agentlaw-worker/ARTIFACTS.md).
 
 ## Isolated setup and installation
 
@@ -146,7 +110,7 @@ versioned executable and verified assets, updates owned MCP/bootstrap entries,
 preserves unrelated settings and records recoverable progress. Codex Desktop/CLI
 share the Codex adapter. `--harness oh-my-pi` has a configuration adapter; live
 harness verification is deferred. Omit `--harness-dir` only when deliberately
-targeting the active user profile. This task has not changed that profile.
+targeting the active user profile.
 
 The model manifest contains three **absolute local paths** and SHA-256 digests:
 
@@ -189,7 +153,9 @@ and candidate, gates new Agentlaw work, and waits for affected MCP and worker
 processes to finish and exit. It replaces the bundle and registrations, probes
 the new MCP with initialize, tool discovery and read-only recall, then removes
 only the old bundle, previous registered version and staging objects approved
-by that plan. Memory, models, machine identity and pending work are preserved.
+by that plan. An item still used by a running process is left in place and
+removed at a later start. Memory, models, machine identity and pending work are
+preserved.
 On exit 0 with valid final `status: "installed"`, report completion and request
 a normal harness restart. The updater already verified its exact plan and
 finished replacement, probe, cleanup, and gate release. Do not repeat
@@ -225,6 +191,13 @@ the repository.
 
 ## Ordinary memory work
 
+Each installation runs one shared runtime. `mcp serve --stdio` is a thin frontend
+that starts the runtime if needed and attaches to it, so later sessions reuse its
+prepared stores and model. The runtime keeps running after the session that
+started it ends. On Windows, a runtime first started by Codex ends together with
+that Codex process because Codex does not let child processes leave its job; the
+next call from any harness starts a new runtime and resumes recorded work.
+
 `mcp serve --stdio` exposes only `agentlaw`. `call --json -` reads one JSON request
 from stdin and emits one result on stdout; progress goes to stderr. Use `schema`
 for the current contract. Do not fabricate IDs or observed versions.
@@ -255,15 +228,23 @@ agentlaw repair
 History defaults to 8192 response bytes; general delivery defaults to 65536.
 These control delivery, not silent truncation. `doctor` diagnoses without source
 repair. `repair` completes recorded publication and rebuilds derived generations.
-In `doctor` output, `model_load` and `vector_index:<repository>` entries under
-`worker_runtime.diagnostics` are unresolved failures. The separate
-`worker_runtime.diagnostic_history` keeps the latest verified resolution of each
-such failure with its resolution time; it does not reconstruct when the
-original failure occurred. The worker snapshot is not a live model probe, and
-the top-level `doctor` status still reports source and local integrity.
+`doctor --audit`, `repair`, `continuity save`, `history export`, and
+`learned-procedure list` and `search` run inside the installation runtime, starting
+it if needed. During repair, other requests to the selected store wait until it finishes.
+Default `doctor` does not start the runtime: `worker_runtime` reports `not_running`, with
+`stale_endpoint` when an old address remains. An unresponsive runtime reports
+`worker_diagnosis_incomplete` and `runtime_unresponsive`. A running runtime
+reports component states and unresolved reasons in `worker_runtime.diagnostics`,
+including `model_load` and `vector_index:<binding>`. Resolved failures have no
+diagnostic history. The top-level status still reports source and local integrity.
 A damaged journal can be rebuilt from retained authoritative decisions while
 preserving originals. A missing/corrupt proposal DB needs backup recovery, never
 a successful-looking empty replacement.
+
+A recall, `history_for` or learned-procedure search query is passed to the
+embedding model up to its first 4 MiB and embedded from at most its first 512
+model tokens. When either limit drops part of the query, the result carries a
+`semantic_query_truncated` diagnostic. Lexical search still uses the full query.
 
 Recall candidates group identical clues from the same source into one
 `retrieval_paths` entry. Its `via` array lists every actual discovery channel:
@@ -348,10 +329,18 @@ exclusion or history rewrite needs a separate scoped decision, not a bypass.
 Scanning materializes a self-contained raw Git transfer store. Retries validate
 its integrity and reuse pattern findings; new candidates are scanned again.
 Replace refs, grafts, shallow/partial/promisor stores, alternates and gitlinks are
-unsupported, without silently reconfiguring Git. Default capture/read-set bounds
-and unmeasured performance are documented in [verification](verification.md).
+unsupported, without silently reconfiguring Git. Capture/projection is limited
+to 100,000 canonical files and 512 MiB, with a cooperative 5-second capture
+budget. Final guarded context is limited to 256 nodes/paths and 16 MiB; large
+connected graphs may be refused. Convenience snapshots and requests retain
+64 MiB and 16 MiB limits respectively. The capture budget is not a hard OS I/O
+deadline, and these bounds are not a measured large-corpus performance guarantee.
 
 ### Existing separate continuity/import/share commands
+
+Share, import, and sync commands run inside the installation runtime, starting it
+if needed. Long import steps report their current step and elapsed time on stderr;
+the JSON result goes to stdout. `share import list` shows imports without a reference.
 
 ```text
 agentlaw continuity save
@@ -381,14 +370,3 @@ Management uses `learned-procedure list` and `learned-procedure search --query
 <text>`; `--help` lists filters and output formats. `history export --memory-id
 <id> --output <new-file>` writes complete versioned JSONL through a temporary
 file, without overwriting existing output.
-
-## Verification boundary
-
-The implementation record distinguishes code, historical evidence and untested
-changes. The regression suite and separate real-model tests cover local Windows
-CPU inference, installation, worker recovery and nonempty Git-clone reconstruction.
-Actual GPU execution, macOS/Linux/Arm, physical power loss and
-million-record user-corpus latency/quality remain unverified.
-
-Building the product does not reconfigure an active harness.
-Installation and Git sharing remain explicit operations.

@@ -196,7 +196,7 @@ mod tests {
             text(&[]).unwrap(),
             describe(&[]).unwrap()
         );
-        for hidden in ["worker-daemon", "model-child", "confirm-update"] {
+        for hidden in ["model-child", "confirm-update"] {
             assert!(!information.contains(hidden), "exposed {hidden}");
         }
         let update = describe(&["update".into()]).unwrap();

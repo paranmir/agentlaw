@@ -123,14 +123,121 @@ pub fn host_resident_bytes() -> Option<u64> {
         None
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn complete_ranges_and_noise() {
-        assert!(gpu_is_unambiguously_faster(&[11, 12, 13], &[1, 2, 3]));
-        assert!(!gpu_is_unambiguously_faster(&[2, 12, 13], &[1, 2, 3]));
-        assert!(!gpu_is_unambiguously_faster(&[2, 3], &[1, 1]));
-        assert!(!gpu_is_unambiguously_faster(&[3, 4, 5], &[0, 1, 2]));
+use std::sync::{mpsc, Arc};
+
+enum CacheCommand {
+    Save(String, crate::execution::Selection),
+    #[cfg(test)]
+    Flush(mpsc::Sender<()>),
+}
+pub(crate) struct SelectionCache {
+    value: Arc<std::sync::Mutex<Option<(String, crate::execution::Selection)>>>,
+    commands: mpsc::Sender<CacheCommand>,
+}
+impl SelectionCache {
+    pub(crate) fn open(path: std::path::PathBuf) -> Self {
+        use std::io::Read;
+        const MAX_BYTES: u64 = 65_536;
+        let mut previous = std::fs::File::open(&path).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() as u64 <= MAX_BYTES).then_some(bytes)
+        });
+        let selection = previous
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice(bytes).ok());
+        if selection.is_none() {
+            previous = None;
+        }
+        let value = Arc::new(std::sync::Mutex::new(selection));
+        let (commands, incoming) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(command) = incoming.recv() {
+                match command {
+                    CacheCommand::Save(fingerprint, selection) => {
+                        let item = (fingerprint, selection);
+                        if let Ok(bytes) = serde_json::to_vec(&item) {
+                            if bytes.len() as u64 <= MAX_BYTES {
+                                if previous.as_ref() == Some(&bytes)
+                                    || std::fs::write(&path, &bytes).is_ok()
+                                {
+                                    previous = Some(bytes);
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(test)]
+                    CacheCommand::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self { value, commands }
+    }
+    pub(crate) fn get(&self) -> Option<(String, crate::execution::Selection)> {
+        self.value.lock().unwrap().clone()
+    }
+    pub(crate) fn save(&self, fingerprint: String, selection: crate::execution::Selection) {
+        *self.value.lock().unwrap() = Some((fingerprint.clone(), selection.clone()));
+        let _ = self
+            .commands
+            .send(CacheCommand::Save(fingerprint, selection));
+    }
+    pub(crate) fn accept(&self, fingerprint: String, selection: Selection) {
+        if selection.cacheable {
+            self.save(fingerprint, selection);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        let (tx, rx) = mpsc::channel();
+        self.commands.send(CacheCommand::Flush(tx)).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     }
 }
+pub(crate) fn cached_selection(
+    cached: Option<(String, Selection)>,
+    fingerprint: Option<&String>,
+) -> Option<Selection> {
+    cached
+        .filter(|(key, _)| Some(key) == fingerprint)
+        .map(|(_, selection)| selection)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuExecutionSettings {
+    pub version: u32,
+    pub intra: usize,
+    pub inter: usize,
+}
+
+pub(crate) fn select_for_launch(
+    hardware_fingerprint: impl FnOnce() -> Option<String>,
+    settings: Option<CpuExecutionSettings>,
+    cached: Option<(String, Selection)>,
+    select: impl FnOnce(Option<&Selection>) -> Selection,
+) -> (Option<String>, Selection) {
+    let hardware = hardware_fingerprint();
+    let fingerprint = match settings {
+        Some(settings) => fingerprint_with_cpu_settings(hardware, settings),
+        None => hardware,
+    };
+    let cached = cached_selection(cached, fingerprint.as_ref());
+    (fingerprint, select(cached.as_ref()))
+}
+
+fn fingerprint_with_cpu_settings(
+    hardware: Option<String>,
+    settings: CpuExecutionSettings,
+) -> Option<String> {
+    hardware.map(|hardware| {
+        format!(
+            "{hardware}:cpu:{}:{}:{}",
+            settings.version, settings.intra, settings.inter
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests;

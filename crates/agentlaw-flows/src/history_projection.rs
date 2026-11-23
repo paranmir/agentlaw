@@ -1,7 +1,6 @@
-//! Disk-backed, causal history selection. Bodies are acquired from immutable C6
-//! components; history length is not a bound on process memory.
+//! Causal history selection over acquired immutable source components.
 use crate::{history_diff, DomainError, HistoryRequest, RequestControl};
-use agentlaw_storage::{history_spool::Component, Store};
+use agentlaw_storage::history_spool::{Component, HistorySpool};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -11,8 +10,224 @@ use std::{
 };
 type Work<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+const HISTORY_WORKSPACE_MEMORY_LIMIT: u64 = 64 * 1024 * 1024;
+const HISTORY_ASSEMBLY_WORKSPACE_RESERVE: u64 = 16 * 1024 * 1024;
+fn inline_assembly_fits(input: &mut impl Read, control: &RequestControl) -> Work<bool> {
+    let mut bytes = [0u8; 32 * 1024];
+    let (
+        mut objects,
+        mut arrays,
+        mut strings,
+        mut numbers,
+        mut literals,
+        mut fields,
+        mut string_bytes,
+    ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut in_string, mut escaped, mut in_number) = (false, false, false);
+    // Each map node is bounded as an internal BTreeMap node with all 11 key/value slots and 12 child pointers.
+    let map_node = (11 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
+        + 16 * std::mem::size_of::<usize>()) as u64;
+    loop {
+        control.check()?;
+        let n = input.read(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &bytes[..n] {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    string_bytes = string_bytes.saturating_add(1);
+                } else if byte == b'\\' {
+                    escaped = true;
+                    string_bytes = string_bytes.saturating_add(1);
+                } else if byte == b'"' {
+                    in_string = false;
+                } else {
+                    string_bytes = string_bytes.saturating_add(1);
+                }
+                continue;
+            }
+            if in_number {
+                if matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                    continue;
+                }
+                in_number = false;
+            }
+            match byte {
+                b'"' => {
+                    strings = strings.saturating_add(1);
+                    in_string = true;
+                }
+                b'{' => objects = objects.saturating_add(1),
+                b'[' => arrays = arrays.saturating_add(1),
+                b':' => fields = fields.saturating_add(1),
+                b'-' | b'0'..=b'9' => {
+                    numbers = numbers.saturating_add(1);
+                    in_number = true;
+                }
+                b't' | b'f' | b'n' => literals = literals.saturating_add(1),
+                _ => {}
+            }
+        }
+        let values = objects
+            .saturating_add(arrays)
+            .saturating_add(strings)
+            .saturating_add(numbers)
+            .saturating_add(literals);
+        let estimate = HISTORY_ASSEMBLY_WORKSPACE_RESERVE
+            .saturating_add(string_bytes.saturating_mul(2))
+            .saturating_add(objects.saturating_add(fields).saturating_mul(map_node))
+            .saturating_add(values.saturating_mul(2 * std::mem::size_of::<Value>() as u64));
+        if estimate > HISTORY_WORKSPACE_MEMORY_LIMIT {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The connection is dropped before its owned directory, including on error.
+struct ProjectionWorkspace {
+    db: Connection,
+    directory: Option<tempfile::TempDir>,
+}
+impl ProjectionWorkspace {
+    fn for_spool(
+        local: &Path,
+        spool: &mut HistorySpool,
+        identity: &str,
+        request: &HistoryRequest,
+        control: &RequestControl,
+    ) -> Work<Self> {
+        // Bound the projected SQLite pages, token postings, diff line references,
+        // JSON escaping and copies, in addition to the acquired source pages.
+        // Saturation deliberately selects the file-backed path on overflow.
+        let source_bytes = spool.size_bytes()?;
+        if source_bytes > HISTORY_WORKSPACE_MEMORY_LIMIT / 4 {
+            spool.spill_to_file()?;
+        }
+        let query_bytes = request
+            .history_for
+            .as_ref()
+            .map_or(0, |query| query.len() as u64);
+        let mut estimate = source_bytes
+            .saturating_add(8 * 1024 * 1024)
+            .saturating_add(query_bytes.saturating_mul(256));
+        let windows = if request.history_for.is_some() {
+            u64::from(request.max_matches.unwrap_or(1)).saturating_add(1)
+        } else {
+            1
+        };
+        spool.visit_metadata_closure(identity, |change| {
+            let result = (|| -> Work<()> {
+                control.check()?;
+                let metadata = serde_json::to_vec(&change.metadata)?.len() as u64;
+                let cost = (256u64 * 1024)
+                    .saturating_add(metadata.saturating_mul(8))
+                    .saturating_add(
+                        change
+                            .body
+                            .bytes
+                            .saturating_add(change.evidence.bytes)
+                            .saturating_mul(256),
+                    );
+                estimate = estimate.saturating_add(cost.saturating_mul(windows));
+                Ok(())
+            })();
+            result.map_err(|e| agentlaw_storage::Error::Io(std::io::Error::other(e.to_string())))
+        })?;
+        if estimate <= HISTORY_WORKSPACE_MEMORY_LIMIT {
+            let db = agentlaw_sqlite::open_in_memory()?;
+            db.execute_batch(
+                "PRAGMA temp_store=MEMORY; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;",
+            )?;
+            Ok(Self {
+                db,
+                directory: None,
+            })
+        } else {
+            spool.spill_to_file()?;
+            let root = local.join("canonical").join("history-spools");
+            std::fs::create_dir_all(&root)?;
+            let directory = tempfile::tempdir_in(root)?;
+            let db = agentlaw_sqlite::open(directory.path().join("projection.sqlite"))?;
+            db.execute_batch(
+                "PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;",
+            )?;
+            Ok(Self {
+                db,
+                directory: Some(directory),
+            })
+        }
+    }
+}
+
 fn failure() -> DomainError {
     DomainError::new("history_projection_failed", "History could not be acquired or projected completely. Original memory is unchanged; use doctor to investigate source integrity and retry. This is not an empty history result.")
+}
+struct NoticeContext<'a> {
+    config_file: Option<&'a Path>,
+    general: bool,
+}
+fn history_notice(limit: usize, context: Option<&NoticeContext<'_>>) -> Value {
+    let general = context.is_some_and(|context| context.general);
+    let key = if general {
+        "response_limit_bytes"
+    } else {
+        "history.response_limit_bytes"
+    };
+    let path = context
+        .and_then(|context| context.config_file)
+        .map(|path| json!(path))
+        .unwrap_or_else(|| {
+            json!("Use agentlaw config path to obtain the installation configuration file.")
+        });
+    json!({"applied_bytes":limit,"config_key":key,"config_file":path,"user_notice":format!("History details exceed the configured response size. Adjust {key} to change this limit.")})
+}
+fn history_artifact(local: &Path, input: &mut impl Read, notice: Value) -> Work<Value> {
+    let mut out = crate::artifacts::ArtifactWriter::create(local.join("response-artifacts"))?;
+    let mut pending = None;
+    let mut buffer = [0u8; 32768];
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(byte) = pending {
+            out.write_all(&[byte])?;
+        }
+        out.write_all(&buffer[..n - 1])?;
+        pending = Some(buffer[n - 1]);
+    }
+    if pending != Some(b'}') {
+        return Err("invalid history result".into());
+    }
+    out.write_all(b",\"response_limit\":")?;
+    serde_json::to_writer(&mut out, &notice)?;
+    out.write_all(b"}")?;
+    let artifact = out.finish()?;
+    Ok(
+        json!({"code":"complete_content_in_file","content_read":false,"complete":true,"artifact":artifact,"response_limit_bytes":notice["applied_bytes"],"response_limit":notice,"next_action":"The complete version-frozen history response is in the artifact and has not been read. Use the harness file-reading tool or shell to read that path in bounded sections before relying on it. If that environment cannot access the path, tell the user what is unread and ask for file transfer or adjust the indicated response limit; do not claim the history was restored. After the indicated retention period it may be cleaned automatically; a new history query reads the then-current source, not necessarily this version."}),
+    )
+}
+
+fn candidates_in_history(
+    db: &Connection,
+    hits: Vec<agentlaw_search::Hit>,
+) -> Work<Vec<agentlaw_search::Hit>> {
+    let mut selected = Vec::new();
+    let mut exists = db.prepare_cached("SELECT 1 FROM nodes WHERE id=?1")?;
+    for mut hit in hits {
+        if exists
+            .query_row([&hit.change_id], |row| row.get::<_, i64>(0))
+            .optional()?
+            .is_some()
+        {
+            hit.memory_id = hit.change_id.clone();
+            selected.push(hit);
+        }
+    }
+    Ok(selected)
 }
 fn component(db: &Connection, id: &str, column: &str) -> Work<Component> {
     // column is exclusively one of the internal literal names, never user input.
@@ -44,7 +259,7 @@ fn write_change(
     db: &Connection,
     id: &str,
     matched: bool,
-    dir: &Path,
+    dir: Option<&Path>,
     out: &mut impl Write,
 ) -> Work<()> {
     let raw: String = db.query_row("SELECT metadata FROM nodes WHERE id=?1", [id], |r| r.get(0))?;
@@ -57,15 +272,6 @@ fn write_change(
     } else {
         parents.first().and_then(Value::as_str)
     };
-    let scratch = tempfile::tempdir_in(dir)?;
-    let before = scratch.path().join("before");
-    let after = scratch.path().join("after");
-    if let Some(base) = base {
-        component(db, base, "body")?.materialize(&before)?;
-    } else {
-        File::create(&before)?;
-    }
-    component(db, id, "body")?.materialize(&after)?;
     let millis = metadata["metadata_after"]["recorded_at_ms"]
         .as_i64()
         .ok_or("invalid timestamp")?;
@@ -81,12 +287,42 @@ fn write_change(
     write!(out, ",\"evidence\":")?;
     history_diff::json_string(&mut component(db, id, "evidence")?.open()?, out)?;
     write!(out, ",\"markdown_diff\":\"")?;
-    history_diff::write_diff(
-        &before,
-        &after,
-        &scratch.path().join("lines.sqlite"),
-        &mut history_diff::JsonEscape(out),
-    )?;
+    if let Some(dir) = dir {
+        let scratch = tempfile::tempdir_in(dir)?;
+        let before = scratch.path().join("before");
+        let after = scratch.path().join("after");
+        if let Some(base) = base {
+            let body = component(db, base, "body")?;
+            if std::io::copy(&mut body.open()?, &mut File::create(&before)?)? != body.bytes {
+                return Err("truncated body".into());
+            }
+        } else {
+            File::create(&before)?;
+        }
+        let body = component(db, id, "body")?;
+        if std::io::copy(&mut body.open()?, &mut File::create(&after)?)? != body.bytes {
+            return Err("truncated body".into());
+        }
+        history_diff::write_diff(
+            &before,
+            &after,
+            &scratch.path().join("lines.sqlite"),
+            &mut history_diff::JsonEscape(out),
+        )?;
+    } else {
+        let mut before = String::new();
+        if let Some(base) = base {
+            component(db, base, "body")?
+                .open()?
+                .read_to_string(&mut before)?;
+        }
+        let mut after = String::new();
+        component(db, id, "body")?
+            .open()?
+            .read_to_string(&mut after)?;
+        history_diff::JsonEscape(&mut *out)
+            .write_all(crate::history::full_diff(&before, &after).as_bytes())?;
+    }
     write!(out, "\"")?;
     if parents.len() > 1 {
         write!(out, ",\"delta_base_id\":")?;
@@ -244,7 +480,7 @@ fn packet(
     map: &Path,
     out: &mut impl Write,
     maximum: Option<u64>,
-    diagnostic: Option<&Value>,
+    diagnostic: Option<&[Value]>,
 ) -> Work<()> {
     let query = request.history_for.is_some();
     let key = if query {
@@ -289,30 +525,14 @@ fn packet(
     write!(out, "],\"history_map\":")?;
     std::io::copy(&mut File::open(map)?, out)?;
     if let Some(diagnostic) = diagnostic {
-        write!(out, ",\"diagnostics\":[")?;
+        write!(out, ",\"diagnostics\":")?;
         serde_json::to_writer(&mut *out, diagnostic)?;
-        write!(out, "]")?;
     }
     write!(out, "}}")?;
     Ok(())
 }
-pub fn project(
-    store: &Store,
-    local: &Path,
-    request: &HistoryRequest,
-    limit: usize,
-    control: &RequestControl,
-) -> crate::Result<Value> {
-    project_with_worker(store, local, request, limit, control, None)
-}
-pub fn project_with_worker(
-    store: &Store,
-    local: &Path,
-    request: &HistoryRequest,
-    limit: usize,
-    control: &RequestControl,
-    worker: Option<(&agentlaw_worker::Client, &str)>,
-) -> crate::Result<Value> {
+/// Answers one history request for the store owner from a single source acquisition.
+pub fn history(ctx: &crate::store::ReadCtx<'_>, request: &HistoryRequest) -> crate::Result<Value> {
     let identity = request
         .memory_id
         .as_deref()
@@ -321,21 +541,180 @@ pub fn project_with_worker(
             DomainError::new("invalid_history_request", "Specify one history identity.")
         })?;
     crate::validate_id(identity)?;
-    control.phase("acquiring_history");
+    ctx.request.check()?;
+    ctx.request.phase("acquiring_history");
+    // OwnedPublishedReader releases the shared source gate before returning.
+    let acquired = ctx.source.acquire_history(&ctx.request.cancel);
+    ctx.request.check()?;
+    let acquired = crate::store::source(acquired)?;
+    ctx.request.check()?;
+    let mut spool = crate::store::source(acquired.into_spool())?;
+    ctx.request.check()?;
+    let workspace = ProjectionWorkspace::for_spool(
+        &ctx.identity.local,
+        &mut spool,
+        identity,
+        request,
+        ctx.request,
+    );
+    ctx.request.check()?;
+    let workspace = workspace.map_err(|_| failure())?;
+    let semantic = PortHistorySemantic { ctx };
+    project_spool(
+        spool,
+        &ctx.identity.local,
+        request,
+        ctx.identity.history_limit.min(ctx.identity.response_limit),
+        ctx.request,
+        &semantic,
+        Some((ctx, &workspace)),
+        None,
+    )
+}
+fn search_owned(
+    db: &Connection,
+    ctx: &crate::store::ReadCtx<'_>,
+    spool: &HistorySpool,
+    identity: &str,
+    query: &str,
+    limit: usize,
+    spill: bool,
+) -> Work<Vec<agentlaw_search::Hit>> {
+    let key = serde_json::to_string(&(
+        &spool.source_position.epoch,
+        spool.source_position.sequence,
+        identity,
+    ))?;
+    let entry = ctx.history_cache.lexical(&key, ctx.request, || {
+        let result = (|| -> Work<crate::history_cache::LexicalCache> {
+            let directory = if spill {
+                let root = ctx.identity.local.join("canonical").join("history-spools");
+                std::fs::create_dir_all(&root)?;
+                Some(tempfile::tempdir_in(root)?)
+            } else {
+                None
+            };
+            let path = directory
+                .as_ref()
+                .map(|d| d.path().join("lexical.sqlite"))
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(format!(
+                        "file:history-lexical-{}?mode=memory&cache=shared",
+                        uuid::Uuid::new_v4()
+                    ))
+                });
+            let mut index = agentlaw_search::SearchIndex::open_temporary(path)?;
+            let mut st = db.prepare("SELECT id FROM nodes ORDER BY ordinal")?;
+            let mut rows = st.query([])?;
+            while let Some(row) = rows.next()? {
+                ctx.request.check()?;
+                let id: String = row.get(0)?;
+                let reader = component(db, &id, "body")?
+                    .open()?
+                    .chain(std::io::Cursor::new(b"\n".to_vec()))
+                    .chain(component(db, &id, "evidence")?.open()?);
+                index.commit_stream(
+                    0,
+                    std::iter::once(Ok(id.clone())),
+                    TextChunks {
+                        reader: Box::new(reader),
+                        tail: Vec::new(),
+                        done: false,
+                        id,
+                    },
+                )?;
+            }
+            index.commit(1, &[], &[])?;
+            Ok(crate::history_cache::LexicalCache { index, directory })
+        })();
+        ctx.request.check()?;
+        result.map_err(|_| failure())
+    })?;
+    let guard = loop {
+        ctx.request.check()?;
+        match entry.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+        }
+    };
+    let _keep_directory = &guard.directory;
+    let hits = guard.index.read_view()?.search(
+        query,
+        &agentlaw_search::ScopeFilter {
+            allowed_scopes: vec!["history".into()],
+        },
+        limit,
+        &[],
+        &[],
+        true,
+    )?;
+    Ok(hits)
+}
+
+fn project_spool(
+    mut spool: HistorySpool,
+    local: &Path,
+    request: &HistoryRequest,
+    limit: usize,
+    control: &RequestControl,
+    semantic: &dyn HistorySemanticChannel,
+    owned: Option<(&crate::store::ReadCtx<'_>, &ProjectionWorkspace)>,
+    config_file: Option<&Path>,
+) -> crate::Result<Value> {
+    let identity = request
+        .memory_id
+        .as_deref()
+        .or(request.procedure_id.as_deref())
+        .ok_or_else(|| {
+            DomainError::new("invalid_history_request", "Specify one history identity.")
+        })?;
+    let legacy_directory = if owned.is_none() {
+        std::fs::create_dir_all(local).map_err(|_| failure())?;
+        Some(tempfile::tempdir_in(local).map_err(|_| failure())?)
+    } else {
+        None
+    };
+    let legacy_workspace = if let Some(directory) = legacy_directory {
+        let db = agentlaw_sqlite::open(directory.path().join("projection.sqlite"))
+            .map_err(|_| failure())?;
+        db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;").map_err(|_| failure())?;
+        Some(ProjectionWorkspace {
+            db,
+            directory: Some(directory),
+        })
+    } else {
+        None
+    };
+    let workspace = owned
+        .map(|(_, workspace)| workspace)
+        .or(legacy_workspace.as_ref())
+        .expect("workspace");
+    let ctx = owned.map(|(ctx, _)| ctx);
+    let notice_context = NoticeContext {
+        config_file: ctx
+            .and_then(|ctx| ctx.identity.config_file.as_deref())
+            .or(config_file),
+        general: ctx.is_some_and(|ctx| ctx.identity.response_limit <= ctx.identity.history_limit),
+    };
+    let db = &workspace.db;
+    let mut semantic_cancelled = false;
     let work = (|| -> Work<Value> {
-        std::fs::create_dir_all(local)?;
-        let scratch = tempfile::tempdir_in(local)?;
-        let db = Connection::open(scratch.path().join("projection.sqlite"))?;
-        db.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-2048; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE nodes(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,metadata TEXT,body TEXT,evidence TEXT,parents INTEGER,children INTEGER DEFAULT 0,keynode INTEGER DEFAULT 0); CREATE TABLE edges(child TEXT,parent TEXT,PRIMARY KEY(child,parent)); CREATE INDEX edge_parent ON edges(parent,child); CREATE TABLE selected(window INTEGER,id TEXT,matched INTEGER,PRIMARY KEY(window,id)); CREATE TABLE rendered(window INTEGER,ordinal INTEGER,id TEXT,offset INTEGER,bytes INTEGER); BEGIN;")?;
-        let mut spool = store.spool_history()?;
+        db.execute_batch("CREATE TABLE nodes(ordinal INTEGER PRIMARY KEY,id TEXT UNIQUE,metadata TEXT,body TEXT,evidence TEXT,parents INTEGER,children INTEGER DEFAULT 0,keynode INTEGER DEFAULT 0); CREATE TABLE edges(child TEXT,parent TEXT,PRIMARY KEY(child,parent)); CREATE INDEX edge_parent ON edges(parent,child); CREATE TABLE selected(window INTEGER,id TEXT,matched INTEGER,PRIMARY KEY(window,id)); BEGIN;")?;
         let mut ordinal = 0u64;
-        let count=spool.visit_metadata_closure(identity,|change|{
-            let result=(||->Work<()>{control.check()?;let id=change.metadata["change_id"].as_str().ok_or("missing identity")?;
-                let parents=change.metadata["parent_change_ids"].as_array().ok_or("missing parents")?;
-                db.execute("INSERT INTO nodes(ordinal,id,metadata,body,evidence,parents) VALUES(?1,?2,?3,?4,?5,?6)",params![ordinal,id,serde_json::to_string(&change.metadata)?,serde_json::to_string(&change.body)?,serde_json::to_string(&change.evidence)?,parents.len() as u64])?;
-                for parent in parents {db.execute("INSERT INTO edges VALUES(?1,?2)",params![id,parent.as_str().ok_or("invalid parent")?])?;}
-                ordinal=ordinal.checked_add(1).ok_or("history count overflow")?;Ok(())})();
-            result.map_err(|e|agentlaw_storage::Error::Io(std::io::Error::other(e.to_string())))
+        let count = spool.visit_metadata_closure(identity, |change| {
+            let result = (|| -> Work<()> {
+                control.check()?;
+                let id = change.metadata["change_id"].as_str().ok_or("missing identity")?;
+                let parents = change.metadata["parent_change_ids"].as_array().ok_or("missing parents")?;
+                db.execute("INSERT INTO nodes(ordinal,id,metadata,body,evidence,parents) VALUES(?1,?2,?3,?4,?5,?6)", params![ordinal,id,serde_json::to_string(&change.metadata)?,serde_json::to_string(&change.body)?,serde_json::to_string(&change.evidence)?,parents.len() as u64])?;
+                for parent in parents { db.execute("INSERT INTO edges VALUES(?1,?2)", params![id,parent.as_str().ok_or("invalid parent")?])?; }
+                ordinal = ordinal.checked_add(1).ok_or("history count overflow")?;
+                Ok(())
+            })();
+            result.map_err(|e| agentlaw_storage::Error::Io(std::io::Error::other(e.to_string())))
         })?;
         db.execute_batch("COMMIT; UPDATE nodes SET children=(SELECT count(*) FROM edges e WHERE e.parent=nodes.id); UPDATE nodes SET keynode=1 WHERE parents<>1 OR children<>1;")?;
         if count == 0 {
@@ -344,6 +723,7 @@ pub fn project_with_worker(
             );
         }
         let mut diagnostic = None;
+        let mut truncated = false;
         if let (Some(start), Some(end)) = (&request.start_change_id, &request.end_change_id) {
             for id in [start, end] {
                 if db
@@ -371,332 +751,438 @@ pub fn project_with_worker(
                     json!({"code":"invalid_history_request","message":"max_matches exceeds the supported request-safety limit of 10000; no value was silently clamped."}),
                 );
             }
-            let directory = local.join("history-search");
-            std::fs::create_dir_all(&directory)?;
-            use sha2::{Digest, Sha256};
-            let key = format!(
-                "{:x}",
-                Sha256::digest(format!(
-                    "{}:{}:{identity}",
-                    spool.source_position.epoch, spool.source_position.sequence
-                ))
-            );
-            control.phase("searching_history");
-            let semantic = (|| -> Work<Vec<String>> {
-                let (client, binding) = worker.ok_or("semantic worker unavailable")?;
-                if client.availability()? != agentlaw_worker::SemanticAvailability::Ready {
-                    return Err("semantic worker not ready".into());
-                }
-                let mut index = crate::history_search::HistoricalSearch::open(
-                    client,
-                    directory.join(format!("{identity}-jobs.sqlite")),
-                    binding,
+            let matches = if let Some(ctx) = ctx {
+                let lexical = search_owned(
+                    db,
+                    ctx,
+                    &spool,
                     identity,
-                    &spool.source_position.epoch,
+                    query,
+                    maximum,
+                    workspace.directory.is_some(),
                 )?;
-                let mut st = db.prepare("SELECT id FROM nodes ORDER BY ordinal")?;
-                let mut rows = st.query([])?;
-                while let Some(row) = rows.next()? {
-                    control.check()?;
-                    let id: String = row.get(0)?;
-                    if !index.contains(&id)? {
-                        let mut reader = component(&db, &id, "body")?
-                            .open()?
-                            .chain(std::io::Cursor::new(b"\n".to_vec()))
-                            .chain(component(&db, &id, "evidence")?.open()?);
-                        index.ingest(&id, "history", &mut reader)?;
+                // A newly indexed change can rank ahead of the acquired DAG.
+                // Fetch the bounded candidate set before filtering and limiting.
+                let candidates = semantic.candidates_with_prefix(
+                    identity,
+                    query,
+                    10_000,
+                    control,
+                    &mut truncated,
+                );
+                control.check()?;
+                let mut channels = vec![candidates_in_history(db, lexical)?];
+                match candidates {
+                    Ok(result) => {
+                        if result.coverage
+                            != crate::semantic::SemanticCoverage::CompleteAt(
+                                spool.source_position.clone(),
+                            )
+                        {
+                            diagnostic = Some(
+                                json!({"code":"semantic_channel_incomplete","message":"Historical semantic search is unavailable or incomplete; a missing result is not evidence that no relevant history exists."}),
+                            );
+                        }
+                        let same_epoch = match &result.coverage {
+                            crate::semantic::SemanticCoverage::CompleteAt(position) => {
+                                position.epoch == spool.source_position.epoch
+                            }
+                            crate::semantic::SemanticCoverage::Partial {
+                                available,
+                                requested,
+                            } => {
+                                available.epoch == spool.source_position.epoch
+                                    && requested.epoch == spool.source_position.epoch
+                            }
+                            crate::semantic::SemanticCoverage::Unavailable(_) => false,
+                        };
+                        if same_epoch {
+                            channels.push(candidates_in_history(db, result.hits)?);
+                        }
+                    }
+                    Err(crate::semantic::SemanticError::Cancelled) => {
+                        semantic_cancelled = true;
+                        return Err("historical semantic search was cancelled".into());
+                    }
+                    Err(_) => {
+                        diagnostic = Some(
+                            json!({"code":"semantic_channel_incomplete","message":"Historical semantic search is unavailable or incomplete; a missing result is not evidence that no relevant history exists."}),
+                        )
                     }
                 }
-                let result = index.search(query, &["history".into()], maximum, &control.cancel)?;
-                if !result.semantic_complete {
-                    return Err("historical semantic coverage incomplete".into());
-                }
-                Ok(
-                    agentlaw_search::reciprocal_rank_fusion(&[result.lexical, result.vector])
-                        .into_iter()
-                        .take(maximum)
-                        .map(|hit| hit.change_id)
-                        .collect(),
-                )
-            })();
-            control.check()?;
-            let matches = match semantic {
-                Ok(ids) => ids,
-                Err(_) => {
-                    diagnostic = Some(
-                        json!({"code":"semantic_channel_incomplete","message":"Historical semantic search is unavailable or incomplete. These results use the shared BM25 lexical backend only; a missing result is not evidence that no relevant history exists. Retry when the embedding worker is ready."}),
-                    );
-                    search(
-                        &db,
-                        &directory.join(format!("{key}.sqlite")),
-                        query,
-                        maximum,
-                        control,
-                    )?
+                agentlaw_search::reciprocal_rank_fusion(&channels)
+                    .into_iter()
+                    .take(maximum)
+                    .map(|hit| hit.change_id)
+                    .collect::<Vec<_>>()
+            } else {
+                let directory = local.join("history-search");
+                std::fs::create_dir_all(&directory)?;
+                use sha2::{Digest, Sha256};
+                let key = format!(
+                    "{:x}",
+                    Sha256::digest(format!(
+                        "{}:{}:{identity}",
+                        spool.source_position.epoch, spool.source_position.sequence
+                    ))
+                );
+                control.phase("searching_history");
+                let candidates =
+                    semantic.search(db, &directory, identity, &spool, query, maximum, control);
+                control.check()?;
+                match candidates {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        diagnostic = Some(
+                            json!({"code":"semantic_channel_incomplete","message":"Historical semantic search is unavailable or incomplete. These results use the shared BM25 lexical backend only; a missing result is not evidence that no relevant history exists. Retry when the embedding worker is ready."}),
+                        );
+                        search(
+                            db,
+                            &directory.join(format!("{key}.sqlite")),
+                            query,
+                            maximum,
+                            control,
+                        )?
+                    }
                 }
             };
             for (rank, id) in matches.into_iter().enumerate() {
-                db.execute(
-                    "INSERT INTO selected VALUES(?1,?2,1)",
-                    params![rank as i64, id],
-                )?;
-                select_ancestors(&db, rank as i64, request.context_layers.unwrap_or(0))?;
+                if ctx.is_none()
+                    || db
+                        .query_row("SELECT 1 FROM nodes WHERE id=?1", [&id], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .optional()?
+                        .is_some()
+                {
+                    db.execute(
+                        "INSERT INTO selected VALUES(?1,?2,1)",
+                        params![rank as i64, id],
+                    )?;
+                    select_ancestors(db, rank as i64, request.context_layers.unwrap_or(0))?;
+                }
             }
         } else {
             db.execute_batch("INSERT INTO selected SELECT 0,id,0 FROM nodes WHERE children=0;")?;
-            select_ancestors(&db, 0, request.context_layers.unwrap_or(0))?;
+            select_ancestors(db, 0, request.context_layers.unwrap_or(0))?;
         }
-        control.phase("projecting_history");
-        let records = scratch.path().join("records.jsonl");
-        let mut rendered = File::create(&records)?;
-        let mut statement=db.prepare("SELECT s.window,s.id,s.matched,n.ordinal FROM selected s JOIN nodes n ON n.id=s.id ORDER BY s.window,n.ordinal")?;
-        let mut rows = statement.query([])?;
-        let mut total = 0u64;
+        if let Some(ctx) = ctx {
+            let offer = ctx
+                .history_semantic
+                .offer(crate::semantic::HistoryIngestHint {
+                    binding: ctx.identity.binding_id.clone(),
+                    subject: identity.to_owned(),
+                    through: spool.source_position.clone(),
+                });
+            if request.history_for.is_some()
+                && matches!(
+                    offer,
+                    crate::semantic::OfferResult::Busy | crate::semantic::OfferResult::Queued
+                )
+                && diagnostic.is_none()
+            {
+                diagnostic = Some(
+                    json!({"code":"semantic_channel_incomplete","message":"Historical semantic search is not fully available; a missing result is not evidence that no relevant history exists."}),
+                );
+            }
+        }
+        let mut diagnostics: Vec<_> = diagnostic.into_iter().collect();
+        if truncated {
+            diagnostics.push(json!({"code":"semantic_query_truncated","message":"Semantic search used the beginning of the query."}));
+        }
+        let diagnostic = (!diagnostics.is_empty()).then_some(diagnostics);
+        if let Some(directory) = &workspace.directory {
+            db.execute_batch("CREATE TABLE rendered(window INTEGER,ordinal INTEGER,id TEXT,offset INTEGER,bytes INTEGER);")?;
+            return render_disk(
+                db,
+                directory.path(),
+                local,
+                request,
+                limit,
+                control,
+                diagnostic.as_deref(),
+                ctx.is_some(),
+                Some(&notice_context),
+            );
+        }
+        let mut entries = Vec::new();
+        let mut st = db.prepare("SELECT s.window,s.id,s.matched FROM selected s JOIN nodes n ON n.id=s.id ORDER BY s.window,n.ordinal")?;
+        let mut rows = st.query([])?;
         while let Some(row) = rows.next()? {
             control.check()?;
             let id: String = row.get(1)?;
-            let start = rendered.stream_position()?;
+            let mut bytes = Vec::new();
             write_change(
-                &db,
+                db,
                 &id,
                 row.get::<_, i64>(2)? != 0,
-                scratch.path(),
-                &mut rendered,
+                workspace.directory.as_ref().map(|d| d.path()),
+                &mut bytes,
             )?;
-            let size = rendered
-                .stream_position()?
-                .checked_sub(start)
-                .ok_or("offset underflow")?;
-            db.execute(
-                "INSERT INTO rendered VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(3)?,
-                    id,
-                    start,
-                    size
-                ],
-            )?;
-            total = total.checked_add(1).ok_or("count overflow")?;
+            entries.push((
+                row.get::<_, i64>(0)?,
+                id,
+                serde_json::from_slice::<Value>(&bytes)?,
+            ));
         }
-        rendered.flush()?;
-        let map = scratch.path().join("map.json");
+        let assemble = |entries: &[(i64, String, Value)]| -> Work<Value> {
+            let mut map = Vec::new();
+            write_map(db, &mut map)?;
+            let map: Value = serde_json::from_slice(&map)?;
+            let mut value = if request.history_for.is_some() {
+                let mut windows: Vec<Value> = Vec::new();
+                let mut last = None;
+                for (window, _, change) in entries {
+                    if last != Some(*window) {
+                        windows.push(json!({"changes":[]}));
+                        last = Some(*window);
+                    }
+                    windows.last_mut().unwrap()["changes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(change.clone());
+                }
+                json!({"match_windows":windows,"history_map":map})
+            } else if request.start_change_id.is_some() {
+                json!({"changes":entries.iter().map(|e| &e.2).collect::<Vec<_>>(),"history_map":map})
+            } else {
+                json!({"latest_changes":entries.iter().map(|e| &e.2).collect::<Vec<_>>(),"history_map":map})
+            };
+            if let Some(diagnostic) = &diagnostic {
+                value["diagnostics"] = json!(diagnostic);
+            }
+            Ok(value)
+        };
+        let complete = assemble(&entries)?;
+        if serde_json::to_vec(&complete)?.len() <= limit {
+            return Ok(complete);
+        }
+        let notice = history_notice(limit, Some(&notice_context));
+        for delivered in (1..entries.len()).rev() {
+            db.execute_batch(
+                "UPDATE nodes SET keynode=CASE WHEN parents<>1 OR children<>1 THEN 1 ELSE 0 END;",
+            )?;
+            db.execute(
+                "UPDATE nodes SET keynode=1 WHERE id=?1",
+                [&entries[delivered - 1].1],
+            )?;
+            let mut partial = assemble(&entries[..delivered])?;
+            partial["response_limit"] = notice.clone();
+            partial["remaining_requested_changes"] = json!(entries.len() - delivered);
+            partial["next_action"] = json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Adjust the indicated limit for a larger response.");
+            if serde_json::to_vec(&partial)?.len() <= limit {
+                return Ok(partial);
+            }
+        }
+        let bytes = serde_json::to_vec(&complete)?;
+        history_artifact(local, &mut bytes.as_slice(), notice)
+    })();
+    control.check()?;
+    work.map_err(|_| {
+        if semantic_cancelled {
+            DomainError::new("cancelled", "Historical semantic search was cancelled.")
+        } else {
+            failure()
+        }
+    })
+}
+
+trait HistorySemanticChannel {
+    fn candidates(
+        &self,
+        _identity: &str,
+        _query: &str,
+        _maximum: usize,
+        _control: &RequestControl,
+    ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
+    {
+        Err(crate::semantic::SemanticError::Unavailable(
+            "history candidates unavailable".into(),
+        ))
+    }
+    fn candidates_with_prefix(
+        &self,
+        identity: &str,
+        query: &str,
+        maximum: usize,
+        control: &RequestControl,
+        _truncated: &mut bool,
+    ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
+    {
+        self.candidates(identity, query, maximum, control)
+    }
+    fn search(
+        &self,
+        db: &Connection,
+        directory: &Path,
+        identity: &str,
+        spool: &HistorySpool,
+        query: &str,
+        maximum: usize,
+        control: &RequestControl,
+    ) -> Work<Vec<String>>;
+}
+struct PortHistorySemantic<'a, 'b> {
+    ctx: &'a crate::store::ReadCtx<'b>,
+}
+impl HistorySemanticChannel for PortHistorySemantic<'_, '_> {
+    fn candidates_with_prefix(
+        &self,
+        identity: &str,
+        query: &str,
+        maximum: usize,
+        control: &RequestControl,
+        truncated: &mut bool,
+    ) -> std::result::Result<crate::semantic::SemanticCandidates, crate::semantic::SemanticError>
+    {
+        let prefix = self.ctx.semantic.embed_prefix(query, control)?;
+        *truncated = prefix.truncated;
+        self.ctx.history_semantic.search_available(
+            &self.ctx.identity.binding_id,
+            identity,
+            &prefix.vector,
+            &["history".into()],
+            maximum,
+            control,
+        )
+    }
+    fn search(
+        &self,
+        _db: &Connection,
+        _directory: &Path,
+        identity: &str,
+        _spool: &HistorySpool,
+        query: &str,
+        maximum: usize,
+        control: &RequestControl,
+    ) -> Work<Vec<String>> {
+        self.candidates_with_prefix(identity, query, maximum, control, &mut false)
+            .map(|result| result.hits.into_iter().map(|hit| hit.change_id).collect())
+            .map_err(|_| "semantic search unavailable".into())
+    }
+}
+fn render_disk(
+    db: &Connection,
+    scratch: &Path,
+    local: &Path,
+    request: &HistoryRequest,
+    limit: usize,
+    control: &RequestControl,
+    diagnostic: Option<&[Value]>,
+    owned: bool,
+    identity: Option<&NoticeContext<'_>>,
+) -> Work<Value> {
+    control.phase("projecting_history");
+    let records = scratch.join("records.jsonl");
+    let mut rendered = File::create(&records)?;
+    let mut statement=db.prepare("SELECT s.window,s.id,s.matched,n.ordinal FROM selected s JOIN nodes n ON n.id=s.id ORDER BY s.window,n.ordinal")?;
+    let mut rows = statement.query([])?;
+    let mut total = 0u64;
+    while let Some(row) = rows.next()? {
+        control.check()?;
+        let id: String = row.get(1)?;
+        let start = rendered.stream_position()?;
+        write_change(
+            &db,
+            &id,
+            row.get::<_, i64>(2)? != 0,
+            Some(scratch),
+            &mut rendered,
+        )?;
+        let size = rendered
+            .stream_position()?
+            .checked_sub(start)
+            .ok_or("offset underflow")?;
+        db.execute(
+            "INSERT INTO rendered VALUES(?1,?2,?3,?4,?5)",
+            params![
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(3)?,
+                id,
+                start,
+                size
+            ],
+        )?;
+        total = total.checked_add(1).ok_or("count overflow")?;
+    }
+    rendered.flush()?;
+    let map = scratch.join("map.json");
+    write_map(&db, &mut File::create(&map)?)?;
+    let all = scratch.join("complete.json");
+    packet(
+        &db,
+        request,
+        &records,
+        &map,
+        &mut File::create(&all)?,
+        None,
+        diagnostic,
+    )?;
+    let bytes = all.metadata()?.len();
+    let fits = !owned || inline_assembly_fits(&mut File::open(&all)?, control)?;
+    if bytes <= limit as u64 && fits {
+        return Ok(serde_json::from_reader(File::open(&all)?)?);
+    }
+    let notice = history_notice(limit, identity);
+    if owned && !fits {
+        let mut notice = notice;
+        if bytes <= limit as u64 {
+            notice["user_notice"] = json!("History exceeds the in-memory response budget. The complete response is available in the file.");
+            notice["in_memory_budget_bytes"] = json!(HISTORY_WORKSPACE_MEMORY_LIMIT);
+        }
+        return history_artifact(local, &mut File::open(&all)?, notice);
+    }
+    let overhead = serde_json::to_vec(&notice)?.len() + 768;
+    let available = limit
+        .saturating_sub(overhead)
+        .saturating_sub(map.metadata()?.len() as usize);
+    let mut delivered = 0u64;
+    let mut used = 0usize;
+    let mut statement = db.prepare("SELECT bytes FROM rendered ORDER BY window,ordinal")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let size = usize::try_from(row.get::<_, u64>(0)?)?
+            .checked_add(32)
+            .ok_or("size overflow")?;
+        if used.checked_add(size).is_none_or(|n| n > available) {
+            break;
+        }
+        used += size;
+        delivered += 1;
+    }
+    while delivered > 0 {
+        // Keep delivered boundary nodes in the compressed map, so the reader
+        // can ask an inclusive range without walking one cursor per change.
+        db.execute_batch(
+            "UPDATE nodes SET keynode=CASE WHEN parents<>1 OR children<>1 THEN 1 ELSE 0 END;",
+        )?;
+        db.execute("UPDATE nodes SET keynode=1 WHERE id=(SELECT id FROM rendered ORDER BY window,ordinal LIMIT 1 OFFSET ?1)",[delivered-1])?;
         write_map(&db, &mut File::create(&map)?)?;
-        let all = scratch.path().join("complete.json");
+        let partial = scratch.join("partial.json");
         packet(
             &db,
             request,
             &records,
             &map,
-            &mut File::create(&all)?,
-            None,
-            diagnostic.as_ref(),
+            &mut File::create(&partial)?,
+            Some(delivered),
+            diagnostic,
         )?;
-        if all.metadata()?.len() <= limit as u64 {
-            return Ok(serde_json::from_reader(File::open(&all)?)?);
-        }
-        let notice = json!({"applied_bytes":limit,"config_key":"history.response_limit_bytes","config_file":"Use agentlaw config path to obtain the installation configuration file.","user_notice":"History details exceed the configured response size. Whole changes are shown with a causal map; this setting can be changed with agentlaw config set history.response_limit_bytes <bytes>."});
-        let overhead = serde_json::to_vec(&notice)?.len() + 768;
-        let available = limit
-            .saturating_sub(overhead)
-            .saturating_sub(map.metadata()?.len() as usize);
-        let mut delivered = 0u64;
-        let mut used = 0usize;
-        let mut statement = db.prepare("SELECT bytes FROM rendered ORDER BY window,ordinal")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let size = usize::try_from(row.get::<_, u64>(0)?)?
-                .checked_add(32)
-                .ok_or("size overflow")?;
-            if used.checked_add(size).is_none_or(|n| n > available) {
-                break;
+        if partial.metadata()?.len() + overhead as u64 <= limit as u64 {
+            let mut value: Value = serde_json::from_reader(File::open(&partial)?)?;
+            value["response_limit"] = notice.clone();
+            value["remaining_requested_changes"] = json!(total - delivered);
+            value["next_action"]=json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Adjust the indicated limit for a larger response.");
+            if serde_json::to_vec(&value)?.len() <= limit {
+                return Ok(value);
             }
-            used += size;
-            delivered += 1;
         }
-        while delivered > 0 {
-            // Keep delivered boundary nodes in the compressed map, so the reader
-            // can ask an inclusive range without walking one cursor per change.
-            db.execute_batch(
-                "UPDATE nodes SET keynode=CASE WHEN parents<>1 OR children<>1 THEN 1 ELSE 0 END;",
-            )?;
-            db.execute("UPDATE nodes SET keynode=1 WHERE id=(SELECT id FROM rendered ORDER BY window,ordinal LIMIT 1 OFFSET ?1)",[delivered-1])?;
-            write_map(&db, &mut File::create(&map)?)?;
-            let partial = scratch.path().join("partial.json");
-            packet(
-                &db,
-                request,
-                &records,
-                &map,
-                &mut File::create(&partial)?,
-                Some(delivered),
-                diagnostic.as_ref(),
-            )?;
-            if partial.metadata()?.len() + overhead as u64 <= limit as u64 {
-                let mut value: Value = serde_json::from_reader(File::open(&partial)?)?;
-                value["response_limit"] = notice.clone();
-                value["remaining_requested_changes"] = json!(total - delivered);
-                value["next_action"]=json!("The remaining requested changes are unread, not absent. Use history with the same identity and start_change_id/end_change_id from history_map to open the desired inclusive causal range. Increase history.response_limit_bytes for a larger response.");
-                if serde_json::to_vec(&value)?.len() <= limit {
-                    return Ok(value);
-                }
-            }
-            delivered -= 1;
-        }
-        // One change/map cannot fit. Freeze the entire requested projection in a
-        // derived file; never claim an unread artifact was delivered inline.
-        let artifact = crate::artifacts::create_from_reader(
-            local.join("response-artifacts"),
-            &mut File::open(&all)?,
-        )?;
-        Ok(
-            json!({"code":"complete_content_in_file","content_read":false,"complete":true,"artifact":artifact,"response_limit":notice,"next_action":"The complete version-frozen history response is in the artifact and has not been read. Use the harness file-reading tool or shell to read that path in bounded sections before relying on it. If that environment cannot access the path, tell the user what is unread and ask for file transfer or raise the configured history response limit; do not claim the history was restored. After the indicated retention period it may be cleaned automatically; a new history query reads the then-current source, not necessarily this version."}),
-        )
-    })();
-    // Cancellation gets its own outcome instead of being disguised as corruption.
-    control.check()?;
-    work.map_err(|_| failure())
+        delivered -= 1;
+    }
+    // One change/map cannot fit. Freeze the entire requested projection in a
+    // derived file; never claim an unread artifact was delivered inline.
+    history_artifact(local, &mut File::open(&all)?, notice)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
-    fn fixture(count: u32) -> (tempfile::TempDir, Store, String, Vec<String>) {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path().join("source"), temp.path().join("canonical")).unwrap();
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut versions = vec![];
-        let mut changes = vec![];
-        for n in 0..count {
-            let change = uuid::Uuid::new_v4().to_string();
-            changes.push(change.clone());
-            let body=format!("# Current understanding\nThis is revision {n} of the cancellation policy.\n{}\n한국어 끝", "unchanged context ".repeat(20));
-            let unit = CurrentUnit {
-                entity_id: id.clone(),
-                entity_type: "memory".into(),
-                state: UnitState::Live {
-                    heads: vec![Head {
-                        body,
-                        metadata: json!({"change_id":change,"applicability":{"scope":"user"},"origin":{"machine_id":uuid::Uuid::new_v4().to_string()},"recorded_at_ms":n as i64,"is_rule":false,"relations":[],"work_targets":[]}),
-                    }],
-                },
-            };
-            versions = store
-                .publish(
-                    &uuid::Uuid::new_v4().to_string(),
-                    vec![Mutation {
-                        unit,
-                        expected_versions: versions,
-                        evidence: format!(
-                            "Observed cancellation revision {n}; preserve the reason."
-                        ),
-                    }],
-                )
-                .unwrap()
-                .references
-                .into_iter()
-                .map(|r| r.observed_version)
-                .collect();
-        }
-        (temp, store, id, changes)
-    }
-    fn request(id: &str) -> HistoryRequest {
-        HistoryRequest {
-            memory_id: Some(id.into()),
-            procedure_id: None,
-            context_layers: Some(0),
-            history_for: None,
-            max_matches: None,
-            start_change_id: None,
-            end_change_id: None,
-        }
-    }
-    #[test]
-    fn latest_has_compact_causal_map_not_one_node_per_revision() {
-        let (temp, store, id, changes) = fixture(12);
-        let value = project(
-            &store,
-            temp.path(),
-            &request(&id),
-            8192,
-            &RequestControl::default(),
-        )
-        .unwrap();
-        assert_eq!(value["latest_changes"].as_array().unwrap().len(), 1);
-        assert_eq!(value["latest_changes"][0]["change_id"], changes[11]);
-        assert_eq!(value["history_map"]["nodes"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            value["history_map"]["paths"][0]["intermediate_change_count"],
-            10
-        );
-        assert!(value.get("response_limit").is_none());
-    }
-    #[test]
-    fn causal_range_is_inclusive_and_budget_provides_details_with_remaining_map() {
-        let (temp, store, id, changes) = fixture(12);
-        let mut r = request(&id);
-        r.context_layers = None;
-        r.start_change_id = Some(changes[1].clone());
-        r.end_change_id = Some(changes[10].clone());
-        let complete =
-            project(&store, temp.path(), &r, 100_000, &RequestControl::default()).unwrap();
-        assert_eq!(complete["changes"].as_array().unwrap().len(), 10);
-        assert_eq!(complete["changes"][0]["change_id"], changes[1]);
-        assert_eq!(complete["changes"][9]["change_id"], changes[10]);
-        let partial = project(&store, temp.path(), &r, 4096, &RequestControl::default()).unwrap();
-        assert!(partial["changes"].as_array().is_some(), "{partial}");
-        assert!(partial["remaining_requested_changes"].as_u64().unwrap() > 0);
-        assert!(serde_json::to_vec(&partial).unwrap().len() <= 4096);
-        assert_eq!(
-            partial["response_limit"]["config_key"],
-            "history.response_limit_bytes"
-        );
-        r.start_change_id = Some(changes[10].clone());
-        r.end_change_id = Some(changes[1].clone());
-        assert_eq!(
-            project(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap()["code"],
-            "invalid_history_interval"
-        );
-    }
-    #[test]
-    fn indivisible_change_uses_whole_frozen_file_and_search_is_ranked() {
-        let (temp, store, id, _) = fixture(4);
-        let mut r = request(&id);
-        let small = project(&store, temp.path(), &r, 128, &RequestControl::default()).unwrap();
-        assert_eq!(small["content_read"], false);
-        let original: Value = serde_json::from_reader(
-            File::open(small["artifact"]["path"].as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert!(original["latest_changes"][0]["markdown_diff"]
-            .as_str()
-            .unwrap()
-            .contains("한국어 끝"));
-        r.history_for = Some("cancellation 2".into());
-        r.max_matches = Some(1);
-        r.context_layers = Some(1);
-        let query = project(&store, temp.path(), &r, 8192, &RequestControl::default()).unwrap();
-        let window = query["match_windows"][0]["changes"].as_array().unwrap();
-        assert_eq!(window.len(), 2);
-        assert_eq!(window[1]["matched"], true);
-        assert!(window[1]["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("revision 2"));
-        assert!(window[0].get("matched").is_none());
-    }
-    #[test]
-    fn map_keeps_forks_and_all_integration_parents() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE nodes(ordinal INTEGER,id TEXT,parents INTEGER,children INTEGER,keynode INTEGER); CREATE TABLE edges(child TEXT,parent TEXT); INSERT INTO nodes VALUES(0,'a',0,2,1),(1,'b',1,1,0),(2,'c',1,1,0),(3,'d',2,0,1); INSERT INTO edges VALUES('b','a'),('c','a'),('d','b'),('d','c');").unwrap();
-        let mut bytes = vec![];
-        write_map(&db, &mut bytes).unwrap();
-        let map: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(map["nodes"][0]["roles"], json!(["root", "fork"]));
-        assert_eq!(map["nodes"][3]["roles"], json!(["head", "integration"]));
-        assert_eq!(map["paths"].as_array().unwrap().len(), 4);
-        // Parallel compressed paths need distinct endpoints to remain selectable:
-        // fork children are anchors, otherwise b and c would become indistinguishable.
-    }
-}
+mod tests;

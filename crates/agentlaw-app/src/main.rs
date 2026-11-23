@@ -5,6 +5,41 @@ use std::ffi::{OsStr, OsString};
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == OsStr::new("runtime-host") {
+        let state = match std::env::var_os("AGENTLAW_HOME") {
+            Some(state) => std::path::PathBuf::from(state),
+            None => std::process::exit(1),
+        };
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => std::process::exit(1),
+        };
+        let gate_state = state.clone();
+        let assets_state = state.clone();
+        let assets = std::sync::Arc::new(move || {
+            agentlaw_app::installed::model_assets(&assets_state).map_err(|error| error.to_string())
+        });
+        let installation_build = match agentlaw_runtime::installation::build_identity(&executable) {
+            Ok(build) => build,
+            Err(_) => std::process::exit(1),
+        };
+        let deps = agentlaw_runtime::ports::HostDeps {
+            state,
+            executable,
+            assets,
+            installation_build,
+            start_gate: std::sync::Arc::new(move || {
+                agentlaw_runtime::installation::gate::check_start(&gate_state)
+            }),
+        };
+        let code = match agentlaw_runtime::host::run(deps) {
+            Ok(agentlaw_runtime::host::RunExit::Stopped) => 0,
+            Ok(agentlaw_runtime::host::RunExit::AlreadyOwned) => 3,
+            Ok(agentlaw_runtime::host::RunExit::StartBlocked(_)) => 4,
+            Err(_) => 1,
+        };
+        std::process::exit(code);
+    }
     let errors = ErrorPolicy::for_args(&args);
     let parsed = match cli::parse(args) {
         Ok(parsed) => parsed,
@@ -29,7 +64,6 @@ fn main() {
 enum ErrorPolicy {
     Stdout,
     Stderr,
-    Worker,
     ModelChild,
 }
 
@@ -48,7 +82,6 @@ mod tests {
             ),
             (vec!["model-child"], ErrorPolicy::ModelChild),
             (vec!["model-child", "extra"], ErrorPolicy::Stdout),
-            (vec!["worker-daemon", "--bad"], ErrorPolicy::Worker),
             (
                 vec!["learned-procedure", "search", "--bad"],
                 ErrorPolicy::Stderr,
@@ -80,7 +113,6 @@ impl ErrorPolicy {
             return Self::Stderr;
         }
         match (first, second) {
-            (Some(first), _) if first == OsStr::new("worker-daemon") => Self::Worker,
             (Some(first), Some(second))
                 if first == OsStr::new("learned-procedure")
                     && (second == OsStr::new("list") || second == OsStr::new("search")) =>
@@ -94,7 +126,6 @@ impl ErrorPolicy {
     fn for_command(command: &cli::Command) -> Self {
         match command {
             cli::Command::ModelChild => Self::ModelChild,
-            cli::Command::WorkerDaemon(_) => Self::Worker,
             cli::Command::Mcp { .. } | cli::Command::LearnedProcedure { .. } => Self::Stderr,
             _ => Self::Stdout,
         }
@@ -110,12 +141,8 @@ impl ErrorPolicy {
                 eprintln!("{}", agentlaw_app::error_payload(error));
                 agentlaw_app::exit_code(error)
             }
-            Self::Worker => {
-                eprintln!("{}", agentlaw_app::error_payload(error));
-                1
-            }
             Self::ModelChild => {
-                eprintln!("agentlaw: private model child failed; consult the broker diagnostic");
+                eprintln!("agentlaw: private model child failed; consult the runtime diagnostic");
                 1
             }
         };

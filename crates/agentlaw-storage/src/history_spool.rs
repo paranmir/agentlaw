@@ -2,10 +2,60 @@
 //! The SQLite file is a temporary owned acquisition, never a canonical replacement.
 use super::*;
 use rusqlite::{params, Connection, OptionalExtension};
+fn initialize_spool(conn: &Connection, temporary: bool) -> Result<()> {
+    if temporary {
+        conn.execute_batch(
+            "PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF; PRAGMA temp_store=FILE;",
+        )?;
+    } else {
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE;",
+        )?;
+    }
+    conn.execute_batch("CREATE TABLE frames(kind TEXT NOT NULL,key TEXT NOT NULL,change_id TEXT NOT NULL,chunk_no INTEGER NOT NULL,payload BLOB NOT NULL,sha TEXT NOT NULL,PRIMARY KEY(kind,key)); CREATE INDEX components ON frames(change_id,kind,chunk_no); CREATE TABLE changes(change_id TEXT PRIMARY KEY,entity_id TEXT NOT NULL,metadata TEXT NOT NULL,descriptor TEXT NOT NULL,checkpoint TEXT NOT NULL); CREATE INDEX entities ON changes(entity_id); CREATE TABLE edges(child TEXT NOT NULL,parent TEXT NOT NULL,owner TEXT NOT NULL,PRIMARY KEY(child,parent)); CREATE INDEX reverse_edges ON edges(parent); CREATE TABLE current_units(entity_id TEXT PRIMARY KEY,state TEXT NOT NULL,target TEXT);")?;
+    Ok(())
+}
+fn insert_frame(conn: &Connection, info: &codec::FrameInfo, payload: &mut dyn Read) -> Result<()> {
+    let mut bytes = Vec::new();
+    payload.read_to_end(&mut bytes)?;
+    let previous: Option<String> = conn
+        .query_row(
+            "SELECT sha FROM frames WHERE kind=?1 AND key=?2",
+            params![info.kind, info.key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(old) = previous {
+        if old != info.sha256 {
+            return Err(Error::Corrupt("immutable frame identity collision".into()));
+        }
+        return Ok(());
+    }
+    let mut key = info.key.split('.');
+    let change = key.next().unwrap();
+    let chunk = key
+        .next()
+        .map(|n| n.parse::<u32>())
+        .transpose()
+        .map_err(|_| Error::Corrupt("chunk number".into()))?
+        .map(i64::from)
+        .unwrap_or(-1);
+    conn.execute(
+        "INSERT INTO frames VALUES(?1,?2,?3,?4,?5,?6)",
+        params![info.kind, info.key, change, chunk, bytes, info.sha256],
+    )?;
+    Ok(())
+}
 #[derive(Debug)]
-struct SpoolLease(PathBuf, bool, Option<File>);
+struct SpoolLease(
+    PathBuf,
+    bool,
+    Option<File>,
+    Option<std::sync::Mutex<Connection>>,
+);
 impl Drop for SpoolLease {
     fn drop(&mut self) {
+        let _ = &self.3;
         if self.1 {
             let _ = fs::remove_file(&self.0);
         }
@@ -28,9 +78,14 @@ pub struct Component {
 impl Component {
     pub fn open(&self) -> Result<ComponentReader> {
         Ok(ComponentReader {
-            conn: Connection::open_with_flags(
+            conn: agentlaw_sqlite::open_with_flags(
                 &self.spool,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                if self.spool.to_string_lossy().starts_with("file:") {
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                } else {
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                },
             )?,
             component: self.clone(),
             next: 0,
@@ -112,6 +167,7 @@ impl SpoolChange {
 pub struct HistorySpool {
     path: PathBuf,
     conn: Connection,
+    scratch_policy: delta_stream::ScratchPolicy,
     pub source_position: published::SourcePosition,
     pub cache_reused: bool,
     lease: std::sync::Arc<SpoolLease>,
@@ -149,7 +205,7 @@ impl Store {
                 .write(true)
                 .open(cache_path.with_extension("lease"))?;
             lease_file.lock_shared()?;
-            let conn = Connection::open_with_flags(
+            let conn = agentlaw_sqlite::open_with_flags(
                 &cache_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
@@ -157,16 +213,18 @@ impl Store {
             return Ok(HistorySpool {
                 path: cache_path.clone(),
                 conn,
+                scratch_policy: delta_stream::ScratchPolicy::Legacy(cache_dir.clone()),
                 source_position: position,
                 cache_reused: true,
-                lease: std::sync::Arc::new(SpoolLease(cache_path, false, Some(lease_file))),
+                lease: std::sync::Arc::new(SpoolLease(cache_path, false, Some(lease_file), None)),
             });
         }
         let dir = self.local.join("history-spools");
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
-        let conn = Connection::open(&path)?;
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; CREATE TABLE frames(kind TEXT NOT NULL,key TEXT NOT NULL,change_id TEXT NOT NULL,chunk_no INTEGER NOT NULL,payload BLOB NOT NULL,sha TEXT NOT NULL,PRIMARY KEY(kind,key)); CREATE INDEX components ON frames(change_id,kind,chunk_no); CREATE TABLE changes(change_id TEXT PRIMARY KEY,entity_id TEXT NOT NULL,metadata TEXT NOT NULL,descriptor TEXT NOT NULL,checkpoint TEXT NOT NULL); CREATE INDEX entities ON changes(entity_id); CREATE TABLE edges(child TEXT NOT NULL,parent TEXT NOT NULL,owner TEXT NOT NULL,PRIMARY KEY(child,parent)); CREATE INDEX reverse_edges ON edges(parent); CREATE TABLE current_units(entity_id TEXT PRIMARY KEY,state TEXT NOT NULL,target TEXT);")?;
+        let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
+        let conn = agentlaw_sqlite::open(&path)?;
+        initialize_spool(&conn, false)?;
         let history = self.safe_path("history")?;
         if history.exists() {
             for writer in fs::read_dir(history)? {
@@ -192,48 +250,17 @@ impl Store {
                     codec::scan(
                         "history",
                         &mut BufReader::new(File::open(pack)?),
-                        |info, payload| {
-                            let mut bytes = Vec::new();
-                            payload.read_to_end(&mut bytes)?;
-                            let previous: Option<String> = conn
-                                .query_row(
-                                    "SELECT sha FROM frames WHERE kind=?1 AND key=?2",
-                                    params![info.kind, info.key],
-                                    |r| r.get(0),
-                                )
-                                .optional()?;
-                            if let Some(old) = previous {
-                                if old != info.sha256 {
-                                    return Err(Error::Corrupt(
-                                        "immutable frame identity collision".into(),
-                                    ));
-                                }
-                                return Ok(());
-                            }
-                            let mut key = info.key.split('.');
-                            let change = key.next().unwrap();
-                            let chunk = key
-                                .next()
-                                .map(|n| n.parse::<u32>())
-                                .transpose()
-                                .map_err(|_| Error::Corrupt("chunk number".into()))?
-                                .map(i64::from)
-                                .unwrap_or(-1);
-                            conn.execute(
-                                "INSERT INTO frames VALUES(?1,?2,?3,?4,?5,?6)",
-                                params![info.kind, info.key, change, chunk, bytes, info.sha256],
-                            )?;
-                            Ok(())
-                        },
+                        |info, payload| insert_frame(&conn, info, payload),
                     )?;
                 }
             }
         }
         let mut spool = HistorySpool {
-            lease: std::sync::Arc::new(SpoolLease(path.clone(), true, None)),
+            lease,
             cache_reused: false,
             path,
             conn,
+            scratch_policy: delta_stream::ScratchPolicy::Legacy(dir.clone()),
             source_position: position,
         };
         spool.validate_history()?;
@@ -327,6 +354,47 @@ impl HistorySpool {
     }
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    /// Size of the acquired SQLite database, regardless of its backing store.
+    pub fn size_bytes(&self) -> Result<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        pages.checked_mul(page_size).ok_or(Error::Capacity)
+    }
+    /// Move an acquired in-memory spool into its private unsynchronized file.
+    /// Existing component handles keep their previous backing alive until dropped.
+    pub fn spill_to_file(&mut self) -> Result<()> {
+        if !self.path.to_string_lossy().starts_with("file:") {
+            return Ok(());
+        }
+        let directory = match &self.scratch_policy {
+            delta_stream::ScratchPolicy::Bounded { directory, .. } => directory.clone(),
+            delta_stream::ScratchPolicy::Legacy(directory) => directory.clone(),
+        };
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+        let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
+        #[cfg(feature = "write-audit")]
+        agentlaw_sqlite::audit::vacuum_into(&self.conn, &path)?;
+        #[cfg(not(feature = "write-audit"))]
+        self.conn
+            .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+        let connection = agentlaw_sqlite::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE;",
+        )?;
+        self.conn = connection;
+        self.path = path;
+        self.lease = lease;
+        self.scratch_policy = delta_stream::ScratchPolicy::Bounded {
+            memory: 0,
+            directory,
+        };
+        Ok(())
     }
     /// An exact retained historical input for the import-only resolution writer.
     pub fn exact_change(&self, change_id: &str) -> Result<SpoolChange> {
@@ -590,7 +658,7 @@ impl HistorySpool {
             change.delta.open()?,
             base,
             change.body.open()?,
-            self.path.parent().unwrap(),
+            &self.scratch_policy,
         )?;
         Ok(change)
     }
@@ -795,3 +863,224 @@ impl HistorySpool {
         })
     }
 }
+
+const HISTORY_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
+
+enum AcquiredPack {
+    Memory(Vec<u8>),
+    File(PathBuf),
+}
+
+/// Owned pack bytes pinned to the source position of the read guard.
+pub struct AcquiredHistory {
+    packs: Vec<AcquiredPack>,
+    files: Vec<SpoolLease>,
+    local: PathBuf,
+    position: published::SourcePosition,
+    spilled: bool,
+    scratch_budget: u64,
+}
+
+impl published::SourceReadGuard<'_> {
+    pub fn acquire_history(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<AcquiredHistory> {
+        self.acquire_history_with_budget(cancel, HISTORY_MEMORY_BUDGET)
+    }
+
+    fn acquire_history_with_budget(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        budget: u64,
+    ) -> Result<AcquiredHistory> {
+        self.acquire_history_observed(cancel, budget, || {})
+    }
+
+    fn acquire_history_observed(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+        budget: u64,
+        mut after_pack: impl FnMut(),
+    ) -> Result<AcquiredHistory> {
+        use std::sync::atomic::Ordering;
+        let mut acquired = AcquiredHistory {
+            packs: Vec::new(),
+            files: Vec::new(),
+            local: self.store.local.clone(),
+            position: self.position.clone(),
+            spilled: false,
+            scratch_budget: budget,
+        };
+        let mut used = 0u64;
+        let check = || {
+            if cancel.load(Ordering::Acquire) {
+                Err(Error::CancelledBeforeDecision)
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let history = self.store.safe_path("history")?;
+        if history.exists() {
+            for writer in fs::read_dir(history)? {
+                let writer = writer?;
+                if writer.file_type()?.is_symlink() {
+                    return Err(Error::Corrupt("history writer symlink".into()));
+                }
+                for entry in fs::read_dir(writer.path())? {
+                    check()?;
+                    let entry = entry?;
+                    if entry.file_type()?.is_symlink() {
+                        return Err(Error::Corrupt("history pack symlink".into()));
+                    }
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "tmp") {
+                        continue;
+                    }
+                    let size = entry.metadata()?.len();
+                    if !acquired.spilled && used.checked_add(size).is_none_or(|n| n > budget) {
+                        acquired.spill_packs()?;
+                    }
+                    if acquired.spilled {
+                        let target = acquired.new_file("pack")?;
+                        let mut out = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&target)?;
+                        std::io::copy(&mut File::open(path)?, &mut out)?;
+                        acquired.packs.push(AcquiredPack::File(target));
+                    } else {
+                        let bytes = fs::read(path)?;
+                        used = used
+                            .checked_add(bytes.len() as u64)
+                            .ok_or(Error::Capacity)?;
+                        if used > budget {
+                            return Err(Error::Capacity);
+                        }
+                        acquired.packs.push(AcquiredPack::Memory(bytes));
+                    }
+                    after_pack();
+                }
+            }
+        }
+        check()?;
+        acquired.scratch_budget = budget;
+        Ok(acquired)
+    }
+}
+
+impl AcquiredHistory {
+    fn new_file(&mut self, extension: &str) -> Result<PathBuf> {
+        let dir = self.local.join("history-spools");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.{}", uuid::Uuid::new_v4(), extension));
+        self.files.push(SpoolLease(path.clone(), true, None, None));
+        Ok(path)
+    }
+
+    fn spill_packs(&mut self) -> Result<()> {
+        self.spilled = true;
+        for pack in std::mem::take(&mut self.packs) {
+            match pack {
+                AcquiredPack::Memory(bytes) => {
+                    let file = self.new_file("pack")?;
+                    fs::write(&file, bytes)?;
+                    self.packs.push(AcquiredPack::File(file));
+                }
+                AcquiredPack::File(path) => self.packs.push(AcquiredPack::File(path)),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn into_spool(self) -> Result<HistorySpool> {
+        self.into_spool_observed(|_| {})
+    }
+
+    fn into_spool_observed(mut self, before_loading: impl FnOnce(&Self)) -> Result<HistorySpool> {
+        // SQLite pages, indexes and validation rows can exceed the packed payload.
+        // Reserve room for them as well as the still-owned input and frame buffers.
+        let raw = self
+            .packs
+            .iter()
+            .map(|pack| match pack {
+                AcquiredPack::Memory(bytes) => bytes.len() as u64,
+                AcquiredPack::File(_) => 0,
+            })
+            .sum::<u64>();
+        let reserved = raw.saturating_mul(4).saturating_add(1024 * 1024);
+        let disk = self.spilled || reserved > self.scratch_budget;
+        if disk && !self.spilled {
+            self.spill_packs()?;
+        }
+        before_loading(&self);
+        let (path, conn, lease) = if disk {
+            let path = self.new_file("sqlite")?;
+            // The database lease outlives acquisition files and all component readers.
+            self.files.pop();
+            let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
+            let conn = agentlaw_sqlite::open(&path)?;
+            (path, conn, lease)
+        } else {
+            let path = PathBuf::from(format!(
+                "file:history-{}?mode=memory&cache=shared",
+                uuid::Uuid::new_v4()
+            ));
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+            let conn = agentlaw_sqlite::open_with_flags(&path, flags)?;
+            let keeper = agentlaw_sqlite::open_with_flags(&path, flags)?;
+            let lease = std::sync::Arc::new(SpoolLease(
+                path.clone(),
+                false,
+                None,
+                Some(std::sync::Mutex::new(keeper)),
+            ));
+            (path, conn, lease)
+        };
+        let mut spool = HistorySpool {
+            path,
+            conn,
+            scratch_policy: delta_stream::ScratchPolicy::Bounded {
+                memory: if disk {
+                    0
+                } else {
+                    self.scratch_budget - reserved
+                },
+                directory: self.local.join("history-spools"),
+            },
+            source_position: self.position.clone(),
+            cache_reused: false,
+            lease,
+        };
+        initialize_spool(&spool.conn, true)?;
+        for pack in std::mem::take(&mut self.packs) {
+            match pack {
+                AcquiredPack::Memory(bytes) => {
+                    codec::scan(
+                        "history",
+                        &mut BufReader::new(std::io::Cursor::new(bytes)),
+                        |info, payload| insert_frame(&spool.conn, info, payload),
+                    )?;
+                }
+                AcquiredPack::File(path) => {
+                    codec::scan(
+                        "history",
+                        &mut BufReader::new(File::open(&path)?),
+                        |info, payload| insert_frame(&spool.conn, info, payload),
+                    )?;
+                    if let Some(index) = self.files.iter().position(|lease| lease.0 == path) {
+                        drop(self.files.swap_remove(index));
+                    }
+                }
+            }
+        }
+        spool.validate_history()?;
+        Ok(spool)
+    }
+}
+
+#[cfg(test)]
+mod tests;

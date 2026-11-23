@@ -1,6 +1,122 @@
 //! Strict streaming utf8-splice-v1 validation, including arbitrarily long insert strings.
 use super::*;
 use std::io::BufRead;
+#[cfg(test)]
+thread_local! {
+    pub(super) static SCRATCH_CREATED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+fn observe_scratch(path: &Path) {
+    SCRATCH_CREATED.with(|paths| paths.borrow_mut().push(path.to_owned()));
+}
+#[derive(Clone)]
+pub(super) enum ScratchPolicy {
+    Legacy(PathBuf),
+    Bounded { memory: u64, directory: PathBuf },
+}
+
+enum ScratchData {
+    Memory(std::io::Cursor<Vec<u8>>),
+    File(std::io::BufWriter<File>),
+}
+struct Scratch {
+    data: Option<ScratchData>,
+    path: Option<PathBuf>,
+    policy: ScratchPolicy,
+}
+impl Scratch {
+    fn new(policy: &ScratchPolicy) -> Result<Self> {
+        let mut scratch = Self {
+            data: Some(ScratchData::Memory(std::io::Cursor::new(Vec::new()))),
+            path: None,
+            policy: policy.clone(),
+        };
+        if matches!(policy, ScratchPolicy::Legacy(_)) {
+            scratch.spill()?;
+        }
+        Ok(scratch)
+    }
+    fn spill(&mut self) -> Result<()> {
+        let dir = match &self.policy {
+            ScratchPolicy::Legacy(dir) => dir,
+            ScratchPolicy::Bounded { directory, .. } => {
+                fs::create_dir_all(directory)?;
+                directory
+            }
+        };
+        let path = dir.join(format!("delta-{}.tmp", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(&path)?;
+        self.path = Some(path.clone());
+        #[cfg(test)]
+        observe_scratch(&path);
+        let old = self
+            .data
+            .replace(ScratchData::File(std::io::BufWriter::new(file)));
+        if let Some(ScratchData::Memory(bytes)) = old {
+            if let Some(ScratchData::File(file)) = &mut self.data {
+                file.write_all(bytes.get_ref())?;
+            }
+        }
+        Ok(())
+    }
+    fn finish(mut self) -> Result<()> {
+        self.data.take();
+        if let Some(path) = &self.path {
+            fs::remove_file(path)?;
+        }
+        self.path = None;
+        Ok(())
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.data.take();
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+impl Write for Scratch {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let (ScratchPolicy::Bounded { memory, .. }, Some(ScratchData::Memory(cursor))) =
+            (&self.policy, &self.data)
+        {
+            if (cursor.get_ref().len() as u64).saturating_add(bytes.len() as u64) > *memory {
+                self.spill().map_err(std::io::Error::other)?;
+            }
+        }
+        match self.data.as_mut().unwrap() {
+            ScratchData::Memory(cursor) => cursor.write(bytes),
+            ScratchData::File(file) => file.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.data.as_mut().unwrap() {
+            ScratchData::Memory(cursor) => cursor.flush(),
+            ScratchData::File(file) => file.flush(),
+        }
+    }
+}
+impl Read for Scratch {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self.data.as_mut().unwrap() {
+            ScratchData::Memory(cursor) => cursor.read(bytes),
+            ScratchData::File(file) => file.get_mut().read(bytes),
+        }
+    }
+}
+impl Seek for Scratch {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        match self.data.as_mut().unwrap() {
+            ScratchData::Memory(cursor) => cursor.seek(position),
+            ScratchData::File(file) => file.seek(position),
+        }
+    }
+}
 struct Json<R> {
     r: R,
 }
@@ -119,15 +235,45 @@ impl<R: BufRead> Json<R> {
 struct Compare<R> {
     expected: R,
 }
+#[derive(Debug)]
+struct Mismatch;
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("delta/checkpoint mismatch")
+    }
+}
+impl std::error::Error for Mismatch {}
+fn compare_copy(input: &mut impl Read, output: &mut impl Write) -> Result<u64> {
+    std::io::copy(input, output).map_err(|error| {
+        if error.get_ref().is_some_and(|cause| cause.is::<Mismatch>()) {
+            Error::Corrupt("delta/checkpoint mismatch".into())
+        } else {
+            Error::Io(error)
+        }
+    })
+}
 impl<R: Read> Write for Compare<R> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let mut buf = [0u8; 65536];
         for part in bytes.chunks(buf.len()) {
-            self.expected.read_exact(&mut buf[..part.len()])?;
+            let mut count = 0;
+            while count < part.len() {
+                match self.expected.read(&mut buf[count..part.len()]) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            Mismatch,
+                        ))
+                    }
+                    Ok(n) => count += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             if part != &buf[..part.len()] {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "delta/checkpoint mismatch",
+                    Mismatch,
                 ));
             }
         }
@@ -147,7 +293,7 @@ pub(super) fn verify(
     delta: impl Read,
     base: impl Read,
     result: impl Read,
-    temp_dir: &Path,
+    scratch_policy: &ScratchPolicy,
 ) -> Result<()> {
     let mut json = Json {
         r: BufReader::new(delta),
@@ -185,12 +331,7 @@ pub(super) fn verify(
                     let mut start = None;
                     let mut delete = None;
                     let mut keys = BTreeSet::new();
-                    let path = temp_dir.join(format!("delta-{}.tmp", uuid::Uuid::new_v4()));
-                    let mut insertion = OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .read(true)
-                        .open(&path)?;
+                    let mut insertion = Scratch::new(scratch_policy)?;
                     loop {
                         if json.peek()? == Some(b'}') {
                             json.byte()?;
@@ -229,7 +370,7 @@ pub(super) fn verify(
                         ));
                     }
                     let unchanged = start - cursor;
-                    if std::io::copy(&mut Read::by_ref(&mut base).take(unchanged), &mut output)?
+                    if compare_copy(&mut Read::by_ref(&mut base).take(unchanged), &mut output)?
                         != unchanged
                     {
                         return Err(Error::Corrupt("splice start outside base".into()));
@@ -243,10 +384,10 @@ pub(super) fn verify(
                         return Err(Error::Corrupt("splice delete outside base".into()));
                     }
                     boundary(&mut base)?;
+                    insertion.flush()?;
                     insertion.seek(SeekFrom::Start(0))?;
-                    std::io::copy(&mut insertion, &mut output)?;
-                    drop(insertion);
-                    fs::remove_file(path)?;
+                    compare_copy(&mut insertion, &mut output)?;
+                    insertion.finish()?;
                     cursor = start.checked_add(delete).ok_or(Error::Capacity)?;
                     previous = Some(start);
                     match json.peek()? {
@@ -281,10 +422,13 @@ pub(super) fn verify(
     {
         return Err(Error::Corrupt("incomplete/trailing delta JSON".into()));
     }
-    std::io::copy(&mut base, &mut output)?;
+    compare_copy(&mut base, &mut output)?;
     let mut tail = [0];
     if output.expected.read(&mut tail)? != 0 {
         return Err(Error::Corrupt("delta result too short".into()));
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

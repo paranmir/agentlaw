@@ -36,6 +36,61 @@ fn inherited<T: Clone + PartialEq>(
     }
     Ok(())
 }
+/// Parse a Task heading consistently for owned and streamed bodies.
+pub(crate) fn task_heading(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes)
+        || !line[hashes..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(line[hashes..].trim().trim_end_matches('#').trim())
+}
+/// Incremental fence prefix parser shared by owned and streamed Task bodies.
+#[derive(Default)]
+pub(crate) struct TaskFenceProbe {
+    marker: Option<char>,
+    run: u64,
+    done: bool,
+}
+impl TaskFenceProbe {
+    pub(crate) fn push(&mut self, ch: char) {
+        if self.done {
+            return;
+        }
+        match self.marker {
+            None if ch.is_whitespace() => {}
+            None if ch == '`' || ch == '~' => {
+                self.marker = Some(ch);
+                self.run = 1;
+            }
+            Some(marker) if marker == ch => self.run = self.run.saturating_add(1),
+            _ => self.done = true,
+        }
+    }
+    pub(crate) fn done(&self) -> bool {
+        self.done
+    }
+    pub(crate) fn finish(&self) -> Option<(char, u64)> {
+        self.marker
+            .filter(|_| self.run >= 3)
+            .map(|marker| (marker, self.run))
+    }
+}
+fn task_fence(line: &str) -> Option<(char, u64)> {
+    let mut probe = TaskFenceProbe::default();
+    for ch in line.chars() {
+        probe.push(ch);
+        if probe.done() {
+            break;
+        }
+    }
+    probe.finish()
+}
 pub fn task_headings(body: &str) -> Result<()> {
     let required = [
         "Objective",
@@ -44,27 +99,21 @@ pub fn task_headings(body: &str) -> Result<()> {
         "References",
     ];
     let mut found = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence: Option<(char, u64)> = None;
     for line in body.lines() {
         let s = line.trim_start();
-        let ch = s.chars().next();
-        if let Some(c) = ch.filter(|c| *c == '`' || *c == '~') {
-            let n = s.chars().take_while(|x| *x == c).count();
-            if n >= 3 {
-                match fence {
-                    None => fence = Some((c, n)),
-                    Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                    _ => {}
-                }
-                continue;
+        if let Some((c, n)) = task_fence(s) {
+            match fence {
+                None => fence = Some((c, n)),
+                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
+                _ => {}
             }
+            continue;
         }
         if fence.is_some() {
             continue;
         }
-        let hashes = s.chars().take_while(|c| *c == '#').count();
-        if (1..=6).contains(&hashes) && s.as_bytes().get(hashes) == Some(&b' ') {
-            let heading = s[hashes..].trim().trim_end_matches('#').trim();
+        if let Some(heading) = task_heading(s) {
             if required.contains(&heading) {
                 found.push(heading)
             }
@@ -86,27 +135,21 @@ pub fn task_sections(body: &str) -> Result<[String; 3]> {
         "References",
     ];
     let mut ranges = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence: Option<(char, u64)> = None;
     let mut offset = 0;
     for line in body.split_inclusive('\n') {
         let s = line.trim_start();
-        let ch = s.chars().next();
-        if let Some(c) = ch.filter(|c| *c == '`' || *c == '~') {
-            let n = s.chars().take_while(|x| *x == c).count();
-            if n >= 3 {
-                match fence {
-                    None => fence = Some((c, n)),
-                    Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                    _ => {}
-                }
-                offset += line.len();
-                continue;
+        if let Some((c, n)) = task_fence(s) {
+            match fence {
+                None => fence = Some((c, n)),
+                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
+                _ => {}
             }
+            offset += line.len();
+            continue;
         }
         if fence.is_none() {
-            let n = s.chars().take_while(|c| *c == '#').count();
-            if (1..=6).contains(&n) && s.as_bytes().get(n) == Some(&b' ') {
-                let heading = s[n..].trim().trim_end_matches('#').trim();
+            if let Some(heading) = task_heading(s) {
                 if names.contains(&heading) {
                     ranges.push((offset, offset + line.len()));
                 }

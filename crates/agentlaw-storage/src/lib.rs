@@ -2,6 +2,8 @@
 //! Readers and writers sharing a local root cooperate through an OS file lock.
 //! Power-loss durability is deliberately NOT asserted by this implementation.
 pub mod acquire;
+mod binding;
+pub use binding::{binding_identity, BindingKey};
 pub mod codec;
 mod current;
 mod delta_stream;
@@ -11,6 +13,7 @@ pub mod history_spool;
 mod import;
 pub mod import_conflict;
 mod journal;
+pub use journal::JournalWriter;
 pub mod journal_repair;
 pub mod maintenance;
 pub mod persistence;
@@ -253,87 +256,7 @@ impl CurrentUnit {
         Ok(out)
     }
     pub fn decode(r: &mut impl std::io::BufRead) -> Result<Self> {
-        let frames = codec::read("current", r)?;
-        let states: Vec<_> = frames.iter().filter(|f| f.kind == "state").collect();
-        if states.len() != 1 {
-            return Err(Error::Corrupt("state cardinality".into()));
-        }
-        let v: Value = codec::parse_json(&states[0].payload)?;
-        let entity_type = v["entity_type"]
-            .as_str()
-            .ok_or_else(|| Error::Corrupt("entity type".into()))?
-            .to_owned();
-        let entity_id = v[if entity_type == "memory" {
-            "memory_id"
-        } else {
-            "procedure_id"
-        }]
-        .as_str()
-        .ok_or_else(|| Error::Corrupt("entity id".into()))?
-        .to_owned();
-        if states[0].key != entity_id {
-            return Err(Error::Corrupt("state key".into()));
-        }
-        let state = match v["state"].as_str() {
-            Some("live") => {
-                if v.get("redirect_to").is_some() || v.get("consolidation_change_id").is_some() {
-                    return Err(Error::Corrupt("live/redirect declarations mixed".into()));
-                }
-                let metadata = v["current_heads"]
-                    .as_array()
-                    .ok_or_else(|| Error::Corrupt("heads".into()))?;
-                if frames.len() != metadata.len() + 1 {
-                    return Err(Error::Corrupt("body cardinality".into()));
-                }
-                let mut heads = Vec::new();
-                for m in metadata {
-                    let id = m["change_id"]
-                        .as_str()
-                        .ok_or_else(|| Error::Corrupt("change id".into()))?;
-                    let f = frames
-                        .iter()
-                        .find(|f| {
-                            f.key == id
-                                && f.kind
-                                    == if entity_type == "memory" {
-                                        "body"
-                                    } else {
-                                        "instructions"
-                                    }
-                        })
-                        .ok_or_else(|| Error::Corrupt("missing body".into()))?;
-                    heads.push(Head {
-                        metadata: m.clone(),
-                        body: String::from_utf8(f.payload.clone())
-                            .map_err(|_| Error::Corrupt("body UTF8".into()))?,
-                    });
-                }
-                UnitState::Live { heads }
-            }
-            Some("redirect") => {
-                if v.get("current_heads").is_some() {
-                    return Err(Error::Corrupt("redirect/live declarations mixed".into()));
-                }
-                if frames.len() != 1 {
-                    return Err(Error::Corrupt("redirect body".into()));
-                }
-                UnitState::Redirect {
-                    redirect_to: v["redirect_to"].as_str().unwrap_or("").into(),
-                    consolidation_change_id: v["consolidation_change_id"]
-                        .as_str()
-                        .unwrap_or("")
-                        .into(),
-                }
-            }
-            _ => return Err(Error::Corrupt("state discriminator".into())),
-        };
-        let unit = Self {
-            entity_id,
-            entity_type,
-            state,
-        };
-        unit.validate()?;
-        Ok(unit)
+        codec::assemble_current(codec::read("current", r)?)
     }
 }
 fn change_id(h: &Head) -> Result<&str> {
@@ -421,6 +344,18 @@ struct Fence {
     operation_id: Option<String>,
     manifest_digest: Option<String>,
 }
+fn load_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let envelope = codec::parse_json(&fs::read(path)?)?;
+    let bytes = envelope["payload"]
+        .as_str()
+        .ok_or_else(|| Error::Corrupt("record payload".into()))?
+        .as_bytes();
+    if envelope["digest"] != codec::digest(bytes) {
+        return Err(Error::Corrupt("record digest".into()));
+    }
+    Ok(serde_json::from_value(codec::parse_json(bytes)?)?)
+}
+
 pub struct Store {
     root: PathBuf,
     local: PathBuf,
@@ -430,6 +365,16 @@ fn local_coordination(local: &Path) -> PathBuf {
     local.parent().unwrap_or(local).join("source-coordination")
 }
 impl Store {
+    /// Keep this binding's journal writer open until the returned guard is dropped.
+    pub fn hold_journal_writer(&self) -> Result<JournalWriter> {
+        let _gate = self.lock_shared()?;
+        journal::hold(&self.local)
+    }
+    /// Retry a failed journal keeper under the source write gate.
+    pub fn retry_journal_writer(&self, writer: &JournalWriter) -> Result<()> {
+        let _gate = self.lock_unchecked()?;
+        writer.retry(&self.local)
+    }
     /// Existing source/control state only: never bootstrap, migrate, recover, or publish.
     /// Diagnostic audits may create disposable local streaming spools.
     pub fn open_read_only(root: impl AsRef<Path>, local: impl AsRef<Path>) -> Result<Self> {
@@ -453,6 +398,12 @@ impl Store {
         let epoch: String = s.load(&s.local.join("source-epoch"))?;
         validate_id(&epoch)?;
         Ok(s)
+    }
+    /// Read an existing binding's epoch without opening or changing source state.
+    pub fn read_source_epoch(local: impl AsRef<Path>) -> Result<String> {
+        let epoch: String = load_record(&local.as_ref().join("source-epoch"))?;
+        validate_id(&epoch)?;
+        Ok(epoch)
     }
     pub fn local_root(&self) -> &Path {
         &self.local
@@ -596,7 +547,10 @@ impl Store {
         }
     }
     fn validate_format(&self) -> Result<()> {
-        let file = File::open(self.root.join("format.md"))
+        Self::validate_existing_format(&self.root)
+    }
+    pub fn validate_existing_format(root: &Path) -> Result<()> {
+        let file = File::open(root.join("format.md"))
             .map_err(|_| Error::Corrupt("not an Agentlaw source: format.md required".into()))?;
         let frames = codec::read("format", &mut BufReader::new(file))?;
         if frames.len() != 1
@@ -617,9 +571,7 @@ impl Store {
                 "source coordination directory must be absolute".into(),
             ));
         }
-        let identity = self.root.to_string_lossy().to_string();
-        #[cfg(windows)]
-        let identity = identity.to_lowercase();
+        let identity = binding::path_identity(&self.root);
         let source_key = codec::digest(identity.as_bytes());
         let dir = self.coordination.join(&source_key);
         if create {
@@ -633,9 +585,7 @@ impl Store {
             .open(dir.join("binding.lock"))?;
         guard.lock_exclusive()?;
         let record = dir.join("binding.json");
-        let binding = self.local.to_string_lossy().to_string();
-        #[cfg(windows)]
-        let binding = binding.to_lowercase();
+        let binding = binding::path_identity(&self.local);
         if record.exists() {
             let old: String = self.load(&record)?;
             if old != binding {
@@ -758,6 +708,10 @@ impl Store {
         validate_id(project_id)?;
         let _l = self.lock()?;
         self.ensure_clean()?;
+        self.read_catalog_locked(project_id)
+    }
+    fn read_catalog_locked(&self, project_id: &str) -> Result<Value> {
+        validate_id(project_id)?;
         let p = self.safe_path(&format!(
             "catalog/projects/{}/{}.md",
             &project_id[..2],
@@ -772,6 +726,9 @@ impl Store {
     pub fn list_catalog(&self) -> Result<Vec<Value>> {
         let _l = self.lock()?;
         self.ensure_clean()?;
+        self.list_catalog_locked()
+    }
+    fn list_catalog_locked(&self) -> Result<Vec<Value>> {
         let base = self.root.join("catalog/projects");
         let mut result = Vec::new();
         if !base.exists() {
@@ -801,6 +758,12 @@ impl Store {
         Ok(result)
     }
     fn lock(&self) -> Result<File> {
+        journal::ensure_ready(&self.local)?;
+        let f = self.lock_unchecked()?;
+        journal::ensure_ready(&self.local)?;
+        Ok(f)
+    }
+    fn lock_unchecked(&self) -> Result<File> {
         let f = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -808,6 +771,18 @@ impl Store {
             .write(true)
             .open(self.local.join("source.lock"))?;
         f.lock_exclusive()?;
+        Ok(f)
+    }
+    fn lock_shared(&self) -> Result<File> {
+        journal::ensure_ready(&self.local)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.local.join("source.lock"))?;
+        FileExt::lock_shared(&f)?;
+        journal::ensure_ready(&self.local)?;
         Ok(f)
     }
     fn writer_id(&self) -> Result<String> {
@@ -829,18 +804,17 @@ impl Store {
         install(path, &serde_json::to_vec(&envelope)?)
     }
     fn load<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
-        let envelope = codec::parse_json(&fs::read(path)?)?;
-        let bytes = envelope["payload"]
-            .as_str()
-            .ok_or_else(|| Error::Corrupt("record payload".into()))?
-            .as_bytes();
-        if envelope["digest"] != codec::digest(bytes) {
-            return Err(Error::Corrupt("record digest".into()));
-        }
-        Ok(serde_json::from_value(codec::parse_json(bytes)?)?)
+        load_record(path)
     }
     fn fence(&self) -> Result<Fence> {
-        self.load(&self.local.join("source-fence"))
+        let path = self.local.join("source-fence");
+        self.load(&path).map_err(|error| match error {
+            Error::Json(_) | Error::Corrupt(_) => Error::Corrupt(format!(
+                "source fence is corrupt: {}: {error}",
+                path.display()
+            )),
+            other => other,
+        })
     }
     fn ensure_clean(&self) -> Result<u64> {
         if self.local.join("validation-required").exists() {
@@ -1093,7 +1067,8 @@ fn install_reader(path: &Path, input: &mut impl Read) -> Result<()> {
     std::io::copy(input, &mut f)?;
     f.sync_all()?;
     drop(f);
-    // On Windows Rust rename replaces existing regular files, using MoveFileExW.
+    // On Windows, std::fs::rename replaces the target even while other
+    // handles with delete sharing keep it open.
     use persistence::Persistence;
     persistence::PlatformPersistence.install_replace(&temp, path)?;
     persistence::PlatformPersistence.sync_namespace(parent)?;

@@ -224,8 +224,6 @@ mod tests {
                 "another-private-value",
             ],
             vec!["help", "share", "private-path"],
-            vec!["describe", "worker-daemon"],
-            vec!["worker-daemon", "--help"],
         ] {
             let error = argv(&args).unwrap_err();
             assert_eq!(error.code, "invalid_arguments");
