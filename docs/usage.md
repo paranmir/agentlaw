@@ -153,7 +153,9 @@ and candidate, gates new Agentlaw work, and waits for affected MCP and worker
 processes to finish and exit. It replaces the bundle and registrations, probes
 the new MCP with initialize, tool discovery and read-only recall, then removes
 only the old bundle, previous registered version and staging objects approved
-by that plan. Memory, models, machine identity and pending work are preserved.
+by that plan. An item still used by a running process is left in place and
+removed at a later start. Memory, models, machine identity and pending work are
+preserved.
 On exit 0 with valid final `status: "installed"`, report completion and request
 a normal harness restart. The updater already verified its exact plan and
 finished replacement, probe, cleanup, and gate release. Do not repeat
@@ -188,6 +190,13 @@ the choice. Star approval never approves an update, and an update never stars
 the repository.
 
 ## Ordinary memory work
+
+Each installation runs one shared runtime. `mcp serve --stdio` is a thin frontend
+that starts the runtime if needed and attaches to it, so later sessions reuse its
+prepared stores and model. The runtime keeps running after the session that
+started it ends. On Windows, a runtime first started by Codex ends together with
+that Codex process because Codex does not let child processes leave its job; the
+next call from any harness starts a new runtime and resumes recorded work.
 
 `mcp serve --stdio` exposes only `agentlaw`. `call --json -` reads one JSON request
 from stdin and emits one result on stdout; progress goes to stderr. Use `schema`

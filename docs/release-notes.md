@@ -1,4 +1,36 @@
-# Agentlaw 0.4.2
+# Agentlaw 0.5.0
+
+- Runs one shared runtime per installation. Each harness session starts a thin
+  stdio MCP frontend that attaches to the runtime over local IPC, so a new
+  session reuses the already prepared stores and embedding model instead of
+  repeating that preparation. MCP and CLI requests use the same runtime.
+- Removes the per-session worker daemon and its shared SQLite broker database.
+  Model loading no longer competes with other clients for a database lock, and
+  a failed model child is cleaned up and restarted by the runtime.
+- Default `doctor` reports runtime health without waiting for store locks or
+  starting the runtime; `doctor --audit` performs the full audit and still
+  returns health if the audit fails.
+- Large recalls keep standing rules in a minimal form and reduce candidates item
+  by item, reporting matched and shown counts, before falling back to a complete
+  file.
+- `share import prepare` reports its current stage and elapsed time on stderr,
+  and imports can be listed and recovered without the lost output.
+- Embedding inputs are bounded to 512 model tokens; truncated queries carry a
+  `semantic_query_truncated` diagnostic.
+- Installation files are replaced safely while readers hold them open, with a
+  bounded retry for transient Windows locks such as antivirus scans. After a
+  managed update, items still used by running processes are removed on a later
+  start instead of blocking the update.
+- Preserves the MCP schema and durable memory formats. A verified update from
+  0.4.x removes the previous version's operating files.
+
+Known limits: on Windows, a runtime first started by Codex ends when that Codex
+process exits; the next call from any harness starts a new runtime. Standing
+rules are still delivered in full, so roughly 60 or more applicable rules move a
+recall into a complete file. Import preparation time itself was not reduced.
+Publishing does not update an active installation. See [usage](usage.md).
+
+## Previous release: 0.4.2
 
 - Adds contextual help and machine-readable command descriptions. Help works
   without loading configuration, installation state or the memory store;
