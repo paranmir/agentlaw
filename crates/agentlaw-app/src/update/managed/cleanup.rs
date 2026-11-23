@@ -386,8 +386,8 @@ fn referenced_by_processes(root: &Path, path: &Path) -> Result<ProcessReference>
     #[cfg(test)]
     if let Some(result) = PROCESS_OBSERVATIONS.with(|observations| {
         let observations = observations.borrow();
-        let (target, processes) = observations.as_ref()?;
-        if target != path {
+        let (installation, processes) = observations.as_ref()?;
+        if installation != root {
             return None;
         }
         Some(processes_reference_path(

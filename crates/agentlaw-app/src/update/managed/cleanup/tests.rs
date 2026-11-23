@@ -1922,7 +1922,7 @@ fn running_previous_bundle_defers_cleanup_until_the_next_start() {
     PROCESS_OBSERVATIONS.with(|observations| {
         assert!(observations
             .replace(Some((
-                previous.clone(),
+                root.clone(),
                 vec![ProcessEntry {
                     pid: std::process::id().wrapping_add(1),
                     name: binary_name().into(),
@@ -1932,11 +1932,7 @@ fn running_previous_bundle_defers_cleanup_until_the_next_start() {
             )))
             .is_none());
     });
-    let result = execute_plan_locked(&root, &cleanup.id, Some(&update.id));
-    PROCESS_OBSERVATIONS.with(|observations| {
-        observations.take();
-    });
-    result.unwrap();
+    execute_plan_locked(&root, &cleanup.id, Some(&update.id)).unwrap();
     let saved = cleanup_load(&root, &cleanup.id).unwrap();
     assert_eq!(
         (
@@ -1952,7 +1948,13 @@ fn running_previous_bundle_defers_cleanup_until_the_next_start() {
     update.phase = "completed".into();
     update.cleanup_completed = true;
     save(&update).unwrap();
+    PROCESS_OBSERVATIONS.with(|observations| {
+        observations.replace(Some((root.clone(), Vec::new())));
+    });
     retry_pending(&root);
+    PROCESS_OBSERVATIONS.with(|observations| {
+        observations.take();
+    });
     assert_eq!(
         cleanup_load(&root, &cleanup.id).unwrap().items[0].phase,
         "removed"
