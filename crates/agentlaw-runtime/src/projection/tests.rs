@@ -29,7 +29,7 @@ impl ActivePointerSink for Sink {
     fn persist_active(&self, _: &str, value: &ActiveGeneration) -> RuntimeResult<()> {
         if self
             .fail_pointer
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err(full_disk());
@@ -43,7 +43,7 @@ impl RetiredFileSink for Sink {
         self.retired.lock().unwrap().push(files.to_vec());
         if self
             .fail_retire
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err(sharing_violation());

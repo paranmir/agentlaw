@@ -869,6 +869,10 @@ fn parsed_sync(input: Value) -> SyncRequest {
     };
     request
 }
+// Hang detector for sync progress, not a speed requirement. Phases that take
+// about 4 s alone took over 20 s with the suite on four CPUs while still
+// advancing, and the Windows CI runner is several times slower again.
+const PROGRESS_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 fn wait_for_path(path: &Path, limit: std::time::Duration) -> bool {
     let until = std::time::Instant::now() + limit;
     while std::time::Instant::now() < until {
@@ -888,7 +892,7 @@ fn delayed_git_fetch_leaves_query_and_lane_available() {
     let mut f = Fixture::new();
     let barrier = slow_git_remote(&mut f);
     let service = Arc::new(sync_service(&f));
-    let ready_until = std::time::Instant::now() + Duration::from_secs(15);
+    let ready_until = std::time::Instant::now() + PROGRESS_LIMIT;
     loop {
         if service
             .query(
@@ -923,7 +927,7 @@ fn delayed_git_fetch_leaves_query_and_lane_available() {
             ))
             .ok();
     });
-    let started = wait_for_path(&barrier.started, Duration::from_secs(15));
+    let started = wait_for_path(&barrier.started, PROGRESS_LIMIT);
     let (query_tx, query_rx) = mpsc::channel();
     let query_service = service.clone();
     let query = thread::spawn(move || {
@@ -956,7 +960,7 @@ fn delayed_git_fetch_leaves_query_and_lane_available() {
     let lane_result = lane_rx.recv_timeout(Duration::from_secs(5));
     let remember_result = remember_rx.recv_timeout(Duration::from_secs(5));
     fs::write(&barrier.release, b"release").unwrap();
-    let sync_result = sync_rx.recv_timeout(Duration::from_secs(25));
+    let sync_result = sync_rx.recv_timeout(PROGRESS_LIMIT);
     assert!(started, "Git upload-pack did not reach the barrier");
     assert!(
         matches!(query_result, Ok(Ok(_))),
@@ -1000,7 +1004,7 @@ fn packet_files(local: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn packet_file_is_created_only_after_lane_persistence_succeeds() {
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{sync::mpsc, thread};
     let mut failed = Fixture::new();
     failed.remote_write("incoming conflicting edit");
     save(
@@ -1029,11 +1033,11 @@ fn packet_file_is_created_only_after_lane_persistence_succeeds() {
         ))
         .ok();
     });
-    let started = wait_for_path(&barrier.started, Duration::from_secs(15));
+    let started = wait_for_path(&barrier.started, PROGRESS_LIMIT);
     let before = packet_files(&failed.local);
     service.close();
     fs::write(&barrier.release, b"release").unwrap();
-    let result = rx.recv_timeout(Duration::from_secs(25));
+    let result = rx.recv_timeout(PROGRESS_LIMIT);
     assert!(started, "Git upload-pack did not reach the barrier");
     assert!(result.is_ok(), "sync failed to return after lane closure");
     match result.unwrap() {
@@ -1087,7 +1091,7 @@ fn packet_file_is_created_only_after_lane_persistence_succeeds() {
 
 #[test]
 fn changed_inputs_during_index_preparation_are_preserved_and_resume() {
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{sync::mpsc, thread};
     let f = Fixture::new();
     f.remote_write("remote update requiring local publication");
     let source = f
@@ -1128,7 +1132,7 @@ fn changed_inputs_during_index_preparation_are_preserved_and_resume() {
         ))
         .ok();
     });
-    let reached = wait_for_path(&started, Duration::from_secs(20));
+    let reached = wait_for_path(&started, PROGRESS_LIMIT);
     if reached {
         save(
             &f.store,
@@ -1138,7 +1142,7 @@ fn changed_inputs_during_index_preparation_are_preserved_and_resume() {
         );
     }
     fs::write(&release, b"release").unwrap();
-    let first = rx.recv_timeout(Duration::from_secs(30));
+    let first = rx.recv_timeout(PROGRESS_LIMIT);
     assert!(reached, "Git index preparation did not reach the barrier");
     let first = first
         .expect("sync did not finish after releasing index child")

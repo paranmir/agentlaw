@@ -85,7 +85,7 @@ impl Drop for Registration {
 }
 fn reserve_slot<D>(ctx: &Context<D>) -> Option<Slot> {
     ctx.slots
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < ctx.limits.admission_slots).then_some(n + 1)
         })
         .ok()
@@ -93,7 +93,7 @@ fn reserve_slot<D>(ctx: &Context<D>) -> Option<Slot> {
 }
 fn reserve_body<D>(ctx: &Context<D>, bytes: u64) -> Option<BodyReservation> {
     ctx.body_bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             n.checked_add(bytes)
                 .filter(|sum| *sum <= ctx.limits.body_budget_bytes)
         })

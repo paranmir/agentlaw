@@ -86,8 +86,9 @@ state directory; only managed installations discover their state automatically.
 ## Build from source / Cargo
 
 Prerequisites: Git, Rust/Cargo and the native linker required by your Rust target.
-The checked-in lockfile was tested with Rust 1.98.1 on Windows x64. Rust execution
-does not require Python; Python is used only for the optional model conversion tool.
+Building requires Rust 1.100 or newer; the checked-in lockfile was tested with
+Rust 1.100.0 on Windows x64. Rust execution does not require Python; Python is
+used only for the optional model conversion tool.
 
 ```sh
 git clone https://github.com/paranmir/agentlaw.git

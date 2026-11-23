@@ -98,14 +98,35 @@ fn main() {
     }
 }
 "#).unwrap();
-        let deps = std::env::current_exe().unwrap().parent().unwrap().to_owned();
-        let library = std::fs::read_dir(&deps).unwrap().map(|e| e.unwrap().path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("libserde_json-") && p.extension().is_some_and(|e| e == "rlib"))
+        // Newer Cargo build layouts keep each dependency in its own directory
+        // instead of one flat `deps` folder, so collect every library directory
+        // under the profile that built this test.
+        let executable = std::env::current_exe().unwrap();
+        let profile = executable.ancestors().skip(1).find(|dir| dir.join("build").is_dir())
+            .expect("Cargo profile directory").to_owned();
+        let (mut library_dirs, mut candidates, mut pending) = (Vec::new(), Vec::new(), vec![profile]);
+        while let Some(dir) = pending.pop() {
+            let mut has_library = false;
+            for path in std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()) {
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name != "incremental") { pending.push(path); }
+                } else if path.extension().is_some_and(|e| e == "rlib") {
+                    has_library = true;
+                    if path.file_name().unwrap().to_string_lossy().starts_with("libserde_json-") { candidates.push(path); }
+                }
+            }
+            if has_library { library_dirs.push(dir); }
+        }
+        let library = candidates.into_iter()
             .max_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap()).expect("compiled serde_json");
+        // One search path per dependency can exceed the Windows command-line limit.
+        let arguments = directory.path().join("model_fixture.args");
+        std::fs::write(&arguments, library_dirs.iter()
+            .map(|dir| format!("-L\ndependency={}\n", dir.display())).collect::<String>()).unwrap();
         let output = std::process::Command::new("rustc")
             .arg("--edition=2021").arg("--crate-name=model_fixture").arg(&source)
             .arg("--extern").arg(format!("serde_json={}", library.display()))
-            .arg("-L").arg(format!("dependency={}", deps.display()))
+            .arg(format!("@{}", arguments.display()))
             .arg("-o").arg(directory.path().join("model_fixture.exe"))
             .output().unwrap();
         assert!(output.status.success(), "helper compilation: {}", String::from_utf8_lossy(&output.stderr));
