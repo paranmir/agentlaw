@@ -87,7 +87,10 @@ pub fn validate_input(value: &Value) -> Result<()> {
     if accepts(&schema, value, &schema) {
         Ok(())
     } else {
-        Err(DomainError::new("invalid_input","Input does not match an Agentlaw action schema. Check required, forbidden, and dependent fields."))
+        Err(DomainError::new(
+            "invalid_input",
+            "Input does not match an Agentlaw action schema. Check required, forbidden, and dependent fields.",
+        ))
     }
 }
 fn ensure_supported(s: &Value) -> Result<()> {
@@ -367,6 +370,30 @@ mod tests {
                 assert!(accepts(&public, &grouped, &public), "{}", example["id"]);
                 assert!(crate::parse_request(&grouped.to_string()).is_ok());
             }
+        }
+        for id in ["recall-project-follow-up", "recall-full-task-before-evolve"] {
+            let example = fixtures["examples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|example| example["id"] == id)
+                .unwrap();
+            assert_eq!(example["valid"], true, "FR-10.4: {id}");
+        }
+        for (id, expected) in [
+            ("rule-metadata-only", true),
+            ("missing-create-body", false),
+            ("missing-consolidate-body", false),
+            ("null-evolve-body", false),
+            ("empty-evolve-body", false),
+        ] {
+            let example = fixtures["examples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|example| example["id"] == id)
+                .unwrap();
+            assert_eq!(example["valid"], expected, "FR-08.6: {id}");
         }
         // Public shape is descriptive, not a replacement for cross-field validation.
         let invalid = serde_json::json!({"action":"connect_project_memory",

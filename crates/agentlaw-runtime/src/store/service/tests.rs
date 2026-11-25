@@ -230,7 +230,7 @@ fn command_snapshot_response_limit_applies_to_connected_restore() {
 }
 
 #[test]
-fn command_restore_stays_pinned_when_path_is_reconnected() {
+fn fr_06_5_command_restore_stays_pinned_when_path_is_reconnected() {
     let (dir, identity) = fixture();
     let service = Arc::new(
         StoreService::open(identity, deps(dir.path()), &RequestControl::default()).unwrap(),
@@ -300,13 +300,15 @@ fn command_restore_stays_pinned_when_path_is_reconnected() {
     resume_tx.send(()).unwrap();
     let result = worker.join().unwrap().unwrap();
     assert_eq!(result["project_connection"]["project_id"], a);
-    let memories = result["recall_result"]["memories"].as_array().unwrap();
-    assert!(memories
-        .iter()
-        .any(|m| m["current_heads"][0]["what_to_remember"] == "Project A rule"));
-    assert!(!memories
-        .iter()
-        .any(|m| m["current_heads"][0]["what_to_remember"] == "Project B rule"));
+    let groups = result["recall_result"]["rules"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["applicability"],
+        json!({"scope":["project"],"project_id":a})
+    );
+    let items = groups[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["what_to_remember"], "Project A rule");
     let reader = ControlReader::open(&service.identity.local).unwrap();
     assert_eq!(
         reader
@@ -866,7 +868,9 @@ fn failing_configured_model_keeps_store_operations_available_and_cancellation_un
             Ok(result) => result.unwrap(),
             Err(error) => {
                 query_control.cancel.store(true, Ordering::Release);
-                panic!("recall did not complete while the configured model remained unavailable: {error}");
+                panic!(
+                    "recall did not complete while the configured model remained unavailable: {error}"
+                );
             }
         }
     });
@@ -948,7 +952,7 @@ fn failing_configured_model_keeps_store_operations_available_and_cancellation_un
 }
 
 #[test]
-fn restore_after_model_crash_keeps_incomplete_guidance_with_mandatory_content_in_a_file() {
+fn fr_06_5_restore_after_model_crash_keeps_incomplete_guidance_with_mandatory_content_in_a_file() {
     let (dir, mut identity) = fixture();
     identity.response_limit = 4096;
     let (dependencies, handle, supervisor) = configured_store_model(dir.path(), false);
@@ -1002,13 +1006,13 @@ fn restore_after_model_crash_keeps_incomplete_guidance_with_mandatory_content_in
         .unwrap()
         .iter()
         .any(|d| d["code"] == "semantic_channel_incomplete"));
-    let rule = delivered["memories"]
+    let rule = delivered["rules"][0]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|m| m["memory_id"] == memory_id)
         .unwrap();
-    assert_eq!(rule["current_heads"][0]["what_to_remember"], body);
+    assert_eq!(rule["what_to_remember"], body);
     let reader = ControlReader::open(&service.identity.local).unwrap();
     let association = reader
         .exact_association(&service.identity.binding_id, path.to_str().unwrap())

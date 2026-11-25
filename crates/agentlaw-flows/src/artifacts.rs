@@ -237,6 +237,10 @@ pub fn cleanup_read_artifacts(
     }
     Ok(removed)
 }
+pub(crate) fn read_delivery_failure(reason: &str, kind: io::ErrorKind) -> DomainError {
+    DomainError::new("result_delivery_failed", format!("{reason} ({kind:?})."))
+}
+
 /// Writes an exceptional read result without a registry transaction or fsync.
 pub(crate) struct ReadArtifactWriter {
     writer: Option<io::BufWriter<File>>,
@@ -245,8 +249,18 @@ pub(crate) struct ReadArtifactWriter {
 }
 impl ReadArtifactWriter {
     pub(crate) fn create(directory: impl AsRef<Path>) -> Result<Self> {
-        std::fs::create_dir_all(directory.as_ref()).map_err(|_| failure())?;
-        let directory = std::fs::canonicalize(directory).map_err(|_| failure())?;
+        std::fs::create_dir_all(directory.as_ref()).map_err(|error| {
+            read_delivery_failure(
+                "The response-artifact directory could not be created",
+                error.kind(),
+            )
+        })?;
+        let directory = std::fs::canonicalize(directory).map_err(|error| {
+            read_delivery_failure(
+                "The response-artifact directory could not be resolved",
+                error.kind(),
+            )
+        })?;
         let id = uuid::Uuid::new_v4();
         let temporary = directory.join(format!("response-{id}.tmp"));
         let final_path = directory.join(format!("response-{id}.json"));
@@ -254,7 +268,12 @@ impl ReadArtifactWriter {
             .create_new(true)
             .write(true)
             .open(&temporary)
-            .map_err(|_| failure())?;
+            .map_err(|error| {
+                read_delivery_failure(
+                    "The temporary response file could not be opened",
+                    error.kind(),
+                )
+            })?;
         Ok(Self {
             writer: Some(io::BufWriter::new(file)),
             temporary,
@@ -262,25 +281,49 @@ impl ReadArtifactWriter {
         })
     }
     pub(crate) fn finish(mut self) -> Result<Artifact> {
-        let mut writer = self.writer.take().ok_or_else(failure)?;
-        writer.flush().map_err(|_| failure())?;
-        drop(writer);
-        std::fs::rename(&self.temporary, &self.final_path).map_err(|_| failure())?;
-        let metadata = std::fs::metadata(&self.final_path).map_err(|_| failure())?;
-        let bytes = metadata.len();
-        let modified = metadata
-            .modified()
-            .map_err(|_| failure())?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| failure())?
-            .as_secs();
+        let mut writer = self
+            .writer
+            .take()
+            .expect("response writer is open before finish");
+        writer.flush().map_err(|error| {
+            read_delivery_failure(
+                "The temporary response file could not be flushed",
+                error.kind(),
+            )
+        })?;
+        let metadata = writer.get_ref().metadata().map_err(|error| {
+            read_delivery_failure(
+                "The temporary response file metadata could not be read",
+                error.kind(),
+            )
+        })?;
+        let modified = metadata.modified().map_err(|error| {
+            read_delivery_failure(
+                "The response file modification time could not be read",
+                error.kind(),
+            )
+        })?;
         let expires = modified
-            .checked_add(RETENTION_SECONDS)
-            .ok_or_else(failure)?;
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| elapsed.as_secs().checked_add(RETENTION_SECONDS))
+            .ok_or_else(|| {
+                DomainError::new(
+                    "result_delivery_failed",
+                    "The response file timestamp does not support a retention deadline.",
+                )
+            })?;
+        drop(writer);
+        std::fs::rename(&self.temporary, &self.final_path).map_err(|error| {
+            read_delivery_failure(
+                "The complete response file could not be published",
+                error.kind(),
+            )
+        })?;
         Ok(Artifact {
             path: self.final_path.clone(),
             format: "json",
-            bytes,
+            bytes: metadata.len(),
             complete: true,
             access: "runtime_host_filesystem",
             expires_at_unix_seconds: expires,
@@ -293,13 +336,13 @@ impl Write for ReadArtifactWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.writer
             .as_mut()
-            .ok_or_else(|| io::Error::other("writer closed"))?
+            .expect("response writer is open during write")
             .write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| io::Error::other("writer closed"))?
+            .expect("response writer is open during flush")
             .flush()
     }
 }

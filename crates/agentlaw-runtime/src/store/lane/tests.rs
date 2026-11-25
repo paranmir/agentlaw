@@ -61,7 +61,11 @@ fn bounded_queue_processes_one_stores_commands_in_order() {
         },
         &RequestControl::default(),
     );
-    assert!(matches!(result,Err(error) if error.code=="capacity"));
+    assert!(
+        matches!(result, Err(error) if error.code == "capacity"
+        && !error.retryable && error.next_action.is_none()),
+        "FR-06.4: writing uses ordinary capacity"
+    );
     lock.execute_batch("COMMIT").unwrap();
     assert!(matches!(first.join().unwrap(), Ok(LaneReply::Done)));
     for receiver in receivers {

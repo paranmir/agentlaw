@@ -293,7 +293,7 @@
         },
         "include_active_tasks": {
           "type": "boolean",
-          "description": "recall only."
+          "description": "Project start, resumption, recovery after compaction, or Task selection only. One active Task yields its handoff sections. Read all heads and refs by ID or from current_states before evolving or reconciling it."
         },
         "memory_candidate_limit": {
           "type": "integer",
@@ -361,7 +361,7 @@
               },
               "what_to_remember": {
                 "type": "string",
-                "description": "Write the complete, coherent current understanding, preserving applicable conditions and exceptions. When evolving a memory, replace its current text rather than appending a chronological log. For task memory, use Objective / Current position / Resume point / References to capture user intent, the current choice and rationale, verification status, unresolved questions, and the next check. Keep the rationale needed to continue in the task itself; reference independent memories and the Plan without duplicating their full texts."
+                "description": "Write the complete, coherent current understanding, preserving applicable conditions and exceptions. Omit this field only on single-head evolve when the body is unchanged; otherwise supply the full body (create, consolidate, multi-head evolve). When editing on evolve, rewrite to the current state rather than appending a progress log. For task memory, use Objective / Current position / Resume point / References to capture user intent, the current choice and rationale, verification status, unresolved questions, and the next check. Keep the rationale needed to continue in the task itself; reference independent memories and the Plan without duplicating their full texts."
               },
               "evidence": {
                 "type": "string",
@@ -427,7 +427,7 @@
               },
               "is_rule": {
                 "type": "boolean",
-                "description": "Use true only for an explicitly established standing rule that stays needed across this project, machine or user's work; evidence must support that intent. If an existing rule overlaps or can be combined, evolve or consolidate it instead of adding another, preserving every scope, condition and exception."
+                "description": "True only for explicitly established standing instructions in this scope. Facts, status, rationale or progress alone do not qualify. Keep one-off exceptions in the Task. State the action, conditions and standing exceptions briefly. Put reasons and support in the evidence field. Merge compatible same-scope rules without loss. Ask the user about conflicts."
               },
               "related_memory_ids": {
                 "type": "array",
@@ -485,7 +485,6 @@
             },
             "required": [
               "operation",
-              "what_to_remember",
               "evidence"
             ],
             "additionalProperties": false

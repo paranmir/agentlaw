@@ -1,5 +1,7 @@
 //! Rebuildable, disk-backed exact membership index. No current body inventory is
 //! retained in Rust; source publication pages update only changed identities.
+use crate::read::{recall_capacity, recall_source_error};
+use crate::Result as FlowResult;
 use crate::*;
 use agentlaw_storage::{published::SourcePosition, CurrentUnit, UnitState};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -438,8 +440,31 @@ impl Default for DeltaBudget {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DeltaErrorPolicy {
+    General,
+    Recall,
+}
+
+impl DeltaErrorPolicy {
+    fn source(self, error: agentlaw_storage::Error) -> DomainError {
+        match self {
+            Self::General => source_error(error),
+            Self::Recall => recall_source_error(error),
+        }
+    }
+
+    fn capacity(self, message: &str) -> DomainError {
+        match self {
+            Self::General => DomainError::new("capacity", message),
+            Self::Recall => recall_capacity(message),
+        }
+    }
+}
+
 pub struct ExactSnapshot {
     pinned: PinnedProjection,
+    delta_errors: DeltaErrorPolicy,
     position: SourcePosition,
     removed: Vec<String>,
     units: Vec<CurrentUnit>,
@@ -700,16 +725,34 @@ impl ExactSnapshot {
         }
         Ok(result.into_iter().collect())
     }
+    pub fn build_for_recall(
+        pinned: PinnedProjection,
+        source: &agentlaw_storage::published::SourceReadGuard<'_>,
+        budget: DeltaBudget,
+    ) -> FlowResult<Self> {
+        Self::build_with_policy(pinned, source, budget, DeltaErrorPolicy::Recall)
+    }
+
     pub fn build(
         pinned: PinnedProjection,
         source: &agentlaw_storage::published::SourceReadGuard<'_>,
         budget: DeltaBudget,
+    ) -> Result<Self> {
+        Self::build_with_policy(pinned, source, budget, DeltaErrorPolicy::General)
+    }
+
+    fn build_with_policy(
+        pinned: PinnedProjection,
+        source: &agentlaw_storage::published::SourceReadGuard<'_>,
+        budget: DeltaBudget,
+        delta_errors: DeltaErrorPolicy,
     ) -> Result<Self> {
         if pinned.generation.epoch != pinned.minimum_ack.epoch {
             return Err(not_ready());
         }
         let mut snapshot = Self {
             position: pinned.minimum_ack.clone(),
+            delta_errors,
             pinned,
             removed: Vec::new(),
             units: Vec::new(),
@@ -739,7 +782,7 @@ impl ExactSnapshot {
         while cursor.sequence < end.sequence {
             let page = source
                 .read_published_paths(&cursor, 1024)
-                .map_err(source_error)?;
+                .map_err(|error| self.delta_errors.source(error))?;
             for path in page.canonical_paths {
                 let kind = if path.starts_with("current/memory/") {
                     "memory"
@@ -756,10 +799,9 @@ impl ExactSnapshot {
                     })?;
                 identities.insert((kind.to_owned(), id.to_owned()));
                 if identities.len() > budget.max_identities as usize {
-                    return Err(DomainError::new(
-                        "capacity",
-                        "Projection delta identity budget exceeded.",
-                    ));
+                    return Err(self
+                        .delta_errors
+                        .capacity("Projection delta identity budget exceeded."));
                 }
             }
             cursor = page.covered_through;
@@ -778,14 +820,17 @@ impl ExactSnapshot {
                 .max_resident_bytes
                 .checked_sub(bytes)
                 .ok_or_else(|| {
-                    DomainError::new("capacity", "Projection delta body budget exceeded.")
+                    self.delta_errors
+                        .capacity("Projection delta body budget exceeded.")
                 })?;
             let mut unit = match source.read_current_compact(&id, kind == "procedure", remaining) {
                 Ok(unit) => unit,
                 Err(agentlaw_storage::Error::NotFound(_)) => continue,
-                Err(error) => return Err(source_error(error)),
+                Err(error) => return Err(self.delta_errors.source(error)),
             };
-            let refs = unit.references().map_err(source_error)?;
+            let refs = unit
+                .references()
+                .map_err(|error| self.delta_errors.source(error))?;
             let key = index_id(&unit);
             let specs = unit
                 .heads()
@@ -817,13 +862,13 @@ impl ExactSnapshot {
                             head.body.len() as u64
                         })
                         .ok_or_else(|| {
-                            DomainError::new("capacity", "Projection delta body budget exceeded.")
+                            self.delta_errors
+                                .capacity("Projection delta body budget exceeded.")
                         })?;
                     if bytes > budget.max_resident_bytes {
-                        return Err(DomainError::new(
-                            "capacity",
-                            "Projection delta body budget exceeded.",
-                        ));
+                        return Err(self
+                            .delta_errors
+                            .capacity("Projection delta body budget exceeded."));
                     }
                     documents.push(agentlaw_search::SearchDocument {
                         memory_id: key.clone(),

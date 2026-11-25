@@ -1849,7 +1849,7 @@ fn missing_proposal_authority_is_not_recreated_by_call_reconnect_or_repair() {
 }
 
 #[test]
-fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() {
+fn fr_06_5_oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
@@ -1912,20 +1912,9 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
     )
     .unwrap();
     assert_eq!(
-        contextual_packet["memories"][0]["current_heads"][0]["what_to_remember"],
-        body
+        contextual_packet["rules"],
+        json!([{"applicability":{"scope":["user"]},"items":[{"memory_id":reference["memory_id"],"what_to_remember":body}]}])
     );
-    // A contextual single-head rule carries its full text without memory_ref;
-    // the explicit-ID recall above returns the full head.
-    assert_eq!(
-        contextual_packet["memories"][0]["memory_id"],
-        saved["results"][0]["memory_ref"]["memory_id"]
-    );
-    let contextual_head = contextual_packet["memories"][0]["current_heads"][0]
-        .as_object()
-        .unwrap();
-    assert!(contextual_head.contains_key("applicability"));
-    assert!(!contextual_head.contains_key("memory_ref"));
     let (_, changed) = run(
         &state,
         &["call", "--json", "-"],
@@ -1953,8 +1942,535 @@ fn oversized_cli_recall_keeps_a_complete_frozen_version_after_later_evolution() 
     );
 }
 
+fn wait_for_recall_index(state: &Path, id: &str) {
+    let config = agentlaw_app::config::load(state).unwrap().unwrap();
+    let control = agentlaw_flows::control::ControlReader::open(config.runtime_root(state)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, _, exact, _) = control.active_projection().unwrap().unwrap();
+        let index = rusqlite::Connection::open_with_flags(
+            exact,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let indexed: bool = index
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM exact_heads WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if indexed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Memory was not indexed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
-fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
+fn recall_closure_failure_returns_only_common_error_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let source = temp.path().join("store");
+    let _cleanup = RuntimeCleanup(state.clone());
+    initialize(&state, &source);
+    let body = "Canonical recall body integrity marker.";
+    let (out, saved) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(json!({
+            "action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed fixture","applies_to":["user"]}]}
+        })),
+    );
+    assert!(out.status.success(), "{saved}");
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let id = saved["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap();
+
+    wait_for_recall_index(&state, id);
+
+    let path = source
+        .join("current/memory")
+        .join(&id[..2])
+        .join(format!("{id}.md"));
+    let mut bytes = std::fs::read(&path).unwrap();
+    let offset = bytes
+        .windows(body.len())
+        .position(|part| part == body.as_bytes())
+        .unwrap();
+    bytes[offset] = b'X';
+    std::fs::write(&path, bytes).unwrap();
+
+    let request = json!({"action":"recall","recall":{"memory_ids":[id]}});
+    let mut mcp = McpFixture::start(&state);
+    mcp.initialize();
+    let rpc = mcp.call(2, request.clone());
+    let (out, cli) = run(&state, &["call", "--json", "-"], Some(request));
+    assert_eq!(rpc["result"]["isError"], true, "FR-06.4: {rpc}");
+    assert!(!out.status.success(), "FR-06.4: {cli}");
+    for error in [&cli, &rpc["result"]["structuredContent"]] {
+        assert_eq!(error["code"], "source_corrupt", "FR-06.4: {error}");
+        assert_eq!(error["retryable"], false);
+        let reason = error["message"].as_str().unwrap().to_lowercase();
+        assert!(
+            ["integrity", "corrupt", "checksum", "hash"]
+                .iter()
+                .any(|term| reason.contains(term)),
+            "{error}"
+        );
+        let action = error["next_action"].as_str().unwrap().to_lowercase();
+        for term in ["preserve", "doctor --audit", "restor"] {
+            assert!(action.contains(term), "{error}");
+        }
+        assert!(
+            action.contains("recall") || action.contains("query"),
+            "{error}"
+        );
+        assert_eq!(error.as_object().unwrap().len(), 4, "FR-06.4: {error}");
+    }
+}
+
+#[cfg(windows)]
+struct SourceReadDenial<'a> {
+    path: &'a Path,
+    principal: String,
+    active: bool,
+}
+
+#[cfg(windows)]
+impl<'a> SourceReadDenial<'a> {
+    fn apply(path: &'a Path) -> Self {
+        let identity = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()
+            .unwrap();
+        assert!(identity.status.success(), "{identity:?}");
+        let identity = String::from_utf8_lossy(&identity.stdout);
+        let sid = identity
+            .trim()
+            .rsplit(',')
+            .next()
+            .unwrap()
+            .trim_matches('"');
+        assert!(sid.starts_with("S-1-"), "Missing current Windows user SID");
+        let guard = Self {
+            path,
+            principal: format!("*{sid}"),
+            active: true,
+        };
+        // Windows accounts normally bypass ancestor traversal checks. Inherit the
+        // catalog directory denial so opening its project directory is also denied.
+        let rights = if path.is_dir() { "(CI)(RX)" } else { "R" };
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/deny", &format!("{}:{rights}", guard.principal)])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        guard
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        let output = std::process::Command::new("icacls")
+            .arg(self.path)
+            .args(["/remove:d", &self.principal])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!("{output:?}")));
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SourceReadDenial<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            if let Err(error) = self.restore() {
+                eprintln!("Failed to restore test source ACL: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn recall_source_error_payloads_give_cause_specific_actions() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let source = temp.path().join("store");
+    let _cleanup = RuntimeCleanup(state.clone());
+    initialize(&state, &source);
+    let (out, saved) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(json!({
+            "action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"Readable canonical record","evidence":"Observed fixture","applies_to":["user"]}]}
+        })),
+    );
+    assert!(out.status.success(), "{saved}");
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let id = saved["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap();
+    wait_for_recall_index(&state, id);
+    let path = source
+        .join("current/memory")
+        .join(&id[..2])
+        .join(format!("{id}.md"));
+    #[cfg(unix)]
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    #[cfg(windows)]
+    let mut denial = SourceReadDenial::apply(&path);
+    let readable = std::fs::File::open(&path);
+    #[cfg(unix)]
+    if readable.is_ok() {
+        std::fs::set_permissions(&path, permissions).unwrap();
+        panic!("FR-06.4: test precondition failed: this process bypasses file read permissions");
+    }
+    assert_eq!(
+        readable.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let request = json!({"action":"recall","recall":{"memory_ids":[id]}});
+    let (out, error) = run(&state, &["call", "--json", "-"], Some(request.clone()));
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, permissions).unwrap();
+    #[cfg(windows)]
+    denial.restore().unwrap();
+    assert!(!out.status.success(), "{error}");
+    assert_eq!(error["code"], "source_operation_failed", "FR-06.4: {error}");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error.as_object().unwrap().len(), 4, "{error}");
+    assert!(!error["message"].as_str().unwrap().is_empty());
+    let action = error["next_action"].as_str().unwrap().to_lowercase();
+    assert!(action.contains("permission"), "{error}");
+    assert!(
+        action.contains("recall") || action.contains("query"),
+        "{error}"
+    );
+    let (out, recovered) = run(&state, &["call", "--json", "-"], Some(request));
+    assert!(out.status.success(), "{recovered}");
+    assert_eq!(
+        recovered["memories"][0]["current_heads"][0]["what_to_remember"],
+        "Readable canonical record"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn catalog_discovery_distinguishes_absence_from_access_denied() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let source = temp.path().join("store");
+    let _cleanup = RuntimeCleanup(state.clone());
+    initialize(&state, &source);
+    let bound = temp.path().join("bound");
+    let unbound = temp.path().join("unbound");
+    std::fs::create_dir(&bound).unwrap();
+    std::fs::create_dir(&unbound).unwrap();
+    let call = |input| run(&state, &["call", "--json", "-"], Some(input));
+    let discover = json!({"action":"connect_project_memory","connect_project_memory":{"intent":"discover","project_path":unbound}});
+    let recall = json!({"action":"recall","recall":{"project_path":unbound,"recall_for":"Resume this project","include_active_tasks":true}});
+    let catalog = source.join("catalog");
+    let projects = catalog.join("projects");
+    assert_eq!(
+        std::fs::read_dir(&projects).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let (discovery_status, empty_discovery) = call(discover.clone());
+    let (out, result) = call(recall.clone());
+    assert!(out.status.success(), "{result}");
+    assert_eq!(result["status"], "needs_user_input");
+    assert_eq!(result["code"], "project_connection_required");
+    assert_eq!(result["candidates"], json!([]));
+    let guidance = result["turn_instruction"].as_str().unwrap().to_lowercase();
+    assert!(
+        guidance.contains("project")
+            && (guidance.contains("select")
+                || guidance.contains("choose")
+                || guidance.contains("connect")),
+        "{result}"
+    );
+
+    let project_name = "Catalog project";
+    let (out, connected) = call(
+        json!({"action":"connect_project_memory","connect_project_memory":{"intent":"create","project_path":bound,"project_name":project_name}}),
+    );
+    assert!(out.status.success(), "{connected}");
+    let id = connected["project_connection"]["project_id"]
+        .as_str()
+        .unwrap();
+    {
+        #[cfg(windows)]
+        let mut access = SourceReadDenial::apply(&catalog);
+        #[cfg(unix)]
+        let restore = {
+            use std::os::unix::fs::PermissionsExt;
+            struct RestoreCatalog<'a>(&'a Path, std::fs::Permissions);
+            impl Drop for RestoreCatalog<'_> {
+                fn drop(&mut self) {
+                    std::fs::set_permissions(self.0, self.1.clone())
+                        .expect("Restore catalog permissions");
+                }
+            }
+            let original = std::fs::metadata(&catalog).unwrap().permissions();
+            std::fs::set_permissions(
+                &catalog,
+                std::fs::Permissions::from_mode(original.mode() & !0o111),
+            )
+            .unwrap();
+            RestoreCatalog(&catalog, original)
+        };
+        let opening = std::fs::read_dir(&projects);
+        assert!(
+            matches!(opening, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "FR-06.4: test precondition failed: catalog denial did not produce PermissionDenied"
+        );
+        for request in [discover.clone(), recall.clone()] {
+            let (out, failure) = call(request);
+            assert!(!out.status.success(), "{failure}");
+            assert_eq!(
+                failure["code"], "source_operation_failed",
+                "FR-06.4: {failure}"
+            );
+            assert_eq!(failure["retryable"], false);
+            assert!(failure.get("candidates").is_none());
+            assert!(failure.get("partial_recall_error").is_none());
+        }
+        let output_path = temp.path().join("procedure-output.jsonl");
+        for (operation, expected) in [
+            ("search", "source_unavailable"),
+            ("list", "inventory_failed"),
+        ] {
+            let mut command = command(&state);
+            command
+                .args([
+                    "learned-procedure",
+                    operation,
+                    "--project",
+                    project_name,
+                    "--output",
+                ])
+                .arg(&output_path);
+            if operation == "search" {
+                command.args(["--query", "release"]);
+            }
+            let out = command.output().unwrap();
+            assert!(!out.status.success(), "{out:?}");
+            let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+            assert_eq!(error["code"], expected, "FR-06.4: {error}");
+        }
+        #[cfg(windows)]
+        access.restore().unwrap();
+        #[cfg(unix)]
+        drop(restore);
+    }
+    for request in [discover, recall] {
+        let (out, restored) = call(request);
+        assert!(out.status.success(), "{restored}");
+        assert!(
+            restored["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["project_id"] == id),
+            "{restored}"
+        );
+    }
+    assert!(discovery_status.status.success(), "{empty_discovery}");
+    assert!(
+        empty_discovery
+            .get("candidates")
+            .is_none_or(|candidates| candidates.as_array().is_some_and(Vec::is_empty)),
+        "FR-03.2: {empty_discovery}"
+    );
+    assert!(empty_discovery["next_action"]
+        .as_str()
+        .is_some_and(|line| line.to_lowercase().contains("connect")));
+}
+
+#[test]
+fn recall_capacity_payload_instructs_retry_after_index_catch_up() {
+    use agentlaw_flows::exact::{
+        DeltaBudget, ExactIndexWriter, ExactSnapshot, ProjectionGenerations,
+    };
+    use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("source"), temp.path().join("local")).unwrap();
+    let source = store.owned_published_reader();
+    let projection = temp.path().join("projection");
+    let control = agentlaw_flows::RequestControl::default();
+    let epoch = source.read_snapshot().unwrap().position().epoch.clone();
+    let shadow = ExactIndexWriter::rebuild_shadow_in(&projection, &source, &control).unwrap();
+    let generations = ProjectionGenerations::open_for_recovery(
+        "bootstrap",
+        &epoch,
+        projection.join("exact-bootstrap.sqlite"),
+        projection.join("lexical-bootstrap.sqlite"),
+    )
+    .unwrap();
+    generations
+        .commit(generations.stage(shadow).unwrap())
+        .unwrap();
+    let id = || uuid::Uuid::new_v4().to_string();
+    store.publish(&id(), vec![Mutation {
+        unit: CurrentUnit {
+            entity_id: id(),
+            entity_type: "memory".into(),
+            state: UnitState::Live { heads: vec![Head {
+                metadata: json!({"change_id":id(),"applicability":{"scope":"user"},"origin":{"machine_id":id(),"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}),
+                body: "An unindexed published memory".into(),
+            }] },
+        },
+        expected_versions: vec![],
+        evidence: "Published fixture".into(),
+    }]).unwrap();
+    let guard = source.read_snapshot().unwrap();
+    let budget = DeltaBudget {
+        max_identities: 0,
+        max_resident_bytes: 0,
+    };
+    let ordinary = ExactSnapshot::build(generations.pin().unwrap(), &guard, budget)
+        .err()
+        .unwrap();
+    let generic = agentlaw_app::error_payload(&ordinary);
+    assert_eq!(generic["code"], "capacity");
+    assert_eq!(generic["retryable"], false);
+    let generic_action = generic["next_action"].as_str().unwrap().to_lowercase();
+    assert!(
+        !generic_action.contains("index") && !generic_action.contains("recall"),
+        "{generic}"
+    );
+
+    let recall = ExactSnapshot::build_for_recall(generations.pin().unwrap(), &guard, budget)
+        .err()
+        .unwrap();
+    let payload = agentlaw_app::error_payload(&recall);
+    assert_eq!(payload["code"], "capacity", "FR-06.4: {payload}");
+    assert_eq!(payload["retryable"], true);
+    assert_eq!(payload.as_object().unwrap().len(), 4);
+    let action = payload["next_action"].as_str().unwrap().to_lowercase();
+    assert!(
+        action.contains("index") && action.contains("recall"),
+        "{payload}"
+    );
+    assert!(
+        action.contains("then") || action.contains("after") || action.contains("once"),
+        "{payload}"
+    );
+}
+
+#[test]
+fn fr_10_4_failed_recall_file_is_a_tool_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let _cleanup = RuntimeCleanup(state.clone());
+    initialize(&state, &temp.path().join("store"));
+    let (out, config) = run(
+        &state,
+        &["config", "set", "response_limit_bytes", "4096"],
+        None,
+    );
+    assert!(out.status.success(), "{config}");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let call = |request| run(&state, &["call", "--json", "-"], Some(request));
+    let (out, connected) = call(
+        json!({"action":"connect_project_memory","connect_project_memory":{"intent":"create","project_path":project,"project_name":"Release work"}}),
+    );
+    assert!(out.status.success(), "{connected}");
+    let task_body = format!("# Objective\n{}\n# Current position\nReviewing\n# Resume point\nRun the checks\n# References\nDesign notes", "Verify the release. ".repeat(320));
+    let (out, saved) = call(
+        json!({"action":"remember_this","remember_this":{"project_path":project,"memories":[{"operation":"create","what_to_remember":task_body,"evidence":"Current release work","applies_to":["project"],"in_working_set":true}]}}),
+    );
+    assert!(out.status.success(), "{saved}");
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let task_id = &saved["results"][0]["memory_ref"]["memory_id"];
+    assert!(task_id.is_string());
+    let task = json!({"action":"recall","recall":{"project_path":project,"include_active_tasks":true,"recall_for":"Resume pending work"}});
+    let (out, envelope) = call(task.clone());
+    assert!(out.status.success(), "{envelope}");
+    assert_eq!(envelope["code"], "complete_content_in_file");
+    let artifact = Path::new(envelope["artifact"]["path"].as_str().unwrap());
+    let directory = artifact.parent().unwrap();
+    assert!(directory
+        .canonicalize()
+        .unwrap()
+        .starts_with(temp.path().canonicalize().unwrap()));
+
+    let (out, rule) = call(
+        json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"Check published policies. ".repeat(280),"evidence":"Agreed standing instruction","applies_to":["user"],"is_rule":true}]}}),
+    );
+    assert!(out.status.success(), "{rule}");
+    assert_eq!(rule["status"], "remembered", "{rule}");
+    std::fs::rename(directory, temp.path().join("saved-response-artifacts")).unwrap();
+    std::fs::write(directory, "A file blocks recreation of this directory").unwrap();
+    let ordinary = json!({"action":"recall","recall":{"recall_for":"Check unrelated work"}});
+
+    let unbound = json!({"action":"recall","recall":{"project_path":temp.path().join("unbound"),"recall_for":"Check unrelated work","include_active_tasks":true}});
+    let mut mcp = McpFixture::start(&state);
+    mcp.initialize();
+    let expected_text = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
+    for (number, (request, expected_id)) in
+        [(task, Some(task_id)), (ordinary, None), (unbound, None)]
+            .into_iter()
+            .enumerate()
+    {
+        let (out, cli) = call(request.clone());
+        let rpc = mcp.call(2 + number as u64, request);
+        assert!(!out.status.success(), "{cli}");
+        assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+        for payload in [&cli, &rpc["result"]["structuredContent"]] {
+            assert_eq!(payload["code"], "result_delivery_failed", "{payload}");
+            assert!(expected_text(&payload["message"]));
+            assert!(payload["retryable"].is_boolean());
+            assert!(expected_text(&payload["next_action"]));
+            for field in [
+                "artifact",
+                "memories",
+                "rules",
+                "active_task_handoff",
+                "partial_recall",
+            ] {
+                assert!(payload.get(field).is_none(), "{payload}");
+            }
+            let errors: Vec<_> = payload["errors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|detail| detail.get("memory_id").is_some())
+                .collect();
+            if let Some(id) = expected_id {
+                assert_eq!(errors.len(), 1, "{payload}");
+                assert_eq!(&errors[0]["memory_id"], id);
+                assert!(expected_text(&errors[0]["reason"]));
+                assert!(
+                    errors[0]["next_action"]
+                        .as_str()
+                        .is_some_and(|text| text.to_lowercase().contains("recall")),
+                    "{payload}"
+                );
+            } else {
+                assert!(errors.is_empty(), "{payload}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fr_06_5_aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let _initial_runtime_cleanup = RuntimeCleanup(state.clone());
@@ -1995,21 +2511,65 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
         ),
     );
     assert_eq!(second["status"], "remembered", "{second}");
+    let (_, target) = run(
+        &state,
+        &["call", "--json", "-"],
+        Some(
+            json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":"Traceability notes for release verification","evidence":"Candidate fixture","applies_to":["user"]}]}}),
+        ),
+    );
+    assert_eq!(target["status"], "remembered", "{target}");
+    let target_id = &target["results"][0]["memory_ref"]["memory_id"];
+    let mut source_ids = Vec::new();
     for candidate_body in ["unrelated task alpha", "unrelated task bravo"] {
         let (_, saved) = run(
             &state,
             &["call", "--json", "-"],
             Some(
-                json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":candidate_body,"evidence":"Candidate fixture","applies_to":["user"]}]}}),
+                json!({"action":"remember_this","remember_this":{"memories":[{"operation":"create","what_to_remember":candidate_body,"evidence":"Candidate fixture","applies_to":["user"],"related_memory_ids":[target_id]}]}}),
             ),
         );
         assert_eq!(saved["status"], "remembered", "{saved}");
+        source_ids.push(saved["results"][0]["memory_ref"]["memory_id"].clone());
     }
+    let assert_candidate_paths = |content: &Value| {
+        let candidates = content["candidates"].as_array().unwrap();
+        let expected_sources: Vec<_> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let id = &candidate["memory_id"];
+                source_ids.contains(id).then_some(id.clone())
+            })
+            .collect();
+        assert_eq!(expected_sources.len(), 2);
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| source_ids.contains(&candidate["memory_id"]))
+        {
+            let paths = candidate["retrieval_paths"].as_array().unwrap();
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0]["via"], json!(["lexical"]));
+            assert!(paths[0].get("source_memory_ids").is_none());
+        }
+        let target = candidates
+            .iter()
+            .find(|candidate| candidate["memory_id"] == *target_id)
+            .unwrap();
+        let paths = target["retrieval_paths"].as_array().unwrap();
+        let related: Vec<_> = paths
+            .iter()
+            .filter(|path| path["via"] == json!(["related_memory"]))
+            .collect();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0]["clue"], *target_id);
+        assert_eq!(related[0]["source_memory_ids"], json!(expected_sources));
+        assert!(related[0].get("source_memory_id").is_none());
+    };
     let (_, response) = run(
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"recall","recall":{"recall_for":"unrelated task","memory_candidate_limit":1}}),
+            json!({"action":"recall","recall":{"recall_for":"unrelated task","memory_candidate_limit":3}}),
         ),
     );
     assert_eq!(response["code"], "complete_content_in_file", "{response}");
@@ -2017,43 +2577,34 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
     let bytes = std::fs::read(response["artifact"]["path"].as_str().unwrap()).unwrap();
     assert_eq!(response["artifact"]["bytes"], bytes.len());
     let packet: Value = serde_json::from_slice(&bytes).unwrap();
-    let memories = packet["memories"].as_array().unwrap();
-    // The required reference keeps the full head; contextual single-head rules
-    // carry only their full text, applicability and rule marker.
-    let expected = &reference["results"][0]["memory_ref"];
-    assert!(memories
-        .iter()
-        .any(|m| m["memory_id"] == expected["memory_id"]
-            && m["current_heads"][0]["memory_ref"] == *expected
-            && m["current_heads"][0]["what_to_remember"] == reference_body));
-    for (saved, body) in [(&first, &first_body), (&second, &second_body)] {
-        let id = &saved["results"][0]["memory_ref"]["memory_id"];
-        let rule = memories
-            .iter()
-            .find(|m| m["memory_id"] == *id)
-            .unwrap_or_else(|| panic!("contextual rule {id} missing: {packet}"));
-        let head = rule["current_heads"][0].as_object().unwrap();
-        assert_eq!(head["what_to_remember"], *body);
-        assert_eq!(head["is_rule"], true);
-        assert!(head.contains_key("applicability"));
-        assert!(!head.contains_key("memory_ref") && !head.contains_key("origin"));
-    }
-    assert_eq!(memories.len(), 3);
+    let assert_mandatory = |packet: &Value| {
+        let memories = packet["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        let expected = &reference["results"][0]["memory_ref"];
+        assert_eq!(memories[0]["memory_id"], expected["memory_id"]);
+        assert_eq!(memories[0]["current_heads"][0]["memory_ref"], *expected);
+        assert_eq!(
+            memories[0]["current_heads"][0]["what_to_remember"],
+            reference_body
+        );
+        let groups = packet["rules"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["applicability"], json!({"scope":["user"]}));
+        let items = groups[0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for (saved, body) in [(&first, &first_body), (&second, &second_body)] {
+            assert!(items.contains(&json!({"memory_id":saved["results"][0]["memory_ref"]["memory_id"],"what_to_remember":body})));
+        }
+    };
+    assert_mandatory(&packet);
+    assert!(response["next_action"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
     assert_eq!(
         packet["candidate_counts"]["memories"],
-        json!({"matched":2,"shown":1})
+        json!({"matched":3,"shown":3})
     );
-    assert_eq!(
-        packet["candidates"][0]["retrieval_paths"][0]["via"],
-        json!(["lexical"])
-    );
-    assert_eq!(
-        packet["candidates"][0]["retrieval_paths"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_candidate_paths(&packet);
     assert!(packet
         .get("undelivered_required")
         .is_none_or(|v| v.as_array().unwrap().is_empty()));
@@ -2061,7 +2612,7 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
         &state,
         &["call", "--json", "-"],
         Some(
-            json!({"action":"recall","recall":{"project_path":"C:/work/unbound-aggregate","recall_for":"unrelated task","include_active_tasks":true}}),
+            json!({"action":"recall","recall":{"project_path":"C:/work/unbound-aggregate","recall_for":"unrelated task","include_active_tasks":true,"memory_candidate_limit":3}}),
         ),
     );
     assert_eq!(unbound["code"], "complete_content_in_file", "{unbound}");
@@ -2075,26 +2626,12 @@ fn aggregate_contextual_rules_and_required_reference_survive_response_limit() {
         unbound_packet["partial_recall"]["code"], "complete_content_in_file",
         "partial recall must be inside the one delivered file"
     );
-    for candidate in unbound_packet["partial_recall"]["candidates"]
-        .as_array()
-        .unwrap()
-    {
-        assert_eq!(candidate["retrieval_paths"][0]["via"], json!(["lexical"]));
-    }
-    assert_eq!(
-        unbound_packet["partial_recall"]["candidates"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        unbound_packet["partial_recall"]["memories"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
+    assert_candidate_paths(&unbound_packet["partial_recall"]);
+    assert_mandatory(&unbound_packet["partial_recall"]);
+    assert_eq!(unbound["content_read"], false);
+    assert!(unbound["next_action"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
     assert!(unbound_packet["turn_instruction"]
         .as_str()
         .unwrap()

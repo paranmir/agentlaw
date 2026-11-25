@@ -4,6 +4,7 @@ use crate::projection::ProjectionHandle;
 use crate::protocol::QueryRequest;
 use agentlaw_flows::exact::{DeltaBudget, ExactSnapshot};
 use agentlaw_flows::prepare::Prepared;
+use agentlaw_flows::read::recall_source_error;
 use agentlaw_flows::store::ReadCtx;
 use agentlaw_flows::{
     ConnectRequest, DomainError, RecallRequest, RememberRequest, Result as FlowResult,
@@ -109,18 +110,21 @@ impl ReadCoordinator {
         request: &RecallRequest,
         project_id: Option<&str>,
     ) -> FlowResult<(Value, Vec<DomainError>)> {
-        ctx.request.check()?;
-        let prepared = agentlaw_flows::read::prepare_recall(ctx, request)?;
-        self.with_exact(ctx, |exact| {
-            agentlaw_flows::read::recall_prepared_with_diagnostics(
-                ctx,
-                exact,
-                request,
-                project_id,
-                self.budget,
-                &prepared,
-            )
-        })
+        agentlaw_flows::read::recall_with_snapshot(
+            ctx,
+            request,
+            project_id,
+            self.budget,
+            || {
+                let pinned = self.projection.generations().pin()?;
+                let guard = ctx
+                    .source
+                    .read_snapshot_for_recall()
+                    .map_err(recall_source_error)?;
+                ExactSnapshot::build_for_recall(pinned, &guard, self.budget)
+            },
+            |error| self.wake_projection_after(error),
+        )
     }
 
     /// Pins the active generation at the current source position and wakes
@@ -132,30 +136,36 @@ impl ReadCoordinator {
     ) -> FlowResult<T> {
         let result = (|| {
             let pinned = self.projection.generations().pin()?;
-            let guard = ctx.source.read_snapshot().map_err(|_| {
-                DomainError::new(
-                    "source_operation_failed",
-                    "Cannot acquire the source read view.",
-                )
-            })?;
+            let guard = ctx.source.read_snapshot().map_err(source_view_error)?;
             let mut exact = ExactSnapshot::build(pinned, &guard, self.budget)?;
             drop(guard);
             work(&mut exact)
         })();
-        if result.as_ref().err().is_some_and(|e| {
-            matches!(
-                e.code.as_str(),
-                "capacity"
-                    | "exact_not_ready"
-                    | "exact_index_corrupt"
-                    | "source_epoch_changed"
-                    | "source_coverage_lost"
-            )
-        }) {
-            self.projection.wake();
+        if let Err(error) = &result {
+            self.wake_projection_after(error);
         }
         result
     }
+
+    fn wake_projection_after(&self, error: &DomainError) {
+        if matches!(
+            error.code.as_str(),
+            "capacity"
+                | "exact_not_ready"
+                | "exact_index_corrupt"
+                | "source_epoch_changed"
+                | "source_coverage_lost"
+        ) {
+            self.projection.wake();
+        }
+    }
+}
+
+fn source_view_error(_: agentlaw_storage::Error) -> DomainError {
+    DomainError::new(
+        "source_operation_failed",
+        "Cannot acquire the source read view.",
+    )
 }
 
 #[cfg(test)]

@@ -194,7 +194,7 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Value {
 }
 
 pub fn error_payload(error: &DomainError) -> Value {
-    let next_action = match error.code.as_str() {
+    let next_action = error.next_action.as_deref().unwrap_or_else(|| match error.code.as_str() {
         "project_connection_required" | "project_location_required" =>
             "Project memory has not been retrieved. Verify the actual project root using the harness workspace or shell, not the MCP process directory. Call the same agentlaw tool with {\"action\":\"connect_project_memory\",\"connect_project_memory\":{\"project_path\":\"<verified absolute project root>\",\"intent\":\"discover\"}}; replace the placeholder with that verified path. Inside that connect_project_memory object, optionally supply clues: {\"repository_url\":\"<observed project remote>\",\"name\":\"<known project name>\"}, omitting unknown values. Discovery does not bind a project. Explain returned candidates in the user's language and ask the user which project to connect, even if there is only one. Use intent=\"connect\" with the selected project_id. Use intent=\"create\" with project_name only after first-time adoption is confirmed; no candidates alone is not permission to create. Then retry the original recall. If the memory store is unavailable, connect it first.",
         "memory_store_connection_required" =>
@@ -202,7 +202,7 @@ pub fn error_payload(error: &DomainError) -> Value {
         "invalid_input" if error.details.is_some() =>
             "Correct the listed field and retry. Optional recall candidate limits may be omitted for their configured defaults; zero is not a disable value.",
         _ => "Explain the issue in the user's language. Do not treat it as an empty or successful result.",
-    };
+    });
     let mut payload = json!({"code":error.code,"message":error.message,"retryable":error.retryable,
         "next_action":next_action});
     if let Some(details) = &error.details {

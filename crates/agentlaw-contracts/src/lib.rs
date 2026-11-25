@@ -23,6 +23,8 @@ pub struct DomainError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
@@ -32,11 +34,16 @@ impl DomainError {
             code: code.into(),
             message: message.into(),
             retryable: false,
+            next_action: None,
             details: None,
         }
     }
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
+        self
+    }
+    pub fn with_next_action(mut self, action: impl Into<String>) -> Self {
+        self.next_action = Some(action.into());
         self
     }
     pub fn unsupported(message: impl Into<String>) -> Self {
@@ -106,7 +113,8 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct MemoryProposal {
     pub operation: Operation,
-    pub what_to_remember: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub what_to_remember: Option<String>,
     pub evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applies_to: Option<AppliesTo>,
@@ -421,12 +429,27 @@ pub struct RecallResponse {
     pub candidate_counts: Option<CandidateCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_task_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_handoff: Option<ActiveTaskHandoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_instruction: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<DomainError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub undelivered_required: Vec<UndeliveredRequired>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_instruction: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTaskHandoff {
+    pub memory_id: String,
+    pub current_heads: Vec<TaskHandoffHead>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskHandoffHead {
+    pub objective: String,
+    pub current_position: String,
+    pub resume_point: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndeliveredRequired {
@@ -479,27 +502,64 @@ pub struct RetrievalPath {
     pub via: Vec<String>,
     pub clue: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_memory_id: Option<String>,
+    pub source_memory_ids: Option<Vec<String>>,
 }
-/// Group only identical clue/source pairs; preserve every actual channel in
-/// first encounter order. This is response compaction, not semantic merging.
+/// Group retrieval paths without losing clue, channel or source combinations.
 pub fn group_retrieval_paths(paths: impl IntoIterator<Item = RetrievalPath>) -> Vec<RetrievalPath> {
-    let mut groups = Vec::<RetrievalPath>::new();
-    let mut positions = std::collections::BTreeMap::new();
+    let mut positions = std::collections::HashMap::new();
+    let mut discoveries: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
     for path in paths {
-        let key = (path.clue.clone(), path.source_memory_id.clone());
-        let index = *positions.entry(key).or_insert_with(|| {
-            groups.push(RetrievalPath {
-                via: Vec::new(),
-                clue: path.clue,
-                source_memory_id: path.source_memory_id,
-            });
-            groups.len() - 1
-        });
-        for channel in path.via {
-            if !groups[index].via.contains(&channel) {
-                groups[index].via.push(channel);
+        let sources = path
+            .source_memory_ids
+            .filter(|ids| !ids.is_empty())
+            .map_or_else(|| vec![None], |ids| ids.into_iter().map(Some).collect());
+        for source in sources {
+            let index = *positions
+                .entry((path.clue.clone(), source.clone()))
+                .or_insert_with(|| {
+                    let index = discoveries.len();
+                    discoveries.push((path.clue.clone(), source, Vec::new()));
+                    index
+                });
+            let channels = &mut discoveries[index].2;
+            for channel in &path.via {
+                if !channels.contains(channel) {
+                    channels.push(channel.clone());
+                }
             }
+        }
+    }
+    let mut groups: Vec<RetrievalPath> = Vec::new();
+    let mut positions = std::collections::HashMap::new();
+    for (clue, source, via) in discoveries {
+        if via.is_empty() {
+            continue;
+        }
+        if let Some(source) = source {
+            let mut channel_set = via.clone();
+            channel_set.sort_unstable();
+            let index = *positions
+                .entry((clue.clone(), channel_set))
+                .or_insert_with(|| {
+                    let index = groups.len();
+                    groups.push(RetrievalPath {
+                        via,
+                        clue,
+                        source_memory_ids: Some(Vec::new()),
+                    });
+                    index
+                });
+            groups[index]
+                .source_memory_ids
+                .as_mut()
+                .unwrap()
+                .push(source);
+        } else {
+            groups.push(RetrievalPath {
+                via,
+                clue,
+                source_memory_ids: None,
+            });
         }
     }
     groups

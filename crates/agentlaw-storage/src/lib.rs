@@ -48,6 +48,10 @@ pub enum Error {
     Sql(#[from] rusqlite::Error),
     #[error("corrupt/unsupported canonical data: {0}")]
     Corrupt(String),
+    #[error("local recall spool: {0}")]
+    LocalRecallSpool(Box<Error>),
+    #[error("local recall epoch: {0}")]
+    LocalRecallEpoch(Box<Error>),
     #[error("source recovery required: {0}")]
     RecoveryRequired(String),
     #[error("all current heads changed: {0}")]
@@ -72,6 +76,18 @@ pub enum Error {
     CancelledBeforeDecision,
     #[error("injected publication interruption at {0:?}")]
     Interrupted(FaultPoint),
+}
+impl Error {
+    fn local_recall_spool(error: impl Into<Error>) -> Self {
+        Self::LocalRecallSpool(Box::new(error.into()))
+    }
+
+    fn without_recall_origin(self) -> Self {
+        match self {
+            Self::LocalRecallSpool(error) | Self::LocalRecallEpoch(error) => *error,
+            error => error,
+        }
+    }
 }
 pub fn validate_id(id: &str) -> Result<()> {
     let u = uuid::Uuid::parse_str(id).map_err(|_| Error::Corrupt("UUID".into()))?;
@@ -729,12 +745,13 @@ impl Store {
         self.list_catalog_locked()
     }
     fn list_catalog_locked(&self) -> Result<Vec<Value>> {
-        let base = self.root.join("catalog/projects");
+        let shards = match fs::read_dir(self.root.join("catalog/projects")) {
+            Ok(shards) => shards,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         let mut result = Vec::new();
-        if !base.exists() {
-            return Ok(result);
-        }
-        for shard in fs::read_dir(base)? {
+        for shard in shards {
             for entry in fs::read_dir(shard?.path())? {
                 let entry = entry?;
                 if entry.path().extension().is_some_and(|e| e == "tmp") {

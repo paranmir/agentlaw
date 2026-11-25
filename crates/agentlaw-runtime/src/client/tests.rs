@@ -237,7 +237,8 @@ fn failed_frame_preserves_domain_error_fields() {
     let client = server.connect();
     let listener = server.data.try_clone().unwrap();
     let error = DomainError {
-        code: "store_busy".into(),
+        code: "capacity".into(),
+        next_action: Some("Wait for indexing to catch up, then repeat the original recall.".into()),
         message: "\u{b2e4}\u{c2dc} \u{c2dc}\u{b3c4}\u{d558}\u{c138}\u{c694}".into(),
         retryable: true,
         details: None,
@@ -268,6 +269,7 @@ fn failed_frame_preserves_domain_error_fields() {
             assert_eq!(actual.code, error.code);
             assert_eq!(actual.message, error.message);
             assert_eq!(actual.retryable, error.retryable);
+            assert_eq!(actual.next_action, error.next_action);
         }
         other => panic!("expected Domain error, got {other:?}"),
     }

@@ -267,6 +267,25 @@ fn write_material(
     proposals: &[MemoryProposal],
 ) -> Result<Snapshot> {
     let position = review.position()?;
+    let inherited_parents: Vec<_> = proposals
+        .iter()
+        .filter(|p| {
+            p.operation == Operation::Evolve
+                && p.applies_to.is_some()
+                && p.what_to_remember.is_none()
+        })
+        .filter_map(|p| match p.parent_refs.as_deref() {
+            Some([reference]) => Some(reference.memory_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let parents = if inherited_parents.is_empty() {
+        None
+    } else {
+        Some(review.snapshot(&inherited_parents, &[])?)
+    };
     let mut ids = BTreeSet::new();
     let mut affected = BTreeSet::new();
     for (index, p) in proposals.iter().enumerate() {
@@ -294,9 +313,28 @@ fn write_material(
             }
         }
         if p.operation == Operation::Create || p.applies_to.is_some() {
-            review.select_proposal(index, &p.what_to_remember)?;
-            ids.extend(review.identical_bodies(&p.what_to_remember)?);
-            for record in query_records(&p.what_to_remember) {
+            let body = if let Some(body) = p.what_to_remember.as_deref() {
+                body
+            } else {
+                let Some([reference]) = p.parent_refs.as_deref() else {
+                    continue;
+                };
+                let Some(state) = parents
+                    .as_ref()
+                    .and_then(|s| s.states.get(&reference.memory_id))
+                else {
+                    continue;
+                };
+                if state.resolved_id != reference.memory_id
+                    || !matches!(state.heads.as_slice(), [parent] if &parent.memory_ref == reference)
+                {
+                    continue;
+                }
+                proposal_body(p, &state.heads)?
+            };
+            review.select_proposal(index, body)?;
+            ids.extend(review.identical_bodies(body)?);
+            for record in query_records(body) {
                 ids.extend(
                     review
                         .search(&crate::exact::allowed_scopes(&scope_context), record)?
@@ -343,8 +381,9 @@ fn overlap_candidates(
         if !requires_overlap(snapshot, p, scope) {
             continue;
         }
-        review.select_proposal(index, &p.what_to_remember)?;
-        for record in query_records(&p.what_to_remember) {
+        let body = proposal_body(p, &[])?;
+        review.select_proposal(index, body)?;
+        for record in query_records(body) {
             let channels = review.search(&[scope_token(scope)], record)?;
             if let Some(id) = admitted(&channels) {
                 if !affected.contains(&id) {
@@ -359,9 +398,10 @@ fn overlap_candidates(
         }
         for state in snapshot.states.values() {
             if !affected.contains(&state.resolved_id)
-                && state.heads.iter().any(|head| {
-                    &head.applicability == scope && head.what_to_remember == p.what_to_remember
-                })
+                && state
+                    .heads
+                    .iter()
+                    .any(|head| &head.applicability == scope && head.what_to_remember == body)
             {
                 chosen.insert(state.resolved_id.clone());
             }
@@ -714,7 +754,7 @@ fn mutations(
                 state: UnitState::Live {
                     heads: vec![Head {
                         metadata,
-                        body: proposal.what_to_remember.clone(),
+                        body: proposal_body(proposal, &[])?.to_owned(),
                     }],
                 },
             },
@@ -867,12 +907,65 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
             Ok(())
         }
     }
-    let prepared = preflight(
+    let expectation = old_version.map_or(PendingExpectation::New, PendingExpectation::Version);
+    let prepared = match preflight(
         &snapshot,
         &StructuralOnly,
         &retained.context,
         &retained.batch.proposals,
-    )?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) if error.code == "stale_memory_ref" => {
+            let mut issues = Vec::new();
+            for index in error
+                .details
+                .iter()
+                .flat_map(|details| details["proposal_indices"].as_array())
+                .flatten()
+                .filter_map(Value::as_u64)
+            {
+                let proposal = &retained.batch.proposals[index as usize];
+                let ids: BTreeSet<_> = proposal
+                    .parent_refs
+                    .iter()
+                    .flatten()
+                    .chain(proposal.consolidation_refs.iter().flatten())
+                    .map(|reference| &reference.memory_id)
+                    .collect();
+                let mut current_states = Vec::new();
+                for id in ids {
+                    if let Some(state) = snapshot.current(id)? {
+                        current_states.push(external_current(&state));
+                    }
+                }
+                let field = if proposal.operation == Operation::Consolidate {
+                    "consolidation_refs"
+                } else {
+                    "parent_refs"
+                };
+                issues.push(json!({
+                    "code":error.code,
+                    "message":error.message,
+                    "proposal_index":index,
+                    "proposal_id":proposal.proposal_id,
+                    "path":format!("/memories/{index}/{field}"),
+                    "submitted_proposal":proposal,
+                    "current_states":current_states,
+                }));
+            }
+            retained.issues = issues;
+            retained.basis.clear();
+            retained.overlap_approved = false;
+            retained.resolution_ref = Some(uuid::Uuid::new_v4().to_string());
+            retained.batch.reference.observed_version = uuid::Uuid::new_v4().to_string();
+            return Ok(Prepared::Remember(RememberPlan {
+                retained,
+                expectation,
+                review_basis: Some(snapshot.publication_basis),
+            }));
+        }
+        Err(error) => return Err(error),
+    };
     for (proposal, scope) in prepared
         .proposals
         .iter()
@@ -994,7 +1087,6 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
         retained.expected_generation = Some(snapshot.generation);
         retained.publication_basis = Some(snapshot.publication_basis.clone());
     }
-    let expectation = old_version.map_or(PendingExpectation::New, PendingExpectation::Version);
     Ok(Prepared::Remember(RememberPlan {
         retained,
         expectation,

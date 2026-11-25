@@ -213,6 +213,7 @@ fn domain_error() -> agentlaw_contracts::DomainError {
         message: "bad body".into(),
         retryable: false,
         details: Some(json!({"field": "value"})),
+        next_action: None,
     }
 }
 
@@ -273,6 +274,23 @@ fn truncated_frames_fail() {
 fn wire_messages_round_trip() {
     let id = RequestId::new();
     let error = domain_error();
+    let frame = serde_json::to_value(DataFrame::Failed {
+        id,
+        error: error.clone(),
+    })
+    .unwrap();
+    assert!(frame["Failed"]["error"].is_object(), "FR-06.4: {frame}");
+    assert!(
+        frame["Failed"]["error"].get("next_action").is_none(),
+        "FR-06.4: {frame}"
+    );
+    let DataFrame::Failed { error: old, .. } = serde_json::from_value(frame).unwrap() else {
+        panic!("Expected a legacy Failed frame");
+    };
+    assert_eq!(
+        old.next_action, None,
+        "FR-06.4: absent guidance must deserialize"
+    );
     for value in [
         HelloReply::Accepted,
         HelloReply::ProtocolMismatch,

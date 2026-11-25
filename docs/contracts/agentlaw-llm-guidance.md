@@ -20,11 +20,11 @@ Persistent memory for ordinary work. At a new work request or resumption, recall
 
 Use remember_this to save decisions, corrections, preferences, reusable friction, findings, and blockers before dependent work. One small reusable correction qualifies. When a user corrects your prior work, extract any reusable approach supported by the correction and save it with its conditions and scope. Batch only other progress that leaves the Task's restart state intact at phase boundaries or before finishing. Preserve scope, rationale, and verification; distinguish user decisions from proposals. Skip incidental chat and unchanged saves.
 
-For work needing intermediate state, reuse the matching Task or create one after initial recall and before substantial work. Evolve its complete current body (Objective / Current position / Resume point / References). Keep the active Task resumable without this chat. If its last confirmed version and durable references a fresh session can access are insufficient, use remember_this before the next substantial step, long-running operation or wait, task switch, or final reply—whichever comes first. Acting on a new result or requirement in further investigation, implementation, or verification is a new substantial step. Save unfinished and failed states too; do not defer required checkpoints to phase completion or a compaction warning. If the checkpoint still suffices, make no checkpoint-related calls.
+For work needing intermediate state, reuse the matching Task or create one after initial recall and before substantial work. Before evolving a Task received only as handoff sections or reconciling its heads, read every current head in full with its reference via memory_ids or the immediately preceding conflict response's current_states. When changing its body, keep the complete Task (Objective / Current position / Resume point / References). Keep the active Task resumable without this chat. If its last confirmed version and durable references a fresh session can access are insufficient, use remember_this before the next substantial step, long-running operation or wait, task switch, or final reply—whichever comes first. Acting on a new result or requirement in further investigation, implementation, or verification is a new substantial step. Save unfinished and failed states too; do not defer required checkpoints to phase completion or a compaction warning. If the checkpoint still suffices, make no checkpoint-related calls.
 
 Persistence is confirmed by status=remembered with memory_ref(ID, observed_version), or by an authoritative recovery read verifying the published checkpoint's content and ID/version. Errors, pending batches, and missing replies are not confirmation. Use the existing recovery contract; do not blindly reissue an uncertain write. If unresolved, report the recovery gap and pause only work relying on restart information not yet confirmed durable; independent work may continue. Keep a compact, complete handoff, not a command log. Keep in_working_set=true while active and false when completed or abandoned. Batch Task and related memory updates in one remember_this call. A self-contained answer needs no Task.
 
-Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, use harness-confirmed project_path, request-specific recall_for, and include_active_tasks=true; set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect an existing project explicitly when observed evidence and user intent identify it; reuse an already established user choice and ask when unclear. Do not auto-connect merely because one candidate exists. Create a new project only with explicit user intent. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
+Set action and only its same-named input object; for example {"action":"recall","recall":{"recall_for":"Current work"}}. For project recall, supply the harness-confirmed project_path and request-specific recall_for. Set include_active_tasks=true at project start, resumption, recovery after compaction, or when choosing a Task. Omit it on ordinary follow-up questions. Set restore_context=true only for missing or incomplete project context. Do not infer a project from MCP cwd or home cwd alone. Without a confirmed project, recall user/machine context. Start with recall, not routine connection preflight. Connect an existing project explicitly when observed evidence and user intent identify it; reuse an already established user choice and ask when unclear. Do not auto-connect merely because one candidate exists. Create a new project only with explicit user intent. Recall limits are recall.memory_candidate_limit and recall.procedure_candidate_limit; history.max_matches is only for history search. Omit optional limits unless needed. Count writes as saved only after success. Do not report routine memory calls; report a top-level update_notice briefly in the next final reply unless you already reported the same notice here.
 
 When explicitly asked to synchronize memory, use sync with an existing user-enabled local policy. Agentlaw owns Git capture, merge preparation, validation, recovery and fixed-commit delivery. Read the complete frozen conflict packet and submit one whole solution for semantic or structural conflicts; do not edit canonical headers or run pull/merge on active memory. Copy returned IDs, handles and revisions. After interruption, inspect status and resume the same operation. Never enable or broaden a policy through an LLM call. Sensitive findings require a separate explicit user decision. Completion covers the fixed cutoff, not later local writes; ordinary remember_this does not commit or push.
 ```
@@ -84,6 +84,8 @@ to information actually missing from that result:
 Project memory has not been retrieved because this folder has no approved connection. Explain the returned candidates. Select an existing identity only when observed evidence and user intent suffice, reusing an already established user choice. If the identity or intent is unclear, ask the user to select one, explicitly request a new project, or skip for now. Do not auto-select merely because one candidate exists. Submit the selected identity through connect_project_memory; use its recall_result if requested, otherwise retry recall. No candidates alone is not permission to create. If discovery was incomplete or the memory store unavailable, do not claim there is no existing project.
 ```
 
+If a folder is unbound, a failed user/machine read leaves the project candidates and connection guidance available. Follow partial_recall_error.next_action when present. Cancellation and failure to deliver the result file end the call with an error. Recall recovery instructions apply only to recall results, including the recall performed for a requested restore.
+
 Project observations come from the LLM's actual work environment. Runtime must
 not fill missing project Git information by inspecting its own cwd, its source
 checkout or the memory repository. A project's Git address is optional evidence,
@@ -113,7 +115,7 @@ Set true to discover project context from multiple perspectives when it is missi
 ### `what_to_remember`
 
 ```text
-Write the complete, coherent current understanding, preserving applicable conditions and exceptions. When evolving a memory, replace its current text rather than appending a chronological log. For task memory, use Objective / Current position / Resume point / References to capture user intent, the current choice and rationale, verification status, unresolved questions, and the next check. Keep the rationale needed to continue in the task itself; reference independent memories and the Plan without duplicating their full texts.
+Write the complete, coherent current understanding, preserving applicable conditions and exceptions. Omit this field only on single-head evolve when the body is unchanged; otherwise supply the full body (create, consolidate, multi-head evolve). When editing on evolve, rewrite to the current state rather than appending a progress log. For task memory, use Objective / Current position / Resume point / References to capture user intent, the current choice and rationale, verification status, unresolved questions, and the next check. Keep the rationale needed to continue in the task itself; reference independent memories and the Plan without duplicating their full texts.
 ```
 
 The existing Task-role clause additionally specifies the exact form:
@@ -140,7 +142,7 @@ This does not require creating a new identity for each failure.
 ### Shared proposal authoring
 
 ```text
-Choose create, evolve, or consolidate explicitly. For evolve, use the full current content and copy the returned memory_ref objects into parent_refs. Resolve returned issues before publication. When a pending batch is returned, continue it through remember_this with new or revised proposals and review judgments; do not repeat retained proposals. Add relationships only when their meaning is established, not merely because memories were retrieved or saved together.
+Choose create, evolve, or consolidate explicitly. For evolve, copy every current memory_ref into parent_refs. Omit an unchanged body only when there is one current head. Resolve returned issues before publication. When a pending batch is returned, continue it through remember_this with new or revised proposals and review judgments; do not repeat retained proposals. Add relationships only when their meaning is established, not merely because memories were retrieved or saved together.
 ```
 
 Operation-specific schema retains `consolidation_refs` and all other accepted
@@ -173,13 +175,13 @@ preservation remains applicable when no active Task is needed.
 ## Bootstrap
 
 The installer uses the following bootstrap for project work and for user/machine
-recall when no project is confirmed. It does not alter `include_active_tasks`;
+recall when no project is confirmed. Task inclusion follows the work context;
 multiview project reconstruction is requested independently through `restore_context`
 (ADR-0141). The exact CLI line is generated from installed paths.
 
 ```text
 Use Agentlaw without waiting for a memory request. When work starts or resumes, recall relevant context and read applicable standing rules returned with recall_for before dependent work; for project work, check for a matching active Task before creating one. Recall again for new questions raised by emerging evidence or similarity to prior work. Reuse results only while they remain in context and cover the same question and conditions. After compaction or a session interruption, recall before dependent work even with a summary, unless this recall already succeeded since resumption. Before substantial project work, recall and reuse or create a matching Task. Before another substantial step or a wait, use remember_this if its last confirmed version and accessible durable references would not let a fresh session resume. Save reusable decisions, corrections, friction, and findings before relying on them. Batch only other progress that leaves this restart state intact at phase boundaries or before finishing; skip incidental chat, unchanged saves, and routine reports.
-For project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. In recall, supply project_path and include_active_tasks=true; use restore_context=true only when project context is missing or incomplete. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.
+For project work, use the actual work folder confirmed by the harness, never the MCP or home cwd alone. Supply project_path on project recall. Set include_active_tasks=true at project start, resumption, recovery after compaction, or when choosing a Task. Omit it on ordinary follow-up questions. Use restore_context=true only for missing or incomplete project context. Before evolving a Task received only as handoff sections or reconciling its heads, read every current head in full with its reference via memory_ids or the immediately preceding conflict response's current_states. Without a confirmed project, recall only user/machine context. Follow the current tool schema and result guidance.
 If agentlaw is hidden, try host tool discovery if available; if unavailable (not denied), use the installed CLI.
 
 CLI fallback: set `{state_assignment}` in the child shell, then pass one JSON request on stdin to `{invocation} call --json -`. Use `{invocation} schema` when the contract is unavailable. The CLI and MCP use the same installation.
@@ -209,21 +211,15 @@ existing memory cannot be checked (ADR-0140/0141):
 Read available project materials and preserve established context with remember_this. Fill missing context through actual work and conversation; do not invent past rationale or require a separate onboarding report. Distinguish verified facts from hypotheses.
 ```
 
-When a response delivers standing rules, include the following instruction
-outside the retrieved bodies. Its presence depends on rule delivery, not on
-Runtime detecting a semantic conflict (ADR-0142):
+The public `is_rule` description gives the conflict instruction. Returning an applicable rule adds no conflict reminder to the recall response. If the LLM finds a conflict, it identifies the rules, their scopes and the affected action, then seeks the user's decision before acting. Report verified discrepancies with implementation and record a one-time exception and its limits in the relevant Task.
 
-```text
-If applicable rules conflict, explicitly ask the user to resolve the conflict before taking the affected action. Show the conflicting rules and their scope; do not choose a winner yourself. Report verified discrepancies between rules and implementation. Preserve user-granted one-time exceptions and their limits in the relevant Task memory; keep the standing rule unchanged.
-```
+True only for explicitly established standing instructions in this scope. Facts, status, rationale or progress alone do not qualify. Keep one-off exceptions in the Task. State the action, conditions and standing exceptions briefly. Put reasons and support in the evidence field. Merge compatible same-scope rules without loss. Ask the user about conflicts.
 
-Rule changes use existing remember_this/evolve, with current content, applicable
-metadata and evidence. Removing rule status preserves the memory and its history.
+Evidence must establish the intent to apply the instruction across future work in its scope. Use ordinary memory for reference facts and Task memory for ongoing progress. Use evolve or consolidate for compatible overlapping rules. A metadata-only change to a single head needs its returned reference and evidence. Removing rule status preserves the memory and its history.
 A user's one-time exception must not silently become a permanent rule change.
 
 Recall candidates group identical clues and source provenance in retrieval_paths;
-each entry's via array preserves its actual discovery channels. Distinct clues
-or link sources remain separate. This is provenance, not factual confidence.
+each entry's via array preserves its actual discovery channels. Identical clues with the same channels may share source_memory_ids. Keep unsourced paths separate. This is provenance, not factual confidence.
 
 Results describe only known response state: unselected Tasks, missing requested
 IDs, unresolved current heads, overlap/version issues, candidate display
@@ -242,12 +238,9 @@ call (ADR-0141):
 Recover the missing required context using the provided steps. If recovery remains blocked, tell the user what could not be checked. Do not make changes that depend on that context; independent investigation may continue.
 ```
 
-Use existing response-specific fields, not a parallel result envelope. Normal
-recall, including zero, one, or several active Task candidates, does not
-repeat the Task policy in `task_instruction`. The model decides which Task
-matches its objective. An empty candidate list is not an instruction to
-create a Task. Only verified omissions, failures, or unresolved context need
-response-specific guidance.
+Use that text verbatim once in turn_instruction for missing required context. Preserve any separately required semantic-channel notice. Do not repeat the recovery instruction in a required_context_recovery diagnostic.
+
+A sole Task handoff includes each current head’s complete Objective, Current position and Resume point. Its task_instruction points to memory_ids for References, full current heads and required references. The model uses the handoff to resume work. Read all current bodies and refs before evolving or reconciling that Task. Multiple Task choices retain their existing selection guidance. An empty candidate list alone does not justify creating a Task.
 
 The generic `turn_instruction` is now conditional on a response-specific need;
 do not repeat a universal save reminder after every recall or successful write.

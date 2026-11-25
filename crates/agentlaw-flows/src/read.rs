@@ -14,8 +14,120 @@ pub(crate) mod streaming;
 pub(crate) use owner::preparation_channels;
 pub use owner::{
     discover, prepare_recall, recall, recall_for_project, recall_prepared,
-    recall_prepared_with_diagnostics, search_procedures_filtered, PreparedRecall,
+    recall_prepared_with_diagnostics, recall_with_snapshot, search_procedures_filtered,
+    PreparedRecall,
 };
+/// Classifies failures from reading persisted source data for recall.
+/// Request validation and derived-index failures have separate boundaries.
+pub fn recall_source_error(error: agentlaw_storage::Error) -> DomainError {
+    use agentlaw_storage::Error;
+    use std::io::ErrorKind;
+
+    fn read_failed(kind: ErrorKind) -> DomainError {
+        source_operation_failed(format!(
+            "Could not open or read the stored source ({kind:?})."
+        ))
+    }
+
+    match error {
+        Error::LocalRecallSpool(_) => recall_spool_error(),
+        Error::LocalRecallEpoch(_) => recall_epoch_error(),
+        Error::Corrupt(_) => corrupt_recall_source(
+            "Stored source failed an integrity check for length, format, or checksum.",
+        ),
+        Error::Io(error) if error.kind() == ErrorKind::UnexpectedEof => corrupt_recall_source(
+            "Stored source failed an integrity check because a frame ended before its declared length.",
+        ),
+        Error::Io(error) => read_failed(error.kind()),
+        Error::Json(error) => match error.io_error_kind() {
+            Some(kind) => read_failed(kind),
+            None => corrupt_recall_source("Stored source metadata failed validation as JSON."),
+        },
+        Error::Capacity | Error::InsufficientResource { .. } => {
+            recall_capacity("Source acquisition exceeded its capacity.")
+        }
+        Error::RecoveryRequired(_) => DomainError::new(
+            "recovery_required",
+            "Source publication recovery must complete before access.",
+        ),
+        Error::CoverageLost => DomainError::new(
+            "source_coverage_lost",
+            "Source publication coverage is incomplete.",
+        ),
+        Error::Stale(_) => DomainError::new(
+            "stale_memory_ref",
+            "Source state changed; inspect current heads and retry review.",
+        ),
+        Error::NotFound(_) => DomainError::new("memory_not_found", "Requested source identity is absent."),
+        _ => source_operation_failed("Could not complete the stored source acquisition."),
+    }
+}
+
+fn corrupt_recall_source(message: &str) -> DomainError {
+    DomainError::new("source_corrupt", message).with_next_action(
+        "Preserve the source. Run doctor --audit, restore the source from a verified copy, and repeat the recall after recovery.",
+    )
+}
+
+fn source_operation_failed(message: impl Into<String>) -> DomainError {
+    DomainError::new("source_operation_failed", message).with_next_action(
+        "Check source read permissions, the mount, and storage access. Resolve the access or read failure before repeating the recall.",
+    )
+}
+
+pub(crate) fn recall_capacity(message: &str) -> DomainError {
+    let mut error = DomainError::new("capacity", message).with_next_action(
+        "If unindexed changes exceeded the query budget, repeat the recall after the index catches up. For other acquisition limits, adjust the request scope or available capacity before repeating the recall.",
+    );
+    error.retryable = true;
+    error
+}
+
+fn recall_spool_error() -> DomainError {
+    let mut error = DomainError::new("recall_spool_unavailable", "The local recall spool could not be created, read, or verified.").with_next_action(
+        "Discard the temporary spool and repeat the original recall to acquire a new copy. If this repeats, check local temporary directory access, storage, and cleanup jobs.",
+    );
+    error.retryable = true;
+    error
+}
+
+fn recall_epoch_error() -> DomainError {
+    let mut error = DomainError::new("recall_epoch_unavailable", "The local source-epoch record could not be read or verified.").with_next_action(
+        "Check access to and integrity of the local state directory and epoch file for this binding. Repeat the original recall once the local state is available and valid.",
+    );
+    error.retryable = true;
+    error
+}
+
+#[derive(Debug)]
+enum RecallFailure {
+    Recoverable(DomainError),
+    Cancelled(DomainError),
+    DeliveryFailed(DomainError),
+}
+
+type RecallResult<T> = std::result::Result<T, RecallFailure>;
+
+impl From<DomainError> for RecallFailure {
+    fn from(error: DomainError) -> Self {
+        Self::Recoverable(error)
+    }
+}
+
+impl From<RecallFailure> for DomainError {
+    fn from(failure: RecallFailure) -> Self {
+        match failure {
+            RecallFailure::Recoverable(error)
+            | RecallFailure::Cancelled(error)
+            | RecallFailure::DeliveryFailed(error) => error,
+        }
+    }
+}
+
+fn check_recall(control: &RequestControl) -> RecallResult<()> {
+    control.check().map_err(RecallFailure::Cancelled)
+}
+
 /// Inspect retained pending work without opening a writable control connection.
 pub fn pending_inspect(ctx: &ReadCtx<'_>, request: &RememberRequest) -> Result<Value> {
     ctx.request.check()?;

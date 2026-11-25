@@ -253,10 +253,17 @@ Recall candidates group identical clues from the same source into one
 {"via":["lexical","vector"],"clue":"Use argument arrays for paths with spaces."}
 ```
 
-Different clues or link-source IDs remain separate. Active Task candidates and
-complete-content files use the same representation. Builds with this change
-emit an array for `via`; releases through v0.3.5 emitted a string. Consumers
-reading that response field must account for the new shape.
+Groups with the same clue and channel set list explicit sources once in `source_memory_ids`. Unsourced paths omit the field. Active Task candidates and complete-content files share this representation.
+
+For a recall error, follow its `next_action`. For `source_corrupt`, preserve the source and run `agentlaw doctor --audit`. Repeat the read after restoring verified data. For `source_operation_failed`, restore read access before repeating the request. For a recall `capacity` error caused by index lag, wait until the index covers the publication. A save or procedure search that reports the same code follows its own error guidance.
+
+If `recall_spool_unavailable` is returned, repeat the recall to acquire a fresh temporary copy. For `recall_epoch_unavailable`, check the binding’s local state and repeat the recall once that state is accessible and valid. When a folder is unbound, a failed user/machine recall appears in `partial_recall_error` alongside the project candidates and connection instructions. Cancellation and failure to deliver a result file remain tool errors.
+
+On contextual recall, `rules` groups automatic single-head rules by applicability. Read each item's complete body. Use the tool's `is_rule` guidance if rules conflict. Recall does not append a conflict reminder when it returns rules. Read a rule by ID for its current update reference. Exact reads, mandatory references and work targets retain their full entries.
+
+Request active Tasks at project start, resumption, recovery after compaction, or when selecting a Task. Omit the option for ordinary follow-up questions. A sole Task normally appears in `active_task_handoff` with the complete Objective, Current position and Resume point for each head. Use its ID to read References, full bodies and required references. Before evolving the Task or reconciling heads, read all current bodies and refs by ID or from the immediately preceding conflict response.
+
+For a single current head, `evolve` may omit an unchanged body. Supply the current parent reference and evidence, including for a scope, rule, Task or relationship change. Other operations and multi-head updates require the complete body.
 
 ## Git and management
 

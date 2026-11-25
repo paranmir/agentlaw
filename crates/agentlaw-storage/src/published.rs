@@ -46,6 +46,7 @@ pub struct SourceReadGuard<'a> {
     pub(crate) store: &'a Store,
     pub(crate) _gate: fs::File,
     pub(crate) position: SourcePosition,
+    recall: bool,
 }
 impl Clone for OwnedPublishedReader {
     fn clone(&self) -> Self {
@@ -96,14 +97,38 @@ impl OwnedPublishedReader {
         self.read_snapshot()?.acquire_history(cancel)
     }
     pub fn read_snapshot(&self) -> Result<SourceReadGuard<'_>> {
+        self.read_snapshot_with_policy(false)
+    }
+    pub fn read_snapshot_for_recall(&self) -> Result<SourceReadGuard<'_>> {
+        self.read_snapshot_with_policy(true)
+    }
+    fn read_snapshot_with_policy(&self, recall: bool) -> Result<SourceReadGuard<'_>> {
         let gate = self.store.lock_shared()?;
         let sequence = self.store.ensure_clean()?;
-        let epoch = self.store.load(&self.store.local.join("source-epoch"))?;
+        let path = self.store.local.join("source-epoch");
+        let epoch = if recall {
+            self.store
+                .load::<String>(&path)
+                .and_then(|epoch| {
+                    crate::validate_id(&epoch)?;
+                    Ok(epoch)
+                })
+                .map_err(|error| Error::LocalRecallEpoch(Box::new(error)))?
+        } else {
+            self.store.load(&path)?
+        };
         Ok(SourceReadGuard {
             store: &self.store,
             _gate: gate,
             position: SourcePosition { epoch, sequence },
+            recall,
         })
+    }
+    /// Project discovery does not require the epoch used for indexed recall.
+    pub fn list_catalog_for_discovery(&self) -> Result<Vec<serde_json::Value>> {
+        let _gate = self.store.lock_shared()?;
+        self.store.ensure_clean()?;
+        self.store.list_catalog_locked()
     }
     pub fn read_published_paths(
         &self,
@@ -124,6 +149,7 @@ impl OwnedPublishedReader {
             store: &self.store,
             _gate: gate,
             position: SourcePosition { epoch, sequence },
+            recall: false,
         })
     }
 }
@@ -192,12 +218,19 @@ impl SourceReadGuard<'_> {
         })
     }
     pub fn acquire_current(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store
-            .acquire_kind_locked(id, "memory", self.position.clone())
+        self.acquire_kind(id, "memory")
     }
     pub fn acquire_procedure(&self, id: &str) -> Result<crate::acquire::AcquiredCurrent> {
-        self.store
-            .acquire_kind_locked(id, "procedure", self.position.clone())
+        self.acquire_kind(id, "procedure")
+    }
+    fn acquire_kind(&self, id: &str, kind: &str) -> Result<crate::acquire::AcquiredCurrent> {
+        if self.recall {
+            self.store
+                .acquire_kind_with_origin(id, kind, self.position.clone())
+        } else {
+            self.store
+                .acquire_kind_locked(id, kind, self.position.clone())
+        }
     }
     pub fn acquire_closure(
         &self,
@@ -207,8 +240,13 @@ impl SourceReadGuard<'_> {
         Vec<crate::acquire::AcquiredResolvedCurrent>,
         Vec<String>,
     )> {
-        self.store
-            .acquire_closure_locked(ids, self.position.clone())
+        if self.recall {
+            self.store
+                .acquire_closure_with_origin(ids, self.position.clone())
+        } else {
+            self.store
+                .acquire_closure_locked(ids, self.position.clone())
+        }
     }
     pub fn read_current(&self, id: &str) -> Result<CurrentUnit> {
         self.store.read_kind(id, "memory")
