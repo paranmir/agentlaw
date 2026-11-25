@@ -1,4 +1,37 @@
-# Agentlaw 0.5.0
+# Agentlaw 0.5.1
+
+- A sole active Task now arrives in `active_task_handoff` with the Objective,
+  Current position and Resume point of every current head, reserved ahead of
+  optional candidates. `task_instruction` points to an ID read for References,
+  full bodies and required references.
+- Automatic single-head rules are grouped by applicability in `rules`. Exact
+  reads, required references, work targets and multi-head rules keep the full
+  `memories` form. Rule-conflict guidance is carried by the `is_rule` tool
+  description instead of being repeated in recall results.
+- Identical retrieval clues found through the same channels list their sources
+  once in `source_memory_ids`, which replaces `source_memory_id`.
+- An `evolve` of a single current head may omit unchanged `what_to_remember`
+  and inherit the parent text, for example to change scope or rule status.
+- Recall failures name their cause and return `code`, `message`, `retryable`
+  and `next_action`: `source_corrupt` for damaged stored bytes,
+  `source_operation_failed` for source read failures, retryable `capacity` for
+  an exceeded unindexed-change budget, and retryable `recall_spool_unavailable`
+  and `recall_epoch_unavailable` for local temporary copies and local epoch
+  state. Writes keep their existing errors and guidance.
+- Recall from an unbound folder keeps the project candidates and connection
+  guidance when the user or machine read fails, and reports that failure in
+  `partial_recall_error`.
+- Request active Tasks only at start, resumption, recovery after compaction or
+  Task selection.
+- Preserves durable memory formats. The MCP input schema now allows omitting
+  `what_to_remember` on single-head `evolve`.
+
+Known limits: every applicable standing rule is still delivered, so a growing
+rule set can still move a recall into a complete file. With several active
+Tasks, their compact choices are not reserved ahead of rules. Publishing does
+not update an active installation. See [usage](usage.md).
+
+## Previous release: 0.5.0
 
 - Runs one shared runtime per installation. Each harness session starts a thin
   stdio MCP frontend that attaches to the runtime over local IPC, so a new
