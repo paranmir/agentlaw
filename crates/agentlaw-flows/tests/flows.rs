@@ -109,7 +109,7 @@ fn discovery_candidate(id: &str, channels: &[&str]) -> MemoryCandidate {
         retrieval_paths: vec![RetrievalPath {
             via: channels.iter().map(|channel| (*channel).into()).collect(),
             clue: "Matching saved evidence".into(),
-            source_memory_id: None,
+            source_memory_ids: None,
         }],
     }
 }
@@ -431,9 +431,185 @@ fn duplicate_and_distinct_semantic_diagnostics_preserve_one_notice() {
     );
 }
 
+// Exercise the disk-backed public response from the same logical heads used by
+// the in-memory selection tests.
+fn with_public_recall(
+    snapshot: &Snapshot,
+    degraded: bool,
+    check: impl FnOnce(&mut dyn FnMut(&RecallRequest) -> serde_json::Value),
+) {
+    use agentlaw_flows::{
+        control::ControlReader,
+        exact::{DeltaBudget, ExactIndexWriter, ExactSnapshot, ProjectionGenerations},
+        history_cache::HistoryCacheGuards,
+        semantic::*,
+        store::{ReadCtx, StoreIdentity},
+    };
+    use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+    use serde_json::json;
+
+    struct SemanticFixture(bool);
+    impl SemanticPort for SemanticFixture {
+        fn embed_prefix(
+            &self,
+            _: &str,
+            _: &RequestControl,
+        ) -> std::result::Result<PrefixEmbedding, SemanticError> {
+            if self.0 {
+                return Err(SemanticError::Unavailable("Model unavailable".into()));
+            }
+            Ok(PrefixEmbedding {
+                vector: QueryVector {
+                    model: "test".into(),
+                    values: std::sync::Arc::from([1.0]),
+                },
+                truncated: false,
+            })
+        }
+        fn plan_pieces(
+            &self,
+            _: &[&str],
+            _: &RequestControl,
+        ) -> std::result::Result<PiecePlan, SemanticError> {
+            unreachable!("recall only embeds query prefixes")
+        }
+        fn embed_planned(
+            &self,
+            _: &PiecePlan,
+            _: usize,
+            _: &PieceVectorReuse,
+            _: &RequestControl,
+        ) -> std::result::Result<Vec<QueryVector>, SemanticError> {
+            unreachable!("recall only embeds query prefixes")
+        }
+        fn search_available(
+            &self,
+            query: SemanticQuery<'_>,
+            _: &RequestControl,
+        ) -> std::result::Result<SemanticCandidates, SemanticError> {
+            Ok(SemanticCandidates {
+                hits: vec![],
+                coverage: SemanticCoverage::CompleteAt(query.source.clone()),
+            })
+        }
+    }
+    impl HistorySemanticPort for SemanticFixture {
+        fn offer(&self, _: HistoryIngestHint) -> OfferResult {
+            unreachable!("recall does not ingest history")
+        }
+        fn search_available(
+            &self,
+            _: &str,
+            _: &str,
+            _: &QueryVector,
+            _: &[String],
+            _: usize,
+            _: &RequestControl,
+        ) -> std::result::Result<SemanticCandidates, SemanticError> {
+            unreachable!("recall does not search history")
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("source");
+    let local = dir.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let store = Store::open(&root, local.join("canonical")).unwrap();
+    let new_id = || uuid::Uuid::new_v4().to_string();
+    let mutations = snapshot.0.values().map(|state| {
+        let heads = state.heads.iter().map(|head| {
+            let applicability = &head.applicability;
+            let scope = match applicability.scope.as_slice() {
+                [ScopeKind::User] => "user",
+                [ScopeKind::Project] => "project",
+                [ScopeKind::Machine] => "machine",
+                [ScopeKind::Project, ScopeKind::Machine] => "project_machine",
+                _ => panic!("unexpected scope for recall fixture"),
+            };
+            let mut scope = json!({"scope":scope});
+            if let Some(project) = &applicability.project_id {
+                scope["project_id"] = json!(project);
+            }
+            if let Some(machine) = &applicability.machine_id {
+                scope["machine_id"] = json!(machine);
+            }
+            let relations: Vec<_> = head.required_memory_ids.iter().map(|id| {
+                json!({"kind":"required","target_memory_id":id})
+            }).collect();
+            Head {
+                metadata: json!({"change_id":new_id(),"applicability":scope,"origin":{"machine_id":A,"user_id":"user"},"recorded_at_ms":0,"is_rule":head.is_rule,"relations":relations,"work_targets":[]}),
+                body: head.what_to_remember.clone(),
+            }
+        }).collect();
+        Mutation {
+            unit: CurrentUnit {
+                entity_id: state.resolved_id.clone(),
+                entity_type: "memory".into(),
+                state: UnitState::Live { heads },
+            },
+            expected_versions: vec![],
+            evidence: "Observed recall fixture".into(),
+        }
+    }).collect();
+    store
+        .publish_catalog(
+            &new_id(),
+            B,
+            json!({"project_id":B,"name":"Recall fixture","description":null,"aliases":[],"repository_observations":[],"catalog_revision":new_id()}),
+        )
+        .unwrap();
+    store.publish(&new_id(), mutations).unwrap();
+    let identity = StoreIdentity {
+        root: std::fs::canonicalize(root).unwrap(),
+        local,
+        user_id: "user".into(),
+        machine_id: A.into(),
+        binding_id: new_id(),
+        history_limit: 8192,
+        response_limit: 65536,
+        config_file: None,
+    };
+    let mut writer = agentlaw_flows::control::ControlWriter::open(&identity.local).unwrap();
+    writer.bind_identity(&identity).unwrap();
+    writer.finish_binding_initialization(&identity).unwrap();
+    let source = store.owned_published_reader();
+    let projection = identity.local.join("projection");
+    let control = RequestControl::default();
+    let shadow = ExactIndexWriter::rebuild_shadow_in(&projection, &source, &control).unwrap();
+    let guard = source.read_snapshot().unwrap();
+    let registry = ProjectionGenerations::open_for_recovery(
+        "bootstrap",
+        &guard.position().epoch,
+        projection.join("exact-bootstrap.sqlite"),
+        projection.join("lexical-bootstrap.sqlite"),
+    )
+    .unwrap();
+    let staged = registry.stage(shadow).unwrap();
+    registry.commit(staged).unwrap();
+    let mut exact =
+        ExactSnapshot::build_for_recall(registry.pin().unwrap(), &guard, DeltaBudget::default())
+            .unwrap();
+    drop(guard);
+    let reader = ControlReader::open(&identity.local).unwrap();
+    let semantic = SemanticFixture(degraded);
+    let cache = HistoryCacheGuards::new();
+    let ctx = ReadCtx {
+        identity: &identity,
+        source: &source,
+        control: &reader,
+        semantic: &semantic,
+        history_semantic: &semantic,
+        history_cache: &cache,
+        request: &control,
+    };
+    check(&mut |request| {
+        agentlaw_flows::read::recall_for_project(&ctx, &mut exact, request, B).unwrap()
+    });
+}
+
 #[test]
-fn degraded_recall_appends_notice_to_required_context_warning() {
-    const REQUIRED_WARNING: &str = "Required context is unavailable. Explain this limitation in the user's language; do not treat absent required context as reviewed.";
+fn fr_06_5_degraded_recall_appends_notice_to_required_context_warning() {
+    const REQUIRED_WARNING: &str = "Recover the missing required context using the provided steps. If recovery remains blocked, tell the user what could not be checked. Do not make changes that depend on that context; independent investigation may continue.";
     let mut source = Snapshot::default();
     let mut rule = memory(A);
     rule.is_rule = true;
@@ -462,18 +638,89 @@ fn degraded_recall_appends_notice_to_required_context_warning() {
     };
     let result = recall(&source, &search, &context(), &request, "now".into()).unwrap();
     assert_eq!(search.queries.borrow().as_slice(), ["topic"]);
-    let mut expected = serde_json::to_value(baseline).unwrap();
-    expected["turn_instruction"] =
-        serde_json::json!(format!("{REQUIRED_WARNING} {EXPECTED_SEMANTIC_NOTICE}"));
-    expected["diagnostics"]
-        .as_array_mut()
-        .unwrap()
-        .insert(0, serde_json::to_value(diagnostic).unwrap());
-    assert_eq!(serde_json::to_value(result).unwrap(), expected);
+    let mut expected = baseline;
+    expected.turn_instruction = Some(format!("{REQUIRED_WARNING} {EXPECTED_SEMANTIC_NOTICE}"));
+    expected.diagnostics.insert(0, diagnostic);
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    let public = |degraded| {
+        let mut result = serde_json::Value::Null;
+        with_public_recall(&source, degraded, |query| result = query(&request));
+        result
+    };
+    let baseline = public(false);
+    let degraded = public(true);
+    assert_eq!(
+        baseline["rules"],
+        serde_json::json!([{
+            "applicability":{"scope":["project"],"project_id":B},
+            "items":[{"memory_id":A,"what_to_remember":"Exact content"}]
+        }])
+    );
+    assert!(baseline["memories"].as_array().unwrap().is_empty());
+    assert_eq!(
+        baseline["undelivered_required"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(baseline["undelivered_required"][0]["memory_id"], B);
+    assert_eq!(baseline["turn_instruction"], REQUIRED_WARNING);
+    assert_eq!(
+        degraded["turn_instruction"],
+        format!("{REQUIRED_WARNING} {EXPECTED_SEMANTIC_NOTICE}")
+    );
+    for field in [
+        "rules",
+        "memories",
+        "undelivered_required",
+        "candidates",
+        "candidate_counts",
+    ] {
+        assert_eq!(degraded[field], baseline[field], "{field}");
+    }
+    let diagnostic_codes = |result: &serde_json::Value| {
+        result["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|d| d["code"].clone())
+            .collect::<Vec<_>>()
+    };
+    let mut codes = diagnostic_codes(&degraded);
+    let index = codes
+        .iter()
+        .position(|code| code == "semantic_channel_incomplete")
+        .unwrap();
+    codes.remove(index);
+    assert_eq!(codes, diagnostic_codes(&baseline));
+    for response in [&baseline, &degraded] {
+        let codes = diagnostic_codes(response);
+        assert!(!codes
+            .iter()
+            .any(|code| code == "required_context_recovery" || code == "rule_review_guidance"));
+    }
+    let mut complete = memory(B);
+    complete.what_to_remember = "Required material".into();
+    source.insert(complete);
+    with_public_recall(&source, false, |query| {
+        let intact = query(&request);
+        assert_eq!(intact["rules"], baseline["rules"]);
+        assert!(intact.get("undelivered_required").is_none());
+        assert!(intact.get("turn_instruction").is_none());
+        assert!(!intact["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|diagnostic| {
+                diagnostic["code"] == "required_context_recovery"
+                    || diagnostic["code"] == "rule_review_guidance"
+            }));
+    });
 }
 
 #[test]
-fn contextual_recall_selects_same_head_applicable_rules_outside_search_limits() {
+fn fr_06_5_contextual_recall_selects_same_head_applicable_rules_outside_search_limits() {
     const USER: &str = "33333333-3333-4333-8333-333333333333";
     const MACHINE: &str = "44444444-4444-4444-8444-444444444444";
     const OTHER: &str = "55555555-5555-4555-8555-555555555555";
@@ -579,14 +826,69 @@ fn contextual_recall_selects_same_head_applicable_rules_outside_search_limits() 
     );
     let mixed = RecallRequest {
         memory_ids: Some(vec![OTHER.into()]),
-        ..contextual
+        ..contextual.clone()
     };
     let mixed_result = recall(&source, &EmptySearch, &context(), &mixed, "now".into()).unwrap();
     assert!(mixed_result.memories.iter().any(|m| m.memory_id == OTHER));
+    use serde_json::json;
+    use serde_json::Value;
+    let full_head = |memory: &Value| {
+        for head in memory["current_heads"].as_array().unwrap() {
+            assert_eq!(head["what_to_remember"], "Exact content");
+            assert_eq!(head["memory_ref"]["memory_id"], memory["memory_id"]);
+            assert!(head["memory_ref"]["observed_version"].is_string());
+            assert!(head["origin"].is_object());
+        }
+    };
+    with_public_recall(&source, false, |query| {
+        for request in [&contextual, &restored] {
+            let result = query(request);
+            let groups = result["rules"].as_array().unwrap();
+            assert_eq!(groups.len(), 3);
+            for (scope, id) in [
+                (json!({"scope":["user"]}), USER),
+                (json!({"scope":["project"],"project_id":B}), B),
+                (json!({"scope":["machine"],"machine_id":A}), MACHINE),
+            ] {
+                assert!(groups.contains(&json!({"applicability":scope,"items":[{"memory_id":id,"what_to_remember":"Exact content"}]})));
+            }
+            let memories = result["memories"].as_array().unwrap();
+            assert_eq!(memories.len(), 2);
+            let extra = memories.iter().find(|m| m["memory_id"] == EXTRA).unwrap();
+            assert_eq!(extra["current_heads"].as_array().unwrap().len(), 1);
+            full_head(extra);
+            let joint = memories.iter().find(|m| m["memory_id"] == BOTH).unwrap();
+            assert_eq!(joint["current_heads"].as_array().unwrap().len(), 2);
+            assert_eq!(joint["head_reconciliation_required"], true);
+            full_head(joint);
+            assert_eq!(result["candidate_counts"]["memories"]["shown"], 0);
+        }
+        let exact = query(&id_only);
+        assert!(exact.get("rules").is_none());
+        assert_eq!(exact["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(exact["memories"][0]["memory_id"], EXTRA);
+        assert_eq!(
+            exact["memories"][0]["current_heads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        full_head(&exact["memories"][0]);
+        let mixed = query(&mixed);
+        let explicit = mixed["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["memory_id"] == OTHER)
+            .unwrap();
+        assert_eq!(explicit["current_heads"].as_array().unwrap().len(), 1);
+        full_head(explicit);
+    });
 }
 
 #[test]
-fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
+fn fr_05_6_repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
     const C: &str = "33333333-3333-4333-8333-333333333333";
     const EXACT: &str = "44444444-4444-4444-8444-444444444444";
     const REQUIRED: &str = "55555555-5555-4555-8555-555555555555";
@@ -601,7 +903,7 @@ fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
                 .map(|(via, clue)| RetrievalPath {
                     via: vec![(*via).into()],
                     clue: (*clue).into(),
-                    source_memory_id: None,
+                    source_memory_ids: None,
                 })
                 .collect(),
         }
@@ -646,6 +948,9 @@ fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
     for id in [B, C] {
         let mut linked = memory(id);
         linked.related_memory_ids = vec![A.into(), A.into()];
+        if id == B {
+            linked.in_working_set = Some(true);
+        }
         source.insert(linked);
     }
     let mut exact = memory(EXACT);
@@ -677,16 +982,16 @@ fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
     let c = &result.candidates[0];
     assert_eq!(c.memory_id, A);
     assert_eq!(c.excerpt, "First preview");
-    assert_eq!(c.retrieval_paths.len(), 7);
+    assert_eq!(c.retrieval_paths.len(), 6);
     assert_eq!(c.retrieval_paths[0].via, ["lexical", "vector"]);
     assert_eq!(c.retrieval_paths[1].clue, "other head clue");
     assert_eq!(c.retrieval_paths[2].clue, "other view clue");
     let sources: Vec<_> = c
         .retrieval_paths
         .iter()
-        .filter_map(|p| p.source_memory_id.as_deref())
+        .filter_map(|p| p.source_memory_ids.as_deref())
         .collect();
-    assert_eq!(sources, [B, C]);
+    assert_eq!(sources, [&[B, C][..]]);
     assert!(c
         .retrieval_paths
         .iter()
@@ -697,7 +1002,7 @@ fn repeated_candidate_discoveries_preserve_views_sources_tasks_and_targets() {
         .any(|p| p.via == ["work_target"] && p.clue == "src/task.rs"));
     let counts = &result.candidate_counts.as_ref().unwrap().memories;
     assert_eq!((counts.matched, counts.shown), (3, 1));
-    assert_eq!(result.active_task_count, Some(1));
+    assert_eq!(result.active_task_count, Some(2));
     assert_eq!(result.memories.len(), 2);
     assert_eq!(
         result
@@ -847,13 +1152,13 @@ fn unsupported_review_cannot_publish() {
 fn pending_delta_is_atomic_and_preserves_omitted_proposals() {
     let batch = PendingBatch::new(&context(), vec![proposal(), proposal()]);
     let mut replacement = batch.proposals[1].clone();
-    replacement.what_to_remember = "replacement".into();
+    replacement.what_to_remember = Some("replacement".into());
     let next = batch
         .apply_delta(&context(), &batch.reference, &[replacement])
         .unwrap();
     assert_eq!(next.proposals.len(), 2);
-    assert_eq!(next.proposals[0].what_to_remember, "body");
-    assert_eq!(batch.proposals[1].what_to_remember, "body");
+    assert_eq!(next.proposals[0].what_to_remember.as_deref(), Some("body"));
+    assert_eq!(batch.proposals[1].what_to_remember.as_deref(), Some("body"));
     assert_ne!(next.reference, batch.reference);
     assert!(next
         .apply_delta(&context(), &batch.reference, &[proposal()])
@@ -861,7 +1166,7 @@ fn pending_delta_is_atomic_and_preserves_omitted_proposals() {
 }
 #[test]
 fn task_headings_ignore_fenced_decoys() {
-    let good="# Objective\na\n# Current position\nb\n```md\n# Objective\n```\n# Resume point\nc\n# References\nd";
+    let good = "# Objective\na\n# Current position\nb\n```md\n# Objective\n```\n# Resume point\nc\n# References\nd";
     assert!(task_headings(good).is_ok());
     assert!(task_headings(&(good.to_owned() + "\n# Objective\nx")).is_err());
 }
@@ -890,10 +1195,90 @@ fn inherited_scope_keeps_parent_identity() {
 }
 #[test]
 fn task_compact_sections_are_complete_and_fences_do_not_end_them() {
-    let body="# Objective\nDeliver fully.\n# Current position\nBefore fence.\n```md\n# Resume point\nNot a boundary\n```\nAfter fence.\n# Resume point\nResume all steps.\n# References\nNot in compact output.\n";
+    let body = "# Objective\nDeliver fully.\n# Current position\nBefore fence.\n```md\n# Resume point\nNot a boundary\n```\nAfter fence.\n# Resume point\nResume all steps.\n# References\nNot in compact output.\n";
     let sections = agentlaw_flows::write::task_sections(body).unwrap();
     assert_eq!(sections[0], "Deliver fully.\n");
     assert!(sections[1].contains("Not a boundary"));
     assert!(sections[1].ends_with("After fence.\n"));
     assert_eq!(sections[2], "Resume all steps.\n");
+}
+
+#[test]
+fn fr_10_4_active_task_selection_omitted_empty_and_multiple() {
+    let request = |include_active_tasks| RecallRequest {
+        recall_for: Some("unrelated".into()),
+        include_active_tasks,
+        memory_candidate_limit: Some(1),
+        ..Default::default()
+    };
+    let lookup = |source: &Snapshot, flag| {
+        recall(
+            source,
+            &EmptySearch,
+            &context(),
+            &request(flag),
+            "now".into(),
+        )
+        .unwrap()
+    };
+    let mut source = Snapshot::default();
+    assert_eq!(lookup(&source, Some(true)).active_task_count, Some(0));
+    let mut first = memory(A);
+    first.in_working_set = Some(true);
+    first.what_to_remember = "# Objective\nFinish implementation\n## Objective # #\nVerify the handoff\n# Current position\nHalfway through\n# Resume point\nRun verification\n# References\nNone\n".into();
+    source.insert(first);
+    let single = lookup(&source, Some(true));
+    assert_eq!(single.active_task_count, Some(1));
+    assert_eq!(
+        serde_json::to_value(single.active_task_handoff).unwrap(),
+        serde_json::json!({
+            "memory_id":A,
+            "current_heads":[{"objective":"Finish implementation\n## Objective # #\nVerify the handoff\n","current_position":"Halfway through\n","resume_point":"Run verification\n"}]
+        })
+    );
+    assert!(single
+        .undelivered_required
+        .iter()
+        .all(|item| item.memory_id != A));
+
+    let mut second = memory(B);
+    second.in_working_set = Some(true);
+    second.what_to_remember = "# Objective\nSecond task\n# Current position\nReady\n# Resume point\nContinue\n# References\nNone".into();
+    source.insert(second);
+    let omitted = lookup(&source, None);
+    assert_eq!(omitted.active_task_count, None);
+    assert!(omitted.memories.is_empty() && omitted.candidates.is_empty());
+    let multiple = lookup(&source, Some(true));
+    assert_eq!(multiple.active_task_count, Some(2));
+    assert!(multiple.memories.is_empty());
+    let counts = &multiple.candidate_counts.unwrap().memories;
+    assert_eq!((counts.matched, counts.shown), (2, 1));
+    assert_eq!(multiple.candidates.len(), 1);
+}
+
+#[test]
+fn fr_08_6_multi_head_evolve_requires_full_body_even_with_all_refs() {
+    let mut source = Snapshot::default();
+    let first = memory(A);
+    let mut second = first.clone();
+    second.memory_ref.observed_version = "v2".into();
+    second.what_to_remember = "Other current understanding".into();
+    source.insert(first.clone());
+    source.0.get_mut(A).unwrap().heads.push(second.clone());
+    let mut evolve = proposal();
+    evolve.operation = Operation::Evolve;
+    evolve.applies_to = None;
+    evolve.parent_refs = Some(vec![first.memory_ref, second.memory_ref]);
+    evolve.what_to_remember = None;
+    let failure = preflight(
+        &source,
+        &Reviewed,
+        &context(),
+        &[proposal(), evolve.clone()],
+    )
+    .unwrap_err();
+    assert_eq!(failure.code, "invalid_input");
+    assert!(!failure.message.is_empty());
+    evolve.what_to_remember = Some("Complete reconciled understanding and context".into());
+    assert!(preflight(&source, &Reviewed, &context(), &[evolve]).is_ok());
 }

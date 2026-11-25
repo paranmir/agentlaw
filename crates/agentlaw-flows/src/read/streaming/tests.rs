@@ -171,3 +171,82 @@ fn unicode_indented_fences_match_owned_task_parsing() {
     assert_eq!(actual, json!(expected));
     assert!(actual[1].as_str().unwrap().contains("# Resume point"));
 }
+
+#[test]
+fn lost_or_changed_local_spool_requires_reacquisition() {
+    use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let local = temp.path().join("local");
+    let store = Store::open(&source, local.join("canonical")).unwrap();
+    let id = || uuid::Uuid::new_v4().to_string();
+    let memory = id();
+    let body = "Canonical body remains intact.";
+    store.publish(&id(), vec![Mutation {
+        unit: CurrentUnit {
+            entity_id: memory.clone(),
+            entity_type: "memory".into(),
+            state: UnitState::Live { heads: vec![Head {
+                metadata:json!({"change_id":id(),"applicability":{"scope":"user"},"origin":{"machine_id":id(),"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}),
+                body: body.into(),
+            }] },
+        },
+        expected_versions:vec![],
+        evidence:"Published fixture".into(),
+    }]).unwrap();
+    let canonical = source
+        .join("current/memory")
+        .join(&memory[..2])
+        .join(format!("{memory}.md"));
+    let original = std::fs::read(&canonical).unwrap();
+    let acquire = || {
+        let (_, mut records, missing) = store
+            .acquire_closure(std::slice::from_ref(&memory))
+            .unwrap();
+        assert!(missing.is_empty());
+        let spool = records
+            .pop()
+            .unwrap()
+            .current
+            .bodies
+            .into_values()
+            .next()
+            .unwrap();
+        let path = spool.path.clone();
+        let mut selection = StreamedSelection::default();
+        let token = selection.insert(spool, 0, body.len() as u64);
+        (selection, path, json!({"body":token}))
+    };
+    for lost in [true, false] {
+        let (selection, spool, response) = acquire();
+        if lost {
+            std::fs::rename(spool, temp.path().join("displaced-spool")).unwrap();
+        } else {
+            std::fs::write(spool, body.replacen('C', "X", 1)).unwrap();
+        }
+        let error = selection
+            .finish_read(&response, &local, &RequestControl::default())
+            .unwrap_err();
+        assert_eq!(
+            error.code, "recall_spool_unavailable",
+            "FR-06.4: lost={lost}, {error:?}"
+        );
+        assert!(error.retryable);
+        assert!(error.details.is_none());
+        let action = error.next_action.unwrap().to_lowercase();
+        assert!(
+            action.contains("recall") && (action.contains("spool") || action.contains("copy")),
+            "{action}"
+        );
+        assert!(!action.contains("doctor --audit"), "{action}");
+        assert!(std::fs::read_dir(local.join("response-artifacts"))
+            .map(|mut paths| paths.next().is_none())
+            .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound));
+        assert_eq!(std::fs::read(&canonical).unwrap(), original);
+        let (fresh, _, result) = acquire();
+        assert_eq!(
+            fresh.inline(&result, &RequestControl::default()).unwrap()["body"],
+            body
+        );
+    }
+}

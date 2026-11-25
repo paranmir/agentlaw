@@ -130,7 +130,7 @@ impl Fixture {
         };
         let pinned = self.registry.pin()?;
         let guard = source.read_snapshot().unwrap();
-        let mut exact = ExactSnapshot::build(pinned, &guard, DeltaBudget::default())?;
+        let mut exact = ExactSnapshot::build_for_recall(pinned, &guard, DeltaBudget::default())?;
         drop(guard);
         let request: RecallRequest = serde_json::from_value(request).unwrap();
         agentlaw_flows::read::recall(&ctx, &mut exact, &request)
@@ -141,7 +141,7 @@ impl Fixture {
 }
 
 #[test]
-fn lagging_projection_includes_fresh_lexical_and_mandatory_closure() {
+fn fr_06_5_lagging_projection_includes_fresh_lexical_and_mandatory_closure() {
     let f = Fixture::new(65536);
     let rule = Fixture::id();
     let required = Fixture::id();
@@ -169,13 +169,13 @@ fn lagging_projection_includes_fresh_lexical_and_mandatory_closure() {
     );
     let result = f.query(json!({"recall_for":"freshuniquetoken","memory_ids":[selected],"memory_candidate_limit":1}), &RequestControl::default()).unwrap();
     let memories = result["memories"].as_array().unwrap();
-    for id in [&rule, &required, &selected] {
+    for id in [&required, &selected] {
         assert!(memories.iter().any(|v| v["memory_id"] == *id));
     }
-    assert!(memories
-        .iter()
-        .any(|v| v["current_heads"][0]["what_to_remember"]
-            == "A standing rule outside the query ranking"));
+    assert_eq!(
+        result["rules"],
+        json!([{"applicability":{"scope":["user"]},"items":[{"memory_id":rule,"what_to_remember":"A standing rule outside the query ranking"}]}])
+    );
 }
 
 #[test]
@@ -376,7 +376,7 @@ fn ordinary_reads_do_not_change_persistent_files() {
 }
 
 #[test]
-fn candidate_items_are_omitted_as_whole_items_before_mandatory_content() {
+fn fr_06_5_candidate_items_are_omitted_as_whole_items_before_mandatory_content() {
     let f = Fixture::new(4096);
     let rule = Fixture::id();
     f.publish(
@@ -401,7 +401,7 @@ fn candidate_items_are_omitted_as_whole_items_before_mandatory_content() {
     assert!(result.get("artifact").is_none());
     assert!(serde_json::to_vec(&result).unwrap().len() <= 4096);
     assert_eq!(
-        result["memories"][0]["current_heads"][0]["what_to_remember"],
+        result["rules"][0]["items"][0]["what_to_remember"],
         "The standing rule must remain complete."
     );
     let counts = &result["candidate_counts"]["memories"];
@@ -578,6 +578,10 @@ fn coordinator_returns_capacity_without_a_partial_result() {
         .run_query(&ctx, QueryRequest::Recall(request))
         .unwrap_err();
     assert_eq!(error.code, "capacity");
+    assert!(
+        error.retryable,
+        "FR-06.4: capacity is retryable after indexing"
+    );
     let target = source.read_snapshot().unwrap().position().clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while projection
@@ -625,69 +629,186 @@ fn large_closure_spools_are_removed_after_file_delivery() {
         assert_eq!(std::fs::read_dir(spool_root).unwrap().count(), 0);
     }
     let artifacts = std::fs::read_dir(f.identity.local.join("response-artifacts")).unwrap();
-    assert!(artifacts.into_iter().all(|entry| entry
-        .unwrap()
-        .path()
-        .extension()
-        .is_some_and(|ext| ext == "json")));
+    assert!(artifacts.into_iter().all(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "json")
+    }));
+}
+
+fn assert_task_handoff(result: &Value, id: &str, heads: Value) {
+    assert_eq!(result["active_task_count"], 1, "{result}");
+    assert_eq!(
+        result["active_task_handoff"],
+        json!({"memory_id":id,"current_heads":heads})
+    );
+    assert!(
+        result["memories"].as_array().unwrap().is_empty(),
+        "{result}"
+    );
+    let instruction = result["task_instruction"].as_str().unwrap();
+    for term in ["memory_ids", "references", "full", "edit", "reconcil"] {
+        assert!(instruction.to_lowercase().contains(term), "{instruction}");
+    }
 }
 
 #[test]
-fn active_task_sections_remain_complete_when_other_candidates_are_present() {
-    let f = Fixture::new(65536);
+fn fr_10_4_active_task_sections_remain_complete_when_other_candidates_are_present() {
+    let mut f = Fixture::new(65536);
     let path = f.dir.path().join("task-project");
     std::fs::create_dir(&path).unwrap();
     let command = json!({"action":"connect_project_memory","connect_project_memory":{"project_path":path.to_str().unwrap(),"intent":"create","project_name":"Task project"}});
     let connected = f
         .call(agentlaw_flows::parse_request(&command.to_string()).unwrap())
         .unwrap();
-    let project = connected["project_connection"]["project_id"]
-        .as_str()
-        .unwrap();
-    let id = Fixture::id();
-    let body = "# Objective\nFinish implementation\n# Current position\nHalfway through\n# Resume point\nRun verification\n# References\nNone\n";
-    let unit = CurrentUnit {
-        entity_id: id.clone(),
-        entity_type: "memory".into(),
-        state: UnitState::Live {
-            heads: vec![Head {
-                metadata: json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}),
-                body: body.into(),
-            }],
-        },
-    };
-    f.store
-        .publish(
-            &Fixture::id(),
-            vec![Mutation {
-                unit,
-                expected_versions: vec![],
-                evidence: "observed".into(),
-            }],
-        )
-        .unwrap();
+    assert!(connected["project_connection"]["project_id"].is_string());
+    let required = Fixture::id();
     f.publish(
-        &Fixture::id(),
-        "some unrelated discoverable context",
+        &required,
+        "Dependency for full Task review",
         false,
         json!([]),
         vec![],
     );
+    let body = "# Objective\nFinish implementation\n## Objective # #\nVerify the handoff\n# Current position\nHalfway through\n# Resume point\nRun verification\n# References\nNone\n";
+    let create = json!({"action":"remember_this","remember_this":{"project_path":path,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Observed task handoff","applies_to":["project"],"in_working_set":true,"required_memory_ids":[required]}]}});
+    let saved = f
+        .call(agentlaw_flows::parse_request(&create.to_string()).unwrap())
+        .unwrap();
+    assert_eq!(saved["status"], "remembered", "{saved}");
+    let id = saved["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for body in ["discoverable context alpha", "discoverable context bravo"] {
+        f.publish(&Fixture::id(), body, false, json!([]), vec![]);
+    }
     let result = f.query(json!({"project_path":path.to_str().unwrap(),"recall_for":"discoverable", "include_active_tasks":true, "memory_candidate_limit":1}), &RequestControl::default()).unwrap();
-    assert_eq!(result["active_task_count"], 1);
-    assert_eq!(result["candidates"][0]["memory_id"], id);
     assert_eq!(
-        result["candidates"][0]["objective"],
-        "Finish implementation\n"
+        result["candidate_counts"]["memories"],
+        json!({"matched":2,"shown":1})
     );
+    let expected = json!([{"objective":"Finish implementation\n## Objective # #\nVerify the handoff\n","current_position":"Halfway through\n","resume_point":"Run verification\n"}]);
+    assert!(result.get("artifact").is_none(), "{result}");
+    assert!(
+        !result["undelivered_required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| item["memory_id"] == id),
+        "{result}"
+    );
+    assert_task_handoff(&result, &id, expected.clone());
+    assert!(result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["memory_id"] != id));
+    let matched = f.query(json!({"project_path":path,"recall_for":"Finish implementation","include_active_tasks":true,"memory_candidate_limit":1}), &RequestControl::default()).unwrap();
+    assert_task_handoff(&matched, &id, expected);
     assert_eq!(
-        result["candidates"][0]["current_position"],
-        "Halfway through\n"
+        matched["candidate_counts"]["memories"],
+        json!({"matched":0,"shown":0})
     );
+
+    let exact = f
+        .query(json!({"memory_ids":[id]}), &RequestControl::default())
+        .unwrap();
+    let task = exact["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["memory_id"] == id)
+        .unwrap();
+    let head = &task["current_heads"][0];
+    assert_eq!(head["what_to_remember"], body);
+    assert_eq!(head["required_memory_ids"], json!([required]));
+    assert!(exact["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["memory_id"] == required
+            && m["current_heads"][0]["what_to_remember"] == "Dependency for full Task review"));
+    let reference = &head["memory_ref"];
     assert_eq!(
-        result["candidates"][0]["resume_point"],
-        "Run verification\n"
+        reference,
+        &json!(f.store.read_current(&id).unwrap().references().unwrap()[0])
     );
+    let change = json!({"action":"remember_this","remember_this":{"project_path":path,"memories":[{"operation":"evolve","parent_refs":[reference],"in_working_set":true,"evidence":"Confirmed handoff after reading the full current head"}]}});
+    let revised = f
+        .call(agentlaw_flows::parse_request(&change.to_string()).unwrap())
+        .unwrap();
+    assert_eq!(revised["status"], "remembered", "{revised}");
+    assert_eq!(f.store.read_current(&id).unwrap().heads()[0].body, body);
+    for index in 0..12 {
+        f.publish(
+            &Fixture::id(),
+            &format!("budgetfixture {index} {}", "padding ".repeat(72)),
+            false,
+            json!([]),
+            vec![],
+        );
+    }
+    f.semantic.set_model(FakeModel::Loading);
+    let request = json!({"project_path":path,"recall_for":"budgetfixture","include_active_tasks":true,"memory_candidate_limit":12});
+    let unlimited = f
+        .query(request.clone(), &RequestControl::default())
+        .unwrap();
+    assert_eq!(
+        unlimited["candidate_counts"]["memories"],
+        json!({"matched":12,"shown":12})
+    );
+    f.identity.response_limit = 4096;
+    let bounded = f
+        .query(request.clone(), &RequestControl::default())
+        .unwrap();
+    assert_eq!(
+        bounded["active_task_handoff"],
+        unlimited["active_task_handoff"]
+    );
+    assert_eq!(bounded["task_instruction"], unlimited["task_instruction"]);
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= 4096);
+    let count = &bounded["candidate_counts"]["memories"];
+    let shown = bounded["candidates"].as_array().unwrap().len();
+    assert_eq!(count, &json!({"matched":12,"shown":shown}));
+    assert!(shown > 0 && shown < 12);
+    let limit = &bounded["response_limit"];
+    assert_eq!(limit["applied_bytes"], 4096);
+    assert_eq!(limit["config_key"], "response_limit_bytes");
+    assert_eq!(limit["config_file"], json!(f.identity.config_file));
+    let notice = limit["user_notice"].as_str().unwrap().to_lowercase();
+    assert!(
+        notice.contains("search") || notice.contains("show") || notice.contains("display"),
+        "{notice}"
+    );
+
+    let mut bare = bounded.clone();
+    bare.as_object_mut().unwrap().remove("response_limit");
+    bare["candidates"] = json!([]);
+    bare["candidate_counts"]["memories"]["shown"] = json!(0);
+    let tight_limit = serde_json::to_vec(&bare).unwrap().len();
+    f.identity.response_limit = tight_limit;
+    let envelope = f.query(request, &RequestControl::default()).unwrap();
+    assert_eq!(envelope["code"], "complete_content_in_file");
+    assert_eq!(envelope["content_read"], false);
+    let file = std::fs::read_to_string(envelope["artifact"]["path"].as_str().unwrap()).unwrap();
+    let content: Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(
+        content["active_task_handoff"],
+        bounded["active_task_handoff"]
+    );
+    assert_eq!(content["task_instruction"], bounded["task_instruction"]);
+    assert_eq!(content["response_limit"]["applied_bytes"], tight_limit);
+    assert_eq!(
+        content["response_limit"]["config_file"],
+        json!(f.identity.config_file)
+    );
+    assert!(content["response_limit"]["user_notice"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert_eq!(file.matches("\"response_limit\"").count(), 1);
 }
 
 #[test]
@@ -738,7 +859,7 @@ fn discover_reports_candidates_without_binding_the_folder() {
 }
 
 #[test]
-fn publication_during_query_preparation_is_in_the_final_rule_snapshot() {
+fn fr_06_5_publication_during_query_preparation_is_in_the_final_rule_snapshot() {
     let f = Fixture::new(65536);
     let rule = Fixture::id();
     let change = Fixture::id();
@@ -769,14 +890,14 @@ fn publication_during_query_preparation_is_in_the_final_rule_snapshot() {
             )
             .unwrap();
         writer.join().unwrap();
-        let found = result["memories"]
+        let found = result["rules"][0]["items"]
             .as_array()
             .unwrap()
             .iter()
             .find(|memory| memory["memory_id"] == rule)
             .unwrap();
         assert_eq!(
-            found["current_heads"][0]["what_to_remember"],
+            found["what_to_remember"],
             "The new rule during preparation."
         );
     });
@@ -831,7 +952,7 @@ fn multiple_procedure_heads_are_compact_rows_counted_as_one_candidate() {
 }
 
 #[test]
-fn restore_uses_saved_project_after_the_folder_is_reconnected() {
+fn fr_06_5_restore_uses_saved_project_after_the_folder_is_reconnected() {
     use crate::{
         ports::{HealthSink, RuntimeResult},
         projection::{
@@ -939,14 +1060,15 @@ fn restore_uses_saved_project_after_the_folder_is_reconnected() {
     let result = coordinator
         .run_recall_for_project(&ctx, request.clone(), &a)
         .unwrap();
-    let bodies: Vec<_> = result["memories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["current_heads"][0]["what_to_remember"].as_str().unwrap())
-        .collect();
-    assert!(bodies.contains(&"Project A rule"));
-    assert!(!bodies.contains(&"Project B rule"));
+    let groups = result["rules"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["applicability"],
+        json!({"scope":["project"],"project_id":a})
+    );
+    let items = groups[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["what_to_remember"], "Project A rule");
     assert_eq!(
         coordinator
             .run_recall_for_project(&ctx, request, &Fixture::id())
@@ -1138,6 +1260,10 @@ fn final_delta_uses_the_callers_budget_after_a_concurrent_publication() {
             .run_query(&ctx, QueryRequest::Recall(request))
             .unwrap_err();
         assert_eq!(error.code, "capacity");
+        assert!(
+            error.retryable,
+            "FR-06.4: capacity is retryable after indexing"
+        );
         writer.join().unwrap();
     });
     assert!(projection.shutdown(Duration::from_secs(10)));
@@ -1210,13 +1336,51 @@ fn embedding_finishes_before_projection_is_pinned() {
 }
 
 #[test]
-fn automatically_applied_rules_are_minimal_but_explicit_and_required_rules_are_full() {
+fn fr_06_5_automatically_applied_rules_are_minimal_but_explicit_and_required_rules_are_full() {
     let f = Fixture::new(65536);
     let auto = Fixture::id();
     let explicit = Fixture::id();
     let required = Fixture::id();
     let root = Fixture::id();
     let multi = Fixture::id();
+    let target = Fixture::id();
+    let active = Fixture::id();
+    let folder = f.dir.path().join("rule-task-project");
+    std::fs::create_dir(&folder).unwrap();
+    let connected =
+        f.connect(json!({"project_path":folder,"intent":"create","project_name":"Rule priority"}));
+    let project = &connected["project_connection"]["project_id"];
+    let task_body = "# Objective\nVerify constraints\n# Current position\nReady\n# Resume point\nInspect required context\n# References\nPublished constraints";
+    for (id, body, working, targets) in [
+        (
+            &target,
+            "Required work target rule",
+            false,
+            json!([{"project_id":project,"path":"src/task.rs","kind":"file","reading":"required"}]),
+        ),
+        (&active, task_body, true, json!([])),
+    ] {
+        let unit = CurrentUnit {
+            entity_id: id.clone(),
+            entity_type: "memory".into(),
+            state: UnitState::Live {
+                heads: vec![Head {
+                    metadata: json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":true,"in_working_set":working,"relations":[],"work_targets":targets}),
+                    body: body.into(),
+                }],
+            },
+        };
+        f.store
+            .publish(
+                &Fixture::id(),
+                vec![Mutation {
+                    unit,
+                    expected_versions: vec![],
+                    evidence: "Established instruction".into(),
+                }],
+            )
+            .unwrap();
+    }
     f.publish(&auto, "Automatic standing rule", true, json!([]), vec![]);
     f.publish(&explicit, "Explicit standing rule", true, json!([]), vec![]);
     f.publish(&required, "Required standing rule", true, json!([]), vec![]);
@@ -1250,7 +1414,7 @@ fn automatically_applied_rules_are_minimal_but_explicit_and_required_rules_are_f
         .unwrap();
     let result = f
         .query(
-            json!({"recall_for":"unrelated", "memory_ids":[explicit,root]}),
+            json!({"recall_for":"unrelated", "memory_ids":[explicit,root],"project_path":folder,"include_active_tasks":true,"work_targets":[{"path":"src/task.rs","kind":"file"}]}),
             &RequestControl::default(),
         )
         .unwrap();
@@ -1258,20 +1422,78 @@ fn automatically_applied_rules_are_minimal_but_explicit_and_required_rules_are_f
     let head = |id: &str| {
         entries.iter().find(|m| m["memory_id"] == id).unwrap()["current_heads"][0].clone()
     };
-    let automatic = head(&auto);
-    assert_eq!(automatic.as_object().unwrap().len(), 3);
-    assert!(automatic.get("what_to_remember").is_some());
-    assert!(automatic.get("applicability").is_some());
-    assert_eq!(automatic["is_rule"], true);
-    for id in [&explicit, &required, &multi] {
+    assert_eq!(
+        result["rules"],
+        json!([{"applicability":{"scope":["user"]},"items":[{"memory_id":auto,"what_to_remember":"Automatic standing rule"}]}])
+    );
+    assert_eq!(
+        entries.iter().filter(|m| m["memory_id"] == multi).count(),
+        1
+    );
+    assert_eq!(
+        entries.iter().find(|m| m["memory_id"] == multi).unwrap()["current_heads"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(entries.iter().all(|m| m["memory_id"] != auto));
+    for id in [&explicit, &required, &multi, &target, &active] {
+        assert_eq!(entries.iter().filter(|m| m["memory_id"] == *id).count(), 1);
         let value = head(id);
         assert!(value.get("memory_ref").is_some());
         assert!(value.get("origin").is_some());
     }
+    assert_eq!(result["active_task_count"], 1);
+    assert!(result.get("active_task_handoff").is_none(), "{result}");
+    assert_eq!(head(&active)["what_to_remember"], task_body);
+    let winner = "Exact uniquely searchable rule";
+    let winner_id = Fixture::id();
+    f.publish(&winner_id, winner, true, json!([]), vec![]);
+    let discovered = f
+        .query(json!({"recall_for":winner}), &RequestControl::default())
+        .unwrap();
+    let items = discovered["rules"][0]["items"].as_array().unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["memory_id"] == winner_id)
+            .collect::<Vec<_>>(),
+        [&json!({"memory_id":winner_id,"what_to_remember":winner})]
+    );
+    for field in ["memories", "candidates"] {
+        assert!(!discovered[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["memory_id"] == winner_id));
+    }
+    let exact = f
+        .query(
+            json!({"memory_ids":[winner_id]}),
+            &RequestControl::default(),
+        )
+        .unwrap();
+    assert!(exact.get("rules").is_none());
+    assert_eq!(exact["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(exact["memories"][0]["memory_id"], winner_id);
+    let heads = exact["memories"][0]["current_heads"].as_array().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["what_to_remember"], winner);
+    assert_eq!(
+        heads[0]["memory_ref"],
+        json!(
+            f.store
+                .read_current(&winner_id)
+                .unwrap()
+                .references()
+                .unwrap()[0]
+        )
+    );
 }
 
 #[test]
-fn task_heads_are_fitted_together_and_counted_once() {
+fn fr_10_4_task_heads_are_fitted_together_and_counted_once() {
     let f = Fixture::new(4096);
     let folder = f.dir.path().join("group-project");
     std::fs::create_dir(&folder).unwrap();
@@ -1283,11 +1505,25 @@ fn task_heads_are_fitted_together_and_counted_once() {
         .unwrap()
         .to_owned();
     let id = Fixture::id();
+    let required = Fixture::id();
+    f.publish(
+        &required,
+        "Required handoff source",
+        false,
+        json!([]),
+        vec![],
+    );
     let head = |ch: char| {
-        Head { metadata:json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}), body:format!("# Objective\n{}\n# Current position\nworking\n# Resume point\nnext\n# References\nnone",ch.to_string().repeat(2100)) }
+        Head {
+        metadata: json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[{"kind":"required","target_memory_id":required}],"work_targets":[]}),
+        body: format!(
+            "# Objective\n{}\n# Current position\nworking\n# Resume point\nnext\n# References\nnone",
+            ch.to_string().repeat(2100)
+        ),
+    }
     };
     let unit = CurrentUnit {
-        entity_id: id,
+        entity_id: id.clone(),
         entity_type: "memory".into(),
         state: UnitState::Live {
             heads: vec![head('a'), head('b')],
@@ -1304,14 +1540,79 @@ fn task_heads_are_fitted_together_and_counted_once() {
         )
         .unwrap();
     let result = f.query(json!({"project_path":folder.to_str().unwrap(),"recall_for":"unrelated", "include_active_tasks":true, "memory_candidate_limit":1}), &RequestControl::default()).unwrap();
-    assert!(result.get("artifact").is_none());
-    assert_eq!(result["candidate_counts"]["memories"]["matched"], 1);
-    assert_eq!(result["candidate_counts"]["memories"]["shown"], 0);
-    assert!(result["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(result["code"], "complete_content_in_file");
+    assert_eq!(result["content_read"], false);
+    let content: Value = serde_json::from_reader(
+        std::fs::File::open(result["artifact"]["path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let current = f.store.read_current(&id).unwrap();
+    let expected_heads: Vec<_> = current.heads().iter().map(|head| {
+        let objective = head.body.lines().nth(1).unwrap();
+        assert!(objective == "a".repeat(2100) || objective == "b".repeat(2100));
+        json!({"objective":format!("{objective}\n"),"current_position":"working\n","resume_point":"next\n"})
+    }).collect();
+    assert_task_handoff(&content, &id, json!(expected_heads));
+    assert_eq!(
+        content["candidate_counts"]["memories"],
+        json!({"matched":0,"shown":0})
+    );
+    assert!(result["next_action"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+
+    let exact = f
+        .query(json!({"memory_ids":[id]}), &RequestControl::default())
+        .unwrap();
+    assert_eq!(exact["content_read"], false);
+    let full: Value = serde_json::from_reader(
+        std::fs::File::open(exact["artifact"]["path"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let memories = full["memories"].as_array().unwrap();
+    let task = memories
+        .iter()
+        .find(|memory| memory["memory_id"] == id)
+        .unwrap();
+    let dependency = memories
+        .iter()
+        .find(|memory| memory["memory_id"] == required)
+        .unwrap();
+    assert_eq!(
+        dependency["current_heads"][0]["what_to_remember"],
+        "Required handoff source"
+    );
+    let heads = task["current_heads"].as_array().unwrap();
+    assert_eq!(heads.len(), 2);
+    for ((actual, stored), reference) in heads
+        .iter()
+        .zip(current.heads())
+        .zip(current.references().unwrap())
+    {
+        assert_eq!(actual["what_to_remember"], stored.body);
+        assert_eq!(actual["memory_ref"], json!(reference));
+        assert_eq!(actual["required_memory_ids"], json!([required]));
+    }
+
+    let artifact_dir = f.identity.local.join("response-artifacts");
+    std::fs::rename(&artifact_dir, f.identity.local.join("saved-artifacts")).unwrap();
+    std::fs::write(&artifact_dir, "An ordinary file blocks directory creation").unwrap();
+    let failed = f.query(json!({"project_path":folder,"recall_for":"unrelated","include_active_tasks":true,"memory_candidate_limit":1}), &RequestControl::default()).unwrap_err();
+    assert_eq!(failed.code, "result_delivery_failed");
+    let details = failed.details.unwrap();
+    let errors = details.as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["memory_id"], id);
+    assert!(errors[0]["reason"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty()));
+    assert!(errors[0]["next_action"]
+        .as_str()
+        .is_some_and(|text| text.to_lowercase().contains("recall")));
 }
 
 #[test]
-fn spooled_task_with_small_selected_sections_stays_inline() {
+fn fr_10_4_spooled_task_with_small_selected_sections_stays_inline() {
     use agentlaw_flows::exact::ExactIndexWriter;
     let f = Fixture::new(65536);
     let folder = f.dir.path().join("spooled-project");
@@ -1326,7 +1627,12 @@ fn spooled_task_with_small_selected_sections_stays_inline() {
     let id = Fixture::id();
     let references = "x".repeat(33 * 1024 * 1024);
     let head = || {
-        Head { metadata:json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}), body:format!("# Objective\nsmall\n# Current position\nsmall\n# Resume point\nsmall\n# References\n{references}") }
+        Head {
+        metadata: json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}),
+        body: format!(
+            "# Objective\nsmall\n# Current position\nsmall\n# Resume point\nsmall\n# References\n{references}"
+        ),
+    }
     };
     let unit = CurrentUnit {
         entity_id: id.clone(),
@@ -1335,6 +1641,7 @@ fn spooled_task_with_small_selected_sections_stays_inline() {
             heads: vec![head(), head()],
         },
     };
+    let expected_refs = unit.references().unwrap();
     f.store
         .publish(
             &Fixture::id(),
@@ -1345,21 +1652,245 @@ fn spooled_task_with_small_selected_sections_stays_inline() {
             }],
         )
         .unwrap();
-    drop(references);
     let source = f.store.owned_published_reader();
-    let mut writer = ExactIndexWriter::open(f.dir.path().join("exact-test.sqlite")).unwrap();
-    writer
-        .synchronize(&source, &RequestControl::default())
+    let synchronize = || {
+        let mut index = ExactIndexWriter::open(f.dir.path().join("exact-test.sqlite")).unwrap();
+        index
+            .synchronize(&source, &RequestControl::default())
+            .unwrap();
+    };
+    let request =
+        json!({"project_path":folder,"recall_for":"unrelated","include_active_tasks":true});
+    let error = f
+        .query(request.clone(), &RequestControl::default())
+        .unwrap_err();
+    assert_eq!(error.code, "capacity");
+    assert!(
+        error.retryable,
+        "FR-06.4: capacity is retryable after indexing"
+    );
+    assert!(!error.message.is_empty());
+    synchronize();
+
+    let single = f.query(request, &RequestControl::default()).unwrap();
+    assert!(single.get("artifact").is_none(), "{single}");
+    let sections =
+        json!({"objective":"small\n","current_position":"small\n","resume_point":"small\n"});
+    assert_task_handoff(&single, &id, json!([sections, sections]));
+    assert_eq!(
+        single["candidate_counts"]["memories"],
+        json!({"matched":0,"shown":0})
+    );
+    let exact = f
+        .query(json!({"memory_ids":[id]}), &RequestControl::default())
         .unwrap();
-    drop(writer);
+    assert_eq!(exact["code"], "complete_content_in_file");
+    assert_eq!(exact["content_read"], false);
+    let file = std::fs::File::open(exact["artifact"]["path"].as_str().unwrap()).unwrap();
+    let content: Value = serde_json::from_reader(std::io::BufReader::new(file)).unwrap();
+    assert_eq!(content["memories"][0]["memory_id"], id);
+    let heads = content["memories"][0]["current_heads"].as_array().unwrap();
+    assert_eq!(heads.len(), 2);
+    let full_body = format!("# Objective\nsmall\n# Current position\nsmall\n# Resume point\nsmall\n# References\n{references}");
+    for (head, reference) in heads.iter().zip(expected_refs) {
+        assert_eq!(head["what_to_remember"].as_str(), Some(full_body.as_str()));
+        assert_eq!(head["memory_ref"], json!(reference));
+    }
+    drop(content);
+    let other = CurrentUnit {
+        entity_id: Fixture::id(),
+        entity_type: "memory".into(),
+        state: UnitState::Live {
+            heads: vec![Head {
+                metadata: json!({"change_id":Fixture::id(),"applicability":{"scope":"project","project_id":project},"origin":{"machine_id":f.identity.machine_id,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"in_working_set":true,"relations":[],"work_targets":[]}),
+                body: "# Objective\nOther task\n# Current position\nReady\n# Resume point\nContinue\n# References\nNone".into(),
+            }],
+        },
+    };
+    f.store
+        .publish(
+            &Fixture::id(),
+            vec![Mutation {
+                unit: other,
+                expected_versions: vec![],
+                evidence: "other active task".into(),
+            }],
+        )
+        .unwrap();
+    drop(references);
+    synchronize();
     let result = f.query(json!({"project_path":folder.to_str().unwrap(),"recall_for":"unrelated", "include_active_tasks":true}), &RequestControl::default()).unwrap();
     assert!(result.get("artifact").is_none());
-    assert_eq!(result["candidates"].as_array().unwrap().len(), 2);
-    assert_eq!(result["candidate_counts"]["memories"]["shown"], 1);
-    assert_eq!(result["candidates"][0]["objective"], "small\n");
+    assert_eq!(result["active_task_count"], 2);
+    assert!(result.get("active_task_handoff").is_none());
+    assert_eq!(result["candidate_counts"]["memories"]["matched"], 2);
+    let task_rows: Vec<_> = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["memory_id"] == id)
+        .collect();
+    assert_eq!(task_rows.len(), 2);
+    assert!(task_rows.iter().all(|row| row["objective"] == "small\n"));
+    assert_eq!(result["candidate_counts"]["memories"]["shown"], 2);
     let spool_root = f.identity.local.join("canonical/acquisitions");
     if spool_root.exists() {
         assert_eq!(std::fs::read_dir(spool_root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn local_epoch_read_failure_preserves_canonical_source() {
+    for missing in [true, false] {
+        let f = Fixture::new(65536);
+        let id = Fixture::id();
+        let body = "Canonical content survives local epoch failure";
+        f.publish(&id, body, false, json!([]), vec![]);
+        let projection = start_read_projection(&f);
+        let coordinator = ReadCoordinator::new(projection.clone(), DeltaBudget::default());
+        let source = f.store.owned_published_reader();
+        let reader = ControlReader::open(&f.identity.local).unwrap();
+        let cache = HistoryCacheGuards::new();
+        let control = RequestControl::default();
+        let ctx = ReadCtx {
+            identity: &f.identity,
+            source: &source,
+            control: &reader,
+            semantic: &f.semantic,
+            history_semantic: &f.semantic,
+            history_cache: &cache,
+            request: &control,
+        };
+        let request = || {
+            QueryRequest::Recall(RecallRequest {
+                memory_ids: Some(vec![id.clone()]),
+                ..Default::default()
+            })
+        };
+        let canonical = f
+            .identity
+            .root
+            .join("current/memory")
+            .join(&id[..2])
+            .join(format!("{id}.md"));
+        let original = std::fs::read(&canonical).unwrap();
+        let epoch = f.identity.local.join("canonical/source-epoch");
+        let saved = f.dir.path().join("saved-source-epoch");
+        let original_epoch = std::fs::read(&epoch).unwrap();
+        if missing {
+            std::fs::rename(&epoch, &saved).unwrap();
+        } else {
+            std::fs::write(&epoch, b"invalid JSON epoch").unwrap();
+        }
+        let observed = coordinator.run_query(&ctx, request());
+        if missing {
+            std::fs::rename(saved, epoch).unwrap();
+        } else {
+            std::fs::write(epoch, original_epoch).unwrap();
+        }
+        let error = observed.unwrap_err();
+        assert_eq!(
+            error.code, "recall_epoch_unavailable",
+            "FR-06.4: missing={missing}, {error:?}"
+        );
+        assert!(error.retryable);
+        assert!(error.details.is_none());
+        let action = error.next_action.unwrap().to_lowercase();
+        assert!(
+            action.contains("local") && action.contains("epoch") && action.contains("recall"),
+            "{action}"
+        );
+        assert!(
+            !action.contains("restore the canonical") && !action.contains("recreate the epoch"),
+            "{action}"
+        );
+        assert_eq!(std::fs::read(canonical).unwrap(), original);
+        assert_eq!(
+            coordinator.run_query(&ctx, request()).unwrap()["memories"][0]["current_heads"][0]
+                ["what_to_remember"],
+            body
+        );
+        assert!(projection.shutdown(std::time::Duration::from_secs(10)));
+    }
+}
+
+#[test]
+fn delta_errors_follow_the_requested_operation() {
+    use crate::protocol::InventoryFilter;
+
+    for corrupt in [false, true] {
+        for operation in ["prepare", "procedure", "recall"] {
+            let f = Fixture::new(65536);
+            let projection = start_read_projection(&f);
+            let id = Fixture::id();
+            let body = "Unindexed delta";
+            f.publish(&id, body, false, json!([]), vec![]);
+            if corrupt {
+                let path = f
+                    .identity
+                    .root
+                    .join("current/memory")
+                    .join(&id[..2])
+                    .join(format!("{id}.md"));
+                let mut bytes = std::fs::read(&path).unwrap();
+                let offset = bytes
+                    .windows(body.len())
+                    .position(|part| part == body.as_bytes())
+                    .unwrap();
+                bytes[offset] = b'X';
+                std::fs::write(path, bytes).unwrap();
+            }
+            let budget = if corrupt {
+                DeltaBudget::default()
+            } else {
+                DeltaBudget {
+                    max_identities: 0,
+                    max_resident_bytes: 0,
+                }
+            };
+            let coordinator = ReadCoordinator::new(projection.clone(), budget);
+            let source = f.store.owned_published_reader();
+            let reader = ControlReader::open(&f.identity.local).unwrap();
+            let cache = HistoryCacheGuards::new();
+            let control = RequestControl::default();
+            let ctx = ReadCtx {
+                identity: &f.identity,
+                source: &source,
+                control: &reader,
+                semantic: &f.semantic,
+                history_semantic: &f.semantic,
+                history_cache: &cache,
+                request: &control,
+            };
+            let error = match operation {
+                "prepare" => coordinator.run_prepare(&ctx, serde_json::from_value(json!({"memories":[{"operation":"create","what_to_remember":"New memory proposal","evidence":"Observed","applies_to":["user"]}]})).unwrap()).err().unwrap(),
+                "procedure" => coordinator.search_procedures(&ctx, "procedure", &InventoryFilter { scope:None, project:None, machine:None, table:false }, 1).unwrap_err(),
+                _ => coordinator.run_query(&ctx, QueryRequest::Recall(RecallRequest {recall_for:Some("unindexed delta".into()), ..Default::default()})).unwrap_err(),
+            };
+            let expected = if !corrupt {
+                "capacity"
+            } else if operation == "recall" {
+                "source_corrupt"
+            } else {
+                "source_unavailable"
+            };
+            assert_eq!(error.code, expected, "FR-06.4: {operation}, {error:?}");
+            assert_eq!(error.retryable, !corrupt && operation == "recall");
+            if operation == "recall" {
+                let action = error.next_action.unwrap().to_lowercase();
+                assert!(
+                    action.contains(if corrupt { "doctor --audit" } else { "index" }),
+                    "{action}"
+                );
+                assert!(
+                    action.contains("recall") || action.contains("query"),
+                    "{action}"
+                );
+            } else {
+                assert!(error.next_action.is_none(), "{error:?}");
+            }
+            assert!(projection.shutdown(std::time::Duration::from_secs(10)));
+        }
     }
 }
 
@@ -1418,7 +1949,7 @@ fn query_detecting_changed_source_epoch_wakes_idle_recovery() {
 }
 
 #[test]
-fn active_task_published_during_embedding_is_in_the_final_recall() {
+fn fr_10_4_active_task_published_during_embedding_is_in_the_final_recall() {
     use std::time::Duration;
     let f = Fixture::new(65536);
     let path = f.dir.path().join("concurrent-task-project");
@@ -1493,16 +2024,15 @@ fn active_task_published_during_embedding_is_in_the_final_recall() {
         let result = coordinator
             .run_query(&ctx, QueryRequest::Recall(request))
             .unwrap();
-        assert_eq!(result["active_task_count"], 1, "{result}");
-        let task = result["candidates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["memory_id"] == id)
-            .expect("published task must not be omitted from complete recall");
-        assert_eq!(task["objective"], "Ship the feature\n");
-        assert_eq!(task["current_position"], "Implementation complete\n");
-        assert_eq!(task["resume_point"], "Review verification\n");
+        assert_task_handoff(
+            &result,
+            &id,
+            json!([{
+                "objective":"Ship the feature\n",
+                "current_position":"Implementation complete\n",
+                "resume_point":"Review verification\n"
+            }]),
+        );
         let exact = f
             .query(json!({"memory_ids":[id]}), &RequestControl::default())
             .unwrap();
@@ -1512,7 +2042,7 @@ fn active_task_published_during_embedding_is_in_the_final_recall() {
         );
         assert_eq!(
             exact["memories"][0]["current_heads"][0]["memory_ref"],
-            json!({"memory_id":expected_reference.memory_id,"observed_version":expected_reference.observed_version})
+            json!(expected_reference)
         );
         writer.join().unwrap();
     });
@@ -1790,10 +2320,74 @@ impl Fixture {
 }
 
 #[test]
-fn exact_current_larger_than_owned_budget_is_delivered_as_whole_file() {
+fn recall_source_errors_preserve_cause_across_acquisition_paths() {
+    use agentlaw_flows::exact::ExactIndexWriter;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let marker = "Canonical body to check.";
+    for file_backed in [false, true] {
+        let f = Fixture::new(65536);
+        let id = Fixture::id();
+        let body = if file_backed {
+            format!("{marker}\n{}", "x".repeat(65 * 1024 * 1024))
+        } else {
+            marker.to_owned()
+        };
+        f.publish(&id, &body, false, json!([]), vec![]);
+        let request = if file_backed {
+            json!({"memory_ids":[id]})
+        } else {
+            json!({"recall_for":marker})
+        };
+        let query = || f.query(request.clone(), &RequestControl::default());
+        if file_backed {
+            let source = f.store.owned_published_reader();
+            let mut index = ExactIndexWriter::open(f.dir.path().join("exact-test.sqlite")).unwrap();
+            index
+                .synchronize(&source, &RequestControl::default())
+                .unwrap();
+            drop(index);
+            let delivered = query().unwrap();
+            assert_eq!(delivered["code"], "complete_content_in_file");
+            assert_eq!(delivered["content_read"], false);
+            assert!(delivered["artifact"]["bytes"].as_u64().unwrap() > body.len() as u64);
+        }
+        let current = f
+            .identity
+            .root
+            .join("current/memory")
+            .join(&id[..2])
+            .join(format!("{id}.md"));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(current)
+            .unwrap();
+        let mut prefix = Vec::new();
+        (&mut file).take(4096).read_to_end(&mut prefix).unwrap();
+        let offset = prefix
+            .windows(marker.len())
+            .position(|bytes| bytes == marker.as_bytes())
+            .unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(b"X").unwrap();
+        drop(file);
+
+        let error = query().unwrap_err();
+        assert_eq!(
+            error.code, "source_corrupt",
+            "FR-06.4: file-backed={file_backed}, {error:?}"
+        );
+        assert!(!error.retryable);
+        assert!(error.details.is_none(), "{error:?}");
+    }
+}
+
+#[test]
+fn fr_06_5_exact_current_larger_than_owned_budget_is_delivered_as_whole_file() {
     use agentlaw_storage::codec;
     use sha2::{Digest, Sha256};
-    use std::io::{Cursor, Read, Write};
+    use std::io::{BufRead, Cursor, Write};
     let f = Fixture::new(65536);
     let root = &f.identity.root;
     let id = uuid::Uuid::new_v4().to_string();
@@ -1871,13 +2465,19 @@ fn exact_current_larger_than_owned_budget_is_delivered_as_whole_file() {
         .unwrap();
     assert_eq!(restored["code"], "complete_content_in_file");
     assert!(restored["artifact"]["bytes"].as_u64().unwrap() > bytes);
-    let mut file = std::fs::File::open(restored["artifact"]["path"].as_str().unwrap()).unwrap();
-    let mut prefix = vec![0; 4096];
-    let n = file.read(&mut prefix).unwrap();
-    let prefix = String::from_utf8_lossy(&prefix[..n]);
-    assert!(prefix.contains("candidate_counts"));
-    assert!(prefix.contains("\"is_rule\":true"));
-    assert!(!prefix.contains("agentlaw-owned-body"));
+    let file = std::fs::File::open(restored["artifact"]["path"].as_str().unwrap()).unwrap();
+    let mut reader = std::io::BufReader::new(file);
+    let prefix = String::from_utf8_lossy(reader.fill_buf().unwrap());
+    assert!(
+        prefix.contains("\"candidate_counts\""),
+        "FR-06.5: contextual file lost candidate counts"
+    );
+    let content: Value = serde_json::from_reader(reader).unwrap();
+    let item = &content["rules"][0]["items"][0];
+    assert_eq!(item["memory_id"], id);
+    let body = item["what_to_remember"].as_str().unwrap();
+    assert_eq!(body.len() as u64, bytes);
+    assert_eq!(format!("{:x}", Sha256::digest(body.as_bytes())), digest);
 }
 
 #[test]

@@ -2,6 +2,7 @@ use crate::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION: &str = "Briefly disclose this recall's incomplete semantic search in the user's language; combine any required-context warning into the same sentence. Omit only an unchanged semantic notice already visible for this task. Do not auto-retry or repair.";
+const REQUIRED_CONTEXT_RECOVERY: &str = "Recover the missing required context using the provided steps. If recovery remains blocked, tell the user what could not be checked. Do not make changes that depend on that context; independent investigation may continue.";
 
 fn add_candidate(
     candidates: &mut Vec<MemoryCandidate>,
@@ -53,8 +54,80 @@ pub fn recall(
     r: &RecallRequest,
     current_time: String,
 ) -> Result<RecallResponse> {
-    recall_with_control(source, search, context, r, current_time, None)
+    let (mut response, handoff_id) =
+        recall_with_control(source, search, context, r, current_time, None, None)?;
+    if let Some(id) = handoff_id {
+        let sections = source.current(&id).and_then(|state| {
+            let state = state.ok_or_else(task_source_unavailable)?;
+            state
+                .heads
+                .iter()
+                .map(|head| crate::write::task_sections(&head.what_to_remember))
+                .collect()
+        });
+        deliver_task_handoff(&mut response, id, sections);
+    }
+    finalize_recall_guidance(&mut response);
+    Ok(response)
 }
+
+pub(crate) fn finalize_recall_guidance(response: &mut RecallResponse) {
+    let degraded = response
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "semantic_channel_incomplete");
+    let instructions: Vec<_> = [
+        (!response.undelivered_required.is_empty()).then_some(REQUIRED_CONTEXT_RECOVERY),
+        response.turn_instruction.as_deref(),
+        degraded.then_some(SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    response.turn_instruction = (!instructions.is_empty()).then(|| instructions.join(" "));
+}
+
+pub(crate) fn task_source_unavailable() -> DomainError {
+    DomainError::new("source_corrupt", "No current Task heads could be read.")
+}
+
+pub(crate) fn deliver_task_handoff(
+    response: &mut RecallResponse,
+    memory_id: String,
+    sections: Result<Vec<[String; 3]>>,
+) {
+    match sections {
+        Ok(heads) if !heads.is_empty() => {
+            response.active_task_handoff = Some(ActiveTaskHandoff {
+                memory_id,
+                current_heads: heads
+                    .into_iter()
+                    .map(
+                        |[objective, current_position, resume_point]| TaskHandoffHead {
+                            objective,
+                            current_position,
+                            resume_point,
+                        },
+                    )
+                    .collect(),
+            });
+            response.task_instruction = Some("Only handoff sections are shown. Look up this Task's memory_id in memory_ids for References, full current heads and required references. Read all current bodies and refs before editing or reconciling.".into());
+        }
+        sections => {
+            let error = sections.err().unwrap_or_else(task_source_unavailable);
+            let instruction = format!("The handoff for Task {memory_id} could not be delivered. Check the source and use memory_ids to read all current heads and required references before resuming dependent work.");
+            response.turn_instruction = Some(match response.turn_instruction.take() {
+                Some(existing) => format!("{existing} {instruction}"),
+                None => instruction,
+            });
+            response.undelivered_required.push(UndeliveredRequired {
+                memory_id,
+                reason: error.message,
+            });
+        }
+    }
+}
+
 pub(crate) fn recall_with_control(
     source: &impl SourceSnapshot,
     search: &impl RecallSearch,
@@ -62,7 +135,8 @@ pub(crate) fn recall_with_control(
     r: &RecallRequest,
     current_time: String,
     control: Option<&RequestControl>,
-) -> Result<RecallResponse> {
+    known_active_tasks: Option<&[String]>,
+) -> Result<(RecallResponse, Option<String>)> {
     if r.procedure_ids.is_some() {
         return Err(DomainError::unsupported(
             "Procedure current-state recall adapter is not connected.",
@@ -91,7 +165,9 @@ pub(crate) fn recall_with_control(
     for id in &selected {
         validate_id(id)?
     }
+    let mut sole_task = None;
     if let Some(query) = &r.recall_for {
+        let mut search_selected = BTreeSet::new();
         let mut queries = vec![query.clone()];
         if r.restore_context == Some(true) {
             queries.extend(
@@ -101,20 +177,27 @@ pub(crate) fn recall_with_control(
             )
         }
         let mut candidate_positions = BTreeMap::new();
-        let mut discovered_ids = BTreeSet::new();
+        let mut discovered_ids = Vec::new();
+        let mut discovered = BTreeSet::new();
         for query in queries {
             let result =
                 search.search(&effective, &query, r.search_terms.as_deref().unwrap_or(&[]))?;
-            discovered_ids.extend(result.full_ids.iter().cloned());
-            selected.extend(result.full_ids);
             response.diagnostics.extend(result.diagnostics);
             for candidate in result.candidates {
-                discovered_ids.insert(candidate.memory_id.clone());
+                if discovered.insert(candidate.memory_id.clone()) {
+                    discovered_ids.push(candidate.memory_id.clone());
+                }
                 add_candidate(
                     &mut response.candidates,
                     &mut candidate_positions,
                     candidate,
                 );
+            }
+            for id in result.full_ids {
+                if discovered.insert(id.clone()) {
+                    discovered_ids.push(id.clone());
+                }
+                search_selected.insert(id);
             }
         }
         // Exactly one related hop from discovery, distinct from required closure.
@@ -134,7 +217,9 @@ pub(crate) fn recall_with_control(
                                         retrieval_paths: vec![RetrievalPath {
                                             via: vec!["related_memory".into()],
                                             clue: related,
-                                            source_memory_id: Some(id.clone()),
+                                            source_memory_ids: Some(vec![state
+                                                .resolved_id
+                                                .clone()]),
                                         }],
                                     },
                                 );
@@ -180,7 +265,7 @@ pub(crate) fn recall_with_control(
                                 retrieval_paths: vec![RetrievalPath {
                                     via: vec!["active_task".into(), "active_working_set".into()],
                                     clue: "Active Task".into(),
-                                    source_memory_id: None,
+                                    source_memory_ids: None,
                                 }],
                             },
                         );
@@ -207,7 +292,7 @@ pub(crate) fn recall_with_control(
                                                 retrieval_paths: vec![RetrievalPath {
                                                     via: vec!["work_target".into()],
                                                     clue: stored.path.clone(),
-                                                    source_memory_id: None,
+                                                    source_memory_ids: None,
                                                 }],
                                             },
                                         );
@@ -219,8 +304,27 @@ pub(crate) fn recall_with_control(
                 }
             }
             if r.include_active_tasks == Some(true) {
-                response.active_task_count = Some(tasks.len())
+                let tasks = known_active_tasks
+                    .map(<[String]>::to_vec)
+                    .unwrap_or_else(|| tasks.into_iter().collect());
+                response.active_task_count = Some(tasks.len());
+                sole_task = match tasks.as_slice() {
+                    [id] => Some(id.clone()),
+                    _ => None,
+                };
             }
+        }
+        for id in search_selected {
+            if let Some(task_id) = &sole_task {
+                if &id == task_id
+                    || source
+                        .current(&id)?
+                        .is_some_and(|state| &state.resolved_id == task_id)
+                {
+                    continue;
+                }
+            }
+            selected.insert(id);
         }
     }
     let exact: BTreeSet<_> = r
@@ -229,7 +333,12 @@ pub(crate) fn recall_with_control(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let mut missing = Vec::new();
+    let mut missing = BTreeSet::new();
+    let mut missing_required = BTreeSet::new();
+    let mut required = selected
+        .difference(&exact)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut visited = BTreeSet::new();
     let mut queue: VecDeque<_> = selected.into_iter().collect();
     while let Some(id) = queue.pop_front() {
@@ -240,10 +349,10 @@ pub(crate) fn recall_with_control(
             Some(s) => s,
             None => {
                 if exact.contains(&id) {
-                    missing.push(id)
-                } else {
+                    missing.insert(id.clone());
+                }
+                if required.contains(&id) && missing_required.insert(id.clone()) {
                     response.undelivered_required.push(UndeliveredRequired{memory_id:id,reason:"The referenced current identity is absent; required context was not delivered.".into()});
-                    response.turn_instruction=Some("Required context is unavailable. Explain this limitation in the user's language; do not treat absent required context as reviewed.".into());
                 }
                 continue;
             }
@@ -258,14 +367,15 @@ pub(crate) fn recall_with_control(
             ));
         }
         for head in &state.heads {
-            queue.extend(head.required_memory_ids.clone())
+            required.extend(head.required_memory_ids.iter().cloned());
+            queue.extend(head.required_memory_ids.clone());
         }
         let multiple = state.heads.len() > 1;
         response.memories.push(RecallMemory{memory_id:state.resolved_id,current_heads:state.heads.into_iter().map(Into::into).collect(),head_reconciliation_required:multiple.then_some(true),head_reconciliation_instruction:multiple.then(||"Review every current head before evolving this memory; do not assume a newest winner.".into())});
     }
     response
         .candidates
-        .retain(|c| !visited.contains(&c.memory_id));
+        .retain(|c| !visited.contains(&c.memory_id) && sole_task.as_ref() != Some(&c.memory_id));
     if r.recall_for.is_some() {
         if r.include_active_tasks == Some(true) {
             response.candidates.sort_by_key(|candidate| {
@@ -298,20 +408,11 @@ pub(crate) fn recall_with_control(
     if !missing.is_empty() {
         response.code = Some("exact_selection_incomplete".into());
         response.missing_ids = Some(MissingIds {
-            memory_ids: missing,
+            memory_ids: missing.into_iter().collect(),
             procedure_ids: vec![],
         })
     }
-    if r.recall_for.is_some()
-        && response
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "semantic_channel_incomplete")
-    {
-        response.turn_instruction = Some(match response.turn_instruction.take() {
-            Some(existing) => format!("{existing} {SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION}"),
-            None => SEMANTIC_CHANNEL_INCOMPLETE_INSTRUCTION.into(),
-        });
-    }
-    Ok(response)
+    let handoff_id = sole_task
+        .filter(|id| !visited.contains(id) && !required.contains(id) && !exact.contains(id));
+    Ok((response, handoff_id))
 }

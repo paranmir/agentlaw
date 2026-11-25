@@ -31,6 +31,7 @@ pub(crate) fn source<T>(r: agentlaw_storage::Result<T>) -> Result<T> {
         _ => DomainError::new("source_operation_failed", "Canonical operation failed; inspect diagnostics without discarding source or pending work."),
     })
 }
+
 pub(crate) fn digest(v: &impl Serialize) -> Result<String> {
     let b = serde_json::to_vec(v).map_err(|_| {
         DomainError::new("serialization_failed", "Could not serialize review basis.")

@@ -136,6 +136,18 @@ impl Store {
         Vec<AcquiredResolvedCurrent>,
         Vec<String>,
     )> {
+        self.acquire_closure_with_origin(ids, position)
+            .map_err(Error::without_recall_origin)
+    }
+    pub(super) fn acquire_closure_with_origin(
+        &self,
+        ids: &[String],
+        position: published::SourcePosition,
+    ) -> Result<(
+        published::SourcePosition,
+        Vec<AcquiredResolvedCurrent>,
+        Vec<String>,
+    )> {
         let mut queue = std::collections::VecDeque::from(ids.to_vec());
         let mut visited = BTreeSet::new();
         let mut resolved = BTreeSet::new();
@@ -152,7 +164,8 @@ impl Store {
                 if !chain.insert(next.clone()) {
                     return Err(Error::Corrupt("redirect cycle".into()));
                 }
-                let current = match self.acquire_kind_locked(&next, "memory", position.clone()) {
+                let current = match self.acquire_kind_with_origin(&next, "memory", position.clone())
+                {
                     Ok(v) => v,
                     Err(Error::NotFound(_)) => {
                         missing.insert(next);
@@ -218,6 +231,15 @@ impl Store {
         kind: &str,
         position: published::SourcePosition,
     ) -> Result<AcquiredCurrent> {
+        self.acquire_kind_with_origin(id, kind, position)
+            .map_err(Error::without_recall_origin)
+    }
+    pub(super) fn acquire_kind_with_origin(
+        &self,
+        id: &str,
+        kind: &str,
+        position: published::SourcePosition,
+    ) -> Result<AcquiredCurrent> {
         validate_id(id)?;
         let path = self.safe_path(&format!("current/{kind}/{}/{}.md", &id[..2], id))?;
         let file = File::open(path).map_err(|e| {
@@ -231,7 +253,7 @@ impl Store {
             .local
             .join("acquisitions")
             .join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).map_err(Error::local_recall_spool)?;
         let lease = std::sync::Arc::new(AcquisitionLease(dir.clone()));
         let mut state = None;
         let mut bodies = BTreeMap::new();
@@ -257,9 +279,10 @@ impl Store {
                 let mut out = OpenOptions::new()
                     .create_new(true)
                     .write(true)
-                    .open(&path)?;
-                std::io::copy(payload, &mut out)?;
-                out.sync_all()?;
+                    .open(&path)
+                    .map_err(Error::local_recall_spool)?;
+                copy_frame_to_spool(payload, &mut out)?;
+                out.sync_all().map_err(Error::local_recall_spool)?;
                 bodies.insert(
                     info.key.clone(),
                     SpoolBody {
@@ -334,7 +357,7 @@ impl Store {
                 .ok_or_else(|| Error::Corrupt("missing head body".into()))?;
             references.push(VersionRef {
                 memory_id: id.into(),
-                observed_version: version_stream(&unit, head, body.bytes, &mut body.open()?)?,
+                observed_version: acquired_body_version(&unit, head, body)?,
             });
         }
         Ok(AcquiredCurrent {
@@ -343,5 +366,57 @@ impl Store {
             references,
             source_position: position,
         })
+    }
+}
+
+fn copy_frame_to_spool(payload: &mut dyn Read, out: &mut File) -> Result<()> {
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = match payload.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        out.write_all(&buffer[..count])
+            .map_err(Error::local_recall_spool)?;
+    }
+}
+
+fn acquired_body_version(unit: &CurrentUnit, head: &Head, body: &SpoolBody) -> Result<String> {
+    struct VerifiedRead<R> {
+        reader: R,
+        started: bool,
+        bytes: u64,
+        digest: Sha256,
+    }
+    impl<R: Read> Read for VerifiedRead<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.started = true;
+            let count = self.reader.read(buffer)?;
+            self.bytes += count as u64;
+            self.digest.update(&buffer[..count]);
+            Ok(count)
+        }
+    }
+    let mut read = VerifiedRead {
+        reader: body
+            .open()
+            .map_err(Error::local_recall_spool)?
+            .take(body.bytes.saturating_add(1)),
+        started: false,
+        bytes: 0,
+        digest: Sha256::new(),
+    };
+    let version = version_stream(unit, head, body.bytes, &mut read);
+    match version {
+        Err(Error::Io(error)) => Err(Error::local_recall_spool(error)),
+        Err(error) if read.started && read.bytes != body.bytes => {
+            Err(Error::local_recall_spool(error))
+        }
+        Ok(_) if format!("{:x}", read.digest.finalize()) != body.sha256 => Err(
+            Error::local_recall_spool(Error::Corrupt("acquired body checksum changed".into())),
+        ),
+        result => result,
     }
 }

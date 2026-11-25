@@ -135,6 +135,16 @@ enum AcquiredClosure {
     Owned(Vec<agentlaw_storage::ResolvedCurrent>),
     Spooled(Vec<agentlaw_storage::acquire::AcquiredResolvedCurrent>),
 }
+impl AcquiredClosure {
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::Owned(units) => units.iter().any(|unit| unit.current.entity_id == id),
+            Self::Spooled(units) => units
+                .iter()
+                .any(|unit| unit.current.state["memory_id"] == id),
+        }
+    }
+}
 #[derive(Clone)]
 struct PreparedQuery {
     text: String,
@@ -151,7 +161,7 @@ struct Found {
     matched: u64,
 }
 
-fn query_texts(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<Vec<PreparedQuery>> {
+fn query_texts(ctx: &ReadCtx<'_>, request: &RecallRequest) -> RecallResult<Vec<PreparedQuery>> {
     let Some(query) = &request.recall_for else {
         return Ok(vec![]);
     };
@@ -165,7 +175,7 @@ fn query_texts(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<Vec<Prepare
     }
     let mut prepared = Vec::new();
     for text in texts {
-        ctx.request.check()?;
+        check_recall(ctx.request)?;
         let combined = match &request.search_terms {
             Some(terms) => format!("{text} {}", terms.join(" ")),
             None => text.clone(),
@@ -175,15 +185,15 @@ fn query_texts(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<Vec<Prepare
     Ok(prepared)
 }
 
-fn prefix_query(ctx: &ReadCtx<'_>, text: String, combined: String) -> Result<PreparedQuery> {
+fn prefix_query(ctx: &ReadCtx<'_>, text: String, combined: String) -> RecallResult<PreparedQuery> {
     let (vectors, truncated) = match ctx.semantic.embed_prefix(&combined, ctx.request) {
         Ok(result) => (Some(vec![result.vector]), result.truncated),
         Err(SemanticError::Cancelled) => {
-            ctx.request.check()?;
-            return Err(DomainError::new(
+            check_recall(ctx.request)?;
+            return Err(RecallFailure::Cancelled(DomainError::new(
                 "cancelled",
                 "Query embedding was cancelled.",
-            ));
+            )));
         }
         Err(_) => (None, false),
     };
@@ -233,8 +243,8 @@ fn search_one(
     exact: &mut ExactSnapshot,
     query: &PreparedQuery,
     scopes: &[String],
-) -> Result<Found> {
-    ctx.request.check()?;
+) -> RecallResult<Found> {
+    check_recall(ctx.request)?;
     let (lexical, strength, matched) = {
         let mut corpus = exact.lexical(&ScopeFilter {
             allowed_scopes: scopes.to_vec(),
@@ -292,7 +302,7 @@ fn search_vector(
     text: &str,
     scopes: &[String],
     vector: &QueryVector,
-) -> Result<(Vec<Hit>, bool)> {
+) -> RecallResult<(Vec<Hit>, bool)> {
     let position = exact.position().clone();
     let (mut vector, complete) = match ctx.semantic.search_available(
         SemanticQuery {
@@ -311,15 +321,15 @@ fn search_vector(
             (result.hits, complete)
         }
         Err(SemanticError::Cancelled) => {
-            ctx.request.check()?;
-            return Err(DomainError::new(
+            check_recall(ctx.request)?;
+            return Err(RecallFailure::Cancelled(DomainError::new(
                 "cancelled",
                 "Semantic search was cancelled.",
-            ));
+            )));
         }
         Err(_) => (Vec::new(), false),
     };
-    ctx.request.check()?;
+    check_recall(ctx.request)?;
     // Never present a stale vector revision as a current result.
     let ids: Vec<_> = vector
         .iter()
@@ -433,39 +443,6 @@ fn channels(found: Found, truncated: bool) -> Channels {
     }
 }
 
-fn connection(ctx: &ReadCtx<'_>, path: Option<&str>) -> Result<Option<String>> {
-    match path {
-        None => Ok(None),
-        Some(path) => {
-            absolute_project_path(path)?;
-            ctx.control
-                .exact_association(&ctx.identity.binding_id, path)?
-                .map(|p| p.project_id)
-                .ok_or_else(|| {
-                    DomainError::new(
-                        "project_connection_required",
-                        "Discover and explicitly select or create a project connection.",
-                    )
-                })
-                .map(Some)
-        }
-    }
-}
-fn context(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<RequestContext> {
-    let machine = request
-        .machine_id
-        .as_ref()
-        .unwrap_or(&ctx.identity.machine_id);
-    validate_id(machine)?;
-    Ok(RequestContext {
-        store_binding_id: ctx.identity.binding_id.clone(),
-        user_id: ctx.identity.user_id.clone(),
-        machine_id: machine.clone(),
-        project_id: connection(ctx, request.project_path.as_deref())?,
-        connection_version: String::new(),
-    })
-}
-
 pub fn discover(ctx: &ReadCtx<'_>, request: &ConnectRequest) -> Result<Value> {
     ctx.request.check()?;
     if request.restore_context == Some(true) {
@@ -519,10 +496,7 @@ fn catalog_candidates(
     ctx: &ReadCtx<'_>,
     clues: Option<&ProjectClues>,
 ) -> Result<Vec<ProjectCandidate>> {
-    let catalog = {
-        let guard = source(ctx.source.read_snapshot())?;
-        source(guard.list_catalog())?
-    };
+    let catalog = source(ctx.source.list_catalog_for_discovery())?;
     let mut candidates = Vec::new();
     for p in catalog {
         ctx.request.check()?;
@@ -593,6 +567,18 @@ pub struct PreparedRecall {
 
 #[doc(hidden)]
 pub fn prepare_recall(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<PreparedRecall> {
+    prepare_queries(ctx, request).map_err(Into::into)
+}
+
+fn prepare_queries(ctx: &ReadCtx<'_>, request: &RecallRequest) -> RecallResult<PreparedRecall> {
+    for id in request
+        .memory_ids
+        .iter()
+        .flatten()
+        .chain(request.procedure_ids.iter().flatten())
+    {
+        validate_id(id)?;
+    }
     Ok(PreparedRecall {
         queries: query_texts(ctx, request)?,
     })
@@ -603,17 +589,16 @@ pub fn recall(
     exact: &mut ExactSnapshot,
     request: &RecallRequest,
 ) -> Result<Value> {
-    let prepared = prepare_recall(ctx, request)?;
-    recall_scoped(
+    execute_recall(
         ctx,
-        exact,
         request,
         None,
         DeltaBudget::default(),
-        &prepared.queries,
         None,
-        &mut Vec::new(),
+        || Ok(exact),
+        |_| {},
     )
+    .map(|(value, _)| value)
 }
 
 /// Recall against the project identity fixed by a completed connection.
@@ -624,15 +609,16 @@ pub fn recall_for_project(
     request: &RecallRequest,
     project_id: &str,
 ) -> Result<Value> {
-    let prepared = prepare_recall(ctx, request)?;
-    recall_prepared(
+    execute_recall(
         ctx,
-        exact,
         request,
         Some(project_id),
         DeltaBudget::default(),
-        &prepared,
+        None,
+        || Ok(exact),
+        |_| {},
     )
+    .map(|(value, _)| value)
 }
 
 #[doc(hidden)]
@@ -644,11 +630,18 @@ pub fn recall_prepared(
     budget: DeltaBudget,
     prepared: &PreparedRecall,
 ) -> Result<Value> {
-    recall_prepared_with_diagnostics(ctx, exact, request, project_id, budget, prepared)
-        .map(|(value, _)| value)
+    execute_recall(
+        ctx,
+        request,
+        project_id,
+        budget,
+        Some(prepared),
+        || Ok(exact),
+        |_| {},
+    )
+    .map(|(value, _)| value)
 }
 
-/// Returns semantic completeness diagnostics independently of inline or file delivery.
 #[doc(hidden)]
 pub fn recall_prepared_with_diagnostics(
     ctx: &ReadCtx<'_>,
@@ -658,96 +651,75 @@ pub fn recall_prepared_with_diagnostics(
     budget: DeltaBudget,
     prepared: &PreparedRecall,
 ) -> Result<(Value, Vec<DomainError>)> {
-    if let Some(id) = project_id {
-        validate_id(id)?;
-    }
-    let mut diagnostics = Vec::new();
-    let value = recall_scoped(
+    execute_recall(
         ctx,
-        exact,
         request,
         project_id,
         budget,
-        &prepared.queries,
-        None,
-        &mut diagnostics,
-    )?;
-    Ok((value, diagnostics))
+        Some(prepared),
+        || Ok(exact),
+        |_| {},
+    )
 }
 
-fn recall_scoped(
+#[doc(hidden)]
+pub fn recall_with_snapshot(
     ctx: &ReadCtx<'_>,
-    exact: &mut ExactSnapshot,
+    request: &RecallRequest,
+    project_id: Option<&str>,
+    budget: DeltaBudget,
+    acquire: impl FnOnce() -> Result<ExactSnapshot>,
+    observe_failure: impl FnOnce(&DomainError),
+) -> Result<(Value, Vec<DomainError>)> {
+    execute_recall(
+        ctx,
+        request,
+        project_id,
+        budget,
+        None,
+        acquire,
+        observe_failure,
+    )
+}
+
+enum RecallScope {
+    Ready(RequestContext),
+    Unbound(RequestContext, Value),
+    Selection(Value),
+}
+
+fn resolve_recall_scope(
+    ctx: &ReadCtx<'_>,
     request: &RecallRequest,
     fixed_project: Option<&str>,
-    budget: DeltaBudget,
-    prepared: &[PreparedQuery],
-    outer: Option<Value>,
-    completeness_diagnostics: &mut Vec<DomainError>,
-) -> Result<Value> {
-    ctx.request.check()?;
-    let mut context = if let Some(project_id) = fixed_project {
-        let machine = request
-            .machine_id
-            .as_ref()
-            .unwrap_or(&ctx.identity.machine_id);
-        validate_id(machine)?;
-        RequestContext {
-            store_binding_id: ctx.identity.binding_id.clone(),
-            user_id: ctx.identity.user_id.clone(),
-            machine_id: machine.clone(),
-            project_id: Some(project_id.to_owned()),
-            connection_version: String::new(),
-        }
-    } else {
-        match context(ctx, request) {
-            Ok(value) => value,
-            Err(error) if error.code == "project_connection_required" => {
-                let discovery = discover(
-                    ctx,
-                    &ConnectRequest {
-                        project_path: request.project_path.clone().unwrap_or_default(),
-                        intent: Some(ConnectIntent::Discover),
-                        clues: None,
-                        project_id: None,
-                        project_name: None,
-                        project_description: None,
-                        memory_store_path: None,
-                        restore_context: None,
-                        recall_for: None,
-                    },
-                )?;
-                let mut result = json!({"status":"needs_user_input", "code":"project_connection_required", "message":"Choose a project memory for this folder.", "project_path":request.project_path, "candidates":discovery["candidates"], "turn_instruction":"Project rules, active Tasks and work targets have not been checked. Read partial_recall or its error; select or create a project explicitly, then repeat the original request."});
-                if request.recall_for.is_some() {
-                    let mut partial = request.clone();
-                    partial.project_path = None;
-                    partial.project_hint = None;
-                    partial.selected_project_id = None;
-                    partial.memory_ids = None;
-                    partial.procedure_ids = None;
-                    partial.restore_context = None;
-                    partial.include_active_tasks = None;
-                    partial.work_targets = None;
-                    match recall_scoped(
-                        ctx,
-                        exact,
-                        &partial,
-                        None,
-                        budget,
-                        &prepared[..prepared.len().min(1)],
-                        Some(result.clone()),
-                        completeness_diagnostics,
-                    ) {
-                        Ok(value) => return Ok(value),
-                        Err(error) if error.code == "cancelled" => return Err(error),
-                        Err(error) => result["partial_recall_error"] = to_value(error)?,
-                    }
-                }
-                return Ok(result);
-            }
-            Err(error) => return Err(error),
-        }
+) -> Result<RecallScope> {
+    let machine = request
+        .machine_id
+        .as_ref()
+        .unwrap_or(&ctx.identity.machine_id);
+    validate_id(machine)?;
+    let mut context = RequestContext {
+        store_binding_id: ctx.identity.binding_id.clone(),
+        user_id: ctx.identity.user_id.clone(),
+        machine_id: machine.clone(),
+        project_id: fixed_project.map(str::to_owned),
+        connection_version: String::new(),
     };
+    if let Some(id) = fixed_project {
+        validate_id(id)?;
+    } else if let Some(path) = &request.project_path {
+        absolute_project_path(path)?;
+        if let Some(association) = ctx
+            .control
+            .exact_association(&ctx.identity.binding_id, path)?
+        {
+            context.project_id = Some(association.project_id);
+        } else {
+            let candidates = catalog_candidates(ctx, None)?;
+            let result = json!({"status":"needs_user_input", "code":"project_connection_required", "message":"Choose a project memory for this folder.", "project_path":path, "candidates":candidates, "turn_instruction":"Project rules, active Tasks and work targets have not been checked. Read partial_recall or its error; select or create a project explicitly, then repeat the original request."});
+            return Ok(RecallScope::Unbound(context, result));
+        }
+    }
     if let Some(hint) = request
         .project_hint
         .as_ref()
@@ -773,18 +745,117 @@ fn recall_scoped(
         } else if options.len() == 1 {
             context.project_id = Some(options[0].project_id.clone());
         } else {
-            return Ok(
+            return Ok(RecallScope::Selection(
                 json!({"code":"project_selection_required","project_candidates":options,"turn_instruction":"Repeat with the same project hint and selected project ID."}),
-            );
+            ));
         }
     }
+    Ok(RecallScope::Ready(context))
+}
+
+fn execute_recall<S: std::borrow::BorrowMut<ExactSnapshot>>(
+    ctx: &ReadCtx<'_>,
+    request: &RecallRequest,
+    fixed_project: Option<&str>,
+    budget: DeltaBudget,
+    prepared: Option<&PreparedRecall>,
+    acquire: impl FnOnce() -> Result<S>,
+    observe_failure: impl FnOnce(&DomainError),
+) -> Result<(Value, Vec<DomainError>)> {
+    ctx.request.check()?;
+    let (context, outer) = match resolve_recall_scope(ctx, request, fixed_project)? {
+        RecallScope::Ready(context) => (context, None),
+        RecallScope::Unbound(context, value) => {
+            if request.recall_for.is_none() {
+                return Ok((value, vec![]));
+            }
+            (context, Some(value))
+        }
+        RecallScope::Selection(value) => return Ok((value, vec![])),
+    };
+    let partial;
+    let request = if outer.is_some() {
+        partial = RecallRequest {
+            project_path: None,
+            project_hint: None,
+            selected_project_id: None,
+            memory_ids: None,
+            procedure_ids: None,
+            restore_context: None,
+            include_active_tasks: None,
+            work_targets: None,
+            ..request.clone()
+        };
+        &partial
+    } else {
+        request
+    };
+    let mut diagnostics = Vec::new();
+    let result = (|| -> RecallResult<Value> {
+        let owned;
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                owned = prepare_queries(ctx, request)?;
+                &owned
+            }
+        };
+        let queries = if outer.is_some() {
+            &prepared.queries[..prepared.queries.len().min(1)]
+        } else {
+            &prepared.queries
+        };
+        check_recall(ctx.request)?;
+        let exact = acquire();
+        check_recall(ctx.request)?;
+        recall_scoped(
+            ctx,
+            exact?.borrow_mut(),
+            request,
+            context,
+            fixed_project,
+            budget,
+            queries,
+            outer.as_ref(),
+            &mut diagnostics,
+        )
+    })();
+    match result {
+        Ok(value) => Ok((value, diagnostics)),
+        Err(RecallFailure::Recoverable(error)) if outer.is_some() => {
+            observe_failure(&error);
+            let mut value = outer.unwrap();
+            value["partial_recall_error"] = to_value(error)?;
+            Ok((value, diagnostics))
+        }
+        Err(failure) => {
+            let error = failure.into();
+            observe_failure(&error);
+            Err(error)
+        }
+    }
+}
+
+fn recall_scoped(
+    ctx: &ReadCtx<'_>,
+    exact: &mut ExactSnapshot,
+    request: &RecallRequest,
+    context: RequestContext,
+    fixed_project: Option<&str>,
+    budget: DeltaBudget,
+    prepared: &[PreparedQuery],
+    outer: Option<&Value>,
+    completeness_diagnostics: &mut Vec<DomainError>,
+) -> RecallResult<Value> {
+    check_recall(ctx.request)?;
     if (request.include_active_tasks == Some(true) || request.work_targets.is_some())
         && context.project_id.is_none()
     {
         return Err(DomainError::new(
             "project_connection_required",
             "Task and work-target lookup require a resolved project.",
-        ));
+        )
+        .into());
     }
 
     let scopes = crate::exact::allowed_scopes(&context);
@@ -793,8 +864,17 @@ fn recall_scoped(
         .iter()
         .map(|s| format!("procedure:{s}"))
         .collect();
-    let (mut snapshot, findings, procedures, proc_search) = loop {
-        ctx.request.check()?;
+    let (
+        mut snapshot,
+        findings,
+        procedures,
+        proc_search,
+        active_tasks,
+        rules,
+        mut full_ids,
+        handoff,
+    ) = loop {
+        check_recall(ctx.request)?;
         let position = exact.position().clone();
         let mut findings = BTreeMap::new();
         let mut procedure_findings = BTreeMap::new();
@@ -804,22 +884,27 @@ fn recall_scoped(
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let active_tasks = if request.include_active_tasks == Some(true) {
+            exact.ids_matching(&context, false, true)?
+        } else {
+            Vec::new()
+        };
         let mut previews = BTreeSet::new();
         for query in prepared {
             let found = search_one(ctx, exact, query, &scope_list)?;
-            if let Some(id) = uncontested(&found.lexical, &found.vector) {
-                selected.insert(id);
-            }
+            let winner = uncontested(&found.lexical, &found.vector)
+                .filter(|id| !matches!(active_tasks.as_slice(), [task] if task == id));
             previews.extend(found.hits.iter().map(|h| h.memory_id.clone()));
-            findings.insert(query.text.clone(), found);
+            findings.insert(query.text.clone(), (found, winner));
             let found = search_one(ctx, exact, query, &procedure_scopes)?;
             procedure_findings.insert(query.text.clone(), found);
         }
+        let rules = if request.recall_for.is_some() {
+            exact.ids_matching(&context, true, false)?
+        } else {
+            Vec::new()
+        };
         if request.recall_for.is_some() {
-            selected.extend(exact.ids_matching(&context, true, false)?);
-            if request.include_active_tasks == Some(true) {
-                selected.extend(exact.ids_matching(&context, false, true)?);
-            }
             if let Some(targets) = &request.work_targets {
                 for (id, reading) in
                     exact.work_targets(context.project_id.as_deref().unwrap(), targets)?
@@ -834,6 +919,13 @@ fn recall_scoped(
                     }
                 }
             }
+        }
+        let full_ids = selected.clone();
+        selected.extend(findings.values().filter_map(|(_, winner)| winner.clone()));
+        selected.extend(rules.iter().cloned());
+        // Compact Task choices still need their original handoff sections.
+        if active_tasks.len() > 1 {
+            selected.extend(active_tasks.iter().cloned());
         }
         previews.extend(
             exact
@@ -866,7 +958,10 @@ fn recall_scoped(
         procedure_ids.extend(automatic.iter().cloned());
         let mut all_procedures = procedure_ids.clone();
         all_procedures.extend(procedure_order.iter().cloned());
-        let guard = source(ctx.source.read_snapshot())?;
+        let guard = ctx
+            .source
+            .read_snapshot_for_recall()
+            .map_err(recall_source_error)?;
         if let Some(project_id) = fixed_project {
             match guard.read_catalog(project_id) {
                 Ok(_) => {}
@@ -876,15 +971,17 @@ fn recall_scoped(
                     return Err(DomainError::new(
                         "project_not_found",
                         "The fixed project no longer exists in the catalog.",
-                    ));
+                    )
+                    .into());
                 }
                 Err(agentlaw_storage::Error::NotFound(_)) => {
                     return Err(DomainError::new(
                         "project_not_found",
                         "The fixed project no longer exists in the catalog.",
-                    ))
+                    )
+                    .into())
                 }
-                Err(error) => return source(Err(error)),
+                Err(error) => return Err(recall_source_error(error).into()),
             }
         }
         exact.advance(&guard, budget)?;
@@ -896,10 +993,24 @@ fn recall_scoped(
         let (resolved, missing) = match guard.read_closure(&selected_ids) {
             Ok((_, units, missing)) => (AcquiredClosure::Owned(units), missing),
             Err(agentlaw_storage::Error::Capacity) => {
-                let (_, units, missing) = source(guard.acquire_closure(&selected_ids))?;
+                let (_, units, missing) = guard
+                    .acquire_closure(&selected_ids)
+                    .map_err(recall_source_error)?;
                 (AcquiredClosure::Spooled(units), missing)
             }
-            Err(error) => return source(Err(error)),
+            Err(error) => return Err(recall_source_error(error).into()),
+        };
+        // A sole Task outside the required closure is acquired at the same
+        // source position without acquiring its required references.
+        let handoff = match active_tasks.as_slice() {
+            [id] if !resolved.contains(id) && !selected.contains(id) && !missing.contains(id) => {
+                match guard.acquire_current(id) {
+                    Ok(current) => Some(current),
+                    Err(agentlaw_storage::Error::NotFound(_)) => None,
+                    Err(error) => return Err(recall_source_error(error).into()),
+                }
+            }
+            _ => None,
         };
         let mut redirect_probe: BTreeSet<String> = selected_ids.iter().cloned().collect();
         match &resolved {
@@ -937,7 +1048,7 @@ fn recall_scoped(
         }
         let mut redirects = Vec::new();
         while let Some(id) = redirect_probe.pop_first() {
-            ctx.request.check()?;
+            check_recall(ctx.request)?;
             match guard.read_current_compact(&id, false, 0) {
                 Ok(unit) => {
                     if let UnitState::Redirect { redirect_to, .. } = &unit.state {
@@ -951,21 +1062,20 @@ fn recall_scoped(
                     }
                 }
                 Err(agentlaw_storage::Error::Capacity | agentlaw_storage::Error::NotFound(_)) => {}
-                Err(error) => return source(Err(error)),
+                Err(error) => return Err(recall_source_error(error).into()),
             }
         }
         let mut procedure_units = Vec::new();
         let mut procedure_spools = Vec::new();
         for id in &procedure_ids {
-            ctx.request.check()?;
-            validate_id(id)?;
+            check_recall(ctx.request)?;
             match guard.read_procedure(id) {
                 Ok(unit) => procedure_units.push(unit),
                 Err(agentlaw_storage::Error::NotFound(_)) => {}
                 Err(agentlaw_storage::Error::Capacity) => {
-                    procedure_spools.push(source(guard.acquire_procedure(id))?)
+                    procedure_spools.push(guard.acquire_procedure(id).map_err(recall_source_error)?)
                 }
-                Err(error) => return source(Err(error)),
+                Err(error) => return Err(recall_source_error(error).into()),
             }
         }
         drop(guard);
@@ -976,7 +1086,7 @@ fn recall_scoped(
         match resolved {
             AcquiredClosure::Owned(resolved) => {
                 for value in resolved {
-                    ctx.request.check()?;
+                    check_recall(ctx.request)?;
                     let unit = value.current;
                     let memories = unit
                         .heads()
@@ -1004,7 +1114,7 @@ fn recall_scoped(
             }
             AcquiredClosure::Spooled(resolved) => {
                 for value in resolved {
-                    ctx.request.check()?;
+                    check_recall(ctx.request)?;
                     let current = value.current;
                     let id = current.state["memory_id"]
                         .as_str()
@@ -1070,7 +1180,7 @@ fn recall_scoped(
             units.insert(format!("procedure/{}", unit.entity_id), unit);
         }
         for current in procedure_spools {
-            ctx.request.check()?;
+            check_recall(ctx.request)?;
             let id = current.state["procedure_id"]
                 .as_str()
                 .ok_or_else(|| {
@@ -1102,7 +1212,7 @@ fn recall_scoped(
             };
             for (head, reference) in unit.heads().iter().zip(&current.references) {
                 streaming.register_version(
-                    source(agentlaw_storage::version(&unit, head))?,
+                    agentlaw_storage::version(&unit, head).map_err(recall_source_error)?,
                     reference.observed_version.clone(),
                 );
             }
@@ -1135,8 +1245,8 @@ fn recall_scoped(
                 .push(head);
         }
         for (id, heads) in projected {
-            ctx.request.check()?;
-            if states.contains_key(&id) {
+            check_recall(ctx.request)?;
+            if states.contains_key(&id) || missing.contains(&id) {
                 continue;
             }
             let unit = CurrentUnit {
@@ -1190,38 +1300,44 @@ fn recall_scoped(
             findings,
             (procedure_ids, procedure_order, automatic),
             procedure_findings,
+            active_tasks,
+            rules,
+            full_ids,
+            handoff,
         );
     };
     let mut queries = BTreeMap::new();
     let mut weak = BTreeSet::new();
     let mut strong = BTreeSet::new();
-    let complete =
-        findings.values().all(|f| f.complete) && proc_search.values().all(|f| f.complete);
-    for (query, found) in &findings {
-        ctx.request.check()?;
+    let complete = findings.values().all(|(found, _)| found.complete)
+        && proc_search.values().all(|f| f.complete);
+    for (query, (found, winner)) in &findings {
+        check_recall(ctx.request)?;
         let mut candidates = Vec::new();
         for hit in &found.hits {
-            ctx.request.check()?;
+            check_recall(ctx.request)?;
             if let Some(state) = snapshot.current(&hit.memory_id)? {
                 for head in state
                     .heads
                     .iter()
                     .filter(|head| scope_matches(&head.applicability, &context))
                 {
-                    let excerpt = snapshot.streaming.excerpt(&head.what_to_remember, 400)?;
+                    let excerpt = snapshot
+                        .streaming
+                        .recall_excerpt(&head.what_to_remember, 400)?;
                     let mut paths = Vec::new();
                     if found.lexical_ids.contains(&hit.memory_id) {
                         paths.push(RetrievalPath {
                             via: vec!["lexical".into()],
                             clue: excerpt.chars().take(80).collect(),
-                            source_memory_id: None,
+                            source_memory_ids: None,
                         });
                     }
                     if found.vector.iter().any(|h| h.memory_id == hit.memory_id) {
                         paths.push(RetrievalPath {
                             via: vec!["vector".into()],
                             clue: excerpt.chars().take(80).collect(),
-                            source_memory_id: None,
+                            source_memory_ids: None,
                         });
                     }
                     if !paths.is_empty() {
@@ -1270,9 +1386,7 @@ fn recall_scoped(
             query.clone(),
             Discovery {
                 candidates,
-                full_ids: uncontested(&found.lexical, &found.vector)
-                    .into_iter()
-                    .collect(),
+                full_ids: winner.iter().cloned().collect(),
                 diagnostics,
             },
         );
@@ -1285,14 +1399,50 @@ fn recall_scoped(
     memory_request.project_hint = None;
     memory_request.selected_project_id = None;
     memory_request.procedure_ids = None;
-    let mut assembled = crate::recall::recall_with_control(
+    let assembled = crate::recall::recall_with_control(
         &snapshot,
         &search,
         &context,
         &memory_request,
         now,
         Some(ctx.request),
-    )?;
+        Some(&active_tasks),
+    );
+    check_recall(ctx.request)?;
+    let (mut assembled, handoff_id) = assembled?;
+    if let Some(id) = handoff_id {
+        let sections = match handoff {
+            Some(current) => {
+                match acquired_task_sections(&mut snapshot.streaming, current, ctx.request)? {
+                    TaskSectionParse::Complete(sections) => Ok(sections),
+                    TaskSectionParse::InvalidHeadings => {
+                        Err(streaming::invalid_spooled_task_headings())
+                    }
+                }
+            }
+            None => Err(crate::recall::task_source_unavailable()),
+        };
+        crate::recall::deliver_task_handoff(&mut assembled, id, sections);
+    }
+    let explicit = request.memory_ids.as_deref().unwrap_or(&[]);
+    for id in &snapshot.publication_basis.absent {
+        if explicit.contains(id)
+            || assembled
+                .undelivered_required
+                .iter()
+                .any(|item| &item.memory_id == id)
+        {
+            continue;
+        }
+        // An unavailable exact rule or Task may never have reached inventory.
+        if !full_ids.contains(id) && !rules.contains(id) {
+            continue;
+        }
+        assembled.undelivered_required.push(UndeliveredRequired {
+            memory_id: id.clone(),
+            reason: "An exact selection could not be confirmed in the current source.".into(),
+        });
+    }
     assembled
         .diagnostics
         .retain(|d| !d.message.starts_with("Learned procedure discovery"));
@@ -1310,65 +1460,54 @@ fn recall_scoped(
             .filter(|d| d.code.starts_with("semantic_channel_"))
             .cloned(),
     );
+    for memory in &assembled.memories {
+        for head in &memory.current_heads {
+            full_ids.extend(head.required_memory_ids.iter().cloned());
+        }
+    }
+    if let [id] = active_tasks.as_slice() {
+        if rules.contains(id) {
+            full_ids.insert(id.clone());
+        }
+    }
     let mut protected = BTreeSet::new();
-    for id in request.memory_ids.as_deref().unwrap_or(&[]) {
-        if let Some(state) = snapshot.current(id)? {
+    for id in full_ids {
+        if let Some(state) = snapshot.current(&id)? {
             protected.insert(state.resolved_id);
         }
     }
-    for memory in &assembled.memories {
-        for head in &memory.current_heads {
-            for id in &head.required_memory_ids {
-                if let Some(state) = snapshot.current(id)? {
-                    protected.insert(state.resolved_id);
-                }
-            }
-        }
-    }
-    if let (Some(project), Some(targets)) =
-        (context.project_id.as_deref(), request.work_targets.as_ref())
-    {
-        for (id, reading) in exact.work_targets(project, targets)? {
-            if reading == Reading::Required {
-                if let Some(state) = snapshot.current(&id)? {
-                    protected.insert(state.resolved_id);
-                }
-            }
-        }
-    }
-    let mut result = to_value(assembled)?;
+    let mut rules: Vec<(Applicability, Vec<Value>)> = Vec::new();
     if request.recall_for.is_some() {
-        if let Some(memories) = result["memories"].as_array_mut() {
-            for memory in memories {
-                let Some(id) = memory["memory_id"].as_str() else {
-                    continue;
-                };
-                if protected.contains(id) {
-                    continue;
-                }
-                let Some(heads) = memory["current_heads"].as_array_mut() else {
-                    continue;
-                };
-                if heads.len() != 1 || heads[0]["is_rule"] != true {
-                    continue;
-                }
-                let applicability: Applicability =
-                    serde_json::from_value(heads[0]["applicability"].clone()).map_err(|_| {
-                        DomainError::new("source_corrupt", "Rule applicability is invalid.")
-                    })?;
-                if !scope_matches(&applicability, &context) {
-                    continue;
-                }
-                if let Some(head) = heads[0].as_object_mut() {
-                    head.retain(|key, _| {
-                        matches!(
-                            key.as_str(),
-                            "what_to_remember" | "applicability" | "is_rule"
-                        )
-                    });
-                }
+        assembled.memories.retain(|memory| {
+            let [head] = memory.current_heads.as_slice() else {
+                return true;
+            };
+            if protected.contains(&memory.memory_id)
+                || head.is_rule != Some(true)
+                || !scope_matches(&head.applicability, &context)
+            {
+                return true;
             }
-        }
+            let item =
+                json!({"memory_id":memory.memory_id,"what_to_remember":head.what_to_remember});
+            if let Some((_, items)) = rules
+                .iter_mut()
+                .find(|(scope, _)| scope == &head.applicability)
+            {
+                items.push(item);
+            } else {
+                rules.push((head.applicability.clone(), vec![item]));
+            }
+            false
+        });
+    }
+    crate::recall::finalize_recall_guidance(&mut assembled);
+    let mut result = to_value(assembled)?;
+    if !rules.is_empty() {
+        result["rules"] = json!(rules
+            .into_iter()
+            .map(|(applicability, items)| { json!({"applicability":applicability,"items":items}) })
+            .collect::<Vec<_>>());
     }
     if request.recall_for.is_some() && !complete {
         result["semantic_complete"] = json!(false);
@@ -1377,7 +1516,7 @@ fn recall_scoped(
         let mut active = Vec::new();
         let mut ordinary = Vec::new();
         for candidate in result["candidates"].as_array().cloned().unwrap_or_default() {
-            ctx.request.check()?;
+            check_recall(ctx.request)?;
             let id = candidate["memory_id"].as_str().unwrap_or("");
             let mut task = false;
             if let Some(state) = snapshot.states.get(id) {
@@ -1406,7 +1545,6 @@ fn recall_scoped(
     let mut output = Vec::new();
     let mut missing = Vec::new();
     for id in &exact_ids {
-        validate_id(id)?;
         if let Some(unit) = snapshot
             .units
             .iter()
@@ -1538,7 +1676,7 @@ fn recall_scoped(
         result["pending_batches"] = json!(notices);
         result["pending_work_instruction"] = json!("Retained proposals need attention. Inspect the listed pending batch before revising or continuing it.");
     }
-    ctx.request.check()?;
+    check_recall(ctx.request)?;
     fit_response(
         ctx,
         &snapshot.streaming,
@@ -1546,6 +1684,35 @@ fn recall_scoped(
         required_procedure_count,
         outer,
     )
+}
+
+fn acquired_task_sections(
+    streaming: &mut streaming::StreamedSelection,
+    current: agentlaw_storage::acquire::AcquiredCurrent,
+    request: &RequestControl,
+) -> RecallResult<TaskSectionParse<Vec<[String; 3]>>> {
+    let heads = current.state["current_heads"]
+        .as_array()
+        .ok_or_else(crate::recall::task_source_unavailable)?;
+    let mut sections = Vec::with_capacity(heads.len());
+    let mut invalid_headings = false;
+    for head in heads {
+        check_recall(request)?;
+        let body = head["change_id"]
+            .as_str()
+            .and_then(|id| current.bodies.get(id))
+            .ok_or_else(crate::recall::task_source_unavailable)?;
+        // Continue after a heading mismatch so a later unreadable head still fails the recall.
+        match streaming.parse_spooled_task_sections(body, Some(request))? {
+            TaskSectionParse::Complete(parts) => sections.push(parts),
+            TaskSectionParse::InvalidHeadings => invalid_headings = true,
+        }
+    }
+    if invalid_headings {
+        Ok(TaskSectionParse::InvalidHeadings)
+    } else {
+        Ok(TaskSectionParse::Complete(sections))
+    }
 }
 
 fn update_candidate_diagnostics(value: &mut Value, original: &Value, required: usize) {
@@ -1600,16 +1767,52 @@ fn update_candidate_diagnostics(value: &mut Value, original: &Value, required: u
         }
     }
 }
+
+fn recall_file_error(error: DomainError, recall: &Value) -> DomainError {
+    let full_tasks = recall["memories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|memory| {
+            memory["current_heads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|head| head["in_working_set"].is_boolean())
+        });
+    let task_candidates = recall["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.get("objective").is_some());
+    let ids: BTreeSet<_> = full_tasks
+        .chain(task_candidates)
+        .filter_map(|task| task["memory_id"].as_str())
+        .chain(recall["active_task_handoff"]["memory_id"].as_str())
+        .collect();
+    if ids.is_empty() {
+        return error;
+    }
+    let details: Vec<_> = ids.into_iter().map(|id| {
+        json!({
+            "memory_id": id,
+            "reason": error.message,
+            "next_action": "Check that the response-artifact directory exists or can be created, is writable, and has available space. Then repeat the original recall."
+        })
+    }).collect();
+    error.with_details(json!(details))
+}
+
 fn fit_response(
     ctx: &ReadCtx<'_>,
     streaming: &streaming::StreamedSelection,
     value: Value,
     required_procedure_count: usize,
-    outer: Option<Value>,
-) -> Result<Value> {
+    outer: Option<&Value>,
+) -> RecallResult<Value> {
     let limit = ctx.identity.response_limit.min(256 * 1024 * 1024);
     let wrap = |partial: &Value| {
-        if let Some(mut result) = outer.clone() {
+        if let Some(mut result) = outer.cloned() {
             result["partial_recall"] = partial.clone();
             result
         } else {
@@ -1627,13 +1830,18 @@ fn fit_response(
         .unwrap_or_else(|| {
             json!("Use agentlaw config path to obtain the installation configuration file.")
         });
-    let notice = json!({"applied_bytes": limit, "config_key":"response_limit_bytes", "config_file":config_file, "user_notice":"The result exceeds the configured response size."});
     let candidates = value["candidates"].as_array().cloned().unwrap_or_default();
     let procedures = value["learned_procedures"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     let required = required_procedure_count.min(procedures.len());
+    let user_notice = if !candidates.is_empty() || procedures.len() > required {
+        "The result exceeds the configured response size. Refine the search or change the displayed candidate count with memory_candidate_limit or procedure_candidate_limit."
+    } else {
+        "The result exceeds the configured response size."
+    };
+    let notice = json!({"applied_bytes":limit,"config_key":"response_limit_bytes","config_file":config_file,"user_notice":user_notice});
     let mut base = value.clone();
     base["response_limit"] = notice.clone();
     base["candidates"] = json!([]);
@@ -1642,16 +1850,19 @@ fn fit_response(
         base["candidate_counts"]["memories"]["shown"] = json!(0);
         base["candidate_counts"]["learned_procedures"]["shown"] = json!(0);
     }
-    if let Some(object) = base.as_object_mut() {
-        object.remove("task_instruction");
-    }
     update_candidate_diagnostics(&mut base, &value, required);
     if streaming.serialized_size(&wrap(&base), ctx.request)? > limit {
         let mut complete = wrap(&value);
         complete["response_limit"] = notice;
-        return streaming.finish_read(&complete, &ctx.identity.local, ctx.request);
+        return streaming
+            .finish_recall(&complete, &ctx.identity.local, ctx.request)
+            .map_err(|failure| match failure {
+                RecallFailure::DeliveryFailed(error) => {
+                    RecallFailure::DeliveryFailed(recall_file_error(error, &value))
+                }
+                other => other,
+            });
     }
-    let task_instruction = value.get("task_instruction").cloned();
     let mut memory_groups: Vec<Vec<Value>> = Vec::new();
     for candidate in candidates {
         if memory_groups
@@ -1666,18 +1877,10 @@ fn fit_response(
     }
     let mut shown_memories = 0;
     for group in memory_groups {
-        ctx.request.check()?;
+        check_recall(ctx.request)?;
         let mut trial = base.clone();
-        let is_task = group
-            .iter()
-            .any(|candidate| candidate.get("objective").is_some());
         trial["candidates"].as_array_mut().unwrap().extend(group);
         trial["candidate_counts"]["memories"]["shown"] = json!(shown_memories + 1);
-        if is_task {
-            if let Some(instruction) = &task_instruction {
-                trial["task_instruction"] = instruction.clone();
-            }
-        }
         update_candidate_diagnostics(&mut trial, &value, required);
         if streaming.serialized_size(&wrap(&trial), ctx.request)? <= limit {
             base = trial;
@@ -1698,7 +1901,7 @@ fn fit_response(
     }
     let mut shown_procedures = 0;
     for group in groups {
-        ctx.request.check()?;
+        check_recall(ctx.request)?;
         let mut trial = base.clone();
         trial["learned_procedures"]
             .as_array_mut()

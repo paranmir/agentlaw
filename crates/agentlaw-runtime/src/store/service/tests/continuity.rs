@@ -492,11 +492,11 @@ fn first_recall_discovers_without_binding_even_one_candidate() {
 }
 
 #[test]
-fn ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_does_not() {
+fn fr_06_5_ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    call(
+    let connected = call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/rules","project_name":"Rules"}),
     );
@@ -524,41 +524,93 @@ fn ordinary_contextual_recall_delivers_rules_outside_search_rank_and_id_only_doe
         &mut runtime,
         json!({"action":"recall","project_path":"C:/work/rules","recall_for":"completely unrelated subject","memory_candidate_limit":1}),
     );
-    for id in &ids {
-        assert!(
-            result["memories"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["memory_id"] == *id),
-            "missing rule {id}: {result}"
-        );
-    }
-    assert_eq!(result["memories"].as_array().unwrap().len(), 3);
+    let machine_scope = json!({"scope":["machine"],"machine_id":machine_id});
+    let project_scope =
+        json!({"scope":["project"],"project_id":connected["project_connection"]["project_id"]});
+    assert_eq!(result["rules"].as_array().unwrap().len(), 3);
+    assert_rule_group(
+        &result,
+        json!({"scope":["user"]}),
+        &ids[0],
+        "Always inspect durable constraints.",
+    );
+    assert_rule_group(
+        &result,
+        machine_scope.clone(),
+        &ids[1],
+        "Use local paths carefully.",
+    );
+    assert_rule_group(
+        &result,
+        project_scope.clone(),
+        &ids[2],
+        "Keep the project contract aligned.",
+    );
     let id_only = call(
         &mut runtime,
         json!({"action":"recall","memory_ids":[ids[0].clone()]}),
     );
     assert_eq!(id_only["memories"].as_array().unwrap().len(), 1);
     assert_eq!(id_only["memories"][0]["memory_id"], ids[0]);
+    assert!(id_only.get("rules").is_none());
     let mixed = call(
         &mut runtime,
         json!({"action":"recall","recall_for":"unrelated","memory_ids":[ids[0].clone()],"machine_id":machine_id,"project_path":"C:/work/rules"}),
     );
-    for id in &ids {
-        assert!(mixed["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["memory_id"] == *id));
-    }
+    assert_eq!(mixed["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(mixed["memories"][0]["memory_id"], ids[0]);
+    assert_eq!(mixed["rules"].as_array().unwrap().len(), 2);
+    assert_rule_group(
+        &mixed,
+        machine_scope.clone(),
+        &ids[1],
+        "Use local paths carefully.",
+    );
+    assert_rule_group(
+        &mixed,
+        project_scope.clone(),
+        &ids[2],
+        "Keep the project contract aligned.",
+    );
+    let revised = call(
+        &mut runtime,
+        json!({"action":"remember_this","memories":[{"operation":"evolve","parent_refs":[user["results"][0]["memory_ref"]],"what_to_remember":"Inspect durable constraints before changing state.","evidence":"Updated standing instruction"}]}),
+    );
+    assert_eq!(revised["status"], "remembered");
+    let restored = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/rules","recall_for":"Resume after compaction","restore_context":true}),
+    );
+    assert_rule_group(
+        &restored,
+        json!({"scope":["user"]}),
+        &ids[0],
+        "Inspect durable constraints before changing state.",
+    );
+    assert_rule_group(
+        &restored,
+        machine_scope,
+        &ids[1],
+        "Use local paths carefully.",
+    );
+    assert_rule_group(
+        &restored,
+        project_scope,
+        &ids[2],
+        "Keep the project contract aligned.",
+    );
 }
 
 #[test]
-fn unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
+fn fr_06_5_unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
+    let connected = call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/bound","project_name":"Existing project"}),
+    );
+    assert!(connected["project_connection"]["project_id"].is_string());
     let user = call(
         &mut runtime,
         json!({"action":"remember_this","memories":[{"operation":"create","what_to_remember":"User-wide prerequisite.","evidence":"Test rule","applies_to":["user"],"is_rule":true}]}),
@@ -572,39 +624,270 @@ fn unbound_project_path_delivers_user_and_machine_rules_as_partial_recall() {
         json!({"action":"recall","recall_for":"unrelated request"}),
     );
     assert!(no_project.get("status").is_none(), "{no_project}");
-    assert_eq!(no_project["memories"].as_array().unwrap().len(), 2);
-    let result = call(
-        &mut runtime,
-        json!({"action":"recall","project_path":"C:/work/unbound","recall_for":"unrelated request","include_active_tasks":true,"memory_candidate_limit":1}),
-    );
+    assert_eq!(no_project["rules"].as_array().unwrap().len(), 2);
+    let unbound = json!({"action":"recall","project_path":"C:/work/unbound","recall_for":"unrelated request","include_active_tasks":true,"memory_candidate_limit":1});
+    let result = call(&mut runtime, unbound.clone());
     assert_eq!(result["status"], "needs_user_input", "{result}");
     assert_eq!(result["code"], "project_connection_required");
     let partial = &result["partial_recall"];
     assert!(partial.is_object(), "{result}");
     assert!(partial.get("active_task_count").is_none());
-    for written in [&user, &machine] {
-        let id = &written["results"][0]["memory_ref"]["memory_id"];
-        assert!(
-            partial["memories"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["memory_id"] == *id),
-            "missing partial rule {id}: {result}"
+    let machine_scope = json!({"scope":["machine"],"machine_id":runtime.machine_id()});
+    assert_eq!(partial["rules"].as_array().unwrap().len(), 2);
+    for recall in [&no_project, partial] {
+        assert_rule_group(
+            recall,
+            json!({"scope":["user"]}),
+            &user["results"][0]["memory_ref"]["memory_id"],
+            "User-wide prerequisite.",
+        );
+        assert_rule_group(
+            recall,
+            machine_scope.clone(),
+            &machine["results"][0]["memory_ref"]["memory_id"],
+            "Machine prerequisite.",
         );
     }
     assert!(result["turn_instruction"]
         .as_str()
         .unwrap()
         .contains("Project rules, active Tasks and work targets have not been checked"));
+    assert!(!result["candidates"].as_array().unwrap().is_empty());
+    let check_error = |response: &Value, code: &str, retryable: bool, guidance: &str| {
+        for field in [
+            "status",
+            "code",
+            "project_path",
+            "candidates",
+            "turn_instruction",
+        ] {
+            assert_eq!(response[field], result[field], "FR-06.4: {field}");
+        }
+        for absent in ["partial_recall", "active_task_count", "artifact"] {
+            assert!(response.get(absent).is_none(), "{response}");
+        }
+        let error = &response["partial_recall_error"];
+        assert_eq!(error["code"], code, "FR-06.4: {response}");
+        assert_eq!(error["retryable"], retryable);
+        assert_eq!(error.as_object().unwrap().len(), 4);
+        assert!(!error["message"].as_str().unwrap().is_empty());
+        let action = error["next_action"].as_str().unwrap().to_lowercase();
+        assert!(action.contains(guidance), "{response}");
+    };
+    let id = user["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap();
+    let path = dir
+        .path()
+        .join("source/current/memory")
+        .join(&id[..2])
+        .join(format!("{id}.md"));
+    let original = std::fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    let marker = b"User-wide prerequisite.";
+    let offset = corrupt
+        .windows(marker.len())
+        .position(|part| part == marker)
+        .unwrap();
+    corrupt[offset] = b'X';
+    std::fs::write(&path, corrupt).unwrap();
+    let failed = runtime.call(parse_request(&unbound.to_string()).unwrap());
+    std::fs::write(&path, &original).unwrap();
+    check_error(&failed.unwrap(), "source_corrupt", false, "doctor --audit");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(std::fs::File::open(&path).is_err());
+        let denied = runtime.call(parse_request(&unbound.to_string()).unwrap());
+        drop(exclusive);
+        check_error(
+            &denied.unwrap(),
+            "source_operation_failed",
+            false,
+            "permission",
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        let denied_locally = std::fs::File::open(&path);
+        let denied = runtime.call(parse_request(&unbound.to_string()).unwrap());
+        std::fs::set_permissions(&path, mode).unwrap();
+        assert_eq!(
+            denied_locally.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        check_error(
+            &denied.unwrap(),
+            "source_operation_failed",
+            false,
+            "permission",
+        );
+    }
+
+    use agentlaw_flows::exact::{
+        DeltaBudget, ExactIndexWriter, ExactSnapshot, ProjectionGenerations,
+    };
+    let owner = runtime.0.clone();
+    let service = &owner.service;
+    let source = &service.source;
+    let epoch = source.read_snapshot().unwrap().position().epoch.clone();
+    let projection = dir.path().join("partial-recall-projection");
+    let control = RequestControl::default();
+    let shadow = ExactIndexWriter::rebuild_shadow_in(&projection, source, &control).unwrap();
+    let registry = ProjectionGenerations::open_for_recovery(
+        "bootstrap",
+        &epoch,
+        projection.join("exact-bootstrap.sqlite"),
+        projection.join("lexical-bootstrap.sqlite"),
+    )
+    .unwrap();
+    registry.commit(registry.stage(shadow).unwrap()).unwrap();
+    let guard = source.read_snapshot().unwrap();
+    let budget = DeltaBudget {
+        max_identities: 0,
+        max_resident_bytes: 0,
+    };
+    let mut exact =
+        ExactSnapshot::build_for_recall(registry.pin().unwrap(), &guard, budget).unwrap();
+    drop(guard);
+    let publication = call(
+        &mut runtime,
+        create("A new unindexed change for partial recall"),
+    );
+    assert_eq!(publication["status"], "remembered", "{publication}");
+    let reader = ControlReader::open(&service.identity.local).unwrap();
+    let cache = agentlaw_flows::history_cache::HistoryCacheGuards::new();
+    let ctx = agentlaw_flows::store::ReadCtx {
+        identity: &service.identity,
+        source,
+        control: &reader,
+        semantic: service.semantic.as_ref(),
+        history_semantic: service.semantic.as_ref(),
+        history_cache: &cache,
+        request: &control,
+    };
+    let Request::Recall(request) = parse_request(&unbound.to_string()).unwrap() else {
+        panic!("Expected recall request");
+    };
+    let prepared = agentlaw_flows::read::prepare_recall(&ctx, &request).unwrap();
+    let capacity =
+        agentlaw_flows::read::recall_prepared(&ctx, &mut exact, &request, None, budget, &prepared)
+            .unwrap();
+    check_error(&capacity, "capacity", true, "index");
+
+    use agentlaw_flows::semantic::{
+        PiecePlan, PieceVectorReuse, PrefixEmbedding, QueryVector, SemanticCandidates,
+        SemanticError, SemanticPort, SemanticQuery,
+    };
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+
+    struct PartialRecallEmbedding {
+        entered: SyncSender<()>,
+        resume: Mutex<Receiver<()>>,
+    }
+
+    impl SemanticPort for PartialRecallEmbedding {
+        fn embed_prefix(
+            &self,
+            text: &str,
+            control: &RequestControl,
+        ) -> std::result::Result<PrefixEmbedding, SemanticError> {
+            assert_eq!(text, "unrelated request");
+            control
+                .check()
+                .expect("Cancel only after partial recall enters embedding");
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(control.check().unwrap_err().code, "cancelled");
+            Err(SemanticError::Cancelled)
+        }
+
+        fn plan_pieces(
+            &self,
+            _: &[&str],
+            _: &RequestControl,
+        ) -> std::result::Result<PiecePlan, SemanticError> {
+            unreachable!("Partial recall embeds the query prefix")
+        }
+
+        fn embed_planned(
+            &self,
+            _: &PiecePlan,
+            _: usize,
+            _: &PieceVectorReuse,
+            _: &RequestControl,
+        ) -> std::result::Result<Vec<QueryVector>, SemanticError> {
+            unreachable!("Partial recall embeds the query prefix")
+        }
+
+        fn search_available(
+            &self,
+            _: SemanticQuery<'_>,
+            _: &RequestControl,
+        ) -> std::result::Result<SemanticCandidates, SemanticError> {
+            unreachable!("Cancellation happened during embedding")
+        }
+    }
+
+    let (entered, embedding_started) = sync_channel(1);
+    let (resume, resume_embedding) = sync_channel(1);
+    let semantic = PartialRecallEmbedding {
+        entered,
+        resume: Mutex::new(resume_embedding),
+    };
+    let cancelled = RequestControl::default();
+    let cancellation_ctx = agentlaw_flows::store::ReadCtx {
+        semantic: &semantic,
+        request: &cancelled,
+        ..ctx
+    };
+    std::thread::scope(|scope| {
+        let cancellation_control = &cancelled;
+        scope.spawn(move || {
+            embedding_started
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            cancellation_control
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            resume.send(()).unwrap();
+        });
+        // This entry point resolves the unbound project and its candidates before embedding.
+        let error = agentlaw_flows::read::recall_with_snapshot(
+            &cancellation_ctx,
+            &request,
+            None,
+            DeltaBudget::default(),
+            || panic!("Cancellation in embedding must precede source acquisition"),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code, "cancelled",
+            "FR-06.4: cancellation must fail the entire recall"
+        );
+    });
 }
 
 #[test]
-fn joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
+fn fr_06_5_joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
-    call(
+    let project = call(
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/joint","project_name":"Joint"}),
     );
@@ -618,27 +901,37 @@ fn joint_project_machine_rule_requires_both_scopes_in_runtime_index() {
         &mut runtime,
         json!({"action":"recall","project_path":"C:/work/joint","recall_for":"unrelated"}),
     );
-    assert!(
-        same["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["memory_id"] == *id),
-        "{same}"
+    let joint = &same["rules"][0]["applicability"];
+    assert_eq!(same["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        joint["project_id"],
+        project["project_connection"]["project_id"]
+    );
+    assert_eq!(joint["machine_id"], runtime.machine_id());
+    let scope = joint["scope"].as_array().unwrap();
+    assert_eq!(scope.len(), 2);
+    assert!(scope.contains(&json!("project")) && scope.contains(&json!("machine")));
+    assert_rule_group(
+        &same,
+        joint.clone(),
+        id,
+        "Joint scope rule irrelevant to the query.",
     );
     let other_machine = uuid::Uuid::new_v4().to_string();
     let different = call(
         &mut runtime,
         json!({"action":"recall","project_path":"C:/work/joint","machine_id":other_machine,"recall_for":"unrelated"}),
     );
-    assert!(
-        !different["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["memory_id"] == *id),
-        "{different}"
+    assert!(different.get("rules").is_none(), "{different}");
+    call(
+        &mut runtime,
+        json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/other-joint","project_name":"Other joint"}),
     );
+    let other_project = call(
+        &mut runtime,
+        json!({"action":"recall","project_path":"C:/work/other-joint","recall_for":"unrelated"}),
+    );
+    assert!(other_project.get("rules").is_none(), "{other_project}");
 }
 #[test]
 fn procedure_authoring_publishes_and_exact_recall_returns_full_instructions() {
@@ -1064,7 +1357,7 @@ fn cross_project_lookup_does_not_rebind_current_folder() {
 }
 
 #[test]
-fn active_task_candidates_copy_only_complete_handoff_sections() {
+fn fr_10_4_active_task_candidates_copy_only_complete_handoff_sections() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
@@ -1072,21 +1365,32 @@ fn active_task_candidates_copy_only_complete_handoff_sections() {
         &mut runtime,
         json!({"action":"connect_project_memory","intent":"create","project_path":"C:/work/task","project_name":"Task"}),
     );
-    let body="# Objective\nComplete the migration.\n# Current position\nFixtures verified.\n# Resume point\nRun the final checks.\n# References\nPrivate full reference section.\n";
-    call(
+    let body = "# Objective\nComplete the migration.\n# Current position\nFixtures verified.\n# Resume point\nRun the final checks.\n# References\nPrivate full reference section.\n";
+    let task = call(
         &mut runtime,
         json!({"action":"remember_this","project_path":"C:/work/task","memories":[{"operation":"create","what_to_remember":body,"evidence":"Current work","applies_to":["project"],"in_working_set":true}]}),
     );
+    let other = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":"C:/work/task","memories":[{"operation":"create","what_to_remember":"# Objective\nAudit a separate module.\n# Current position\nWaiting for inputs.\n# Resume point\nCheck the module.\n# References\nAudit plan.","evidence":"Separate active work","applies_to":["project"],"in_working_set":true}]}),
+    );
+    assert_eq!(other["status"], "remembered");
     let result = call(
         &mut runtime,
         json!({"action":"recall","project_path":"C:/work/task","recall_for":"resume","include_active_tasks":true}),
     );
-    let c = &result["candidates"][0];
+    let id = &task["results"][0]["memory_ref"]["memory_id"];
+    let c = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["memory_id"] == *id)
+        .unwrap();
     assert_eq!(c["objective"], "Complete the migration.\n");
     assert_eq!(c["resume_point"], "Run the final checks.\n");
     assert!(c.get("excerpt").is_none());
     assert!(c.get("applicability").is_none());
-    assert_eq!(result["active_task_count"], 1);
+    assert_eq!(result["active_task_count"], 2);
     assert!(result.get("task_instruction").is_none());
     assert!(c["retrieval_paths"]
         .as_array()
@@ -1107,7 +1411,7 @@ fn active_task_candidates_copy_only_complete_handoff_sections() {
 }
 
 #[test]
-fn task_projection_retains_search_two_link_sources_and_target_paths() {
+fn fr_05_6_task_projection_retains_search_two_link_sources_and_target_paths() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime =
         Fixture::open(dir.path().join("source"), dir.path().join("local"), "user").unwrap();
@@ -1133,6 +1437,11 @@ fn task_projection_retains_search_two_link_sources_and_target_paths() {
         assert_eq!(saved["status"], "remembered", "{saved}");
         sources.push(saved["results"][0]["memory_ref"]["memory_id"].clone());
     }
+    let other = call(
+        &mut runtime,
+        json!({"action":"remember_this","project_path":folder,"memories":[{"operation":"create","what_to_remember":"# Objective\nAudit a separate module.\n# Current position\nWaiting for inputs.\n# Resume point\nCheck the module.\n# References\nAudit plan.","evidence":"Separate active work","applies_to":["project"],"in_working_set":true}]}),
+    );
+    assert_eq!(other["status"], "remembered");
     let result = call(
         &mut runtime,
         json!({"action":"recall","project_path":folder,"recall_for":"shared material","restore_context":true,"include_active_tasks":true,"work_targets":[{"path":"src/task.rs","kind":"file"}]}),
@@ -1150,16 +1459,14 @@ fn task_projection_retains_search_two_link_sources_and_target_paths() {
     assert!(paths
         .iter()
         .all(|p| p["via"].as_array().is_some_and(|v| !v.is_empty())));
-    for source in sources {
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|p| p["source_memory_id"] == source)
-                .count(),
-            1,
-            "{c}"
-        );
-    }
+    let linked: Vec<_> = paths
+        .iter()
+        .filter_map(|p| p.get("source_memory_ids"))
+        .collect();
+    assert_eq!(linked.len(), 1, "{c}");
+    let linked = linked[0].as_array().unwrap();
+    assert_eq!(linked.len(), 2);
+    assert!(sources.iter().all(|id| linked.contains(id)));
     assert!(paths
         .iter()
         .any(|p| p["via"].as_array().unwrap().contains(&json!("lexical"))));
@@ -1175,7 +1482,7 @@ fn task_projection_retains_search_two_link_sources_and_target_paths() {
         task_paths[0]["via"],
         json!(["active_task", "active_working_set"])
     );
-    assert_eq!(result["active_task_count"], 1);
+    assert_eq!(result["active_task_count"], 2);
 }
 
 fn selected_memory<'a>(result: &'a Value, memory_id: &Value) -> Option<&'a Value> {
@@ -1345,4 +1652,16 @@ fn id_only_and_mixed_recall_preserve_full_body_and_semantic_notice_boundary() {
         );
     }
     assert_incomplete_semantic_notice(&mixed);
+}
+
+fn assert_rule_group(result: &Value, applicability: Value, id: &Value, body: &str) {
+    let groups = result["rules"].as_array().unwrap();
+    let group = groups
+        .iter()
+        .find(|group| group["applicability"] == applicability)
+        .unwrap();
+    assert_eq!(
+        group["items"],
+        json!([{"memory_id":id,"what_to_remember":body}])
+    );
 }

@@ -5,88 +5,60 @@ description: Use for detailed Agentlaw Task authoring, memory reconciliation, co
 
 # Agentlaw
 
-Agentlaw preserves context; the LLM judges meaning and applicability. Follow the
-single `agentlaw` tool's current schema. Learned procedures are saved instructions,
-not installed harness skills. Answer in the user's language without routine memory reports.
+Use the installed tool's contract for requests, recall and saving. Judge which memories apply.
 
-Use exactly the action's same-named input object, for example
-`{"action":"recall","recall":{"recall_for":"Current work"}}`. All fields below
-belong inside that object. Recall limits are `memory_candidate_limit` and
-`procedure_candidate_limit`; `max_matches` belongs only to `history` search.
-Follow the exposed schema on older installations rather than sending unsupported nesting.
+## Check a connection
 
-## Establish the right context
+When asked about connectivity, run a recall for the verified project and inspect
+its diagnostics. Empty success means the call returned no matches. Never write a
+dummy memory. Report the folder, what the recall accessed, and any degraded or
+unverified capability. Without a verified project, say its connection is unchecked.
 
-Verify the working project folder through harness/work tools, not the MCP location
-or memory store. A home-directory cwd alone does not establish a project. Ask when
-unclear; without a project, recall user/machine context only.
+If MCP is missing, try tool discovery, then the installed CLI with its configured
+state directory and `agentlaw schema`. CLI success verifies only the CLI path.
+For an unavailable store, follow recovery guidance using a local Markdown store
+path. A GitHub URL cannot serve as that path. Confirm creation and location if a
+new store is needed. Preserve existing state.
 
-For project work, `recall` with verified `project_path`, request-specific `recall_for`
-and `include_active_tasks=true`. Set `restore_context=true` only when project
-context is missing or incomplete, not merely because compaction occurred.
-Reuse applicable context rather than restoring every turn.
+Reuse a folder's binding across sessions. For an unbound folder, use the candidates
+already returned and the contract's connect/create guidance. Run `discover` only
+when candidates are missing or need refreshing.
 
-## When asked whether Agentlaw is connected
+## Write a resumable Task
 
-Perform that project recall, not just tool discovery or user-only recall. Inspect
-errors and diagnostics. Empty success means no returned matches, not disconnection
-or an empty store. Never save a dummy memory as a connectivity test.
+Request active Tasks at project start, resumption, recovery after compaction, or when selecting a Task. Omit the option for ordinary follow-up questions. Before editing a Task from its handoff or reconciling heads, read every full current body and reference by ID or from the immediately preceding conflict response's `current_states`.
 
-- Tool missing: discover if supported; otherwise use the installed CLI, configured
-  state directory and `agentlaw schema`. CLI success does not prove MCP connectivity.
-- Store unavailable: follow returned recovery guidance. Connect a local Markdown
-  store or confirm creation/location. A GitHub URL is not its local path. Do not reset state.
-- `project_connection_required` with `status="needs_user_input"`: recall has
-  already discovered candidates. Use an explicit user choice if given; otherwise
-  ask which candidate to connect, whether to create a new project, or whether to
-  skip. A sole candidate is not permission to auto-connect. Use
-  `connect_project_memory` with `intent="connect"` and the selected `project_id`,
-  or `intent="create"` and `project_name` only after confirmed first adoption.
-  Use any returned `recall_result`; otherwise retry recall. Call
-  `intent="discover"` only if candidates are missing or need fresh discovery.
-- Existing folder binding: reuse it across sessions; do not reconnect routinely.
+Check the candidate's objective and scope even when the count, title, recency or rank
+suggests a match. Ask only if ambiguity affects the work. Fill the four headings
+so a fresh session can act:
 
-Report verified access, project folder, recall outcome and degraded/unverified
-capabilities. Without a project, explicitly say project connection was not checked.
+- **Objective** — requested outcome and constraints.
+- **Current position** — approach, rationale, progress, blockers and unresolved
+  issues. Include consequential failed or rejected attempts. Identify the project,
+  revision and coverage of verification. Distinguish observations from hypotheses.
+- **Resume point** — next safe action or open question. Keep a blocked Task active
+  and name the condition for resuming. For an in-flight operation, record the
+  request, known status and how to check it before retrying.
+- **References** — durable IDs, files and Plan. Keep essential chat-only reasons
+  in the Task itself.
 
-## Task and memory details
+## Reconcile and recover
 
-Match an existing Task by objective and scope, not title, recency, or candidate
-count. Its Objective states the requested outcome and constraints; Current
-position records the approach, reasons, evidence, progress, and blockers;
-Resume point gives the next concrete action or unresolved question; References
-points to useful IDs and files without hiding essential context outside the Task.
-A new Task needs an actionable restart point, not just a title. Across these
-headings, preserve still-valid constraints, the approach and rationale,
-important findings and failed or rejected attempts, verification and in-flight
-status, and the next safe step. Scope evidence to its project, revision, and
-coverage; distinguish observations, hypotheses, and pending work. Reference
-durable details, but retain rationale available only in chat. For unresolved
-operations, record the request, known status, and how to check before repeating.
-In recovery, a newer version alone is insufficient: verify published content.
-Evolve the complete current body, preserving still-relevant state rather than
-copying a Plan; skip writes that merely restate unchanged progress or log commands.
-Keep unresolved issues until resolved. Completed or abandoned work leaves the
-working set; blocked work stays active with its resume condition.
+Mark a rule only for explicitly established standing instructions. Keep the action,
+conditions and lasting exceptions in its body, the reasons in `evidence`, and
+one-off exceptions in the Task. Installation versions and measurements belong
+in ordinary memory. Use the tool's `is_rule` guidance when applying rules that overlap or conflict.
 
-Choose `create`, `evolve`, or `consolidate` explicitly and copy returned IDs and
-versions. Select user/project/machine scope deliberately. A one-off request is
-not a lasting preference; a small reusable correction can deserve a memory
-without a Task. Label proposals and unverified claims. For multiple candidates,
-use the current request to select relevant ones; ask only when ambiguity changes
-the work. Follow the tool contract for recall timing. Do
-not use `history` or another recall merely to reconfirm a successful save.
-Repeated friction may warrant a learned procedure through the existing
-`remember_this` authoring flow. Follow returned instructions, not an invented
-tool or action.
+When changing text, rewrite it into its current state. For a metadata or relationship
+change on a single current head, omit the unchanged body and supply its reference
+and evidence. Read by ID if you need the reference.
 
-## Resolve, do not conceal
+Ask the user to decide when an unresolved choice is theirs. For Git sharing, use the applicable sensitive-pattern check and obtain the appropriate user decision.
 
-A retained proposal is not published. Continue review through `remember_this` using
-returned references; do not resubmit unchanged proposals. Ask the user to resolve
-conflicting standing rules or decisions requiring their choice.
-
-If required context is unavailable, report it and pause dependent changes. Lexical-only
-success is not semantic readiness. Use CLI `doctor` when needed; repair only within
-authorization. Git sharing is separate from saving and requires sensitive-pattern
-inspection and the appropriate user decision.
+A confirmed save needs no verification recall. After an uncertain write, verify
+the published content and reference before repeating it. Lexical results alone
+do not establish semantic readiness. For a recall integrity error (`source_corrupt`), preserve the bytes and check
+`agentlaw doctor --audit` before recovery. If the local spool fails, repeat the recall for a fresh copy. For an unreadable local epoch, check the binding’s local state. Follow a nested `partial_recall_error` while retaining the unbound folder’s connection choices. Use the failing operation’s own guidance and repair
+only within authorization. Recurring friction may warrant a learned procedure
+through `remember_this`. These procedures are saved instructions, distinct from
+installed harness skills.

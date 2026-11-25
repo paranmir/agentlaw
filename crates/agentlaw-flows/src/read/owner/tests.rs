@@ -124,7 +124,12 @@ impl SearchFixture {
         }
     }
 
-    fn read<T>(&self, model: &Model, run: impl FnOnce(&ReadCtx<'_>, &mut ExactSnapshot) -> T) -> T {
+    fn read<T>(
+        &self,
+        model: &Model,
+        for_recall: bool,
+        run: impl FnOnce(&ReadCtx<'_>, &mut ExactSnapshot) -> T,
+    ) -> T {
         let source = self.store.owned_published_reader();
         let reader = crate::control::ControlReader::open(&self.identity.local).unwrap();
         let cache = crate::history_cache::HistoryCacheGuards::new();
@@ -139,9 +144,14 @@ impl SearchFixture {
             request: &request,
         };
         let guard = source.read_snapshot().unwrap();
-        let mut exact =
-            ExactSnapshot::build(self.registry.pin().unwrap(), &guard, DeltaBudget::default())
-                .unwrap();
+        let pinned = self.registry.pin().unwrap();
+        let budget = DeltaBudget::default();
+        let mut exact = if for_recall {
+            ExactSnapshot::build_for_recall(pinned, &guard, budget)
+        } else {
+            ExactSnapshot::build(pinned, &guard, budget)
+        }
+        .unwrap();
         drop(guard);
         run(&ctx, &mut exact)
     }
@@ -280,7 +290,7 @@ fn truncation_case(coverage: Coverage, procedures: bool) {
     let target = f.publish("zebralexicaltail", procedures, false);
     let model = Model::new(coverage);
     let long = format!("{}zebralexicaltail", "irrelevantword ".repeat(599));
-    let value = f.read(&model, |ctx, exact| {
+    let value = f.read(&model, !procedures, |ctx, exact| {
         if procedures {
             search_procedures_filtered(ctx, exact, &long, Some("user"), None, None, 10).unwrap()
         } else {
@@ -381,7 +391,7 @@ fn score(mut hit: Hit, score: f64) -> Hit {
 }
 
 fn planned(f: &SearchFixture, model: &Model, query: &str) -> Channels {
-    f.read(model, |ctx, exact| {
+    f.read(model, false, |ctx, exact| {
         let plan = model.plan_pieces(&[query], ctx.request).unwrap();
         preparation_channels(
             ctx,
@@ -493,7 +503,7 @@ fn piece_search_rejects_a_hit_with_only_the_source_change_uuid() {
     let fixture = SearchFixture::new();
     let current = fixture.publish("harbor inspection", false, false);
     let mut model = Model::new(Coverage::Complete);
-    let change = fixture.read(&model, |_, exact| {
+    let change = fixture.read(&model, false, |_, exact| {
         exact.heads(&[current.memory_id.clone()]).unwrap()[0].metadata["change_id"]
             .as_str()
             .unwrap()

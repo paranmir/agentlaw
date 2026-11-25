@@ -36,19 +36,103 @@ fn inherited<T: Clone + PartialEq>(
     }
     Ok(())
 }
-/// Parse a Task heading consistently for owned and streamed bodies.
-pub(crate) fn task_heading(line: &str) -> Option<&str> {
-    let line = line.trim_start();
-    let hashes = line.bytes().take_while(|b| *b == b'#').count();
-    if !(1..=6).contains(&hashes)
-        || !line[hashes..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-    {
-        return None;
+#[derive(Clone, Copy)]
+enum TaskHeadingState {
+    Indentation,
+    OpeningHashes(u8),
+    BeforeName,
+    Name,
+    AfterName,
+    ClosingHashes,
+    TrailingWhitespace,
+    Invalid,
+}
+
+/// Recognizes required headings without buffering a potentially unbounded line.
+/// Only the final contiguous run of closing hashes is ignored.
+pub(crate) struct TaskHeadingProbe {
+    state: TaskHeadingState,
+    possible_names: [bool; TASK_HEADINGS.len()],
+    name_bytes: usize,
+}
+
+impl Default for TaskHeadingProbe {
+    fn default() -> Self {
+        Self {
+            state: TaskHeadingState::Indentation,
+            possible_names: [true; TASK_HEADINGS.len()],
+            name_bytes: 0,
+        }
     }
-    Some(line[hashes..].trim().trim_end_matches('#').trim())
+}
+
+impl TaskHeadingProbe {
+    pub(crate) fn push(&mut self, ch: char) {
+        use TaskHeadingState::*;
+
+        let whitespace = ch.is_whitespace();
+        self.state = match self.state {
+            Indentation if whitespace => Indentation,
+            Indentation if ch == '#' => OpeningHashes(1),
+            OpeningHashes(count) if ch == '#' && count < 6 => OpeningHashes(count + 1),
+            OpeningHashes(_) if whitespace => BeforeName,
+            BeforeName if whitespace => BeforeName,
+            Name if ch == '#' && self.complete_name().is_some() => ClosingHashes,
+            Name if whitespace && self.complete_name().is_some() => AfterName,
+            BeforeName | Name => self.match_name_byte(ch),
+            AfterName if whitespace => AfterName,
+            AfterName | ClosingHashes if ch == '#' => ClosingHashes,
+            ClosingHashes | TrailingWhitespace if whitespace => TrailingWhitespace,
+            _ => Invalid,
+        };
+    }
+
+    fn match_name_byte(&mut self, ch: char) -> TaskHeadingState {
+        if !ch.is_ascii() {
+            return TaskHeadingState::Invalid;
+        }
+        for (possible, name) in self.possible_names.iter_mut().zip(TASK_HEADINGS) {
+            *possible &= name.as_bytes().get(self.name_bytes) == Some(&(ch as u8));
+        }
+        self.name_bytes += 1;
+        if self.possible_names.iter().any(|possible| *possible) {
+            TaskHeadingState::Name
+        } else {
+            TaskHeadingState::Invalid
+        }
+    }
+
+    fn complete_name(&self) -> Option<&'static str> {
+        TASK_HEADINGS
+            .into_iter()
+            .zip(self.possible_names)
+            .find_map(|(name, possible)| {
+                (possible && name.len() == self.name_bytes).then_some(name)
+            })
+    }
+
+    pub(crate) fn done(&self) -> bool {
+        matches!(self.state, TaskHeadingState::Invalid)
+    }
+
+    pub(crate) fn finish(&self) -> Option<&'static str> {
+        use TaskHeadingState::*;
+        match self.state {
+            Name | AfterName | ClosingHashes | TrailingWhitespace => self.complete_name(),
+            _ => None,
+        }
+    }
+}
+
+fn task_heading(line: &str) -> Option<&'static str> {
+    let mut probe = TaskHeadingProbe::default();
+    for ch in line.chars() {
+        probe.push(ch);
+        if probe.done() {
+            break;
+        }
+    }
+    probe.finish()
 }
 /// Incremental fence prefix parser shared by owned and streamed Task bodies.
 #[derive(Default)]
@@ -91,53 +175,26 @@ fn task_fence(line: &str) -> Option<(char, u64)> {
     }
     probe.finish()
 }
-pub fn task_headings(body: &str) -> Result<()> {
-    let required = [
-        "Objective",
-        "Current position",
-        "Resume point",
-        "References",
-    ];
-    let mut found = Vec::new();
-    let mut fence: Option<(char, u64)> = None;
-    for line in body.lines() {
-        let s = line.trim_start();
-        if let Some((c, n)) = task_fence(s) {
-            match fence {
-                None => fence = Some((c, n)),
-                Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
-                _ => {}
-            }
-            continue;
-        }
-        if fence.is_some() {
-            continue;
-        }
-        if let Some(heading) = task_heading(s) {
-            if required.contains(&heading) {
-                found.push(heading)
-            }
-        }
-    }
-    if found != required {
-        return Err(DomainError::new("invalid_task_headings","Task must contain Objective / Current position / Resume point / References headings exactly once in that order."));
-    }
-    Ok(())
+pub(crate) const TASK_HEADINGS: [&str; 4] = [
+    "Objective",
+    "Current position",
+    "Resume point",
+    "References",
+];
+
+pub(crate) enum TaskSectionParse<T> {
+    Complete(T),
+    InvalidHeadings,
 }
-/// Copy complete handoff sections, preserving their bytes; fenced heading text is
-/// content and cannot change section boundaries.
-pub fn task_sections(body: &str) -> Result<[String; 3]> {
-    task_headings(body)?;
-    let names = [
-        "Objective",
-        "Current position",
-        "Resume point",
-        "References",
-    ];
-    let mut ranges = Vec::new();
+
+fn task_heading_ranges(body: &str) -> TaskSectionParse<[(usize, usize); 4]> {
+    let mut ranges = [(0, 0); TASK_HEADINGS.len()];
+    let mut seen = 0;
     let mut fence: Option<(char, u64)> = None;
     let mut offset = 0;
     for line in body.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
         let s = line.trim_start();
         if let Some((c, n)) = task_fence(s) {
             match fence {
@@ -145,22 +202,60 @@ pub fn task_sections(body: &str) -> Result<[String; 3]> {
                 Some((fc, fn_)) if fc == c && n >= fn_ => fence = None,
                 _ => {}
             }
-            offset += line.len();
             continue;
         }
         if fence.is_none() {
             if let Some(heading) = task_heading(s) {
-                if names.contains(&heading) {
-                    ranges.push((offset, offset + line.len()));
+                if TASK_HEADINGS.get(seen) != Some(&heading) {
+                    return TaskSectionParse::InvalidHeadings;
                 }
+                ranges[seen] = (start, offset);
+                seen += 1;
             }
         }
-        offset += line.len();
     }
-    Ok(std::array::from_fn(|i| {
-        body[ranges[i].1..ranges[i + 1].0].to_owned()
-    }))
+    if seen == TASK_HEADINGS.len() {
+        TaskSectionParse::Complete(ranges)
+    } else {
+        TaskSectionParse::InvalidHeadings
+    }
 }
+
+fn invalid_task_headings() -> DomainError {
+    DomainError::new("invalid_task_headings","Task must contain Objective / Current position / Resume point / References headings exactly once in that order.")
+}
+
+pub fn task_headings(body: &str) -> Result<()> {
+    match task_heading_ranges(body) {
+        TaskSectionParse::Complete(_) => Ok(()),
+        TaskSectionParse::InvalidHeadings => Err(invalid_task_headings()),
+    }
+}
+
+/// Copy complete handoff sections, preserving their bytes; fenced heading text is
+/// content and cannot change section boundaries.
+pub fn task_sections(body: &str) -> Result<[String; 3]> {
+    match task_heading_ranges(body) {
+        TaskSectionParse::Complete(ranges) => Ok(std::array::from_fn(|i| {
+            body[ranges[i].1..ranges[i + 1].0].to_owned()
+        })),
+        TaskSectionParse::InvalidHeadings => Err(invalid_task_headings()),
+    }
+}
+pub(crate) fn proposal_body<'a>(
+    proposal: &'a MemoryProposal,
+    parents: &'a [Memory],
+) -> Result<&'a str> {
+    match (proposal.what_to_remember.as_deref(), &proposal.operation, parents) {
+        (Some(body), _, _) if !body.is_empty() => Ok(body),
+        (None, Operation::Evolve, [parent]) => Ok(&parent.what_to_remember),
+        _ => Err(DomainError::new(
+            "invalid_input",
+            "Submit the complete what_to_remember body. It can be omitted only when evolving one current head.",
+        )),
+    }
+}
+
 pub fn preflight(
     source: &impl SourceSnapshot,
     gate: &impl ReviewGate,
@@ -176,7 +271,8 @@ pub fn preflight(
     let mut proposals = input.to_vec();
     let mut affected = HashSet::new();
     let mut resolved_applicability = Vec::new();
-    for p in &mut proposals {
+    let mut stale_proposals = Vec::new();
+    for (index, p) in proposals.iter_mut().enumerate() {
         let explicit_scope = p.applies_to.is_some();
         if (p.operation == Operation::Evolve && p.consolidation_refs.is_some())
             || (p.operation == Operation::Consolidate && p.parent_refs.is_some())
@@ -186,11 +282,11 @@ pub fn preflight(
                 "Parent and consolidation reference fields cannot be mixed.",
             ));
         }
-        if p.what_to_remember.is_empty() || p.evidence.is_empty() {
-            return Err(DomainError::new(
-                "invalid_input",
-                "Complete content and evidence are required.",
-            ));
+        if p.evidence.is_empty() {
+            return Err(DomainError::new("invalid_input", "Evidence is required."));
+        }
+        if p.operation != Operation::Evolve || p.what_to_remember.is_some() {
+            proposal_body(p, &[])?;
         }
         let refs = match p.operation {
             Operation::Create => {
@@ -244,6 +340,7 @@ pub fn preflight(
             ));
         }
         let mut parents = Vec::new();
+        let mut stale = false;
         for (id, state) in states {
             if !affected.insert(id) {
                 return Err(DomainError::new(
@@ -258,12 +355,16 @@ pub fn preflight(
                 .cloned()
                 .collect();
             if current != supplied {
-                return Err(DomainError::new(
-                    "stale_memory_ref",
-                    "Copy all current head references and review their full contents.",
-                ));
+                stale = true;
             }
             parents.extend(state.heads);
+        }
+        if stale {
+            stale_proposals.push(index);
+            continue;
+        }
+        if p.what_to_remember.is_none() {
+            p.what_to_remember = Some(proposal_body(p, &parents)?.to_owned());
         }
         if parents.iter().any(|p| p.in_working_set == Some(true)) && p.in_working_set.is_none() {
             return Err(DomainError::new(
@@ -367,7 +468,7 @@ pub fn preflight(
                     "Task memory must have project-only scope.",
                 ));
             }
-            task_headings(&p.what_to_remember)?
+            task_headings(proposal_body(p, &parents)?)?
         }
         for id in p
             .related_memory_ids
@@ -387,6 +488,13 @@ pub fn preflight(
             validate_id(&target.project_id)?;
             relative_path(&target.path)?;
         }
+    }
+    if !stale_proposals.is_empty() {
+        return Err(DomainError::new(
+            "stale_memory_ref",
+            "Copy all current head references and review their full contents.",
+        )
+        .with_details(serde_json::json!({"proposal_indices":stale_proposals})));
     }
     let basis = source.read_set();
     gate.review(context, &proposals, &basis)?;

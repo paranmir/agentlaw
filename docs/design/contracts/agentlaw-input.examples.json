@@ -3,6 +3,110 @@
   "schema": "agentlaw-input.schema.json",
   "examples": [
     {
+      "id": "rule-metadata-only",
+      "valid": true,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "evidence": "The user confirmed the change.",
+            "is_rule": false,
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ]
+          }
+        ]
+      },
+      "reason": "Only omission on evolve can inherit the body of a verified sole current parent."
+    },
+    {
+      "id": "missing-create-body",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "create",
+            "evidence": "The user confirmed the change.",
+            "applies_to": [
+              "project"
+            ]
+          }
+        ]
+      },
+      "reason": "Only omission on evolve can inherit the body of a verified sole current parent."
+    },
+    {
+      "id": "missing-consolidate-body",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "consolidate",
+            "evidence": "The user confirmed the change.",
+            "consolidation_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              },
+              {
+                "memory_id": "22222222-2222-4222-8222-222222222222",
+                "observed_version": "example-other-version"
+              }
+            ]
+          }
+        ]
+      },
+      "reason": "Only omission on evolve can inherit the body of a verified sole current parent."
+    },
+    {
+      "id": "null-evolve-body",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "evidence": "The user confirmed the change.",
+            "what_to_remember": null,
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ]
+          }
+        ]
+      },
+      "reason": "Only omission on evolve can inherit the body of a verified sole current parent."
+    },
+    {
+      "id": "empty-evolve-body",
+      "valid": false,
+      "input": {
+        "action": "remember_this",
+        "memories": [
+          {
+            "operation": "evolve",
+            "evidence": "The user confirmed the change.",
+            "what_to_remember": "",
+            "parent_refs": [
+              {
+                "memory_id": "11111111-1111-4111-8111-111111111111",
+                "observed_version": "example-returned-version"
+              }
+            ]
+          }
+        ]
+      },
+      "reason": "Only omission on evolve can inherit the body of a verified sole current parent."
+    },
+    {
       "id": "recall-query",
       "valid": true,
       "input": {
@@ -10,6 +114,18 @@
         "recall_for": "Which interpreter should this machine use?"
       },
       "reason": "Ordinary discovery."
+    },
+    {
+      "id": "recall-project-follow-up",
+      "valid": true,
+      "input": {"action": "recall", "project_path": "C:/work/app", "recall_for": "Which cancellation exception applies to this retry?"},
+      "reason": "A new project question needs recall without repeating Task selection."
+    },
+    {
+      "id": "recall-full-task-before-evolve",
+      "valid": true,
+      "input": {"action": "recall", "project_path": "C:/work/app", "memory_ids": ["44444444-4444-4444-8444-444444444444"]},
+      "reason": "Use the handoff ID to read complete current bodies, update references and required references before evolving."
     },
     {
       "id": "recall-context",
@@ -27,7 +143,7 @@
           }
         ]
       },
-      "reason": "Context reconstruction and explicit Task request."
+      "reason": "Project resumption needs Task selection. If one Task is confirmed, read its handoff sections."
     },
     {
       "id": "recall-exact-mixed",

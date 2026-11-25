@@ -769,7 +769,30 @@ fn delta_capacity_is_explicit_and_source_guard_can_be_released() {
             max_resident_bytes: 0,
         },
     );
-    assert_eq!(result.err().unwrap().code, "capacity");
+    let error = result.err().unwrap();
+    assert_eq!(error.code, "capacity");
+    assert!(!error.retryable);
+    assert!(error.next_action.is_none());
+    let error = ExactSnapshot::build_for_recall(
+        registry.pin().unwrap(),
+        &guard,
+        DeltaBudget {
+            max_identities: 0,
+            max_resident_bytes: 0,
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code, "capacity");
+    assert!(
+        error.retryable,
+        "FR-06.4: capacity is retryable after indexing"
+    );
+    let action = error.next_action.unwrap().to_lowercase();
+    assert!(
+        action.contains("index") && action.contains("recall"),
+        "{action}"
+    );
     let exact_budget = DeltaBudget {
         max_identities: 1,
         max_resident_bytes: "capacity testing token".len() as u64,

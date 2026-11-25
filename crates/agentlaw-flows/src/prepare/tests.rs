@@ -595,3 +595,193 @@ fn newly_published_dependent_requires_review_before_a_prepared_change_can_publis
     );
     assert_eq!(f.store.generation().unwrap(), generation);
 }
+
+#[test]
+fn fr_08_6_omitted_body_preserves_markdown_and_records_each_change() {
+    let mut f = Fixture::new();
+    let folder = "C:/work/inherited-body";
+    let project = f.run(
+        "connect_project_memory",
+        json!({"intent":"create","project_path":folder,"project_name":"Inherited body"}),
+    );
+    let body = "# Objective\r\n검토 café\r\n# Current position\nReady\n# Resume point\nVerify\n# References\nDesign";
+    let dependency = f.run("remember_this", create("Dependency with distinct content"));
+    let dependency_id = &dependency["results"][0]["memory_ref"]["memory_id"];
+    let created = f.run("remember_this", json!({"project_path":folder,"memories":[{"operation":"create","what_to_remember":body,"evidence":"Initial state","applies_to":["project"],"in_working_set":true}]}));
+    assert_eq!(created["status"], "remembered", "{created}");
+    let mut reference = created["results"][0]["memory_ref"].clone();
+    let task_id = reference["memory_id"].as_str().unwrap().to_owned();
+    let invalid = f.prepare(json!({"project_path":folder,"memories":[{"operation":"evolve","parent_refs":[reference],"evidence":"Missing active disposition"}]}));
+    assert!(matches!(invalid, Err(error) if error.code == "working_set_disposition_required"));
+
+    for (change, evidence) in [
+        (json!({"in_working_set":false}), "Completed the Task"),
+        (
+            json!({"is_rule":true}),
+            "Established as a standing instruction",
+        ),
+        (
+            json!({"required_memory_ids":[dependency_id]}),
+            "Identified required reading",
+        ),
+        (json!({}), "Recorded additional evidence"),
+    ] {
+        let mut proposal =
+            json!({"operation":"evolve","parent_refs":[reference],"evidence":evidence});
+        proposal
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        let result = f.run(
+            "remember_this",
+            json!({"project_path":folder,"memories":[proposal]}),
+        );
+        assert_eq!(result["status"], "remembered", "{result}");
+        let old = reference;
+        reference = result["results"][0]["memory_ref"].clone();
+        assert_ne!(reference, old);
+        assert_eq!(reference["memory_id"], task_id);
+        let current = f.store.read_current(&task_id).unwrap();
+        let head = &current.heads()[0];
+        assert_eq!(head.body, body);
+        if change.get("in_working_set").is_some() {
+            assert_ne!(head.metadata["in_working_set"], true);
+        }
+        if change.get("is_rule").is_some() {
+            assert_eq!(head.metadata["is_rule"], true);
+        }
+        if change.get("required_memory_ids").is_some() {
+            assert!(head.metadata["relations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relation| relation["kind"] == "required"
+                    && relation["target_memory_id"] == *dependency_id));
+        }
+        let history = f.store.history(&task_id).unwrap();
+        assert!(history
+            .iter()
+            .any(|entry| entry.evidence == evidence && entry.body == body));
+    }
+    assert!(project["project_connection"]["project_id"].is_string());
+    let ordinary_body = "검토 notes for café releases.\r\n\nKeep the original wording.";
+    let ordinary = f.run(
+        "remember_this",
+        json!({"project_path":folder,"memories":[{"operation":"create","what_to_remember":ordinary_body,"evidence":"Project observation","applies_to":["project"]}]}),
+    );
+    assert_eq!(ordinary["status"], "remembered", "{ordinary}");
+    let original = &ordinary["results"][0]["memory_ref"];
+    let id = original["memory_id"].as_str().unwrap();
+    let evidence = "Confirmed applicable across projects";
+    let changed = f.run(
+        "remember_this",
+        json!({"project_path":folder,"memories":[{"operation":"evolve","parent_refs":[original],"applies_to":["user"],"evidence":evidence}]}),
+    );
+    assert_eq!(changed["status"], "remembered", "{changed}");
+    let revised = &changed["results"][0]["memory_ref"];
+    assert_ne!(revised, original);
+    assert_eq!(revised["memory_id"], id);
+    let current = f.store.read_current(id).unwrap();
+    assert_eq!(current.heads()[0].body, ordinary_body);
+    assert_eq!(
+        current.heads()[0].metadata["applicability"]["scope"],
+        "user"
+    );
+    assert!(f
+        .store
+        .history(id)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.evidence == evidence && entry.body == ordinary_body));
+}
+
+#[test]
+fn fr_08_6_inherited_body_scope_change_requires_overlap_review_and_fresh_parent() {
+    for change_parent in [false, true] {
+        let mut f = Fixture::new();
+        let folder = "C:/work/overlap";
+        f.run(
+            "connect_project_memory",
+            json!({"intent":"create","project_path":folder,"project_name":"Overlap target"}),
+        );
+        let body = "Inspect the published version before resuming.";
+        let parent = f.run("remember_this", create(body));
+        let reference = &parent["results"][0]["memory_ref"];
+        let id = reference["memory_id"].as_str().unwrap();
+        let target = f.run("remember_this", json!({"project_path":folder,"memories":[{"operation":"create","applies_to":["project"],"what_to_remember":body,"evidence":"Project-specific observation"}]}));
+        assert_eq!(target["status"], "remembered", "{target}");
+        let before = f.store.read_current(id).unwrap().references().unwrap();
+        let pending = f.run("remember_this", json!({"project_path":folder,"memories":[{"operation":"evolve","parent_refs":[reference],"applies_to":["project"],"evidence":"Scope narrowed"}]}));
+        assert_eq!(pending["status"], "resolution_required", "{pending}");
+        assert!(pending["resolution_ref"].is_string(), "{pending}");
+        assert_eq!(
+            f.store.read_current(id).unwrap().references().unwrap(),
+            before
+        );
+        if change_parent {
+            let changed = f.run("remember_this", json!({"memories":[{"operation":"evolve","parent_refs":[reference],"what_to_remember":"Read the latest reconciliation record.","evidence":"Concurrent update"}]}));
+            assert_eq!(changed["status"], "remembered", "{changed}");
+        }
+        let before_resume = f.store.read_current(id).unwrap().references().unwrap();
+        let resumed = f.run("remember_this", json!({"pending_action":"continue","pending_batch_ref":pending["pending_batch_ref"],"resolution_ref":pending["resolution_ref"]}));
+        let current = f.store.read_current(id).unwrap();
+        if change_parent {
+            assert_eq!(resumed["status"], "resolution_required", "{resumed}");
+            assert_eq!(current.references().unwrap(), before_resume);
+            assert!(
+                resumed
+                    .to_string()
+                    .contains(&before_resume[0].observed_version),
+                "{resumed}"
+            );
+        } else {
+            assert_eq!(resumed["status"], "remembered", "{resumed}");
+            assert_ne!(current.references().unwrap(), before_resume);
+            assert_eq!(current.heads()[0].body, body);
+            assert_eq!(
+                current.heads()[0].metadata["applicability"]["scope"],
+                "project"
+            );
+        }
+    }
+}
+
+#[test]
+fn fr_08_6_invalid_body_or_evidence_leaves_batch_and_existing_pending_unchanged() {
+    let mut f = Fixture::new();
+    let first = f.run("remember_this", create("Original full body"));
+    let second = f.run("remember_this", create("An independent observation"));
+    let reference = &first["results"][0]["memory_ref"];
+    let other = &second["results"][0]["memory_ref"];
+    let pending = f.run("remember_this", create("Original full body"));
+    assert_eq!(pending["status"], "resolution_required", "{pending}");
+    let before = durable_state(&f);
+    for invalid in [
+        json!({"operation":"create","applies_to":["user"],"evidence":"Observed"}),
+        json!({"operation":"consolidate","consolidation_refs":[reference,other],"evidence":"Reviewed"}),
+        json!({"operation":"evolve","parent_refs":[reference],"what_to_remember":null,"evidence":"Observed"}),
+        json!({"operation":"evolve","parent_refs":[reference],"what_to_remember":"","evidence":"Observed"}),
+        json!({"operation":"evolve","parent_refs":[reference]}),
+    ] {
+        let fields = json!({"memories":[create("An otherwise publishable observation")["memories"][0],invalid]});
+        let request = json!({"action":"remember_this","remember_this":fields});
+        let parsed = agentlaw_contracts::parse_request(&request.to_string());
+        assert!(
+            matches!(parsed, Err(error) if error.code == "invalid_input" && !error.message.is_empty())
+        );
+        assert_eq!(durable_state(&f), before);
+    }
+    let complete = "Original full body and the independent observation, with their distinct contexts preserved.";
+    let consolidated = f.run(
+        "remember_this",
+        json!({"memories":[{"operation":"consolidate","consolidation_refs":[reference,other],"what_to_remember":complete,"evidence":"Reviewed both current heads"}]}),
+    );
+    assert_eq!(consolidated["status"], "remembered", "{consolidated}");
+    let published = consolidated["results"][0]["memory_ref"]["memory_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        f.store.read_current(published).unwrap().heads()[0].body,
+        complete
+    );
+}

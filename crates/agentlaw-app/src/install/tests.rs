@@ -77,7 +77,10 @@ fn generated_bootstrap_matches_accepted_contract() {
         .split_once(&format!("\n{END}"))
         .unwrap()
         .0;
-    assert_eq!(body, expected);
+    assert_eq!(
+        body, expected,
+        "FR-10.4: generated bootstrap differs from the approved guidance"
+    );
 }
 #[test]
 fn instruction_replacement_preserves_user_text_and_refuses_ambiguous_markers() {
