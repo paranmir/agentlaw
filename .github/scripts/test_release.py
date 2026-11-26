@@ -223,16 +223,42 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.find_release("repos/owner/product", "v0.4.1")
 
-    def test_new_draft_is_found_by_list_and_refreshed_by_id(self):
-        draft = {"id": 42, "draft": True, "prerelease": False, "assets": [], "html_url": "release-url"}
-        with patch.object(release, "find_release", side_effect=[None, draft]), \
-                patch.object(release, "api", side_effect=[None, None, draft, {**draft, "draft": False}]) as reads, \
-                patch.object(release, "command") as commands:
-            release.publish_files(REPOSITORY, MERGE, "0.4.1", {}, Path("notes"))
-            self.assertEqual([call.args[0] for call in reads.call_args_list][-2:],
-                             [f"repos/{REPOSITORY}/releases/42"] * 2)
-            self.assertEqual([call.args[1:3] for call in commands.call_args_list][1:],
-                             [("release", "create"), ("release", "edit")])
+    def test_new_draft_is_uploaded_and_published_while_missing_from_list(self):
+        prefix = f"repos/{REPOSITORY}"
+        draft = {"id": 42, "draft": True, "assets": [], "html_url": "release-url"}
+        complete = {**draft, "assets": [{"name": "asset", "state": "uploaded", "size": 4,
+                                        "digest": "sha256:" + release.digest(b"data")}]}
+        release_reads = iter((draft, complete, {**complete, "draft": False}))
+        tag_endpoint = f"{prefix}/git/ref/tags/v0.4.1"
+
+        def read(endpoint, optional=False):
+            if endpoint == f"{prefix}/releases/42":
+                return next(release_reads)
+            self.assertIn(endpoint, (tag_endpoint, f"{prefix}/releases/latest"))
+            return None
+
+        def run(*args):
+            if args[:5] == ("gh", "api", f"{prefix}/git/refs", "--method", "POST"):
+                return json.dumps({"object": {"type": "commit", "sha": MERGE}}).encode()
+            if args[:3] == ("gh", "api", f"{prefix}/releases"):
+                return json.dumps(draft).encode()
+            return b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "asset"
+            path.write_bytes(b"data")
+            notes = Path(directory) / "notes.md"
+            notes.write_text("Release notes\n")
+            with patch.object(release, "listing", return_value=[]) as listing, \
+                    patch.object(release, "api", side_effect=read) as reads, \
+                    patch.object(release, "command", side_effect=run) as commands:
+                release.publish_files(REPOSITORY, MERGE, "0.4.1", {"asset": path}, notes)
+                listing.assert_called_once_with(f"{prefix}/releases")
+                self.assertEqual([call.args for call in reads.call_args_list if call.args[0] == tag_endpoint],
+                                 [(tag_endpoint,)])
+                commands.assert_any_call("gh", "release", "upload", "v0.4.1", str(path), "--repo", REPOSITORY)
+                commands.assert_any_call("gh", "release", "edit", "v0.4.1", "--repo", REPOSITORY,
+                                         "--draft=false", "--latest")
 
     def test_pagination_does_not_silently_truncate(self):
         with patch.object(release, "api", side_effect=[[1] * 100, [2]]) as request:

@@ -231,13 +231,20 @@ def publish_files(repository, commit, version, files, notes):
         require(re.fullmatch(r"\d+\.\d+\.\d+", latest_version), "Latest release has an unsupported version")
         require(version_tuple(version) > version_tuple(latest_version), "Refusing to replace latest with an older version")
     if not ref:
-        command("gh", "api", f"{prefix}/git/refs", "--method", "POST",
-                "-f", f"ref=refs/tags/{tag}", "-f", f"sha={commit}")
+        created_ref = json.loads(command(
+            "gh", "api", f"{prefix}/git/refs", "--method", "POST",
+            "-f", f"ref=refs/tags/{tag}", "-f", f"sha={commit}",
+        ))
+        obj = created_ref["object"]
+        require(obj["type"] == "commit" and obj["sha"] == commit,
+                "Created version tag does not name the release commit")
     if not release:
-        command("gh", "release", "create", tag, "--repo", repository, "--verify-tag", "--draft",
-                "--title", f"Agentlaw {version}", "--notes-file", str(notes))
-        release = find_release(prefix, tag)
-        require(release is not None, "Created release is not visible; retry publication")
+        created = json.loads(command(
+            "gh", "api", f"{prefix}/releases", "--method", "POST",
+            "-f", f"tag_name={tag}", "-f", f"target_commitish={commit}",
+            "-f", f"name=Agentlaw {version}", "-F", "draft=true", "-F", f"body=@{notes}",
+        ))
+        release = api(f"{prefix}/releases/{created['id']}")
     existing = {asset["name"] for asset in release["assets"]}
     for name in sorted(files):
         if name not in existing:
