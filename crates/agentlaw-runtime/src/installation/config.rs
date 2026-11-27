@@ -239,27 +239,26 @@ pub fn coordination_root(state: &Path) -> PathBuf {
 mod tests;
 
 pub fn load(root: &Path) -> Result<Option<Config>> {
-    match fs::read(root.join("config.json")) {
+    let path = root.join("config.json");
+    let invalid = |reason| {
+        DomainError::new(
+            "invalid_configuration",
+            format!("Invalid configuration in {}: {reason}", path.display()),
+        )
+        .with_next_action("Correct config.json and repeat the original request.")
+    };
+    match fs::read(&path) {
         Ok(bytes) => {
-            let text = std::str::from_utf8(&bytes).map_err(|_| {
-                DomainError::new("invalid_configuration", "Configuration is not UTF-8.")
-            })?;
-            let value = agentlaw_contracts::validation::decode_unique(text)?;
-            let config: Config = serde_json::from_value(value).map_err(|_| {
-                DomainError::new(
-                    "invalid_configuration",
-                    "Configuration format is invalid; existing data was not reset.",
-                )
-            })?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| invalid("expected UTF-8."))?;
+            let value = agentlaw_contracts::validation::decode_unique(text)
+                .map_err(|_| invalid("expected JSON with unique keys."))?;
+            let config: Config = serde_json::from_value(value)
+                .map_err(|_| invalid("fields do not match the configuration format."))?;
             if !config.memory_store_path.is_absolute() {
-                return Err(DomainError::new(
-                    "invalid_configuration",
-                    "Memory store path must be absolute.",
-                ));
+                return Err(invalid("memory_store_path must be absolute."));
             }
             if config.history_response_limit_bytes == 0 || config.response_limit_bytes < 4096 {
-                return Err(DomainError::new(
-                    "invalid_configuration",
+                return Err(invalid(
                     "history_response_limit_bytes must be positive and response_limit_bytes must be at least 4096.",
                 ));
             }
@@ -270,15 +269,16 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
                 let name = relative.to_string_lossy();
                 !p.is_absolute() || name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit())
             }) {
-                return Err(DomainError::new("invalid_configuration", "The selected binding state must stay inside this installation's bindings directory."));
+                return Err(invalid("the selected binding state must stay inside this installation's bindings directory."));
             }
             Ok(Some(config))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(DomainError::new(
-            "configuration_unreadable",
-            "Configuration could not be read; existing data was not reset.",
-        )),
+        Err(error) => Err(DomainError::new(
+            "configuration_io",
+            format!("Cannot read configuration {}: {error}", path.display()),
+        )
+        .with_next_action("Restore access to config.json and repeat the original request.")),
     }
 }
 

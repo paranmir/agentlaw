@@ -540,11 +540,36 @@ pub fn history(ctx: &crate::store::ReadCtx<'_>, request: &HistoryRequest) -> cra
         .ok_or_else(|| {
             DomainError::new("invalid_history_request", "Specify one history identity.")
         })?;
-    crate::validate_id(identity)?;
     ctx.request.check()?;
     ctx.request.phase("acquiring_history");
-    // OwnedPublishedReader releases the shared source gate before returning.
-    let acquired = ctx.source.acquire_history(&ctx.request.cancel);
+    let mut canonical = request.clone();
+    let acquired = {
+        use agentlaw_storage::EntityKind;
+        let guard = crate::store::source(ctx.source.read_snapshot())?;
+        let (kind, path, field) = if request.memory_id.is_some() {
+            (EntityKind::Memory, "/memory_id", &mut canonical.memory_id)
+        } else {
+            (
+                EntityKind::Procedure,
+                "/procedure_id",
+                &mut canonical.procedure_id,
+            )
+        };
+        *field = Some(crate::store::select_source_id(
+            &guard,
+            kind,
+            identity,
+            path,
+            crate::store::source_error,
+        )?);
+        guard.acquire_history(&ctx.request.cancel)
+    };
+    let request = &canonical;
+    let identity = request
+        .memory_id
+        .as_deref()
+        .or(request.procedure_id.as_deref())
+        .unwrap();
     ctx.request.check()?;
     let acquired = crate::store::source(acquired)?;
     ctx.request.check()?;

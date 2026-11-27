@@ -179,6 +179,26 @@ pub struct SourceAuditReport {
     pub current_units: u64,
     pub validated: bool,
 }
+fn audit_io(path: &Path, error: std::io::Error) -> Error {
+    Error::SourceRead {
+        path: path.to_path_buf(),
+        source: error,
+    }
+}
+fn audit_source_error(path: &Path, error: Error) -> Error {
+    match error {
+        Error::Io(error) => audit_io(path, error),
+        other => other,
+    }
+}
+fn source_entries(path: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(audit_io(path, error)),
+    }
+}
+
 impl Store {
     pub fn spool_history(&self) -> Result<HistorySpool> {
         self.spool_history_internal(false)
@@ -225,19 +245,32 @@ impl Store {
         let lease = std::sync::Arc::new(SpoolLease(path.clone(), true, None, None));
         let conn = agentlaw_sqlite::open(&path)?;
         initialize_spool(&conn, false)?;
-        let history = self.safe_path("history")?;
-        if history.exists() {
-            for writer in fs::read_dir(history)? {
-                let writer = writer?;
-                if writer.file_type()?.is_symlink() {
+        let history = self
+            .safe_path("history")
+            .map_err(|error| audit_source_error(&self.root.join("history"), error))?;
+        if let Some(writers) = source_entries(&history)? {
+            for writer in writers {
+                let writer = writer.map_err(|error| audit_io(&history, error))?;
+                let writer_path = writer.path();
+                if writer
+                    .file_type()
+                    .map_err(|error| audit_io(&writer_path, error))?
+                    .is_symlink()
+                {
                     return Err(Error::Corrupt("history writer symlink".into()));
                 }
-                for entry in fs::read_dir(writer.path())? {
-                    let entry = entry?;
-                    if entry.file_type()?.is_symlink() {
+                for entry in
+                    fs::read_dir(&writer_path).map_err(|error| audit_io(&writer_path, error))?
+                {
+                    let entry = entry.map_err(|error| audit_io(&writer_path, error))?;
+                    let pack = entry.path();
+                    if entry
+                        .file_type()
+                        .map_err(|error| audit_io(&pack, error))?
+                        .is_symlink()
+                    {
                         return Err(Error::Corrupt("history pack symlink".into()));
                     }
-                    let pack = entry.path();
                     if pack.extension().is_some_and(|e| e == "tmp") {
                         continue;
                     }
@@ -247,11 +280,11 @@ impl Store {
                             "source changed while history was acquired".into(),
                         ));
                     }
-                    codec::scan(
-                        "history",
-                        &mut BufReader::new(File::open(pack)?),
-                        |info, payload| insert_frame(&conn, info, payload),
-                    )?;
+                    let file = File::open(&pack).map_err(|error| audit_io(&pack, error))?;
+                    codec::scan("history", &mut BufReader::new(file), |info, payload| {
+                        insert_frame(&conn, info, payload)
+                    })
+                    .map_err(|error| audit_source_error(&pack, error))?;
                 }
             }
         }
@@ -287,15 +320,24 @@ impl Store {
     pub fn audit_source(&self) -> Result<SourceAuditReport> {
         let mut spool = self.spool_history_internal(true)?;
         let report = spool.audit_current(self)?;
-        let base = self.safe_path("catalog/projects")?;
-        if base.exists() {
-            for shard in fs::read_dir(base)? {
-                let shard = shard?;
-                if shard.file_type()?.is_symlink() {
+        let base = self
+            .safe_path("catalog/projects")
+            .map_err(|error| audit_source_error(&self.root.join("catalog/projects"), error))?;
+        if let Some(shards) = source_entries(&base)? {
+            for shard in shards {
+                let shard = shard.map_err(|error| audit_io(&base, error))?;
+                let shard_path = shard.path();
+                if shard
+                    .file_type()
+                    .map_err(|error| audit_io(&shard_path, error))?
+                    .is_symlink()
+                {
                     return Err(Error::Corrupt("catalog shard symlink".into()));
                 }
-                for entry in fs::read_dir(shard.path())? {
-                    let path = entry?.path();
+                for entry in
+                    fs::read_dir(&shard_path).map_err(|error| audit_io(&shard_path, error))?
+                {
+                    let path = entry.map_err(|error| audit_io(&shard_path, error))?.path();
                     if path.extension().is_some_and(|e| e == "tmp") {
                         continue;
                     }
@@ -308,12 +350,15 @@ impl Store {
                         .and_then(|s| s.to_str())
                         .ok_or_else(|| Error::Corrupt("catalog filename".into()))?;
                     validate_id(id)?;
-                    let canonical =
-                        self.safe_path(&format!("catalog/projects/{}/{}.md", &id[..2], id))?;
+                    let canonical = self
+                        .safe_path(&format!("catalog/projects/{}/{}.md", &id[..2], id))
+                        .map_err(|error| audit_source_error(&path, error))?;
                     if canonical != path {
                         return Err(Error::Corrupt("catalog path identity".into()));
                     }
-                    let frames = codec::read("catalog", &mut BufReader::new(File::open(&path)?))?;
+                    let file = File::open(&path).map_err(|error| audit_io(&path, error))?;
+                    let frames = codec::read("catalog", &mut BufReader::new(file))
+                        .map_err(|error| audit_source_error(&path, error))?;
                     if frames.len() != 1
                         || frames[0].kind != "project"
                         || frames[0].key != id
@@ -699,12 +744,13 @@ impl HistorySpool {
         let mut count = 0u64;
         for kind in ["memory", "procedure"] {
             let base = store.root.join("current").join(kind);
-            if !base.exists() {
+            let Some(shards) = source_entries(&base)? else {
                 continue;
-            }
-            for shard in fs::read_dir(base)? {
-                for entry in fs::read_dir(shard?.path())? {
-                    let path = entry?.path();
+            };
+            for shard in shards {
+                let shard = shard.map_err(|error| audit_io(&base, error))?.path();
+                for entry in fs::read_dir(&shard).map_err(|error| audit_io(&shard, error))? {
+                    let path = entry.map_err(|error| audit_io(&shard, error))?.path();
                     if path.extension().is_some_and(|s| s == "tmp") {
                         continue;
                     }
@@ -718,7 +764,9 @@ impl HistorySpool {
                             epoch: store.load(&store.local.join("source-epoch"))?,
                             sequence: store.generation_for_audit()?,
                         };
-                        store.acquire_kind_locked(id, kind, position)?
+                        store
+                            .acquire_kind_with_origin(id, kind, position)
+                            .map_err(|error| audit_source_error(&path, error))?
                     };
                     if acquired.source_position != self.source_position {
                         return Err(Error::Stale("source changed during audit".into()));

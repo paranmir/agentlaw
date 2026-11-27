@@ -2,6 +2,7 @@
 use crate::write::*;
 use crate::*;
 use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+use agentlaw_storage::{EntityKind, PrefixCondition, PrefixMatch};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -27,7 +28,16 @@ pub(crate) fn source<T>(r: agentlaw_storage::Result<T>) -> Result<T> {
         agentlaw_storage::Error::Capacity => DomainError::new("source_payload_requires_spool", "Selected source requires file-backed delivery."),
         agentlaw_storage::Error::Stale(_) => DomainError::new("stale_memory_ref", "Source state changed; inspect current heads and retry review."),
         agentlaw_storage::Error::NotFound(_) => DomainError::new("memory_not_found", "Requested source identity is absent."),
-        agentlaw_storage::Error::RecoveryRequired(_) => DomainError::new("recovery_required", "Source publication recovery must complete before access."),
+        agentlaw_storage::Error::RecoveryRequired(_) => DomainError::new("recovery_required", "Source publication recovery must complete before access.")
+            .with_next_action("Complete publication recovery, then check the retained operation or current heads before resubmitting a write."),
+        agentlaw_storage::Error::Corrupt(_) => DomainError::new("source_corrupt", format!("Cannot read canonical source: {e}"))
+            .with_diagnostic(AcquisitionDetails { acquisition_failure: AcquisitionFailure::SourceCorrupt }),
+        agentlaw_storage::Error::Io(_) | agentlaw_storage::Error::SourceRead { .. } =>
+            DomainError::new("source_operation_failed", format!("Cannot read canonical source: {e}"))
+                .with_diagnostic(AcquisitionDetails { acquisition_failure: AcquisitionFailure::SourceRead }),
+        agentlaw_storage::Error::PublicationInvariant(reason) => panic!("publication invariant failed: {reason}"),
+        agentlaw_storage::Error::PublicationDecisionIo(_) =>
+            DomainError::new("source_operation_failed", format!("Publication decision could not be confirmed: {e}")),
         _ => DomainError::new("source_operation_failed", "Canonical operation failed; inspect diagnostics without discarding source or pending work."),
     })
 }
@@ -37,6 +47,176 @@ pub(crate) fn digest(v: &impl Serialize) -> Result<String> {
         DomainError::new("serialization_failed", "Could not serialize review basis.")
     })?;
     Ok(format!("{:x}", Sha256::digest(b)))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmittedPrefix {
+    pub(crate) condition: PrefixCondition,
+    path: String,
+    provided: String,
+}
+
+pub(crate) fn selected_id(actual: PrefixMatch, path: &str, input: &str) -> Result<String> {
+    match actual {
+        PrefixMatch::Unique(id) => Ok(id),
+        PrefixMatch::Absent => Err(validation::identity_input_error(
+            "not_found",
+            path,
+            &json!(input),
+        )),
+        PrefixMatch::Ambiguous => Err(validation::identity_input_error(
+            "ambiguous",
+            path,
+            &json!(input),
+        )),
+    }
+}
+
+pub(crate) fn select_source_id(
+    guard: &agentlaw_storage::published::SourceReadGuard<'_>,
+    kind: EntityKind,
+    input: &str,
+    path: &str,
+    map_error: impl FnOnce(agentlaw_storage::Error) -> DomainError,
+) -> Result<String> {
+    if !validation::is_entity_identity(input) {
+        return Err(validation::identity_input_error(
+            "invalid_input",
+            path,
+            &json!(input),
+        ));
+    }
+    if !validation::is_identity_prefix(input) {
+        return Ok(input.to_owned());
+    }
+    selected_id(
+        guard
+            .match_identity_prefix(kind, &input.to_ascii_lowercase())
+            .map_err(map_error)?,
+        path,
+        input,
+    )
+}
+
+pub(crate) fn source_error(error: agentlaw_storage::Error) -> DomainError {
+    source::<()>(Err(error)).expect_err("storage error")
+}
+
+pub(crate) fn prefix_error(
+    error: agentlaw_storage::Error,
+    submitted: &[SubmittedPrefix],
+) -> DomainError {
+    match error {
+        agentlaw_storage::Error::PrefixSelection { index, actual } => {
+            let input = &submitted[index];
+            match actual {
+                PrefixMatch::Unique(_) => DomainError::new(
+                    "source_changed",
+                    "The prefix now selects a different identity.",
+                )
+                .with_next_action("Inspect current heads and submit the intended canonical UUID.")
+                .with_details(json!([{"path":input.path,"provided_value":input.provided}])),
+                other => selected_id(other, &input.path, &input.provided)
+                    .expect_err("prefix no longer resolves uniquely"),
+            }
+        }
+        other => source_error(other),
+    }
+}
+
+pub(crate) fn normalize_write_ids(
+    guard: &agentlaw_storage::published::SourceReadGuard<'_>,
+    request: &mut RememberRequest,
+) -> Result<Vec<SubmittedPrefix>> {
+    let mut prefixes = Vec::new();
+    let mut resolve = |kind, input: &mut String, path: String| -> Result<()> {
+        let selected = select_source_id(guard, kind, input, &path, source_error)?;
+        if validation::is_identity_prefix(input) {
+            prefixes.push(SubmittedPrefix {
+                condition: PrefixCondition {
+                    kind,
+                    prefix: input.to_ascii_lowercase(),
+                    selected: selected.clone(),
+                },
+                path,
+                provided: input.clone(),
+            });
+        }
+        *input = selected;
+        Ok(())
+    };
+    let mut unique_ids = |ids: &mut [String], field: &str| -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for (index, id) in ids.iter_mut().enumerate() {
+            let provided = json!(id);
+            let path = format!("{field}/{index}");
+            resolve(EntityKind::Memory, id, path.clone())?;
+            if !seen.insert(id.clone()) {
+                return Err(validation::identity_input_error(
+                    "invalid_input",
+                    &path,
+                    &provided,
+                ));
+            }
+        }
+        Ok(())
+    };
+    for (index, proposal) in request.memories.iter_mut().flatten().enumerate() {
+        for (field, ids) in [
+            ("related_memory_ids", &mut proposal.related_memory_ids),
+            ("required_memory_ids", &mut proposal.required_memory_ids),
+        ] {
+            if let Some(ids) = ids {
+                unique_ids(ids, &format!("/memories/{index}/{field}"))?;
+            }
+        }
+    }
+    if let Some(procedure) = &mut request.procedure {
+        unique_ids(
+            &mut procedure.evidence_memory_ids,
+            "/procedure/evidence_memory_ids",
+        )?;
+    }
+    for (index, proposal) in request.memories.iter_mut().flatten().enumerate() {
+        for (field, refs) in [
+            ("parent_refs", &mut proposal.parent_refs),
+            ("consolidation_refs", &mut proposal.consolidation_refs),
+        ] {
+            let mut seen = BTreeSet::new();
+            for (position, reference) in refs.iter_mut().flatten().enumerate() {
+                let provided = json!(reference.memory_id);
+                let path = format!("/memories/{index}/{field}/{position}/memory_id");
+                resolve(EntityKind::Memory, &mut reference.memory_id, path.clone())?;
+                if !seen.insert(reference.clone()) {
+                    return Err(validation::identity_input_error(
+                        "invalid_input",
+                        &path,
+                        &provided,
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(procedure) = &mut request.procedure {
+        let mut seen = BTreeSet::new();
+        for (position, reference) in procedure.parent_refs.iter_mut().flatten().enumerate() {
+            let provided = json!(reference.procedure_id);
+            let path = format!("/procedure/parent_refs/{position}/procedure_id");
+            resolve(
+                EntityKind::Procedure,
+                &mut reference.procedure_id,
+                path.clone(),
+            )?;
+            if !seen.insert(reference.clone()) {
+                return Err(validation::identity_input_error(
+                    "invalid_input",
+                    &path,
+                    &provided,
+                ));
+            }
+        }
+    }
+    Ok(prefixes)
 }
 pub(crate) fn external_current(state: &CurrentState) -> Value {
     json!({"memory_id":state.resolved_id,"current_heads":state.heads.iter().cloned().map(RecallHead::from).collect::<Vec<_>>(),"head_reconciliation_required":state.heads.len()>1})
@@ -96,6 +276,11 @@ pub(crate) struct Snapshot {
     pub(crate) publication_basis: agentlaw_storage::ReadSet,
 }
 impl SourceSnapshot for Snapshot {
+    fn match_memory_prefix(&self, _: &str) -> Result<PrefixMatch> {
+        Err(DomainError::unsupported(
+            "Prefix selection requires the authoritative source inventory.",
+        ))
+    }
     fn current(&self, id: &str) -> Result<Option<CurrentState>> {
         validate_id(id)?;
         let mut cursor = id.to_owned();

@@ -24,6 +24,14 @@ pub trait SourceSnapshot {
     fn current(&self, id: &str) -> Result<Option<CurrentState>>;
     fn inventory(&self) -> Result<Vec<CurrentState>>;
     fn read_set(&self) -> ReadSet;
+    fn match_memory_prefix(&self, prefix: &str) -> Result<agentlaw_storage::PrefixMatch> {
+        Ok(agentlaw_storage::PrefixMatch::count(
+            self.inventory()?
+                .into_iter()
+                .map(|state| state.requested_id)
+                .filter(|id| id.replace('-', "").starts_with(prefix)),
+        ))
+    }
 }
 pub fn validate_id(id: &str) -> Result<()> {
     let parsed = uuid::Uuid::parse_str(id)

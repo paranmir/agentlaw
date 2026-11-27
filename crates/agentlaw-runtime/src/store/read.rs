@@ -36,6 +36,7 @@ impl ReadCoordinator {
                 limit,
             )
         })
+        .map_err(|error| acquisition_guidance(error, "procedure search"))
     }
     pub fn new(projection: ProjectionHandle, budget: DeltaBudget) -> Self {
         Self { projection, budget }
@@ -80,6 +81,7 @@ impl ReadCoordinator {
         self.with_exact(ctx, |exact| {
             agentlaw_flows::prepare::prepare(ctx, exact, request)
         })
+        .map_err(|error| acquisition_guidance(error, "write preparation"))
     }
 
     /// Prepares a connect command outside the mutation lane.
@@ -161,11 +163,49 @@ impl ReadCoordinator {
     }
 }
 
-fn source_view_error(_: agentlaw_storage::Error) -> DomainError {
-    DomainError::new(
-        "source_operation_failed",
-        "Cannot acquire the source read view.",
-    )
+fn source_view_error(error: agentlaw_storage::Error) -> DomainError {
+    use agentlaw_contracts::{AcquisitionDetails, AcquisitionFailure};
+    let (code, cause) = match error {
+        agentlaw_storage::Error::Corrupt(_) => {
+            ("source_corrupt", Some(AcquisitionFailure::SourceCorrupt))
+        }
+        agentlaw_storage::Error::RecoveryRequired(_) => ("recovery_required", None),
+        agentlaw_storage::Error::Io(_) | agentlaw_storage::Error::SourceRead { .. } => (
+            "source_operation_failed",
+            Some(AcquisitionFailure::SourceRead),
+        ),
+        _ => ("source_operation_failed", None),
+    };
+    let error = DomainError::new(
+        code,
+        format!("Cannot acquire the source read view: {error}"),
+    );
+    if let Some(acquisition_failure) = cause {
+        error.with_diagnostic(AcquisitionDetails {
+            acquisition_failure,
+        })
+    } else {
+        error
+    }
+}
+
+fn acquisition_guidance(error: DomainError, operation: &str) -> DomainError {
+    use agentlaw_contracts::{AcquisitionDetails, AcquisitionFailure};
+    let Some(details) = error.diagnostic::<AcquisitionDetails>() else {
+        return error;
+    };
+    let action = match details.acquisition_failure {
+        AcquisitionFailure::ProjectionCapacity => "Wait for the index to catch up",
+        AcquisitionFailure::SourceRead => {
+            "Restore source access by checking permissions, file sharing and storage availability"
+        }
+        AcquisitionFailure::SourceCorrupt => {
+            "Preserve the source, run doctor --audit, and restore damaged data from a verified copy"
+        }
+    };
+    error.with_next_action(format!(
+        "{action}, then repeat the original {operation} request."
+    ))
 }
 
 #[cfg(test)]

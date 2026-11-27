@@ -205,8 +205,19 @@ pub fn error_payload(error: &DomainError) -> Value {
     });
     let mut payload = json!({"code":error.code,"message":error.message,"retryable":error.retryable,
         "next_action":next_action});
-    if let Some(details) = &error.details {
-        payload["errors"] = details.clone();
+    if let Some(audit) = error.diagnostic::<agentlaw_contracts::AuditFailureDetails>() {
+        payload["worker_runtime"] = json!(audit.worker_runtime);
+        payload["observed_at_ms"] = json!(audit.observed_at_ms);
+    } else if let Some(publication) = error.diagnostic::<agentlaw_contracts::PublicationDetails>() {
+        payload["publication_state"] = json!(publication.publication_state);
+        payload["publication_ref"] = json!(publication.publication_ref);
+    } else if error
+        .diagnostic::<agentlaw_contracts::AcquisitionDetails>()
+        .is_none()
+    {
+        if let Some(details) = &error.details {
+            payload["errors"] = details.clone();
+        }
     }
     payload
 }
@@ -407,7 +418,7 @@ mod tests {
         let mut s = McpSession::default();
         let mut b = TestBackend(0);
         ready(&mut s, &mut b);
-        let r=s.handle(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"memory_ids":["m"]}}}}"#,&mut b).unwrap();
+        let r=s.handle(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentlaw","arguments":{"action":"recall","recall":{"memory_ids":["11111111-1111-4111-8111-111111111111"]}}}}"#,&mut b).unwrap();
         assert_eq!(b.0, 1);
         assert_eq!(r["result"]["isError"], false);
         let text: Value =

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::installation::config::Config;
-use crate::protocol::{BindingError, BindingRef};
+use crate::protocol::{BindingError, BindingRef, ConfigurationFailure};
 use agentlaw_storage::BindingKey;
 
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct ConfigSnapshot {
 #[derive(Debug, Clone)]
 pub enum ConfigState {
     Missing,
-    Invalid(String),
+    Invalid(ConfigurationFailure),
     Ready(Arc<ConfigSnapshot>),
 }
 

@@ -146,6 +146,24 @@
       "reason": "Project resumption needs Task selection. If one Task is confirmed, read its handoff sections."
     },
     {
+      "id": "inspect-conditional-publication",
+      "valid": true,
+      "input": {"action":"remember_this","pending_action":"inspect","publication_ref":"11111111-1111-4111-8111-111111111111"},
+      "reason": "Read a returned operation's state without executing a write."
+    },
+    {
+      "id": "discovery-with-identity-prefix",
+      "valid": true,
+      "input": {"action":"recall","recall_for":"Deployment constraints","memory_ids":["abcdef12"],"procedure_ids":["98765432"]},
+      "reason": "Choose the unique identity of each kind and also run discovery."
+    },
+    {
+      "id": "identity-prefix-too-short",
+      "valid": false,
+      "input": {"action":"recall","memory_ids":["abcdef1"]},
+      "reason": "An identity prefix needs at least eight hex digits."
+    },
+    {
       "id": "recall-exact-mixed",
       "valid": true,
       "input": {

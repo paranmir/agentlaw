@@ -33,6 +33,13 @@ fn command(state: &Path) -> Command {
     cmd
 }
 fn run(state: &Path, args: &[&str], input: Option<Value>) -> (Output, Value) {
+    let out = run_command_output(state, args, input);
+    let value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("Invalid JSON output: {:?}", out));
+    (out, value)
+}
+
+fn run_command_output(state: &Path, args: &[&str], input: Option<Value>) -> Output {
     let mut cmd = command(state);
     cmd.args(args)
         .stdin(Stdio::piped())
@@ -100,9 +107,7 @@ fn run(state: &Path, args: &[&str], input: Option<Value>) -> (Output, Value) {
         "Owned CLI command timed out: {args:?}; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let value = serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|_| panic!("Invalid JSON output: {:?}", out));
-    (out, value)
+    out
 }
 use owned_process::OwnedProcess as Daemon;
 fn initialize(state: &Path, source: &Path) {
@@ -2045,6 +2050,12 @@ struct SourceReadDenial<'a> {
 #[cfg(windows)]
 impl<'a> SourceReadDenial<'a> {
     fn apply(path: &'a Path) -> Self {
+        // Inherit the denial to child directories so catalog enumeration fails.
+        let rights = if path.is_dir() { "(CI)(RX)" } else { "R" };
+        Self::apply_rights(path, rights)
+    }
+
+    fn apply_rights(path: &'a Path, rights: &str) -> Self {
         let identity = std::process::Command::new("whoami")
             .args(["/user", "/fo", "csv", "/nh"])
             .output()
@@ -2063,9 +2074,6 @@ impl<'a> SourceReadDenial<'a> {
             principal: format!("*{sid}"),
             active: true,
         };
-        // Windows accounts normally bypass ancestor traversal checks. Inherit the
-        // catalog directory denial so opening its project directory is also denied.
-        let rights = if path.is_dir() { "(CI)(RX)" } else { "R" };
         let output = std::process::Command::new("icacls")
             .arg(path)
             .args(["/deny", &format!("{}:{rights}", guard.principal)])
@@ -2251,7 +2259,7 @@ fn catalog_discovery_distinguishes_absence_from_access_denied() {
         }
         let output_path = temp.path().join("procedure-output.jsonl");
         for (operation, expected) in [
-            ("search", "source_unavailable"),
+            ("search", "source_operation_failed"),
             ("list", "inventory_failed"),
         ] {
             let mut command = command(&state);
@@ -2270,7 +2278,16 @@ fn catalog_discovery_distinguishes_absence_from_access_denied() {
             let out = command.output().unwrap();
             assert!(!out.status.success(), "{out:?}");
             let error: Value = serde_json::from_slice(&out.stderr).unwrap();
-            assert_eq!(error["code"], expected, "FR-06.4: {error}");
+            assert_eq!(error["code"], expected, "FR-06.4 CT-04g: {error}");
+            if operation == "search" {
+                assert_eq!(error["retryable"], false);
+                let action = error["next_action"].as_str().unwrap().to_lowercase();
+                assert!(
+                    action.contains("search")
+                        && (action.contains("access") || action.contains("permission")),
+                    "{error}"
+                );
+            }
         }
         #[cfg(windows)]
         access.restore().unwrap();
@@ -2636,4 +2653,2388 @@ fn fr_06_5_aggregate_contextual_rules_and_required_reference_survive_response_li
         .as_str()
         .unwrap()
         .contains("Project rules, active Tasks and work targets have not been checked"));
+}
+
+struct IdentityFrontend {
+    runtime: RuntimeCleanup,
+    temp: tempfile::TempDir,
+    state: std::path::PathBuf,
+    source: std::path::PathBuf,
+}
+
+impl IdentityFrontend {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let source = temp.path().join("store");
+        let runtime = RuntimeCleanup(state.clone());
+        initialize(&state, &source);
+        Self {
+            runtime,
+            temp,
+            state,
+            source,
+        }
+    }
+
+    fn call(&self, action: &str, fields: Value) -> (Output, Value) {
+        run(
+            &self.state,
+            &["call", "--json", "-"],
+            Some(json!({"action": action, (action): fields})),
+        )
+    }
+
+    fn success(&self, action: &str, fields: Value) -> Value {
+        let (out, result) = self.call(action, fields);
+        assert!(out.status.success(), "{action}: {result}");
+        result
+    }
+
+    fn memory(&self, body: &str, scope: &str, rule: bool) -> Value {
+        self.success(
+            "remember_this",
+            json!({"memories":[{
+                "operation":"create", "what_to_remember":body, "applies_to":[scope],
+                "evidence":"Observed", "is_rule":rule
+            }]}),
+        )["results"][0]["memory_ref"]
+            .clone()
+    }
+
+    fn procedure(&self, memory_id: &Value) -> Value {
+        let mut proposal = json!({"operation":"create","evidence_memory_ids":[memory_id]});
+        let prepared = self.success("remember_this", json!({"procedure":proposal}));
+        proposal["applies_to"] = json!(["machine"]);
+        proposal["name"] = json!("Verify deployment");
+        proposal["use_when"] = json!("During deployment");
+        proposal["instructions"] = json!("Check the deployment results.");
+        proposal["evidence"] = json!("Verified in deployment");
+        self.success(
+            "remember_this",
+            json!({"procedure":proposal,"authoring_ref":prepared["authoring_ref"]}),
+        )["procedure_ref"]
+            .clone()
+    }
+
+    fn current_path(&self, reference: &Value) -> std::path::PathBuf {
+        let id = reference["memory_id"].as_str().unwrap();
+        self.source
+            .join("current/memory")
+            .join(&id[..2])
+            .join(format!("{id}.md"))
+    }
+}
+
+#[test]
+fn fr_01_5_mixed_recall_resolves_memory_and_procedure_prefixes() {
+    // ID-01
+    let f = IdentityFrontend::new();
+    let memory = f.memory("Check the deployment logs", "user", false);
+    let other = f.memory("Record deployment time", "user", false);
+    let rule = f.memory("Follow the release checklist", "user", true);
+    let procedure = f.procedure(&memory["memory_id"]);
+    wait_for_recall_index(&f.state, rule["memory_id"].as_str().unwrap());
+    let mut request = json!({"recall_for":"deployment","memory_ids":[memory["memory_id"],other["memory_id"]],"procedure_ids":[procedure["procedure_id"]]});
+    let full = f.success("recall", request.clone());
+    request["memory_ids"][0] = json!(&memory["memory_id"].as_str().unwrap()[..8]);
+    request["procedure_ids"][0] = json!(&procedure["procedure_id"].as_str().unwrap()[..8]);
+    let short = f.success("recall", request);
+    for field in [
+        "memories",
+        "learned_procedures",
+        "rules",
+        "candidate_counts",
+    ] {
+        assert_eq!(short[field], full[field], "FR-01.5 ID-01: {field}");
+    }
+    assert!(short["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["current_heads"][0]["memory_ref"] == memory
+            && row["current_heads"][0]["what_to_remember"] == "Check the deployment logs"));
+    assert!(short["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["current_heads"][0]["memory_ref"] == other));
+    assert!(short["learned_procedures"]
+        .to_string()
+        .contains(procedure["procedure_id"].as_str().unwrap()));
+    assert!(short["learned_procedures"]
+        .to_string()
+        .contains("Check the deployment results."));
+    assert!(short["rules"]
+        .to_string()
+        .contains(rule["memory_id"].as_str().unwrap()));
+}
+
+#[test]
+fn fr_01_5_uppercase_prefix_retrieves_memory_outside_project_scope() {
+    // ID-02
+    let f = IdentityFrontend::new();
+    let project = f.temp.path().join("release");
+    std::fs::create_dir(&project).unwrap();
+    f.success(
+        "connect_project_memory",
+        json!({"intent":"create","project_path":project,"project_name":"Release"}),
+    );
+    let saved = f.success("remember_this", json!({"project_path":project,"memories":[{
+        "operation":"create","what_to_remember":"Release verification","evidence":"Observed","applies_to":["project"]
+    }]}));
+    let reference = &saved["results"][0]["memory_ref"];
+    let id = reference["memory_id"].as_str().unwrap();
+    let full = f.success("recall", json!({"project_path":project,"memory_ids":[id]}));
+    let prefix = id.replace('-', "")[..9].to_uppercase();
+    let outside = f.success("recall", json!({"memory_ids":[prefix]}));
+    assert_eq!(outside["memories"], full["memories"], "FR-01.5 ID-02");
+    assert_eq!(
+        outside["memories"][0]["current_heads"][0]["memory_ref"],
+        *reference
+    );
+    assert!(outside.get("candidate_counts").is_none());
+}
+
+fn assert_id_recall_error(
+    out: &Output,
+    error: &Value,
+    code: &str,
+    path: &str,
+    value: &str,
+) -> String {
+    assert!(!out.status.success(), "FR-01.5: {error}");
+    assert_eq!(error["code"], code, "{error}");
+    assert_eq!(error["retryable"], false);
+    let details = error["errors"].as_array().unwrap();
+    assert!(
+        details
+            .iter()
+            .any(|entry| entry["path"] == path && entry["provided_value"] == value),
+        "{error}"
+    );
+    for field in [
+        "status",
+        "memories",
+        "learned_procedures",
+        "rules",
+        "candidate_counts",
+        "artifact",
+    ] {
+        assert!(error.get(field).is_none(), "{error}");
+    }
+    error["next_action"].as_str().unwrap().to_lowercase()
+}
+
+#[test]
+fn fr_01_5_malformed_identity_inputs_identify_the_submitted_value() {
+    // ID-03
+    let f = IdentityFrontend::new();
+    for value in [
+        "abcdef1",
+        "0123456789abcdef0123456789abcdef0",
+        "abcdef1g",
+        "abcd-ef12",
+        "abcdef12-3456-1345-8234-abcdef123456",
+        "abcdef12-3456-4345-1234-abcdef123456",
+    ] {
+        let (out, error) = f.call("recall", json!({"memory_ids":[value]}));
+        let action = assert_id_recall_error(&out, &error, "invalid_input", "/memory_ids/0", value);
+        assert!(
+            action.contains("uuid") || action.contains("prefix"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn fr_01_5_unmatched_prefix_rejects_the_whole_mixed_recall() {
+    // ID-04
+    let f = IdentityFrontend::new();
+    let existing = f.memory("Deployment notes", "user", false);
+    let id = existing["memory_id"].as_str().unwrap();
+    let absent = if id.starts_with("aaaaaaaa") {
+        "bbbbbbbb"
+    } else {
+        "aaaaaaaa"
+    };
+    let (out, error) = f.call(
+        "recall",
+        json!({"recall_for":"deployment","memory_ids":[id,absent]}),
+    );
+    let action = assert_id_recall_error(&out, &error, "not_found", "/memory_ids/1", absent);
+    assert!(
+        action.contains("id")
+            && (action.contains("lookup")
+                || action.contains("look up")
+                || action.contains("search")
+                || action.contains("recall")
+                || action.contains("find")),
+        "{error}"
+    );
+}
+
+#[test]
+fn fr_01_5_history_compact_uuid_selects_the_same_versions() {
+    // ID-07
+    let f = IdentityFrontend::new();
+    let memory = f.memory("Record deployment time", "user", false);
+    let procedure = f.procedure(&memory["memory_id"]);
+    for (field, reference) in [("memory_id", memory), ("procedure_id", procedure)] {
+        let id = reference[field].as_str().unwrap();
+        let mut request = json!({(field): id, "context_layers": 2});
+        let canonical = f.success("history", request.clone());
+        request[field] = json!(id.replace('-', ""));
+        let compact = f.success("history", request);
+        assert_eq!(compact, canonical, "FR-01.5 ID-07: {field}");
+        assert!(!canonical["latest_changes"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn fr_01_5_missing_canonical_id_preserves_the_selected_body() {
+    // ID-08
+    let f = IdentityFrontend::new();
+    let reference = f.memory("Record deployment time", "user", false);
+    let missing = if reference["memory_id"] == "11111111-1111-4111-8111-111111111111" {
+        "22222222-2222-4222-8222-222222222222"
+    } else {
+        "11111111-1111-4111-8111-111111111111"
+    };
+    let result = f.success(
+        "recall",
+        json!({"memory_ids":[reference["memory_id"],missing]}),
+    );
+    assert_eq!(
+        result["code"], "exact_selection_incomplete",
+        "FR-01.5 ID-08"
+    );
+    assert_eq!(
+        result["missing_ids"],
+        json!({"memory_ids":[missing],"procedure_ids":[]})
+    );
+    assert_eq!(
+        result["memories"][0]["current_heads"][0]["memory_ref"],
+        reference
+    );
+    assert_eq!(
+        result["memories"][0]["current_heads"][0]["what_to_remember"],
+        "Record deployment time"
+    );
+}
+
+#[test]
+fn fr_01_6_missing_evidence_identifies_required_field_on_cli_and_mcp() {
+    // ER-04
+    let f = IdentityFrontend::new();
+    let reference = f.memory("Original deployment notes", "user", false);
+    let fields = json!({"memories":[{"operation":"evolve","parent_refs":[reference],"what_to_remember":"Revision"}]});
+    let (out, cli) = f.call("remember_this", fields.clone());
+    assert!(!out.status.success(), "FR-01.6 ER-04: {cli}");
+    let mut mcp = McpFixture::start(&f.state);
+    mcp.initialize();
+    let rpc = mcp.call(2, json!({"action":"remember_this","remember_this":fields}));
+    assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+    for error in [&cli, &rpc["result"]["structuredContent"]] {
+        let detail = error["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == "/memories/0/evidence")
+            .unwrap_or_else(|| panic!("{error}"));
+        assert!(detail.get("provided_value").is_none(), "{detail}");
+        assert!(
+            detail.to_string().to_lowercase().contains("required"),
+            "{detail}"
+        );
+    }
+    let current = f.success("recall", json!({"memory_ids":[reference["memory_id"]]}));
+    assert_eq!(
+        current["memories"][0]["current_heads"][0]["memory_ref"],
+        reference
+    );
+}
+
+#[test]
+fn fr_01_6_audit_preserves_truncated_canonical_memory() {
+    // ER-09
+    let f = IdentityFrontend::new();
+    let body = "Check the length of the published deployment record.";
+    let reference = f.memory(body, "user", false);
+    let path = f.current_path(&reference);
+    let original = std::fs::read(&path).unwrap();
+    let start = original
+        .windows(body.len())
+        .position(|bytes| bytes == body.as_bytes())
+        .unwrap();
+    let footer = b"\n<!-- /agentlaw-record-v1 -->\n";
+    let footer_start = start + body.len();
+    assert_eq!(&original[footer_start..footer_start + footer.len()], footer);
+    for length in [footer_start + footer.len() / 2, start + body.len() / 2] {
+        let truncated = &original[..length];
+        std::fs::write(&path, truncated).unwrap();
+        let error = failed_source_audit(&f.state);
+        let message = error["message"].as_str().unwrap().to_lowercase();
+        assert!(
+            ["unexpected eof", "unexpected end", "end of file", "truncat"]
+                .iter()
+                .any(|cause| message.contains(cause)),
+            "{error}"
+        );
+        assert_eq!(error["code"], "source_corrupt", "{error}");
+        assert_eq!(error["retryable"], false);
+        let action = error["next_action"].as_str().unwrap().to_lowercase();
+        assert!(
+            action.contains("preserv") && action.contains("restor") && action.contains("cop"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), truncated);
+    }
+}
+
+#[test]
+fn fr_01_6_unparseable_installation_config_names_the_configuration() {
+    // ER-11
+    let f = IdentityFrontend::new();
+    f.runtime.shutdown();
+    let config = f.state.join("config.json");
+    assert!(config.is_file());
+    std::fs::write(&config, b"{\"response_limit_bytes\":").unwrap();
+    let (out, error) = run(&f.state, &["config", "get", "response_limit_bytes"], None);
+    assert!(!out.status.success(), "FR-01.6 ER-11: {error}");
+    assert_eq!(error["code"], "invalid_configuration", "{error}");
+    assert_configuration_path(&error, &config);
+    assert_eq!(
+        std::fs::read(config).unwrap(),
+        b"{\"response_limit_bytes\":"
+    );
+}
+
+fn assert_configuration_path(error: &Value, config: &Path) {
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains(config.to_str().unwrap()), "{error}");
+}
+
+fn failed_source_audit(state: &Path) -> Value {
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let started = now_ms();
+    let out = run_command_output(state, &["doctor", "--audit"], None);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let error: Value = serde_json::from_slice(&out.stderr)
+        .unwrap_or_else(|error| panic!("Invalid audit stderr: {error}; {out:?}"));
+    let observed = error["observed_at_ms"].as_u64().unwrap();
+    assert!((started..=now_ms()).contains(&observed), "{error}");
+    let health = &error["worker_runtime"];
+    assert_eq!(health["status"], "running", "{health}");
+    assert!(
+        health["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|component| component["kind"] == "host" && component["state"] == "ready"),
+        "{health}"
+    );
+    assert!(health["activity"].is_object(), "{health}");
+    error
+}
+
+fn frontend_with_colliding_identities() -> (IdentityFrontend, [(&'static str, &'static str); 2]) {
+    use agentlaw_storage::{CurrentUnit, Head, Mutation, Store, UnitState};
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let source = temp.path().join("store");
+    let _runtime = RuntimeCleanup(state.clone());
+    let store = Store::open(&source, temp.path().join("publisher")).unwrap();
+    let machine = uuid::Uuid::new_v4().to_string();
+    let entries = [
+        (
+            "abcdef12-a000-4000-8000-000000000001",
+            "Check deployment logs",
+        ),
+        (
+            "abcdef12-b000-4000-8000-000000000002",
+            "Review office supplies",
+        ),
+    ];
+    store.publish(&uuid::Uuid::new_v4().to_string(), entries.iter().map(|(id, body)| Mutation {
+        unit: CurrentUnit {
+            entity_id: (*id).into(), entity_type:"memory".into(),
+            state: UnitState::Live { heads: vec![Head {
+                metadata: json!({"change_id":uuid::Uuid::new_v4().to_string(),"applicability":{"scope":"user"},
+                    "origin":{"machine_id":machine,"user_id":"user"},"recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}),
+                body: (*body).into(),
+            }] },
+        },
+        expected_versions:vec![], evidence:"Observed test publication".into(),
+    }).collect()).unwrap();
+    drop(store);
+    let (out, connected) = run(
+        &state,
+        &["store", "connect", "--path", source.to_str().unwrap()],
+        None,
+    );
+    assert!(out.status.success(), "{connected}");
+    (
+        IdentityFrontend {
+            runtime: _runtime,
+            temp,
+            state,
+            source,
+        },
+        entries,
+    )
+}
+
+#[test]
+fn fr_01_5_ambiguous_prefix_is_not_narrowed_by_search_matches() {
+    // ID-05
+    let (f, entries) = frontend_with_colliding_identities();
+    let call = |fields| f.call("recall", fields);
+    let query = "deployment";
+    wait_for_recall_index(&f.state, entries[0].0);
+    let (out, error) = call(json!({"recall_for":query,"memory_ids":["abcdef12"]}));
+    let action = assert_id_recall_error(&out, &error, "ambiguous", "/memory_ids/0", "abcdef12");
+    assert!(
+        action.contains("longer") || action.contains("full"),
+        "FR-01.5 ID-05: {error}"
+    );
+    for (id, body) in entries {
+        let (out, result) = call(json!({"memory_ids":[id.replace('-', "")[..9]]}));
+        assert!(out.status.success(), "{result}");
+        assert_eq!(
+            result["memories"][0]["current_heads"][0]["memory_ref"]["memory_id"],
+            id
+        );
+        assert_eq!(
+            result["memories"][0]["current_heads"][0]["what_to_remember"],
+            body
+        );
+    }
+}
+
+#[cfg(unix)]
+struct DeniedRead<'a> {
+    path: &'a Path,
+    original: std::fs::Permissions,
+}
+
+#[test]
+fn duplicate_identity_text_reports_the_second_input() {
+    // ID-17
+    let f = IdentityFrontend::new();
+    let (out, error) = f.call("recall", json!({"memory_ids":["abcdef12","abcdef12"]}));
+    let correction =
+        assert_id_recall_error(&out, &error, "invalid_input", "/memory_ids/1", "abcdef12");
+    assert!(
+        correction.contains("duplicate")
+            || correction.contains("unique")
+            || correction.contains("once"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unbound_project_reports_ambiguous_explicit_prefix() {
+    // ID-18
+    let (f, _) = frontend_with_colliding_identities();
+    let path = f.temp.path().join("unconnected-project");
+    std::fs::create_dir(&path).unwrap();
+    let (out, error) = f.call(
+        "recall",
+        json!({
+            "project_path":path, "recall_for":"deployment", "memory_ids":["abcdef12"]
+        }),
+    );
+    assert_id_recall_error(&out, &error, "ambiguous", "/memory_ids/0", "abcdef12");
+    for field in [
+        "partial_recall",
+        "partial_recall_error",
+        "project_candidates",
+    ] {
+        assert!(error.get(field).is_none(), "{error}");
+    }
+}
+
+#[cfg(unix)]
+impl<'a> DeniedRead<'a> {
+    fn apply(path: &'a Path) -> Self {
+        Self::apply_mode(path, 0)
+    }
+
+    fn apply_mode(path: &'a Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self { path, original }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DeniedRead<'_> {
+    fn drop(&mut self) {
+        std::fs::set_permissions(self.path, self.original.clone()).unwrap();
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn fr_01_6_audit_reports_unreadable_source_without_repairing_it() {
+    // ER-10
+    let f = IdentityFrontend::new();
+    let reference = f.memory("Verify deployment", "user", false);
+    let path = f.current_path(&reference);
+    let bytes = std::fs::read(&path).unwrap();
+    let (error, cause) = {
+        #[cfg(unix)]
+        let _denial = DeniedRead::apply(&path);
+        #[cfg(windows)]
+        let _denial = SourceReadDenial::apply(&path);
+        let cause = std::fs::File::open(&path).unwrap_err();
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        (failed_source_audit(&f.state), cause.to_string())
+    };
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(error["code"], "diagnostic_io", "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains(&cause),
+        "{error}"
+    );
+    assert_eq!(error["retryable"], false);
+    let action = error["next_action"].as_str().unwrap().to_lowercase();
+    assert!(
+        action.contains("access") || action.contains("permission"),
+        "{error}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn fr_01_6_inaccessible_configuration_reports_io_and_preserves_selection() {
+    // ER-12
+    let f = IdentityFrontend::new();
+    f.runtime.shutdown();
+    let config = f.state.join("config.json");
+    let selected = std::fs::read(&config).unwrap();
+    let args = ["config", "get", "response_limit_bytes"];
+    let before = run(&f.state, &args, None);
+    assert!(before.0.status.success(), "{}", before.1);
+    let error = {
+        #[cfg(unix)]
+        let _denial = DeniedRead::apply(&config);
+        #[cfg(windows)]
+        let _file_denial = SourceReadDenial::apply(&config);
+        assert_eq!(
+            std::fs::File::open(&config).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let (out, error) = run(&f.state, &args, None);
+        assert!(!out.status.success(), "FR-01.6 ER-12: {error}");
+        let mut mcp = McpFixture::start(&f.state);
+        mcp.initialize();
+        let rpc = mcp.call(
+            2,
+            json!({"action":"recall","recall":{"recall_for":"Deployment"}}),
+        );
+        assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+        [error, rpc["result"]["structuredContent"].clone()]
+    };
+    assert_eq!(std::fs::read(&config).unwrap(), selected);
+    f.runtime.shutdown();
+    let (out, restored) = run(&f.state, &args, None);
+    assert!(out.status.success(), "{restored}");
+    assert_eq!(restored, before.1);
+    for error in error {
+        assert_eq!(error["code"], "configuration_io", "{error}");
+        assert_configuration_path(&error, &config);
+        let action = error["next_action"].as_str().unwrap().to_lowercase();
+        assert!(
+            action.contains("permission") || action.contains("access"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn fr_01_6_failed_delivery_lists_only_fully_selected_tasks() {
+    // ER-07 and ER-08
+    let f = IdentityFrontend::new();
+    let (out, config) = run(
+        &f.state,
+        &["config", "set", "response_limit_bytes", "4096"],
+        None,
+    );
+    assert!(out.status.success(), "{config}");
+    let project = f.temp.path().join("release");
+    std::fs::create_dir(&project).unwrap();
+    f.success(
+        "connect_project_memory",
+        json!({"intent":"create","project_path":project,"project_name":"Release"}),
+    );
+    let proposals: Vec<_> = (0..30).map(|number| {
+        let objective = format!("Release check {number}. ").repeat(40);
+        let body = format!("# Objective\n{objective}\n# Current position\nReviewing\n# Resume point\nRun the checks\n# References\n{}", "Design notes. ".repeat(450));
+        json!({"operation":"create","what_to_remember":body,"evidence":"Release review","applies_to":["project"],"in_working_set":true})
+    }).collect();
+    let mut ids = Vec::new();
+    for chunk in proposals.chunks(4) {
+        let saved = f.success(
+            "remember_this",
+            json!({"project_path":project,"memories":chunk}),
+        );
+        assert_eq!(saved["status"], "remembered", "{saved}");
+        ids.extend(
+            saved["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["memory_ref"]["memory_id"].clone()),
+        );
+    }
+    f.memory(
+        &"Verify the signed deployment record. ".repeat(220),
+        "user",
+        true,
+    );
+    let selected = json!({"project_path":project,"include_active_tasks":true,"memory_ids":[ids[0]],"recall_for":"release check","memory_candidate_limit":30});
+    let choices = json!({"project_path":project,"include_active_tasks":true,"recall_for":"unrelated subject","memory_candidate_limit":30});
+    let mut directory = None;
+    for request in [&selected, &choices] {
+        let result = f.success("recall", request.clone());
+        assert_eq!(
+            result["code"], "complete_content_in_file",
+            "FR-01.6 ER-07/ER-08: {result}"
+        );
+        let path = Path::new(result["artifact"]["path"].as_str().unwrap());
+        let full: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(full["active_task_count"], ids.len());
+        assert!(full.get("active_task_handoff").is_none(), "{full}");
+        let candidates = full["candidates"].as_array().unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|entry| entry["memory_id"] == ids[1] && entry.get("objective").is_some()),
+            "{full}"
+        );
+        if request == &selected {
+            assert!(full["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["memory_id"] == ids[0]));
+        } else {
+            assert!(
+                full["memories"].as_array().is_none_or(Vec::is_empty),
+                "{full}"
+            );
+        }
+        directory = Some(path.parent().unwrap().to_path_buf());
+    }
+    let directory = directory.unwrap();
+    assert!(directory
+        .canonicalize()
+        .unwrap()
+        .starts_with(f.temp.path().canonicalize().unwrap()));
+    std::fs::rename(&directory, f.temp.path().join("successful-artifacts")).unwrap();
+    std::fs::write(
+        &directory,
+        "A file blocks recreation of the result directory",
+    )
+    .unwrap();
+    let mut mcp = McpFixture::start(&f.state);
+    mcp.initialize();
+    for (number, (request, expected)) in [(selected, Some(&ids[0])), (choices, None)]
+        .into_iter()
+        .enumerate()
+    {
+        let (out, cli) = f.call("recall", request.clone());
+        assert!(!out.status.success(), "{cli}");
+        let rpc = mcp.call(
+            2 + number as u64,
+            json!({"action":"recall","recall":request}),
+        );
+        assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+        for payload in [&cli, &rpc["result"]["structuredContent"]] {
+            assert_eq!(
+                payload["code"], "result_delivery_failed",
+                "FR-01.6 ER-07/ER-08: {payload}"
+            );
+            assert!(payload.get("artifact").is_none(), "{payload}");
+            if let Some(id) = expected {
+                let errors = payload["errors"].as_array().unwrap();
+                assert_eq!(errors.len(), 1, "{payload}");
+                assert_eq!(&errors[0]["memory_id"], id);
+                assert!(errors[0]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty()));
+                assert!(errors[0]["next_action"]
+                    .as_str()
+                    .is_some_and(|action| action.to_lowercase().contains("recall")));
+            } else {
+                assert!(
+                    payload["errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|entry| entry.get("memory_id").is_none()),
+                    "{payload}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fr_01_6_failed_write_delivery_leaves_the_committed_version_visible() {
+    // ER-13
+    assert_write_delivery_failure(false);
+    assert_write_delivery_failure(true);
+}
+
+fn assert_write_delivery_failure(registry: bool) {
+    let f = IdentityFrontend::new();
+    let (out, config) = run(
+        &f.state,
+        &["config", "set", "response_limit_bytes", "4096"],
+        None,
+    );
+    assert!(out.status.success(), "{config}");
+    let original = f.memory(&"Original release checklist. ".repeat(300), "user", false);
+    let id = &original["memory_id"];
+    let directory = f.state.join("response-artifacts");
+    let blocked = if registry {
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("response-registry.sqlite");
+        std::fs::create_dir(&path).unwrap();
+        path
+    } else {
+        if directory.is_dir() {
+            std::fs::rename(&directory, f.temp.path().join("saved-artifacts")).unwrap();
+        }
+        std::fs::write(
+            &directory,
+            "A file blocks recreation of the result directory",
+        )
+        .unwrap();
+        directory
+    };
+    let cause = if registry {
+        rusqlite::Connection::open(blocked.canonicalize().unwrap())
+            .unwrap_err()
+            .to_string()
+    } else {
+        std::fs::create_dir_all(&blocked).unwrap_err().to_string()
+    };
+
+    let mut proposals: Vec<_> = (0..35)
+        .map(|index| {
+            json!({
+                "operation":"create","what_to_remember":format!("Release checkpoint {index}"),
+                "evidence":"Observed", "applies_to":["user"]
+            })
+        })
+        .collect();
+    proposals.insert(0, json!({
+        "operation":"evolve","parent_refs":[original],
+        "what_to_remember":"Updated release checklist", "evidence":"Verified the updated checklist"
+    }));
+    let (out, error) = f.call("remember_this", json!({"memories":proposals}));
+    let current = f.success("recall", json!({"memory_ids":[id]}));
+    let heads = current["memories"][0]["current_heads"].as_array().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["what_to_remember"], "Updated release checklist");
+    assert_ne!(heads[0]["memory_ref"], original);
+    if registry {
+        std::fs::remove_dir(&blocked).unwrap();
+    } else {
+        std::fs::remove_file(&blocked).unwrap();
+    }
+    let history = f.success("history", json!({"memory_id":id,"context_layers":2}));
+    let history: Value = if let Some(path) = history["artifact"]["path"].as_str() {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    } else {
+        history
+    };
+    let changes = history["latest_changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2, "{history}");
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change["evidence"] == "Verified the updated checklist")
+            .count(),
+        1,
+        "{history}"
+    );
+
+    assert!(!out.status.success(), "FR-01.6 ER-13: {error}");
+    assert_eq!(error["code"], "result_delivery_failed", "{error}");
+    assert!(error.get("artifact").is_none());
+    let diagnostic = error["message"].as_str().unwrap();
+    assert!(diagnostic.contains(&cause), "Expected {cause:?} in {error}");
+    assert!(
+        diagnostic.contains(blocked.file_name().unwrap().to_str().unwrap()),
+        "{error}"
+    );
+    let diagnostic = diagnostic.to_lowercase();
+    if registry {
+        assert!(
+            diagnostic.contains("open") || diagnostic.contains("insert"),
+            "{error}"
+        );
+    } else {
+        assert!(diagnostic.contains("creat"), "{error}");
+    }
+    let action = error["next_action"].as_str().unwrap().to_lowercase();
+    assert!(
+        (action.contains("check") || action.contains("confirm"))
+            && (action.contains("current") || action.contains("already")),
+        "{error}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn inspect_publication(f: &IdentityFrontend, operation: &Value) -> (Output, Value) {
+    f.call(
+        "remember_this",
+        json!({"pending_action":"inspect","publication_ref":operation}),
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn pending_prefix_evolution(
+    f: &IdentityFrontend,
+    verify_response: bool,
+) -> (Value, Value, std::path::PathBuf) {
+    let reference = f.memory("Preserve the verified release notes.", "user", false);
+    let id = reference["memory_id"].as_str().unwrap();
+    let local = agentlaw_app::config::load(&f.state)
+        .unwrap()
+        .unwrap()
+        .runtime_root(&f.state);
+    let recovery = local.join("canonical/recovery");
+    assert!(recovery.is_dir(), "{recovery:?}");
+    let operation = {
+        #[cfg(unix)]
+        let _denial = DeniedRead::apply_mode(&recovery, 0o500);
+        #[cfg(windows)]
+        let _denial = SourceReadDenial::apply_rights(&recovery, "W");
+        assert_eq!(
+            std::fs::create_dir(recovery.join("permission-probe"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let result = f.call("remember_this", json!({"memories":[{
+            "operation":"evolve","parent_refs":[{"memory_id":&id[..8],"observed_version":reference["observed_version"]}],
+            "what_to_remember":"Preserve the signed release notes.","evidence":"Signature verified"
+        }]}));
+        let (out, error) = result;
+        assert!(!out.status.success(), "{error}");
+        let db = rusqlite::Connection::open_with_flags(
+            local.join("control.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let recorded: String = db
+            .query_row("SELECT operation FROM prefix_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let operation = json!(recorded);
+        if verify_response {
+            assert_eq!(
+                error["publication_state"], "before_decision",
+                "FR-01.6 ER-20: {error}"
+            );
+            assert_eq!(error["publication_ref"], operation, "{error}");
+            assert!(uuid::Uuid::parse_str(&recorded).is_ok());
+            assert!(
+                error["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("inspect"),
+                "{error}"
+            );
+        }
+        assert!(!recovery.join(&recorded).exists());
+        let current = f.success("recall", json!({"memory_ids":[id]}));
+        assert_eq!(
+            current["memories"][0]["current_heads"][0]["memory_ref"],
+            reference
+        );
+        operation
+    };
+    (reference, operation, recovery)
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn predecision_io_returns_readable_publication_reference() {
+    // ER-20
+    let f = IdentityFrontend::new();
+    let (reference, operation, recovery) = pending_prefix_evolution(&f, true);
+    let probe = tempfile::tempdir_in(&recovery).unwrap();
+    probe.close().unwrap();
+    let source = f.current_path(&reference);
+    let original = std::fs::read(&source).unwrap();
+    let operation_dir = recovery.join(operation.as_str().unwrap());
+    let (out, inspected) = inspect_publication(&f, &operation);
+    assert!(out.status.success(), "{inspected}");
+    assert_eq!(inspected["publication_ref"], operation);
+    assert_eq!(
+        inspected["publication_state"], "before_decision",
+        "{inspected}"
+    );
+    assert!(!operation_dir.join("decision").exists());
+    assert!(!operation_dir.join("published").exists());
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    let db = rusqlite::Connection::open_with_flags(
+        recovery
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("control.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let retained: String = db
+        .query_row("SELECT operation FROM prefix_executions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(operation, retained);
+    drop(db);
+    f.runtime.shutdown();
+    let found = f.success("recall", json!({"memory_ids":[reference["memory_id"]]}));
+    assert_eq!(
+        found["memories"][0]["current_heads"][0]["what_to_remember"],
+        "Preserve the signed release notes."
+    );
+    let (out, inspected) = inspect_publication(&f, &operation);
+    assert!(out.status.success(), "{inspected}");
+    assert_eq!(inspected["publication_ref"], operation);
+    assert_eq!(inspected["publication_state"], "published", "{inspected}");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inaccessible_decision_keeps_intent_and_operation_reference() {
+    // ER-21
+    let f = IdentityFrontend::new();
+    use agentlaw_storage::{Error, FaultPoint, Store};
+    let (_, operation, recovery) = pending_prefix_evolution(&f, false);
+    let canonical = recovery.parent().unwrap();
+    let operation_id = operation.as_str().unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        canonical.parent().unwrap().join("control.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let payload: String = db
+        .query_row(
+            "SELECT payload FROM prefix_executions WHERE operation=?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let mutations =
+        serde_json::from_value(payload["execution"]["Remember"]["retained"]["mutations"].clone())
+            .unwrap();
+    let store =
+        Store::open_with_coordination(&f.source, canonical, f.state.join("source-coordination"))
+            .unwrap();
+    let fault = store.publish_with_fault(operation_id, mutations, Some(FaultPoint::Decision));
+    assert!(
+        matches!(fault, Err(Error::Interrupted(FaultPoint::Decision))),
+        "{fault:?}"
+    );
+    let decision = recovery.join(operation_id).join("decision");
+    {
+        #[cfg(unix)]
+        let _denial = DeniedRead::apply(&decision);
+        #[cfg(windows)]
+        let _denial = SourceReadDenial::apply(&decision);
+        assert_eq!(
+            std::fs::File::open(&decision).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let (_, observed) = inspect_publication(&f, &operation);
+        assert_eq!(
+            observed["publication_state"], "decision_unknown",
+            "FR-01.6 ER-21: {observed}"
+        );
+        assert_eq!(observed["publication_ref"], operation);
+        let action = observed["next_action"].as_str().unwrap().to_lowercase();
+        assert!(
+            action.contains("inspect")
+                && (action.contains("access") || action.contains("permission")),
+            "{observed}"
+        );
+        let recorded: String = db
+            .query_row("SELECT operation FROM prefix_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(operation, recorded);
+    }
+    let (out, inspected) = inspect_publication(&f, &operation);
+    assert!(out.status.success(), "{inspected}");
+    assert_eq!(inspected["publication_ref"], operation);
+    assert_eq!(inspected["publication_state"], "decided", "{inspected}");
+}
+
+const RESTART_DIR_ENV: &str = "AGENTLAW_TEST_PREFIX_RESTART_DIRECTORY";
+const RESTART_PHASE_ENV: &str = "AGENTLAW_TEST_PREFIX_RESTART_PHASE";
+const RESTART_PARENT: &str = "abcdef12-a000-4000-8000-000000000001";
+const RESTART_COMPETITOR: &str = "abcdef12-b000-4000-8000-000000000002";
+const RESTART_BINDING: &str = "11111111-1111-4111-8111-111111111111";
+const RESTART_MACHINE: &str = "22222222-2222-4222-8222-222222222222";
+
+struct RestartFixture {
+    store: agentlaw_storage::Store,
+    identity: agentlaw_flows::store::StoreIdentity,
+}
+
+impl RestartFixture {
+    fn open(directory: &Path) -> Self {
+        let root = directory.join("source");
+        let local = directory.join("local");
+        let store = agentlaw_storage::Store::open(&root, local.join("canonical")).unwrap();
+        Self {
+            store,
+            identity: agentlaw_flows::store::StoreIdentity {
+                root: root.canonicalize().unwrap(),
+                local,
+                user_id: "test".into(),
+                machine_id: RESTART_MACHINE.into(),
+                binding_id: RESTART_BINDING.into(),
+                history_limit: 8192,
+                response_limit: 65536,
+                config_file: None,
+            },
+        }
+    }
+
+    fn writer(&self) -> agentlaw_flows::control::ControlWriter {
+        let mut writer =
+            agentlaw_flows::control::ControlWriter::open(&self.identity.local).unwrap();
+        writer.bind_identity(&self.identity).unwrap();
+        writer
+            .finish_binding_initialization(&self.identity)
+            .unwrap();
+        writer
+    }
+
+    fn reader(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            self.identity.local.join("control.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+    }
+
+    fn seed(&self, entity: &str, body: &str) {
+        use agentlaw_storage::{CurrentUnit, Head, Mutation, UnitState};
+        self.store.publish(&uuid::Uuid::new_v4().to_string(), vec![Mutation {
+            unit:CurrentUnit {entity_id:entity.into(),entity_type:"memory".into(),state:UnitState::Live {
+                heads:vec![Head {metadata:json!({"change_id":uuid::Uuid::new_v4().to_string(),
+                    "applicability":{"scope":"user"},"origin":{"machine_id":RESTART_MACHINE,"user_id":"test"},
+                    "recorded_at_ms":0,"is_rule":false,"relations":[],"work_targets":[]}),body:body.into()}],
+            }}, expected_versions:vec![],evidence:"Verified fixture publication".into(),
+        }]).unwrap();
+    }
+
+    fn prepare(&self, fields: Value) -> agentlaw_flows::prepare::Prepared {
+        use agentlaw_flows::{
+            control::ControlReader,
+            exact::{DeltaBudget, ExactIndexWriter, ExactSnapshot, ProjectionGenerations},
+            history_cache::HistoryCacheGuards,
+            prepare,
+            store::ReadCtx,
+            RequestControl,
+        };
+        let source = self.store.owned_published_reader();
+        let reader = ControlReader::open(&self.identity.local).unwrap();
+        let control = RequestControl::default();
+        let cache = HistoryCacheGuards::new();
+        let projection = self.identity.local.join("prefix-test-projection");
+        let shadow = ExactIndexWriter::rebuild_shadow_in(&projection, &source, &control).unwrap();
+        let guard = source.read_snapshot().unwrap();
+        let registry = ProjectionGenerations::open_for_recovery(
+            "bootstrap",
+            &guard.position().epoch,
+            projection.join("exact-bootstrap.sqlite"),
+            projection.join("lexical-bootstrap.sqlite"),
+        )
+        .unwrap();
+        registry.commit(registry.stage(shadow).unwrap()).unwrap();
+        let mut exact =
+            ExactSnapshot::build(registry.pin().unwrap(), &guard, DeltaBudget::default()).unwrap();
+        drop(guard);
+        let ctx = ReadCtx {
+            identity: &self.identity,
+            source: &source,
+            control: &reader,
+            semantic: &RestartSemantic,
+            history_semantic: &RestartSemantic,
+            history_cache: &cache,
+            request: &control,
+        };
+        prepare::prepare(&ctx, &mut exact, serde_json::from_value(fields).unwrap()).unwrap()
+    }
+
+    fn recover(&self) {
+        use agentlaw_flows::{recovery::recover, store::LaneCtx, RequestControl};
+        recover(&mut LaneCtx {
+            identity: &self.identity,
+            source: &self.store,
+            control: &mut self.writer(),
+            request: &RequestControl::default(),
+        })
+        .unwrap();
+    }
+}
+
+struct RestartSemantic;
+impl agentlaw_flows::semantic::SemanticPort for RestartSemantic {
+    fn embed_prefix(
+        &self,
+        _: &str,
+        _: &agentlaw_flows::RequestControl,
+    ) -> Result<agentlaw_flows::semantic::PrefixEmbedding, agentlaw_flows::semantic::SemanticError>
+    {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "Model omitted in test fixture".into(),
+        ))
+    }
+    fn plan_pieces(
+        &self,
+        _: &[&str],
+        _: &agentlaw_flows::RequestControl,
+    ) -> Result<agentlaw_flows::semantic::PiecePlan, agentlaw_flows::semantic::SemanticError> {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "Model omitted in test fixture".into(),
+        ))
+    }
+    fn embed_planned(
+        &self,
+        _: &agentlaw_flows::semantic::PiecePlan,
+        _: usize,
+        _: &agentlaw_flows::semantic::PieceVectorReuse,
+        _: &agentlaw_flows::RequestControl,
+    ) -> Result<Vec<agentlaw_flows::semantic::QueryVector>, agentlaw_flows::semantic::SemanticError>
+    {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "Model omitted in test fixture".into(),
+        ))
+    }
+    fn search_available(
+        &self,
+        _: agentlaw_flows::semantic::SemanticQuery<'_>,
+        _: &agentlaw_flows::RequestControl,
+    ) -> Result<agentlaw_flows::semantic::SemanticCandidates, agentlaw_flows::semantic::SemanticError>
+    {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "Model omitted in test fixture".into(),
+        ))
+    }
+}
+impl agentlaw_flows::semantic::HistorySemanticPort for RestartSemantic {
+    fn offer(
+        &self,
+        _: agentlaw_flows::semantic::HistoryIngestHint,
+    ) -> agentlaw_flows::semantic::OfferResult {
+        agentlaw_flows::semantic::OfferResult::Accepted
+    }
+    fn search_available(
+        &self,
+        _: &str,
+        _: &str,
+        _: &agentlaw_flows::semantic::QueryVector,
+        _: &[String],
+        _: usize,
+        _: &agentlaw_flows::RequestControl,
+    ) -> Result<agentlaw_flows::semantic::SemanticCandidates, agentlaw_flows::semantic::SemanticError>
+    {
+        Err(agentlaw_flows::semantic::SemanticError::Unavailable(
+            "Model omitted in test fixture".into(),
+        ))
+    }
+}
+
+fn pause_restart_child(directory: &Path) -> ! {
+    std::fs::write(directory.join("checkpoint-reached"), b"ready").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+mod execution_delete_pause {
+    use rusqlite::ffi;
+    use std::{
+        ffi::{c_char, c_void, CStr},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            OnceLock,
+        },
+    };
+
+    static DIRECTORY: OnceLock<std::path::PathBuf> = OnceLock::new();
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static UPDATED: AtomicBool = AtomicBool::new(false);
+
+    pub fn install(directory: &std::path::Path) {
+        DIRECTORY.set(directory.to_path_buf()).unwrap();
+        // SQLite installs these observers only in the test-owned child.
+        assert_eq!(
+            unsafe { ffi::sqlite3_auto_extension(Some(install_connection)) },
+            ffi::SQLITE_OK
+        );
+    }
+
+    pub fn arm() {
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn install_connection(
+        db: *mut ffi::sqlite3,
+        _: *mut *mut c_char,
+        _: *const ffi::sqlite3_api_routines,
+    ) -> i32 {
+        unsafe {
+            ffi::sqlite3_update_hook(db, Some(updated), std::ptr::null_mut());
+            ffi::sqlite3_set_authorizer(db, Some(authorize), std::ptr::null_mut());
+        }
+        ffi::SQLITE_OK
+    }
+
+    unsafe extern "C" fn updated(
+        _: *mut c_void,
+        _: i32,
+        _: *const c_char,
+        table: *const c_char,
+        _: i64,
+    ) {
+        if ARMED.load(Ordering::SeqCst) && !table.is_null() {
+            let table = unsafe { CStr::from_ptr(table) }.to_bytes();
+            if table == b"pending" || table == b"authoring" {
+                UPDATED.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe extern "C" fn authorize(
+        _: *mut c_void,
+        action: i32,
+        table: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> i32 {
+        if action == ffi::SQLITE_DELETE
+            && UPDATED.load(Ordering::SeqCst)
+            && !table.is_null()
+            && unsafe { CStr::from_ptr(table) }.to_bytes() == b"prefix_executions"
+        {
+            super::pause_restart_child(DIRECTORY.get().unwrap());
+        }
+        ffi::SQLITE_OK
+    }
+}
+
+fn run_prefix_restart_child() -> bool {
+    use agentlaw_flows::{
+        apply::{self, Applied},
+        store::LaneCtx,
+        RequestControl,
+    };
+    let Some(directory) = std::env::var_os(RESTART_DIR_ENV).map(std::path::PathBuf::from) else {
+        return false;
+    };
+    let checkpoint = std::env::var(RESTART_PHASE_ENV).unwrap();
+    if checkpoint.starts_with("commit") {
+        execution_delete_pause::install(&directory);
+    }
+    let fixture = RestartFixture::open(&directory);
+    let mut writer = fixture.writer();
+    let mut lane = LaneCtx {
+        identity: &fixture.identity,
+        source: &fixture.store,
+        control: &mut writer,
+        request: &RequestControl::default(),
+    };
+    let plan = if checkpoint == "commit-memory" {
+        let parent = fixture.store.read_current(RESTART_PARENT).unwrap();
+        let version = &parent.references().unwrap()[0].observed_version;
+        fixture.prepare(json!({"memories":[{"operation":"evolve","parent_refs":[{"memory_id":"abcdef12","observed_version":version}],
+            "what_to_remember":"Restore the verified release archive before starting.","evidence":"Recovery verified"}]}))
+    } else {
+        let prepared = fixture.prepare(
+            json!({"procedure":{"operation":"create","evidence_memory_ids":[RESTART_PARENT]}}),
+        );
+        let Applied::Response(context) = apply::apply(&mut lane, prepared).unwrap() else {
+            panic!("Expected authoring context");
+        };
+        let token = &context["authoring_ref"];
+        assert!(token.is_string(), "{context}");
+        std::fs::write(directory.join("authoring-token"), token.as_str().unwrap()).unwrap();
+        fixture.prepare(json!({"authoring_ref":token,"procedure":{"operation":"create","applies_to":["machine"],
+            "evidence_memory_ids":["abcdef12"],"name":"Restore verified release archive","use_when":"After a failed deployment",
+            "instructions":"Restore the verified archive before starting.","evidence":"Recovery verified"}}))
+    };
+    let interrupt_after_decision = checkpoint == "decided";
+    let decision_directory = directory.clone();
+    let request = RequestControl::new(
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        move |phase| match (checkpoint.as_str(), phase) {
+            ("commit-memory" | "commit-procedure", "published") => execution_delete_pause::arm(),
+            ("undecided", "publishing") => pause_restart_child(&directory),
+            _ => {}
+        },
+    );
+    lane.request = &request;
+    let outcome = apply::apply(&mut lane, plan);
+    if interrupt_after_decision {
+        assert!(
+            outcome.is_err(),
+            "Conditional fault hook did not interrupt apply"
+        );
+        let (operation, _) = restart_operation(&fixture);
+        assert_decided_without_receipt(&fixture, &operation);
+        pause_restart_child(&decision_directory);
+    }
+    panic!(
+        "Publication checkpoint was never reached: {:?}",
+        outcome.err()
+    );
+}
+
+fn stop_prefix_child(directory: &Path, test: &str, checkpoint: &str) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test, "--nocapture"])
+        .env(RESTART_DIR_ENV, directory)
+        .env(RESTART_PHASE_ENV, checkpoint);
+    if checkpoint == "decided" {
+        command.env("AGENTLAW_TEST_CONDITIONAL_PUBLISH_FAULT", "decision");
+    }
+    let child = command.spawn().unwrap();
+    let mut child = Daemon::new(child);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !directory.join("checkpoint-reached").is_file() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{checkpoint}: child exited before its checkpoint"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{checkpoint}: publication checkpoint timeout"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.stop();
+}
+
+fn restart_operation(f: &RestartFixture) -> (String, String) {
+    let (operation, payload): (String, String) = f
+        .reader()
+        .query_row(
+            "SELECT operation, payload FROM prefix_executions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let data: Value = serde_json::from_str(&payload).unwrap();
+    let entity = data["execution"]["Procedure"]["mutation"]["unit"]["entity_id"]
+        .as_str()
+        .unwrap_or(RESTART_PARENT);
+    (operation, entity.into())
+}
+
+fn assert_decided_without_receipt(f: &RestartFixture, operation: &str) {
+    let receipt = restart_receipt(f, operation);
+    assert!(receipt.with_file_name("decision").is_file(), "{operation}");
+    assert!(!receipt.exists(), "{operation}");
+}
+
+fn restart_receipt(f: &RestartFixture, operation: &str) -> std::path::PathBuf {
+    f.identity
+        .local
+        .join("canonical/recovery")
+        .join(operation)
+        .join("published")
+}
+
+fn assert_retired_execution(f: &RestartFixture) {
+    let executions: u64 = f
+        .reader()
+        .query_row("SELECT count(*) FROM prefix_executions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(executions, 0);
+}
+
+fn authoring_consumed(f: &RestartFixture, dir: &Path) -> bool {
+    let token = std::fs::read_to_string(dir.join("authoring-token")).unwrap();
+    f.reader()
+        .query_row(
+            "SELECT used FROM authoring WHERE token=?1",
+            [token],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn recovered_procedure_result(f: &RestartFixture, dir: &Path) -> Option<Value> {
+    let token = std::fs::read_to_string(dir.join("authoring-token")).unwrap();
+    let reader = agentlaw_flows::control::ControlReader::open(&f.identity.local).unwrap();
+    reader
+        .authoring_result(&f.identity.binding_id, &token)
+        .unwrap()
+        .and_then(|(_, _, result)| result)
+        .map(|result| serde_json::from_str(&result).unwrap())
+}
+
+#[test]
+fn interrupted_control_commit_finalizes_receipt_atomically() {
+    // ER-17
+    if run_prefix_restart_child() {
+        unreachable!();
+    }
+    for (checkpoint, procedure) in [("commit-memory", false), ("commit-procedure", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let f = RestartFixture::open(dir.path());
+        f.seed(RESTART_PARENT, "Preserve the original release archive.");
+        stop_prefix_child(
+            dir.path(),
+            "interrupted_control_commit_finalizes_receipt_atomically",
+            checkpoint,
+        );
+        let (operation, entity) = restart_operation(&f);
+        let receipt = restart_receipt(&f, &operation);
+        let original_receipt = std::fs::read(&receipt).unwrap();
+        let generation = f.store.generation().unwrap();
+        if procedure {
+            assert!(!authoring_consumed(&f, dir.path()));
+            assert!(recovered_procedure_result(&f, dir.path()).is_none());
+            assert_eq!(f.store.history(&entity).unwrap().len(), 1);
+        } else {
+            let visible: u64 = f
+                .reader()
+                .query_row(
+                    "SELECT count(*) FROM pending WHERE status='published'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(visible, 0);
+            assert_eq!(f.store.history(&entity).unwrap().len(), 2);
+        }
+        f.recover();
+        assert_retired_execution(&f);
+        assert_eq!(std::fs::read(receipt).unwrap(), original_receipt);
+        assert_eq!(f.store.generation().unwrap(), generation);
+        if procedure {
+            assert!(authoring_consumed(&f, dir.path()));
+            let result = recovered_procedure_result(&f, dir.path()).unwrap();
+            let heads = f
+                .store
+                .read_procedure(&entity)
+                .unwrap()
+                .references()
+                .unwrap();
+            assert_eq!(
+                result["procedure_ref"],
+                json!({"procedure_id":entity,"observed_version":heads[0].observed_version})
+            );
+            assert_eq!(f.store.history(&entity).unwrap().len(), 1);
+        } else {
+            let result: String = f
+                .reader()
+                .query_row(
+                    "SELECT result FROM pending WHERE status='published'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let result: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["status"], "remembered");
+            let heads = f.store.read_current(&entity).unwrap().references().unwrap();
+            assert_eq!(
+                result["results"][0]["memory_ref"]["observed_version"],
+                heads[0].observed_version
+            );
+            assert_eq!(f.store.history(&entity).unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn restart_completes_decided_prefix_publication_once() {
+    // ER-18
+    if run_prefix_restart_child() {
+        unreachable!();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let f = RestartFixture::open(dir.path());
+    f.seed(RESTART_PARENT, "Preserve the original release archive.");
+    stop_prefix_child(
+        dir.path(),
+        "restart_completes_decided_prefix_publication_once",
+        "decided",
+    );
+    let (operation, entity) = restart_operation(&f);
+    let receipt = restart_receipt(&f, &operation);
+    assert_decided_without_receipt(&f, &operation);
+    assert!(!authoring_consumed(&f, dir.path()));
+    f.recover();
+    assert_retired_execution(&f);
+    assert!(authoring_consumed(&f, dir.path()));
+    let generation = f.store.generation().unwrap();
+    let references = f
+        .store
+        .read_procedure(&entity)
+        .unwrap()
+        .references()
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    let result = recovered_procedure_result(&f, dir.path()).unwrap();
+    assert_eq!(
+        result["procedure_ref"],
+        json!({"procedure_id":entity,"observed_version":references[0].observed_version})
+    );
+    let published_receipt = std::fs::read(&receipt).unwrap();
+    f.recover();
+    assert_eq!(std::fs::read(receipt).unwrap(), published_receipt);
+    assert_eq!(f.store.generation().unwrap(), generation, "{operation}");
+    assert_eq!(
+        f.store
+            .read_procedure(&entity)
+            .unwrap()
+            .references()
+            .unwrap(),
+        references
+    );
+    assert_eq!(f.store.history(&entity).unwrap().len(), 1);
+}
+
+#[test]
+fn restart_rechecks_undecided_prefix_without_publishing() {
+    // ER-27
+    if run_prefix_restart_child() {
+        unreachable!();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let f = RestartFixture::open(dir.path());
+    f.seed(RESTART_PARENT, "Preserve the original release archive.");
+    let original = f
+        .store
+        .read_current(RESTART_PARENT)
+        .unwrap()
+        .references()
+        .unwrap();
+    stop_prefix_child(
+        dir.path(),
+        "restart_rechecks_undecided_prefix_without_publishing",
+        "undecided",
+    );
+    let (operation, entity) = restart_operation(&f);
+    let receipt = restart_receipt(&f, &operation);
+    assert!(!receipt.exists());
+    assert!(!authoring_consumed(&f, dir.path()));
+    f.seed(RESTART_COMPETITOR, "Verified a separate archive.");
+    let generation = f.store.generation().unwrap();
+    f.recover();
+    assert!(!receipt.exists());
+    assert_retired_execution(&f);
+    assert!(!authoring_consumed(&f, dir.path()));
+    assert_eq!(f.store.generation().unwrap(), generation);
+    assert!(matches!(
+        f.store.read_procedure(&entity),
+        Err(agentlaw_storage::Error::NotFound(_))
+    ));
+    assert_eq!(
+        f.store
+            .read_current(RESTART_PARENT)
+            .unwrap()
+            .references()
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        f.store.read_current(RESTART_COMPETITOR).unwrap().heads()[0].body,
+        "Verified a separate archive."
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn publish_competing_version(
+    f: &IdentityFrontend,
+    recovery: &Path,
+    reference: &Value,
+    collide: bool,
+) -> Value {
+    use agentlaw_storage::{Mutation, Store, UnitState};
+    let canonical = recovery.parent().unwrap();
+    let store =
+        Store::open_with_coordination(&f.source, canonical, f.state.join("source-coordination"))
+            .unwrap();
+    let id = reference["memory_id"].as_str().unwrap();
+    let mut unit = store.read_current(id).unwrap();
+    let versions = if collide {
+        let mut competitor = format!("{}-0000-4000-8000-000000000001", &id[..8]);
+        if competitor == id {
+            competitor.replace_range(35.., "2");
+        }
+        unit.entity_id = competitor;
+        vec![]
+    } else {
+        vec![reference["observed_version"].as_str().unwrap().to_owned()]
+    };
+    let UnitState::Live { heads } = &mut unit.state else {
+        panic!("Expected live memory");
+    };
+    heads[0].metadata["change_id"] = json!(uuid::Uuid::new_v4().to_string());
+    heads[0].body = if collide {
+        "Check a separate release archive.".into()
+    } else {
+        "The other writer verified the latest release archive.".into()
+    };
+    let receipt = store
+        .publish(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![Mutation {
+                unit,
+                expected_versions: versions,
+                evidence: "Independent verification".into(),
+            }],
+        )
+        .unwrap();
+    serde_json::to_value(&receipt.references[0]).unwrap()
+}
+
+#[cfg(any(unix, windows))]
+fn assert_settled_without_publication(recovery: &Path, operation: &Value) {
+    let operation = operation.as_str().unwrap();
+    let directory = recovery.join(operation);
+    assert!(!directory.join("decision").exists());
+    assert!(!directory.join("published").exists());
+    let db = rusqlite::Connection::open_with_flags(
+        recovery
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("control.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let active: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM prefix_executions WHERE operation=?1)",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!active);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn restart_preserves_rejection_for_original_publication_reference() {
+    // ER-28
+    let f = IdentityFrontend::new();
+    let (reference, operation, recovery) = pending_prefix_evolution(&f, true);
+    f.runtime.shutdown();
+    let competing = publish_competing_version(&f, &recovery, &reference, true);
+    let before = std::fs::read(f.current_path(&reference)).unwrap();
+    for _ in 0..2 {
+        let (out, inspected) = inspect_publication(&f, &operation);
+        assert!(out.status.success(), "FR-01.6 ER-28: {inspected}");
+        assert_eq!(inspected["publication_ref"], operation);
+        assert_eq!(inspected["publication_state"], "rejected", "{inspected}");
+        assert_eq!(inspected["rejection_code"], "ambiguous");
+        assert!(inspected.get("pending_batch_ref").is_none());
+        let guidance = inspected["next_action"].as_str().unwrap().to_lowercase();
+        assert!(
+            guidance.contains("longer")
+                || guidance.contains("full")
+                || guidance.contains("canonical"),
+            "{inspected}"
+        );
+    }
+    assert_settled_without_publication(&recovery, &operation);
+    assert_eq!(std::fs::read(f.current_path(&reference)).unwrap(), before);
+    let current = f.success("recall", json!({"memory_ids":[competing["memory_id"]]}));
+    assert_eq!(
+        current["memories"][0]["current_heads"][0]["memory_ref"],
+        competing
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn restart_returns_review_batch_for_original_publication_reference() {
+    // ER-29
+    let f = IdentityFrontend::new();
+    let (reference, operation, recovery) = pending_prefix_evolution(&f, true);
+    f.runtime.shutdown();
+    let competing = publish_competing_version(&f, &recovery, &reference, false);
+    let path = f.current_path(&reference);
+    let concurrent_bytes = std::fs::read(&path).unwrap();
+    let inspect_review = || {
+        let (out, inspected) = inspect_publication(&f, &operation);
+        assert!(out.status.success(), "FR-01.6 ER-29: {inspected}");
+        assert_eq!(inspected["publication_ref"], operation);
+        assert_eq!(
+            inspected["publication_state"], "review_required",
+            "{inspected}"
+        );
+        assert!(inspected.get("rejection_code").is_none());
+        let pending = &inspected["pending_batch_ref"];
+        assert!(
+            pending["pending_batch_id"].is_string() && pending["observed_version"].is_string(),
+            "{inspected}"
+        );
+        pending.clone()
+    };
+    let pending = inspect_review();
+    let proposal = f.success(
+        "remember_this",
+        json!({"pending_action":"inspect","pending_batch_ref":pending}),
+    );
+    assert_eq!(proposal["pending_batch_ref"], pending);
+    assert_eq!(
+        proposal["proposals"][0]["what_to_remember"],
+        "Preserve the signed release notes."
+    );
+    let issue = proposal["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["current_states"].is_array())
+        .unwrap_or_else(|| panic!("{proposal}"));
+    let heads = issue["current_states"][0]["current_heads"]
+        .as_array()
+        .unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["memory_ref"], competing);
+    assert_eq!(
+        heads[0]["what_to_remember"],
+        "The other writer verified the latest release archive."
+    );
+    f.runtime.shutdown();
+    assert_eq!(inspect_review(), pending);
+    assert_settled_without_publication(&recovery, &operation);
+    assert_eq!(std::fs::read(&path).unwrap(), concurrent_bytes);
+    let resolution_ref = proposal["resolution_ref"]
+        .as_str()
+        .filter(|reference| !reference.is_empty())
+        .expect("ER-29: retained review must provide a resolution reference");
+    let continued = f.success(
+        "remember_this",
+        json!({"pending_action":"continue","pending_batch_ref":pending,"resolution_ref":resolution_ref}),
+    );
+    assert_eq!(continued["status"], "resolution_required", "{continued}");
+    assert_eq!(
+        continued["pending_batch_ref"]["pending_batch_id"],
+        pending["pending_batch_id"]
+    );
+    assert_ne!(
+        continued["pending_batch_ref"]["observed_version"],
+        pending["observed_version"]
+    );
+    assert_eq!(
+        inspect_review()["pending_batch_id"],
+        pending["pending_batch_id"]
+    );
+    assert_eq!(std::fs::read(path).unwrap(), concurrent_bytes);
+}
+
+#[cfg(any(unix, windows))]
+fn with_head_reread_fault<T>(
+    parent: &Path,
+    before_next_publication: impl Fn() + Send + Sync + 'static,
+    run: impl FnOnce(&agentlaw_flows::RequestControl) -> T,
+) -> (T, String, bool) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    };
+    enum FileAccess {
+        Deny(mpsc::SyncSender<String>),
+        Restore(mpsc::SyncSender<()>),
+    }
+    std::thread::scope(|scope| {
+        let (commands, worker) = mpsc::channel();
+        scope.spawn(move || {
+            let mut denied = None;
+            for command in worker {
+                match command {
+                    FileAccess::Deny(ack) => {
+                        assert!(denied.is_none());
+                        #[cfg(unix)]
+                        {
+                            denied = Some(DeniedRead::apply(parent));
+                        }
+                        #[cfg(windows)]
+                        {
+                            denied = Some(SourceReadDenial::apply(parent));
+                        }
+                        let cause = std::fs::File::open(parent).unwrap_err();
+                        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+                        ack.send(cause.to_string()).unwrap();
+                    }
+                    FileAccess::Restore(ack) => {
+                        drop(denied.take());
+                        assert!(std::fs::File::open(parent).is_ok());
+                        ack.send(()).unwrap();
+                    }
+                }
+            }
+        });
+        let cause = Arc::new(Mutex::new(None));
+        let recorded = cause.clone();
+        let continued = Arc::new(AtomicBool::new(false));
+        let reached_next = continued.clone();
+        let control =
+            agentlaw_flows::RequestControl::new(Arc::new(AtomicBool::new(false)), move |phase| {
+                if phase == "rereading_changed_heads" {
+                    let (ack, completed) = mpsc::sync_channel(0);
+                    commands.send(FileAccess::Deny(ack)).unwrap();
+                    *recorded.lock().unwrap() = Some(completed.recv().unwrap());
+                } else if phase == "publishing"
+                    && recorded.lock().unwrap().is_some()
+                    && !reached_next.swap(true, Ordering::SeqCst)
+                {
+                    before_next_publication();
+                    let (ack, completed) = mpsc::sync_channel(0);
+                    commands.send(FileAccess::Restore(ack)).unwrap();
+                    completed.recv().unwrap();
+                }
+            });
+        let result = run(&control);
+        drop(control);
+        let cause = cause
+            .lock()
+            .unwrap()
+            .take()
+            .expect("ER-31: heads-change reread checkpoint was not reached");
+        (result, cause, continued.load(Ordering::SeqCst))
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn inspect_restart_fixture(f: &RestartFixture, fields: Value) -> Value {
+    use agentlaw_flows::{
+        control::ControlReader, history_cache::HistoryCacheGuards, read, store::ReadCtx,
+        RequestControl,
+    };
+    let source = f.store.owned_published_reader();
+    let reader = ControlReader::open(&f.identity.local).unwrap();
+    let ctx = ReadCtx {
+        identity: &f.identity,
+        source: &source,
+        control: &reader,
+        semantic: &RestartSemantic,
+        history_semantic: &RestartSemantic,
+        history_cache: &HistoryCacheGuards::new(),
+        request: &RequestControl::default(),
+    };
+    read::pending_inspect(&ctx, &serde_json::from_value(fields).unwrap()).unwrap()
+}
+
+#[cfg(any(unix, windows))]
+fn recovery_control_snapshot(local: &Path, operation: &str, token: &str) -> Value {
+    let db = rusqlite::Connection::open_with_flags(
+        local.join("control.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let payload: Option<String> = db
+        .query_row(
+            "SELECT (SELECT payload FROM prefix_executions WHERE binding=?1 AND operation=?2)",
+            [RESTART_BINDING, operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (pending, outcome, used): (u64, bool, bool) = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM pending WHERE binding=?1),
+            EXISTS(SELECT 1 FROM prefix_execution_outcomes WHERE binding=?1 AND operation=?2),
+            (SELECT used FROM authoring WHERE token=?3)",
+            [RESTART_BINDING, operation, token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let directory = local.join("canonical/recovery").join(operation);
+    json!({"execution":payload,"pending":pending,"terminal_outcome":outcome,"token_used":used,
+        "decision":directory.join("decision").exists(),"receipt":directory.join("published").exists()})
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn failed_parent_head_reread_preserves_reference_and_other_executions_recover() {
+    // ER-31
+    use agentlaw_flows::{
+        apply::{self, Applied},
+        recovery,
+        store::LaneCtx,
+        RequestControl,
+    };
+    use agentlaw_storage::Mutation;
+    const INDEPENDENT: &str = "fedcba98-a000-4000-8000-000000000001";
+    const PROPOSAL: &str = "Preserve the signed release notes.";
+    const COMPETING: &str = "Another writer verified the release notes.";
+    let dir = tempfile::tempdir().unwrap();
+    let f = RestartFixture::open(dir.path());
+    let mut writer = f.writer();
+    f.seed(RESTART_PARENT, "Preserve the verified release notes.");
+    f.seed(INDEPENDENT, "Review the deployment manifest.");
+    let apply =
+        |writer: &mut agentlaw_flows::control::ControlWriter, plan, request: &RequestControl| {
+            apply::apply(
+                &mut LaneCtx {
+                    identity: &f.identity,
+                    source: &f.store,
+                    control: writer,
+                    request,
+                },
+                plan,
+            )
+        };
+    let prepared =
+        f.prepare(json!({"procedure":{"operation":"create","evidence_memory_ids":[INDEPENDENT]}}));
+    let Applied::Response(authoring) =
+        apply(&mut writer, prepared, &RequestControl::default()).unwrap()
+    else {
+        panic!("Expected a retained authoring token");
+    };
+    let token = authoring["authoring_ref"].as_str().unwrap().to_owned();
+    let prepare_evolution = |id: &str, body| {
+        let version = f.store.read_current(id).unwrap().references().unwrap()[0]
+            .observed_version
+            .clone();
+        f.prepare(json!({"memories":[{"operation":"evolve","parent_refs":[{"memory_id":&id[..8],"observed_version":version}],
+            "what_to_remember":body,"evidence":"Signed notes inspected"}]}))
+    };
+    let stale_plan = prepare_evolution(RESTART_PARENT, PROPOSAL);
+    let mut parent = f.store.read_current(RESTART_PARENT).unwrap();
+    let prior = parent.references().unwrap();
+    let agentlaw_storage::UnitState::Live { heads } = &mut parent.state else {
+        panic!("Expected current memory");
+    };
+    heads[0].body = COMPETING.into();
+    heads[0].metadata["change_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let concurrent = f
+        .store
+        .publish(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![Mutation {
+                unit: parent,
+                expected_versions: vec![prior[0].observed_version.clone()],
+                evidence: "Concurrent verification".into(),
+            }],
+        )
+        .unwrap();
+    let concurrent_ref = serde_json::to_value(&concurrent.references[0]).unwrap();
+    let parent_file = f
+        .identity
+        .root
+        .join("current/memory")
+        .join(&RESTART_PARENT[..2])
+        .join(format!("{RESTART_PARENT}.md"));
+    let current_bytes = std::fs::read(&parent_file).unwrap();
+    let (failed, cause, _) = with_head_reread_fault(
+        &parent_file,
+        || {},
+        |request| apply(&mut writer, stale_plan, request),
+    );
+    let error = failed
+        .err()
+        .expect("FR-01.6 ER-31: current heads could not be read");
+    let operation: String = f
+        .reader()
+        .query_row("SELECT operation FROM prefix_executions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let output = agentlaw_app::error_payload(&error);
+    assert_eq!(output["publication_ref"], operation, "{output}");
+    assert_eq!(output["publication_state"], "before_decision", "{output}");
+    assert!(
+        output["message"].as_str().unwrap().contains(&cause),
+        "{output}"
+    );
+    assert!(
+        output["next_action"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("inspect"),
+        "{output}"
+    );
+    let blocked = recovery_control_snapshot(&f.identity.local, &operation, &token);
+    assert!(blocked["execution"].is_string());
+    assert_eq!(blocked["pending"], 0);
+    for field in ["terminal_outcome", "token_used", "decision", "receipt"] {
+        assert_eq!(blocked[field], false, "{blocked}");
+    }
+    assert_eq!(std::fs::read(&parent_file).unwrap(), current_bytes);
+    let independent = prepare_evolution(INDEPENDENT, "Review the signed deployment manifest.");
+    let recovery_dir = f.identity.local.join("canonical/recovery");
+    {
+        #[cfg(unix)]
+        let _write_denial = DeniedRead::apply_mode(&recovery_dir, 0o500);
+        #[cfg(windows)]
+        let _write_denial = SourceReadDenial::apply_rights(&recovery_dir, "W");
+        assert!(apply(&mut writer, independent, &RequestControl::default()).is_err());
+    }
+    let independent_operation: String = f
+        .reader()
+        .query_row(
+            "SELECT operation FROM prefix_executions WHERE operation<>?1",
+            [&operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(writer);
+
+    // Fix the test database's traversal order so the failure precedes the independent execution.
+    let db = rusqlite::Connection::open(f.identity.local.join("control.sqlite")).unwrap();
+    uuid::Uuid::parse_str(&operation).unwrap();
+    db.execute_batch(&format!(
+        "CREATE INDEX fixture_recovery_order
+        ON prefix_executions(binding, (operation <> '{operation}'), operation, payload)"
+    ))
+    .unwrap();
+    let first: String = db
+        .query_row(
+            "SELECT operation,payload FROM prefix_executions WHERE binding=?1",
+            [RESTART_BINDING],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first, operation,
+        "FR-01.6 ER-31: fixture must replay the failing execution first"
+    );
+    drop(db);
+
+    let restarted = RestartFixture::open(dir.path());
+    let observe_local = restarted.identity.local.clone();
+    let observe_operation = operation.clone();
+    let (recovery_result, _, proceeded) = with_head_reread_fault(
+        &parent_file,
+        move || {
+            assert_eq!(
+                recovery_control_snapshot(&observe_local, &observe_operation, &token),
+                blocked
+            );
+        },
+        |request| {
+            recovery::recover(&mut LaneCtx {
+                identity: &restarted.identity,
+                source: &restarted.store,
+                control: &mut restarted.writer(),
+                request,
+            })
+        },
+    );
+    recovery_result.unwrap();
+    assert!(
+        proceeded,
+        "FR-01.6 ER-31: recovery stopped at the failed reread"
+    );
+    assert_eq!(std::fs::read(&parent_file).unwrap(), current_bytes);
+    let receipt_path = restart_receipt(&restarted, &independent_operation);
+    let receipt = std::fs::read(&receipt_path).unwrap();
+    let published = restarted
+        .store
+        .read_current(INDEPENDENT)
+        .unwrap()
+        .references()
+        .unwrap();
+    assert_eq!(restarted.store.history(INDEPENDENT).unwrap().len(), 2);
+    assert_eq!(
+        inspect_restart_fixture(
+            &restarted,
+            json!({"pending_action":"inspect","publication_ref":independent_operation})
+        )["publication_state"],
+        "published"
+    );
+
+    let next = RestartFixture::open(dir.path());
+    next.recover();
+    let review = inspect_restart_fixture(
+        &next,
+        json!({"pending_action":"inspect","publication_ref":operation}),
+    );
+    assert_eq!(review["publication_state"], "review_required", "{review}");
+    assert_eq!(review["publication_ref"], operation);
+    let retained = inspect_restart_fixture(
+        &next,
+        json!({"pending_action":"inspect","pending_batch_ref":review["pending_batch_ref"]}),
+    );
+    assert_eq!(retained["proposals"][0]["what_to_remember"], PROPOSAL);
+    let issue = retained["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["current_states"].is_array())
+        .unwrap();
+    let heads = issue["current_states"][0]["current_heads"]
+        .as_array()
+        .unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["memory_ref"], concurrent_ref);
+    assert_eq!(heads[0]["what_to_remember"], COMPETING);
+    assert_retired_execution(&next);
+    assert_eq!(std::fs::read(parent_file).unwrap(), current_bytes);
+    assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
+    assert_eq!(
+        next.store
+            .read_current(INDEPENDENT)
+            .unwrap()
+            .references()
+            .unwrap(),
+        published
+    );
+    assert_eq!(next.store.history(INDEPENDENT).unwrap().len(), 2);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn cancelled_changed_head_reread_records_rejection_before_restart() {
+    // ER-32
+    use agentlaw_contracts::{Request, Result};
+    use agentlaw_flows::{
+        apply::{self, Applied},
+        store::LaneCtx,
+        RequestControl,
+    };
+    use agentlaw_storage::Mutation;
+    use std::{
+        io::{BufRead, BufReader},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::{atomic::Ordering, mpsc, Mutex},
+        time::Instant,
+    };
+
+    const WAIT: Duration = Duration::from_secs(15);
+
+    struct PublicationBackend {
+        directory: std::path::PathBuf,
+        resume_publication: Option<mpsc::Receiver<()>>,
+        finished: mpsc::Sender<()>,
+    }
+
+    impl agentlaw_app::Backend for PublicationBackend {
+        fn call(&mut self, _: Request) -> Result<Value> {
+            unreachable!("MCP serves with request control")
+        }
+
+        fn call_with_control(
+            &mut self,
+            request: Request,
+            transport: RequestControl,
+        ) -> Result<Value> {
+            let Request::RememberThis(request) = request else {
+                panic!("Expected the prefix publication request");
+            };
+            let fixture = RestartFixture::open(&self.directory);
+            let mut writer = fixture.writer();
+            let plan = fixture.prepare(serde_json::to_value(request).unwrap());
+            let resume = Mutex::new(self.resume_publication.take().unwrap());
+            let control = RequestControl::new(transport.cancel.clone(), move |phase| {
+                transport.phase(phase);
+                if phase == "publishing" {
+                    resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(WAIT)
+                        .expect("Competing writer did not finish");
+                } else if phase == "rereading_changed_heads" {
+                    let deadline = Instant::now() + WAIT;
+                    while !transport.cancel.load(Ordering::Acquire) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "MCP transport did not receive cancellation"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            let result = apply::apply(
+                &mut LaneCtx {
+                    identity: &fixture.identity,
+                    source: &fixture.store,
+                    control: &mut writer,
+                    request: &control,
+                },
+                plan,
+            );
+            self.finished.send(()).unwrap();
+            match result? {
+                Applied::Response(value) => Ok(value),
+                _ => panic!("Expected a publication response"),
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = RestartFixture::open(dir.path());
+    fixture.seed(RESTART_PARENT, "Preserve the verified release notes.");
+    let parent = fixture.store.read_current(RESTART_PARENT).unwrap();
+    let version = parent.references().unwrap()[0].observed_version.clone();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (resume_publication, resume) = mpsc::channel();
+    let (finished, completion) = mpsc::channel();
+    let backend = PublicationBackend {
+        directory: dir.path().to_path_buf(),
+        resume_publication: Some(resume),
+        finished,
+    };
+    let (operation, concurrent, current_bytes) = std::thread::scope(|scope| {
+        let server = scope.spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            agentlaw_app::transport::serve(
+                BufReader::new(stream.try_clone().unwrap()),
+                stream,
+                backend,
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        client.set_write_timeout(Some(WAIT)).unwrap();
+        let mut input = BufReader::new(client.try_clone().unwrap());
+        let receive = |input: &mut BufReader<TcpStream>| {
+            let mut line = String::new();
+            assert_ne!(
+                input.read_line(&mut line).unwrap(),
+                0,
+                "MCP closed before sending a response"
+            );
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let wait_for = |input: &mut BufReader<TcpStream>, phase: &str| loop {
+            let msg = receive(input);
+            assert!(msg.get("id").is_none(), "Expected progress {phase}: {msg}");
+            if msg["method"] == "notifications/progress" && msg["params"]["message"] == phase {
+                assert_eq!(msg["params"]["progressToken"], "publication");
+                break;
+            }
+        };
+        writeln!(client, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).unwrap();
+        assert_eq!(receive(&mut input)["id"], 1);
+        writeln!(
+            client,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        writeln!(client, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"agentlaw","_meta":{"progressToken":"publication"},
+            "arguments":{"action":"remember_this","remember_this":{"memories":[{
+                "operation":"evolve","parent_refs":[{"memory_id":&RESTART_PARENT[..8],"observed_version":version}],
+                "what_to_remember":"Preserve the signed release notes.","evidence":"Signature verified"
+            }]}}
+        }})).unwrap();
+        wait_for(&mut input, "publishing");
+
+        let mut changed = parent;
+        let agentlaw_storage::UnitState::Live { heads } = &mut changed.state else {
+            panic!("Expected current memory");
+        };
+        heads[0].body = "The other writer verified the latest release archive.".into();
+        heads[0].metadata["change_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let concurrent = fixture
+            .store
+            .publish(
+                &uuid::Uuid::new_v4().to_string(),
+                vec![Mutation {
+                    unit: changed,
+                    expected_versions: vec![version],
+                    evidence: "Independent release verification".into(),
+                }],
+            )
+            .unwrap()
+            .references;
+        let source_path = fixture
+            .identity
+            .root
+            .join("current/memory")
+            .join(&RESTART_PARENT[..2])
+            .join(format!("{RESTART_PARENT}.md"));
+        let current_bytes = std::fs::read(source_path).unwrap();
+        resume_publication.send(()).unwrap();
+        wait_for(&mut input, "rereading_changed_heads");
+        let (operation, entity) = restart_operation(&fixture);
+        assert_eq!(entity, RESTART_PARENT);
+        writeln!(
+            client,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":2}})
+        )
+        .unwrap();
+        completion
+            .recv_timeout(WAIT)
+            .expect("Publication did not finish after MCP cancellation");
+        client.shutdown(Shutdown::Write).unwrap();
+        server.join().unwrap();
+        (operation, concurrent, current_bytes)
+    });
+    let check_outcome = |fixture: &RestartFixture| {
+        let outcome = inspect_restart_fixture(
+            fixture,
+            json!({"pending_action":"inspect","publication_ref":operation}),
+        );
+        assert_eq!(outcome["publication_ref"], operation, "{outcome}");
+        assert_eq!(
+            outcome["publication_state"], "rejected",
+            "FR-01.6 ER-32: {outcome}"
+        );
+        assert_eq!(outcome["rejection_code"], "cancelled", "{outcome}");
+        assert!(outcome.get("pending_batch_ref").is_none(), "{outcome}");
+        assert_retired_execution(fixture);
+        assert!(!restart_receipt(fixture, &operation).exists());
+        let pending: u64 = fixture
+            .reader()
+            .query_row("SELECT count(*) FROM pending", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+        let current = fixture
+            .store
+            .read_current(RESTART_PARENT)
+            .unwrap()
+            .references()
+            .unwrap();
+        assert_eq!(current, concurrent);
+        assert_eq!(fixture.store.history(RESTART_PARENT).unwrap().len(), 2);
+        let path = fixture
+            .identity
+            .root
+            .join("current/memory")
+            .join(&RESTART_PARENT[..2])
+            .join(format!("{RESTART_PARENT}.md"));
+        assert_eq!(std::fs::read(path).unwrap(), current_bytes);
+        outcome
+    };
+    let outcome = check_outcome(&fixture);
+    drop(fixture);
+    let restarted = RestartFixture::open(dir.path());
+    restarted.recover();
+    assert_eq!(check_outcome(&restarted), outcome);
 }

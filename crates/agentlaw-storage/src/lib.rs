@@ -19,7 +19,8 @@ pub mod maintenance;
 pub mod persistence;
 mod publication;
 mod read_set;
-pub use read_set::ReadSet;
+pub use published::{EntityKind, PrefixCondition, PrefixMatch, PublicationEvidence};
+pub use read_set::{PublicationBasis, ReadSet};
 pub mod published;
 mod recovery;
 pub mod resource;
@@ -40,6 +41,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[error("cannot read canonical source {path}: {source}")]
+    SourceRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("publication invariant failed: {0}")]
+    PublicationInvariant(&'static str),
+    #[error("cannot confirm the publication decision: {0}")]
+    PublicationDecisionIo(Box<Error>),
+    #[error("current heads changed: {0:?}")]
+    HeadsChanged(Vec<String>),
     #[error("external operation: {0}")]
     ExternalOperation(String),
     #[error("JSON: {0}")]
@@ -58,6 +70,8 @@ pub enum Error {
     Stale(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("prefix selection changed at condition {index}: {actual:?}")]
+    PrefixSelection { index: usize, actual: PrefixMatch },
     #[error("bounded in-memory operation exceeded; spool adapter required")]
     Capacity,
     #[error("insufficient_resource: {resource} needs {required} bytes; {available} available")]

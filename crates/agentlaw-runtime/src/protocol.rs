@@ -468,8 +468,32 @@ pub enum HelloReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindingError {
     ConnectionRequired,
-    ConfigInvalid(String),
+    ConfigInvalid(ConfigurationFailure),
     BindingChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConfigurationFailure {
+    Domain(agentlaw_contracts::DomainError),
+    Legacy(String),
+}
+
+impl ConfigurationFailure {
+    pub fn into_domain(self) -> agentlaw_contracts::DomainError {
+        match self {
+            Self::Domain(error) => error,
+            Self::Legacy(reason) => {
+                agentlaw_contracts::DomainError::new("invalid_configuration", reason)
+            }
+        }
+    }
+}
+
+impl From<&str> for ConfigurationFailure {
+    fn from(reason: &str) -> Self {
+        Self::Legacy(reason.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,7 +505,7 @@ pub enum RejectReason {
     InvalidBody(agentlaw_contracts::DomainError),
     BindingChanged,
     ConnectionRequired,
-    ConfigInvalid(String),
+    ConfigInvalid(ConfigurationFailure),
     StoreUnavailable(String),
 }
 

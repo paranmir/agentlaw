@@ -7,6 +7,17 @@ use std::{
 };
 
 pub const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_frame_bytes(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Corrupt("unexpected end of framed data".into())
+        } else {
+            Error::Io(error)
+        }
+    })
+}
+
 /// Verified first state frame only. C6 redo already verifies the complete installed
 /// file; dependency-registry maintenance must not materialize arbitrarily large bodies.
 pub(crate) fn state_prefix(r: &mut impl BufRead) -> Result<serde_json::Value> {
@@ -36,9 +47,9 @@ pub(crate) fn state_prefix(r: &mut impl BufRead) -> Result<serde_json::Value> {
         .strip_prefix("sha256=")
         .ok_or_else(|| Error::Corrupt("state prefix digest".into()))?;
     let mut bytes = vec![0u8; length as usize];
-    r.read_exact(&mut bytes)?;
+    read_frame_bytes(r, &mut bytes)?;
     let mut footer = [0u8; 30];
-    r.read_exact(&mut footer)?;
+    read_frame_bytes(r, &mut footer)?;
     if footer != *b"\n<!-- /agentlaw-record-v1 -->\n" || digest(&bytes) != sha {
         return Err(Error::Corrupt("state prefix integrity".into()));
     }
@@ -162,11 +173,14 @@ fn scan_inner(
             expected: bytes,
             early_eof: false,
         };
-        consume(&info, &mut payload)?;
+        let consumed = consume(&info, &mut payload).and_then(|()| {
+            std::io::copy(&mut payload, &mut std::io::sink())?;
+            Ok(())
+        });
         if payload.early_eof {
-            return Err(Error::Corrupt("payload length/UTF8/digest".into()));
+            return Err(Error::Corrupt("unexpected end of framed payload".into()));
         }
-        std::io::copy(&mut payload, &mut std::io::sink())?;
+        consumed?;
         if payload.count != bytes
             || payload.invalid_utf8
             || !payload.tail.is_empty()
@@ -175,7 +189,7 @@ fn scan_inner(
             return Err(Error::Corrupt("payload length/UTF8/digest".into()));
         }
         let mut footer = [0u8; 30];
-        r.read_exact(&mut footer)?;
+        read_frame_bytes(r, &mut footer)?;
         if &footer != b"\n<!-- /agentlaw-record-v1 -->\n" {
             return Err(Error::Corrupt("frame footer".into()));
         }
@@ -366,7 +380,7 @@ pub fn read(kind: &str, r: &mut impl BufRead) -> Result<Vec<Frame>> {
             return Err(Error::Corrupt("payload length/digest/UTF-8".into()));
         }
         let mut footer = [0; 30];
-        r.read_exact(&mut footer)?;
+        read_frame_bytes(r, &mut footer)?;
         if &footer != b"\n<!-- /agentlaw-record-v1 -->\n" {
             return Err(Error::Corrupt("record footer".into()));
         }

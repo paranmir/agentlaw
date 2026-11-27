@@ -16,6 +16,7 @@ impl Store {
             None,
             None,
             Some(limits),
+            &[],
         )
     }
     pub fn publish(&self, operation_id: &str, mutations: Vec<Mutation>) -> Result<PublishReceipt> {
@@ -35,6 +36,7 @@ impl Store {
             None,
             None,
             None,
+            &[],
         )
     }
     pub fn publish_with_fault(
@@ -43,7 +45,7 @@ impl Store {
         mutations: Vec<Mutation>,
         fault: Option<FaultPoint>,
     ) -> Result<PublishReceipt> {
-        self.publish_checked(operation_id, mutations, fault, None, None, None, None)
+        self.publish_checked(operation_id, mutations, fault, None, None, None, None, &[])
     }
     pub fn publish_if_generation_control(
         &self,
@@ -60,6 +62,7 @@ impl Store {
             Some(cancel),
             None,
             None,
+            &[],
         )
     }
     pub(super) fn publish_checked(
@@ -71,6 +74,7 @@ impl Store {
         cancel: Option<&std::sync::atomic::AtomicBool>,
         read_set: Option<&ReadSet>,
         limits: Option<&resource::ResourceLimits>,
+        prefix_conditions: &[PrefixCondition],
     ) -> Result<PublishReceipt> {
         validate_id(operation_id)?;
         let operation_dir = self.local.join("recovery").join(operation_id);
@@ -93,15 +97,16 @@ impl Store {
         if dir.join("manifest").exists() {
             let m: Manifest = self.load(&dir.join("manifest"))?;
             if m.request_digest != request_digest {
-                return Err(Error::Corrupt(
-                    "operation identity reused with different request".into(),
+                return Err(Error::PublicationInvariant(
+                    "operation identity reused with different request",
                 ));
             }
             if dir.join("published").exists() {
                 return Ok(m.receipt);
             }
+            self.validate_prefixes_locked(prefix_conditions)?;
             if let Some(read_set) = read_set {
-                self.validate_read_set_locked(read_set)?;
+                self.validate_publication_read_set_locked(read_set, !prefix_conditions.is_empty())?;
             }
             if prior != m.prior_generation || expected_generation.is_some_and(|g| g != prior) {
                 return Err(Error::Stale(
@@ -124,20 +129,27 @@ impl Store {
                 },
             )?;
             self.check_cancel_before_decision(cancel, prior)?;
-            self.record(&dir.join("decision"), &md)?;
+            self.record(&dir.join("decision"), &md).map_err(|error| {
+                if !prefix_conditions.is_empty() && matches!(error, Error::Io(_)) {
+                    Error::PublicationDecisionIo(Box::new(error))
+                } else {
+                    error
+                }
+            })?;
             self.redo(&dir, &m, fault)?;
             return Ok(m.receipt);
         }
+        self.validate_prefixes_locked(prefix_conditions)?;
         if expected_generation.is_some_and(|g| g != prior) {
             return Err(Error::Stale(
                 "source generation changed; dependency predicates must be re-evaluated".into(),
             ));
         }
         if mutations.is_empty() {
-            return Err(Error::Corrupt("empty batch".into()));
+            return Err(Error::PublicationInvariant("empty batch"));
         }
         if let Some(read_set) = read_set {
-            self.validate_read_set_locked(read_set)?;
+            self.validate_publication_read_set_locked(read_set, !prefix_conditions.is_empty())?;
         }
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
             return Err(Error::CancelledBeforeDecision);
@@ -196,13 +208,17 @@ impl Store {
                 if mutation.unit.entity_type != "memory"
                     || !old_units.contains_key(&mutation.unit.entity_id)
                 {
-                    return Err(Error::Corrupt("redirect requires existing memory".into()));
+                    return Err(Error::PublicationInvariant(
+                        "redirect requires existing memory",
+                    ));
                 }
                 let dest = mutations
                     .iter()
                     .find(|m| m.unit.entity_id == *redirect_to)
                     .ok_or_else(|| {
-                        Error::Corrupt("redirect destination must publish in same batch".into())
+                        Error::PublicationInvariant(
+                            "redirect destination must publish in same batch",
+                        )
                     })?;
                 if !old_units.contains_key(redirect_to)
                     || dest.unit.heads().len() != 1
@@ -231,7 +247,7 @@ impl Store {
             let unit = &mutation.unit;
             unit.validate()?;
             if !ids.insert(&unit.entity_id) {
-                return Err(Error::Corrupt("duplicate batch target".into()));
+                return Err(Error::PublicationInvariant("duplicate batch target"));
             }
             let old = old_units.get(&unit.entity_id).cloned();
             let mut actual = old
@@ -255,23 +271,21 @@ impl Store {
             for source in &mutations {
                 if matches!(&source.unit.state,UnitState::Redirect{redirect_to,..} if redirect_to==&unit.entity_id)
                 {
-                    parent_units.push(
-                        old_units
-                            .get(&source.unit.entity_id)
-                            .ok_or_else(|| Error::Corrupt("missing consolidation source".into()))?,
-                    );
+                    parent_units.push(old_units.get(&source.unit.entity_id).ok_or_else(|| {
+                        Error::PublicationInvariant("missing consolidation source")
+                    })?);
                 }
             }
             for head in unit.heads() {
                 if !changes.insert(change_id(head)?.to_owned()) {
-                    return Err(Error::Corrupt("duplicate new change".into()));
+                    return Err(Error::PublicationInvariant("duplicate new change"));
                 }
                 if old.as_ref().is_some_and(|o| {
                     o.heads()
                         .iter()
                         .any(|h| change_id(h).ok() == change_id(head).ok())
                 }) {
-                    return Err(Error::Corrupt("immutable change reused".into()));
+                    return Err(Error::PublicationInvariant("immutable change reused"));
                 }
                 history.extend(history_frames(
                     unit,
@@ -286,8 +300,9 @@ impl Store {
         }
         let _l = self.lock()?;
         self.recover_locked()?;
+        self.validate_prefixes_locked(prefix_conditions)?;
         if let Some(read_set) = read_set {
-            self.validate_read_set_locked(read_set)?;
+            self.validate_publication_read_set_locked(read_set, !prefix_conditions.is_empty())?;
             prior = self.ensure_clean()?;
             journal::reject_existing_changes(self, &proposed_ids)?;
         } else if self.ensure_clean()? != prior {
@@ -375,7 +390,13 @@ impl Store {
         )?;
         hit(fault, FaultPoint::DirtyFence)?;
         self.check_cancel_before_decision(cancel, prior)?;
-        self.record(&dir.join("decision"), &md)?;
+        self.record(&dir.join("decision"), &md).map_err(|error| {
+            if !prefix_conditions.is_empty() && matches!(error, Error::Io(_)) {
+                Error::PublicationDecisionIo(Box::new(error))
+            } else {
+                error
+            }
+        })?;
         hit(fault, FaultPoint::Decision)?;
         self.redo(&dir, &manifest, fault)?;
         drop(_l);

@@ -275,7 +275,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           },
           "description": "recall only. Retrieve complete current memories by known returned IDs; omit recall_for for ID-only lookup."
         },
@@ -283,7 +283,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           },
           "description": "recall only. Retrieve learned procedures by known returned IDs; omit recall_for for ID-only lookup."
         },
@@ -386,7 +386,7 @@
                   "properties": {
                     "memory_id": {
                       "type": "string",
-                      "description": "Copy memory_id from the returned memory_ref."
+                      "description": "Use the returned memory ID or its unique hex prefix of at least eight digits."
                     },
                     "observed_version": {
                       "type": "string",
@@ -407,7 +407,7 @@
                   "properties": {
                     "memory_id": {
                       "type": "string",
-                      "description": "Copy memory_id from the returned memory_ref."
+                      "description": "Use the returned memory ID or its unique hex prefix of at least eight digits."
                     },
                     "observed_version": {
                       "type": "string",
@@ -491,6 +491,10 @@
           },
           "description": "remember_this only. Submit one or more complete memory proposals. For initial memory writes this is required; do not combine with procedure. For pending_action=continue, omit unchanged proposals."
         },
+        "publication_ref": {
+          "type": "string",
+          "description": "Read-only publication check. With pending_action=inspect, copy the returned operation UUID. For rejected, use rejection_code. For review_required, inspect the returned pending_batch_ref. Do not resubmit an unresolved write."
+        },
         "pending_batch_ref": {
           "type": "object",
           "properties": {
@@ -516,7 +520,7 @@
             "continue",
             "discard"
           ],
-          "description": "remember_this retained work only; requires pending_batch_ref. inspect: no other write fields. continue: submit changed memories and/or review_judgments as instructed. discard: requires discard_reason and user_confirmed=true; do not submit edits."
+          "description": "remember_this only. For inspect, supply exactly one returned pending_batch_ref or publication_ref and no write fields. Continue and discard require pending_batch_ref. continue: submit changed memories and/or review_judgments as instructed. discard: requires discard_reason and user_confirmed=true; do not submit edits."
         },
         "review_judgments": {
           "type": "array",
@@ -587,7 +591,7 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "description": "Copy a returned identity; do not invent one."
+                "description": "Use a known UUID or its unique 8–32 digit hex prefix."
               }
             },
             "applies_to": {
@@ -639,11 +643,11 @@
       "properties": {
         "memory_id": {
           "type": "string",
-          "description": "history only. Copy a known memory ID. Supply exactly one of memory_id or procedure_id."
+          "description": "history only. Use a known memory UUID or unique hex prefix (8–32 digits). Supply exactly one of memory_id or procedure_id."
         },
         "procedure_id": {
           "type": "string",
-          "description": "history only. Copy a known learned procedure ID. Supply exactly one of memory_id or procedure_id."
+          "description": "history only. Use a known procedure UUID or unique hex prefix (8–32 digits). Supply exactly one of memory_id or procedure_id."
         },
         "context_layers": {
           "type": "integer",

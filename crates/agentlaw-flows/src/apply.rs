@@ -1,4 +1,5 @@
 //! Publishing retained work and recording its results.
+use crate::control::{record_prefix_outcome, PrefixTerminalOutcome};
 use crate::prepare::{ConnectPlanKind, PendingExpectation, Prepared};
 use crate::store::*;
 use crate::*;
@@ -25,44 +26,15 @@ pub struct FollowUp {
 pub fn apply(ctx: &mut LaneCtx<'_>, prepared: Prepared) -> Result<Applied> {
     ctx.request.check()?;
     match prepared {
+        Prepared::WithPrefixes(plan, prefixes) => apply_with_prefixes(ctx, *plan, prefixes),
         Prepared::Replay(value) => Ok(Applied::Response(value)),
-        Prepared::Remember(mut plan) => {
-            if plan.retained.batch.store_binding_id != ctx.identity.binding_id {
-                return Err(DomainError::new(
-                    "store_binding_mismatch",
-                    "Retained work belongs to another binding.",
-                ));
-            }
-            let old = match &plan.expectation {
-                PendingExpectation::New => None,
-                PendingExpectation::Version(version) => Some(version.as_str()),
-            };
-            if !plan.retained.issues.is_empty() {
-                if let Some(basis) = &plan.review_basis {
-                    let reader = ctx.source.owned_published_reader();
-                    let guard = source(reader.read_snapshot())?;
-                    match guard.validate_read_set(basis) {
-                        Ok(()) => {}
-                        Err(agentlaw_storage::Error::Stale(_)) => {
-                            plan.retained.basis.clear();
-                            plan.retained.resolution_ref = Some(uuid::Uuid::new_v4().to_string());
-                            plan.retained.issues = vec![
-                                json!({"code":"source_changed","message":"The source changed after review. Inspect retained proposals and continue to revalidate all heads and new dependencies."}),
-                            ];
-                        }
-                        Err(error) => return source(Err(error)),
-                    }
-                }
-            }
-            save_pending(ctx, &plan.retained, old)?;
-            let value = if plan.retained.issues.is_empty() {
-                publish_retained(ctx, plan.retained)?
-            } else {
-                crate::prepare::pending_response(&plan.retained, "resolution_required")
-            };
-            Ok(Applied::Response(value))
-        }
+        Prepared::Remember(plan) => apply_remember(ctx, plan, None),
         Prepared::Discard(plan) => {
+            ensure_subject_idle(
+                &ctx.control.connection,
+                &ctx.identity.binding_id,
+                &plan.reference.pending_batch_id,
+            )?;
             let (retained, status, _) = crate::control::load_pending(
                 &ctx.control.connection,
                 &ctx.identity.binding_id,
@@ -102,6 +74,11 @@ pub fn apply(ctx: &mut LaneCtx<'_>, prepared: Prepared) -> Result<Applied> {
             Ok(Applied::Response(plan.response))
         }
         Prepared::Procedure(plan) => {
+            ensure_subject_idle(
+                &ctx.control.connection,
+                &ctx.identity.binding_id,
+                &plan.token,
+            )?;
             let tx = sql(ctx.control.connection.transaction())?;
             let changed = sql(tx.execute(
                 "UPDATE authoring SET used=1 WHERE token=?1 AND binding=?2 AND used=0",
@@ -345,12 +322,7 @@ pub(crate) fn publish_retained_parts(
     match publication {
         Ok(receipt) => {
             request.phase("published");
-            let results=retained.mutations.iter().filter(|m|matches!(m.unit.state,UnitState::Live{..})).enumerate().map(|(index,m)| {
-                let reference=receipt.references.iter().find(|r|r.memory_id==m.unit.entity_id).ok_or_else(||DomainError::new("publication_receipt_incomplete","Published receipt lacks a proposal destination; preserve retained execution and inspect source."))?;
-                Ok(json!({"proposal_index":index,"memory_ref":{"memory_id":reference.memory_id,"observed_version":reference.observed_version}}))
-            }).collect::<Result<Vec<_>>>()?;
-            let result =
-                json!({"status":"remembered","results":results,"diagnostics":retained.diagnostics});
+            let result = remember_receipt(&retained, &receipt)?;
             sql(connection.execute(
                 "UPDATE pending SET status='published',result=?1 WHERE id=?2",
                 params![encode(&result)?, retained.batch.reference.pending_batch_id],
@@ -361,6 +333,18 @@ pub(crate) fn publish_retained_parts(
             error @ (agentlaw_storage::Error::CancelledBeforeDecision
             | agentlaw_storage::Error::Stale(_)),
         ) => {
+            if matches!(error, agentlaw_storage::Error::Stale(_)) {
+                let issues = stale_parent_issues(store, request, &retained)?;
+                if !issues.is_empty() {
+                    let old = retained.batch.reference.observed_version.clone();
+                    transition_to_review(&mut retained, issues);
+                    save_pending_parts(connection, &retained, Some(&old))?;
+                    return Ok(crate::prepare::pending_response(
+                        &retained,
+                        "resolution_required",
+                    ));
+                }
+            }
             let cancelled = matches!(error, agentlaw_storage::Error::CancelledBeforeDecision);
             let old = retained.batch.reference.observed_version.clone();
             retained.operation_id = None;
@@ -409,13 +393,7 @@ pub(crate) fn publish_procedure_parts(
     ) {
         Ok(receipt) => {
             request.phase("published");
-            let reference = receipt.references.first().ok_or_else(|| {
-                DomainError::new(
-                    "publication_result_invalid",
-                    "Procedure reference is absent.",
-                )
-            })?;
-            let result = json!({"status":"remembered","procedure_ref":{"procedure_id":reference.memory_id,"observed_version":reference.observed_version}});
+            let result = procedure_receipt(&receipt)?;
             sql(connection.execute(
                 "UPDATE authoring_executions SET status='published',result=?1 WHERE token=?2",
                 params![encode(&result)?, token],
@@ -448,4 +426,663 @@ pub(crate) fn publish_procedure_parts(
         }
         Err(error) => source(Err(error)),
     }
+}
+use agentlaw_storage::{Mutation, PublicationBasis, PublishReceipt};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+enum PrefixExecution {
+    Remember {
+        retained: Retained,
+        old_version: Option<String>,
+    },
+    Procedure {
+        token: String,
+        generation: u64,
+        mutation: Mutation,
+        submission: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PrefixIntent {
+    execution: PrefixExecution,
+    prefixes: Vec<SubmittedPrefix>,
+}
+
+pub(crate) fn publication_inspect_action(operation: &str) -> String {
+    format!("Restore access if needed, then call remember_this with pending_action=inspect and publication_ref={operation} to inspect the original operation before resubmitting.")
+}
+
+fn publication_error(error: DomainError, operation: &str, state: PublicationState) -> DomainError {
+    error
+        .with_next_action(publication_inspect_action(operation))
+        .with_diagnostic(PublicationDetails {
+            publication_state: state,
+            publication_ref: operation.to_owned(),
+        })
+}
+
+fn unresolved_publication_state(
+    store: &agentlaw_storage::Store,
+    operation: &str,
+) -> PublicationState {
+    match store
+        .owned_published_reader()
+        .publication_evidence(operation)
+    {
+        Ok(agentlaw_storage::PublicationEvidence::Undecided) => PublicationState::BeforeDecision,
+        _ => PublicationState::DecisionUnknown,
+    }
+}
+
+fn ensure_subject_idle(
+    connection: &rusqlite::Connection,
+    binding: &str,
+    subject: &str,
+) -> Result<()> {
+    let existing = sql(connection
+        .query_row(
+            "SELECT operation FROM prefix_executions WHERE binding=?1 AND subject=?2",
+            params![binding, subject],
+            |row| row.get::<_, String>(0),
+        )
+        .optional())?;
+    if let Some(operation) = existing {
+        return Err(publication_error(
+            DomainError::new(
+                "publication_in_progress",
+                "Recover the recorded publication before changing this work.",
+            ),
+            &operation,
+            PublicationState::DecisionUnknown,
+        ));
+    }
+    Ok(())
+}
+
+fn stale_parent_issues(
+    store: &agentlaw_storage::Store,
+    request: &RequestControl,
+    retained: &Retained,
+) -> Result<Vec<Value>> {
+    let refs = |proposal: &MemoryProposal| {
+        proposal
+            .parent_refs
+            .as_ref()
+            .or(proposal.consolidation_refs.as_ref())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let ids: std::collections::BTreeSet<_> = retained
+        .batch
+        .proposals
+        .iter()
+        .flat_map(|proposal| {
+            refs(proposal)
+                .into_iter()
+                .map(|reference| reference.memory_id)
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let snapshot = crate::read::snapshot_selected_read(
+        &store.owned_published_reader(),
+        request,
+        &ids.into_iter().collect::<Vec<_>>(),
+        &[],
+    )?;
+    let mut issues = Vec::new();
+    for (index, proposal) in retained.batch.proposals.iter().enumerate() {
+        let references = refs(proposal);
+        if references.is_empty() {
+            continue;
+        }
+        let ids: std::collections::BTreeSet<_> = references
+            .iter()
+            .map(|reference| &reference.memory_id)
+            .collect();
+        let mut stale = false;
+        let mut current_states = Vec::new();
+        for id in ids {
+            let state = snapshot.current(id)?;
+            let current: std::collections::BTreeSet<_> = state
+                .iter()
+                .flat_map(|state| state.heads.iter())
+                .map(|head| &head.memory_ref)
+                .collect();
+            stale |= current
+                != references
+                    .iter()
+                    .filter(|reference| &reference.memory_id == id)
+                    .collect();
+            if let Some(state) = state {
+                current_states.push(external_current(&state));
+            }
+        }
+        if stale {
+            issues.push(json!({
+                "code":"source_changed",
+                "message":"Copy all current head references and review their full contents.",
+                "proposal_index":index,"proposal_id":proposal.proposal_id,
+                "submitted_proposal":proposal,"current_states":current_states,
+            }));
+        }
+    }
+    Ok(issues)
+}
+
+fn transition_to_review(retained: &mut Retained, issues: Vec<Value>) {
+    retained.operation_id = None;
+    retained.expected_generation = None;
+    retained.publication_basis = None;
+    retained.resolution_ref = Some(uuid::Uuid::new_v4().to_string());
+    retained.mutations.clear();
+    retained.basis.clear();
+    retained.overlap_approved = false;
+    retained.batch.reference.observed_version = uuid::Uuid::new_v4().to_string();
+    retained.issues = issues;
+}
+
+fn apply_remember(
+    ctx: &mut LaneCtx<'_>,
+    mut plan: crate::prepare::RememberPlan,
+    guarded: Option<&agentlaw_storage::published::SourceReadGuard<'_>>,
+) -> Result<Applied> {
+    if plan.retained.batch.store_binding_id != ctx.identity.binding_id {
+        return Err(DomainError::new(
+            "store_binding_mismatch",
+            "Retained work belongs to another binding.",
+        ));
+    }
+    ensure_subject_idle(
+        &ctx.control.connection,
+        &ctx.identity.binding_id,
+        &plan.retained.batch.reference.pending_batch_id,
+    )?;
+    let old = match &plan.expectation {
+        PendingExpectation::New => None,
+        PendingExpectation::Version(version) => Some(version.as_str()),
+    };
+    if !plan.retained.issues.is_empty() {
+        if let Some(basis) = &plan.review_basis {
+            let validation = if let Some(guard) = guarded {
+                guard.validate_read_set(basis)
+            } else {
+                let reader = ctx.source.owned_published_reader();
+                let guard = source(reader.read_snapshot())?;
+                guard.validate_read_set(basis)
+            };
+            match validation {
+                Ok(()) => {}
+                Err(agentlaw_storage::Error::Stale(_)) => {
+                    plan.retained.basis.clear();
+                    plan.retained.resolution_ref = Some(uuid::Uuid::new_v4().to_string());
+                    plan.retained.issues = vec![
+                        json!({"code":"source_changed","message":"The source changed after review. Inspect retained proposals and continue to revalidate all heads and new dependencies."}),
+                    ];
+                }
+                Err(error) => return source(Err(error)),
+            }
+        }
+    }
+    save_pending(ctx, &plan.retained, old)?;
+    let response = if plan.retained.issues.is_empty() {
+        publish_retained(ctx, plan.retained)?
+    } else {
+        crate::prepare::pending_response(&plan.retained, "resolution_required")
+    };
+    Ok(Applied::Response(response))
+}
+
+fn apply_with_prefixes(
+    ctx: &mut LaneCtx<'_>,
+    plan: Prepared,
+    prefixes: Vec<SubmittedPrefix>,
+) -> Result<Applied> {
+    let conditions: Vec<_> = prefixes
+        .iter()
+        .map(|input| input.condition.clone())
+        .collect();
+    let (operation, subject, execution) = match plan {
+        Prepared::Remember(plan) if plan.retained.issues.is_empty() => {
+            let old_version = match plan.expectation {
+                PendingExpectation::New => None,
+                PendingExpectation::Version(version) => Some(version),
+            };
+            let id = plan.retained.batch.reference.pending_batch_id.clone();
+            let op = plan
+                .retained
+                .operation_id
+                .clone()
+                .expect("prepared publication has an operation");
+            (
+                op,
+                id,
+                PrefixExecution::Remember {
+                    retained: plan.retained,
+                    old_version,
+                },
+            )
+        }
+        Prepared::Procedure(plan) => (
+            plan.operation_id.to_string(),
+            plan.token.clone(),
+            PrefixExecution::Procedure {
+                token: plan.token,
+                generation: plan.generation,
+                mutation: plan.mutation,
+                submission: plan.submission,
+            },
+        ),
+        other => {
+            let reader = ctx.source.owned_published_reader();
+            let guard = source(reader.read_snapshot())?;
+            guard
+                .validate_prefixes(&conditions)
+                .map_err(|error| prefix_error(error, &prefixes))?;
+            return match other {
+                Prepared::Remember(plan) => apply_remember(ctx, plan, Some(&guard)),
+                other => apply(ctx, other),
+            };
+        }
+    };
+    let binding = &ctx.identity.binding_id;
+    let connection = &ctx.control.connection;
+    let tx = sql(connection.unchecked_transaction())?;
+    ensure_subject_idle(&tx, binding, &subject)?;
+    match &execution {
+        PrefixExecution::Remember {
+            retained,
+            old_version,
+        } => {
+            if retained.batch.store_binding_id != *binding {
+                return Err(DomainError::new(
+                    "store_binding_mismatch",
+                    "Retained work belongs to another binding.",
+                ));
+            }
+            let current = sql(tx
+                .query_row(
+                    "SELECT version,status FROM pending WHERE id=?1 AND binding=?2",
+                    params![subject, binding],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional())?;
+            let matches = match (&current, old_version) {
+                (None, None) => true,
+                (Some((version, status)), Some(old)) => version == old && status == "pending",
+                _ => false,
+            };
+            if !matches {
+                return Err(DomainError::new(
+                    "stale_pending_ref",
+                    "Inspect the latest retained proposals before continuing.",
+                ));
+            }
+        }
+        PrefixExecution::Procedure { token, .. } => {
+            let current = sql(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM authoring WHERE token=?1 AND binding=?2 AND used=0)",
+                params![token, binding],
+                |row| row.get::<_, bool>(0),
+            ))?;
+            if !current {
+                return Err(DomainError::new(
+                    "stale_authoring_ref",
+                    "Authoring context was used concurrently; prepare again.",
+                ));
+            }
+        }
+    }
+    let intent = PrefixIntent {
+        execution,
+        prefixes,
+    };
+    sql(tx.execute(
+        "INSERT INTO prefix_executions(binding,operation,subject,payload) VALUES(?1,?2,?3,?4)",
+        params![binding, operation, subject, encode(&intent)?],
+    ))?;
+    sql(tx.commit())?;
+    finish_prefix_execution(
+        ctx.source,
+        connection,
+        binding,
+        ctx.request,
+        &operation,
+        intent,
+    )
+    .map(Applied::Response)
+    .map_err(PrefixRunError::into_domain)
+}
+
+fn delete_prefix_execution(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &str,
+    operation: &str,
+) -> Result<()> {
+    sql(tx.execute(
+        "DELETE FROM prefix_executions WHERE binding=?1 AND operation=?2",
+        params![binding, operation],
+    ))?;
+    Ok(())
+}
+
+fn reject_prefix_execution(
+    connection: &rusqlite::Connection,
+    binding: &str,
+    operation: &str,
+    error: DomainError,
+) -> PrefixRunError {
+    let settle = || {
+        let tx = sql(connection.unchecked_transaction())?;
+        record_prefix_outcome(
+            &tx,
+            binding,
+            operation,
+            PrefixTerminalOutcome::Rejected(&error.code),
+        )?;
+        delete_prefix_execution(&tx, binding, operation)?;
+        sql(tx.commit())
+    };
+    match settle() {
+        Ok(()) => PrefixRunError::Rejected(error),
+        Err(error) => PrefixRunError::Incomplete(publication_error(
+            error,
+            operation,
+            PublicationState::BeforeDecision,
+        )),
+    }
+}
+
+fn prefix_publication_cancelled() -> DomainError {
+    DomainError::new(
+        "cancelled",
+        "Publication was cancelled before the decision.",
+    )
+}
+
+fn save_prefix_review(
+    connection: &rusqlite::Connection,
+    binding: &str,
+    operation: &str,
+    retained: &Retained,
+    old_version: Option<&str>,
+) -> Result<()> {
+    let tx = sql(connection.unchecked_transaction())?;
+    save_pending_parts(&tx, retained, old_version)?;
+    record_prefix_outcome(
+        &tx,
+        binding,
+        operation,
+        PrefixTerminalOutcome::ReviewRequired(&retained.batch.reference),
+    )?;
+    delete_prefix_execution(&tx, binding, operation)?;
+    sql(tx.commit())
+}
+
+enum PrefixRunError {
+    Rejected(DomainError),
+    ParentRereadFailed(DomainError),
+    Incomplete(DomainError),
+}
+impl From<DomainError> for PrefixRunError {
+    fn from(error: DomainError) -> Self {
+        Self::Incomplete(error)
+    }
+}
+impl PrefixRunError {
+    fn into_domain(self) -> DomainError {
+        match self {
+            Self::Rejected(error) | Self::ParentRereadFailed(error) | Self::Incomplete(error) => {
+                error
+            }
+        }
+    }
+}
+fn finish_prefix_execution(
+    store: &agentlaw_storage::Store,
+    connection: &rusqlite::Connection,
+    binding: &str,
+    request: &RequestControl,
+    operation: &str,
+    intent: PrefixIntent,
+) -> std::result::Result<Value, PrefixRunError> {
+    let conditions: Vec<_> = intent
+        .prefixes
+        .iter()
+        .map(|input| input.condition.clone())
+        .collect();
+    let (basis, mutations) = match &intent.execution {
+        PrefixExecution::Remember { retained, .. } => (
+            PublicationBasis::ReadSet(
+                retained
+                    .publication_basis
+                    .as_ref()
+                    .expect("prepared publication has a read set"),
+            ),
+            retained.mutations.clone(),
+        ),
+        PrefixExecution::Procedure {
+            generation,
+            mutation,
+            ..
+        } => (
+            PublicationBasis::Generation(*generation),
+            vec![mutation.clone()],
+        ),
+    };
+    request.phase("publishing");
+    let receipt = match store.publish_conditionally(
+        operation,
+        mutations,
+        basis,
+        &conditions,
+        &request.cancel,
+    ) {
+        Ok(receipt) => receipt,
+        Err(agentlaw_storage::Error::HeadsChanged(changed)) => {
+            if let PrefixExecution::Remember {
+                mut retained,
+                old_version,
+            } = intent.execution
+            {
+                let mut issues = Vec::new();
+                if changed.iter().all(|id| {
+                    retained.batch.proposals.iter().any(|proposal| {
+                        proposal
+                            .parent_refs
+                            .iter()
+                            .flatten()
+                            .chain(proposal.consolidation_refs.iter().flatten())
+                            .any(|reference| &reference.memory_id == id)
+                    })
+                }) {
+                    request.phase("rereading_changed_heads");
+                    if request.check().is_err() {
+                        return Err(reject_prefix_execution(
+                            connection,
+                            binding,
+                            operation,
+                            prefix_publication_cancelled(),
+                        ));
+                    }
+                    let reread = RequestControl::default();
+                    issues = stale_parent_issues(store, &reread, &retained).map_err(|error| {
+                        PrefixRunError::ParentRereadFailed(publication_error(
+                            error,
+                            operation,
+                            unresolved_publication_state(store, operation),
+                        ))
+                    })?;
+                }
+                if !issues.is_empty() {
+                    transition_to_review(&mut retained, issues);
+                    save_prefix_review(
+                        connection,
+                        binding,
+                        operation,
+                        &retained,
+                        old_version.as_deref(),
+                    )
+                    .map_err(|error| {
+                        publication_error(error, operation, PublicationState::BeforeDecision)
+                    })?;
+                    return Ok(crate::prepare::pending_response(
+                        &retained,
+                        "resolution_required",
+                    ));
+                }
+            }
+            return Err(reject_prefix_execution(
+                connection,
+                binding,
+                operation,
+                DomainError::new(
+                    "source_changed",
+                    "Current source changed before publication.",
+                )
+                .with_next_action(
+                    "Inspect current heads and review the proposed changes before resubmitting.",
+                ),
+            ));
+        }
+        Err(
+            error @ (agentlaw_storage::Error::PrefixSelection { .. }
+            | agentlaw_storage::Error::Stale(_)
+            | agentlaw_storage::Error::CancelledBeforeDecision
+            | agentlaw_storage::Error::CoverageLost),
+        ) => {
+            let error = match error {
+                agentlaw_storage::Error::Stale(_) | agentlaw_storage::Error::CoverageLost => DomainError::new("source_changed", "Source changed before publication.")
+                    .with_next_action("Inspect current heads and review the proposed changes before resubmitting."),
+                agentlaw_storage::Error::CancelledBeforeDecision => prefix_publication_cancelled(),
+                other => prefix_error(other, &intent.prefixes),
+            };
+            return Err(reject_prefix_execution(
+                connection, binding, operation, error,
+            ));
+        }
+        Err(error) => {
+            let state = if matches!(
+                error,
+                agentlaw_storage::Error::Io(_)
+                    | agentlaw_storage::Error::SourceRead { .. }
+                    | agentlaw_storage::Error::Sql(_)
+            ) {
+                unresolved_publication_state(store, operation)
+            } else {
+                PublicationState::DecisionUnknown
+            };
+            return Err(PrefixRunError::Incomplete(publication_error(
+                source_error(error),
+                operation,
+                state,
+            )));
+        }
+    };
+    request.phase("published");
+    let tx = sql(connection.unchecked_transaction())?;
+    let result = match intent.execution {
+        PrefixExecution::Remember {
+            retained,
+            old_version,
+        } => {
+            let result = remember_receipt(&retained, &receipt)?;
+            save_pending_parts(&tx, &retained, old_version.as_deref())?;
+            sql(tx.execute(
+                "UPDATE pending SET status='published',result=?1 WHERE id=?2",
+                params![encode(&result)?, retained.batch.reference.pending_batch_id],
+            ))?;
+            result
+        }
+        PrefixExecution::Procedure {
+            token,
+            generation,
+            mutation,
+            submission,
+        } => {
+            let result = procedure_receipt(&receipt)?;
+            let changed = sql(tx.execute(
+                "UPDATE authoring SET used=1 WHERE token=?1 AND binding=?2 AND used=0",
+                params![token, binding],
+            ))?;
+            if changed != 1 {
+                return Err(DomainError::new(
+                    "control_corrupt",
+                    "Published procedure lacks its reserved authoring context.",
+                )
+                .into());
+            }
+            sql(tx.execute("INSERT INTO authoring_executions(token,binding,operation,generation,mutation,submission,status,result) VALUES(?1,?2,?3,?4,?5,?6,'published',?7)",
+                params![token,binding,operation,generation.to_string(),encode(&mutation)?,submission,encode(&result)?]))?;
+            result
+        }
+    };
+    delete_prefix_execution(&tx, binding, operation)?;
+    sql(tx.commit())?;
+    Ok(result)
+}
+
+pub(crate) fn recover_prefix_executions(
+    store: &agentlaw_storage::Store,
+    connection: &rusqlite::Connection,
+    binding: &str,
+    request: &RequestControl,
+) -> Result<()> {
+    let pending = {
+        let mut statement =
+            sql(connection
+                .prepare("SELECT operation,payload FROM prefix_executions WHERE binding=?1"))?;
+        let rows = sql(statement.query_map([binding], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }))?;
+        sql(rows.collect::<std::result::Result<Vec<_>, _>>())?
+    };
+    for (operation, payload) in pending {
+        match finish_prefix_execution(
+            store,
+            connection,
+            binding,
+            request,
+            &operation,
+            decode(&payload)?,
+        ) {
+            Ok(_) | Err(PrefixRunError::Rejected(_)) => {}
+            Err(PrefixRunError::ParentRereadFailed(error)) => {
+                use std::io::Write;
+
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "Publication recovery deferred for {operation} ({}): {}",
+                    error.code,
+                    error.message,
+                );
+            }
+            Err(PrefixRunError::Incomplete(error)) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn remember_receipt(retained: &Retained, receipt: &PublishReceipt) -> Result<Value> {
+    let results=retained.mutations.iter().filter(|m|matches!(m.unit.state,UnitState::Live{..})).enumerate().map(|(index,m)| {
+                let reference=receipt.references.iter().find(|r|r.memory_id==m.unit.entity_id).ok_or_else(||DomainError::new("publication_receipt_incomplete","Published receipt lacks a proposal destination; preserve retained execution and inspect source."))?;
+                Ok(json!({"proposal_index":index,"memory_ref":{"memory_id":reference.memory_id,"observed_version":reference.observed_version}}))
+            }).collect::<Result<Vec<_>>>()?;
+    let result =
+        json!({"status":"remembered","results":results,"diagnostics":retained.diagnostics});
+    Ok(result)
+}
+
+fn procedure_receipt(receipt: &PublishReceipt) -> Result<Value> {
+    let reference = receipt.references.first().ok_or_else(|| {
+        DomainError::new(
+            "publication_result_invalid",
+            "Procedure reference is absent.",
+        )
+    })?;
+    let result = json!({"status":"remembered","procedure_ref":{"procedure_id":reference.memory_id,"observed_version":reference.observed_version}});
+    Ok(result)
 }

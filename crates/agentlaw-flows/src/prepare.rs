@@ -430,6 +430,7 @@ fn overlap_candidates(
     Ok((result, diagnostics))
 }
 pub enum Prepared {
+    WithPrefixes(Box<Prepared>, Vec<SubmittedPrefix>),
     Replay(Value),
     Remember(RememberPlan),
     Discard(DiscardPlan),
@@ -441,10 +442,20 @@ pub enum Prepared {
 pub fn prepare(
     ctx: &ReadCtx<'_>,
     exact: &mut crate::exact::ExactSnapshot,
-    request: RememberRequest,
+    mut request: RememberRequest,
 ) -> Result<Prepared> {
     ctx.request.check()?;
-    prepare_remember(
+    let prefixes = {
+        let guard = source(ctx.source.read_snapshot())?;
+        if guard.position() != exact.position() {
+            return Err(DomainError::new(
+                "source_changed",
+                "Source changed during preparation; retry.",
+            ));
+        }
+        normalize_write_ids(&guard, &mut request)?
+    };
+    let prepared = prepare_remember(
         &mut ReadPreparation {
             ctx,
             exact,
@@ -452,7 +463,12 @@ pub fn prepare(
             reuse: PieceVectorReuse::default(),
         },
         request,
-    )
+    )?;
+    if prefixes.is_empty() {
+        Ok(prepared)
+    } else {
+        Ok(Prepared::WithPrefixes(Box::new(prepared), prefixes))
+    }
 }
 
 pub fn prepare_connect(ctx: &ReadCtx<'_>, request: ConnectRequest) -> Result<Prepared> {
@@ -655,6 +671,18 @@ pub(crate) fn pending_response(retained: &Retained, status: &str) -> Value {
     json!({"status":status,"pending_batch_ref":retained.batch.reference,"proposal_map":retained.batch.proposals.iter().enumerate().map(|(i,p)|json!({"proposal_index":i,"proposal_id":p.proposal_id})).collect::<Vec<_>>(),"proposals":retained.batch.proposals,"issues":retained.issues,"resolution_ref":retained.resolution_ref,"diagnostics":retained.diagnostics})
 }
 
+fn stored_relations(head: &Head, kind: &str) -> Result<Vec<Value>> {
+    let mut relations = head.metadata["relations"]
+        .as_array()
+        .ok_or_else(|| DomainError::new("source_corrupt", "Parent relations are missing."))?
+        .iter()
+        .filter(|relation| relation["kind"] == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    relations.sort_by_key(Value::to_string);
+    Ok(relations)
+}
+
 fn mutations(
     machine_id: &str,
     user_id: &str,
@@ -716,20 +744,7 @@ fn mutations(
                     for h in unit.heads() {
                         if source(agentlaw_storage::version(unit, h))? == reference.observed_version
                         {
-                            let mut set = h.metadata["relations"]
-                                .as_array()
-                                .ok_or_else(|| {
-                                    DomainError::new(
-                                        "source_corrupt",
-                                        "Parent relations are missing.",
-                                    )
-                                })?
-                                .iter()
-                                .filter(|r| r["kind"] == kind)
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            set.sort_by_key(Value::to_string);
-                            parent_sets.push(set)
+                            parent_sets.push(stored_relations(h, kind)?);
                         }
                     }
                 }
@@ -794,11 +809,31 @@ fn mutations(
     Ok(result)
 }
 
+fn describe_proposal(
+    detail: &mut Value,
+    proposal: &MemoryProposal,
+    location: ProposalLocation,
+    input_index: Option<usize>,
+    stored: bool,
+) {
+    detail["proposal_index"] = json!(location.index);
+    if let Some(id) = proposal.proposal_id.as_ref().filter(|_| stored) {
+        detail["proposal_id"] = json!(id);
+    }
+    if let Some(index) = input_index {
+        detail["path"] = json!(location.input_path(index));
+    } else {
+        detail["submitted_proposal"] = json!(proposal);
+    }
+}
+
 fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result<Prepared> {
     if r.procedure.is_some() {
         return prepare_procedure(access, &r);
     }
     let mut old_version = None;
+    let mut stored_proposals = 0;
+    let positions;
     let mut retained = if let Some(reference) = &r.pending_batch_ref {
         let (mut retained, status, result) = access.load(reference)?;
         match r.pending_action.as_ref() {
@@ -859,6 +894,7 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
             ));
         }
         old_version = Some(reference.observed_version.clone());
+        stored_proposals = retained.batch.proposals.len();
         if let Some(delta) = &r.memories {
             if retained.operation_id.is_some() {
                 return Err(DomainError::new(
@@ -866,9 +902,12 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
                     "Resume the retained execution before editing its proposals.",
                 ));
             }
-            retained.batch = retained
-                .batch
-                .apply_delta(&retained.context, reference, delta)?;
+            (retained.batch, positions) =
+                retained
+                    .batch
+                    .apply_delta_with_positions(&retained.context, reference, delta)?;
+        } else {
+            positions = vec![None; retained.batch.proposals.len()];
         }
         retained
     } else {
@@ -876,6 +915,7 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
         let proposals = r
             .memories
             .ok_or_else(|| DomainError::new("invalid_input", "memories are required."))?;
+        positions = (0..proposals.len()).map(Some).collect();
         Retained {
             diagnostics: vec![],
             batch: PendingBatch::new(&context, proposals),
@@ -908,23 +948,36 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
         }
     }
     let expectation = old_version.map_or(PendingExpectation::New, PendingExpectation::Version);
-    let prepared = match preflight(
+    let prepared = match preflight_with_relations(
         &snapshot,
         &StructuralOnly,
         &retained.context,
         &retained.batch.proposals,
+        |parent, kind| {
+            let reference = &parent.memory_ref;
+            for unit in snapshot
+                .units
+                .iter()
+                .filter(|unit| unit.entity_id == reference.memory_id)
+            {
+                for head in unit.heads() {
+                    let version = source(agentlaw_storage::version(unit, head))?;
+                    if snapshot.streaming.actual_version(version) == reference.observed_version {
+                        return stored_relations(head, kind).map(Value::Array);
+                    }
+                }
+            }
+            Err(DomainError::new(
+                "source_changed",
+                "Parent head disappeared from the prepared snapshot.",
+            ))
+        },
     ) {
         Ok(prepared) => prepared,
-        Err(error) if error.code == "stale_memory_ref" => {
+        Err(PreflightError::Stale(error, locations)) => {
             let mut issues = Vec::new();
-            for index in error
-                .details
-                .iter()
-                .flat_map(|details| details["proposal_indices"].as_array())
-                .flatten()
-                .filter_map(Value::as_u64)
-            {
-                let proposal = &retained.batch.proposals[index as usize];
+            for location in locations {
+                let proposal = &retained.batch.proposals[location.index];
                 let ids: BTreeSet<_> = proposal
                     .parent_refs
                     .iter()
@@ -938,20 +991,20 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
                         current_states.push(external_current(&state));
                     }
                 }
-                let field = if proposal.operation == Operation::Consolidate {
-                    "consolidation_refs"
-                } else {
-                    "parent_refs"
-                };
-                issues.push(json!({
+                let mut issue = json!({
                     "code":error.code,
                     "message":error.message,
-                    "proposal_index":index,
-                    "proposal_id":proposal.proposal_id,
-                    "path":format!("/memories/{index}/{field}"),
                     "submitted_proposal":proposal,
                     "current_states":current_states,
-                }));
+                });
+                describe_proposal(
+                    &mut issue,
+                    proposal,
+                    location,
+                    positions[location.index],
+                    true,
+                );
+                issues.push(issue);
             }
             retained.issues = issues;
             retained.basis.clear();
@@ -964,7 +1017,24 @@ fn prepare_remember(access: &mut impl Preparation, r: RememberRequest) -> Result
                 review_basis: Some(snapshot.publication_basis),
             }));
         }
-        Err(error) => return Err(error),
+        Err(PreflightError::Located(error, details)) => {
+            let details: Vec<_> = details
+                .into_iter()
+                .map(|mut detail| {
+                    let index = detail.location.index;
+                    describe_proposal(
+                        &mut detail.value,
+                        &retained.batch.proposals[index],
+                        detail.location,
+                        positions[index],
+                        index < stored_proposals,
+                    );
+                    detail.value
+                })
+                .collect();
+            return Err(error.with_details(json!(details)));
+        }
+        Err(PreflightError::Domain(error)) => return Err(error),
     };
     for (proposal, scope) in prepared
         .proposals
@@ -1121,10 +1191,14 @@ fn prepare_procedure(access: &mut impl Preparation, r: &RememberRequest) -> Resu
         .unwrap_or_default();
     let snapshot = access.snapshot(&p.evidence_memory_ids, &procedure_ids)?;
     let mut evidence = Vec::new();
-    for id in &p.evidence_memory_ids {
+    for (index, id) in p.evidence_memory_ids.iter().enumerate() {
         validate_id(id)?;
         evidence.push(snapshot.current(id)?.ok_or_else(|| {
-            DomainError::new("memory_not_found", "Procedure evidence memory is absent.")
+            validation::identity_input_error(
+                "not_found",
+                &format!("/procedure/evidence_memory_ids/{index}"),
+                &json!(id),
+            )
         })?)
     }
     let mut parents = Vec::new();
@@ -1149,7 +1223,11 @@ fn prepare_procedure(access: &mut impl Preparation, r: &RememberRequest) -> Resu
                 .iter()
                 .find(|u| u.entity_id == id && u.entity_type == "learned_procedure")
                 .ok_or_else(|| {
-                    DomainError::new("procedure_not_found", "Procedure parent is absent.")
+                    validation::identity_input_error(
+                        "not_found",
+                        "/procedure/parent_refs/0/procedure_id",
+                        &json!(id),
+                    )
                 })?;
             let actual: BTreeSet<_> = source(unit.references())?
                 .into_iter()

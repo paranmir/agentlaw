@@ -109,6 +109,7 @@ impl StoreService {
         &self,
         value: Value,
         history: bool,
+        operation: crate::installation::delivery::Operation,
         snapshot: &ConfigSnapshot,
     ) -> Result<Value> {
         let limit = if history {
@@ -119,7 +120,7 @@ impl StoreService {
         } else {
             snapshot.config.response_limit_bytes
         };
-        crate::installation::delivery::adapt(value, &self.state, limit)
+        crate::installation::delivery::adapt_for_operation(value, &self.state, limit, operation)
     }
     fn import_identity(&self, snapshot: &ConfigSnapshot) -> StoreIdentity {
         StoreIdentity {

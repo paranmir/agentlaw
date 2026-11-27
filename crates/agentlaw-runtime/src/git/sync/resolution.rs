@@ -310,6 +310,47 @@ pub(super) fn check_plan(
     }
     Ok(())
 }
+fn frozen_memory_ids(
+    current: &BTreeMap<String, CurrentUnit>,
+    submitted: &[String],
+    path: &str,
+) -> Result<Vec<String>> {
+    use agentlaw_contracts::validation::{
+        identity_input_error, is_entity_identity, is_identity_prefix,
+    };
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::with_capacity(submitted.len());
+    for (index, id) in submitted.iter().enumerate() {
+        let error = |code| identity_input_error(code, &format!("{path}/{index}"), &json!(id));
+        if !is_entity_identity(id) {
+            return Err(error("invalid_input"));
+        }
+        let mut candidates = current
+            .values()
+            .filter(|unit| unit.entity_type == "memory")
+            .map(|unit| unit.entity_id.as_str());
+        let canonical = if is_identity_prefix(id) {
+            let prefix = id.to_ascii_lowercase();
+            let mut matches =
+                candidates.filter(|candidate| candidate.replace('-', "").starts_with(&prefix));
+            let canonical = matches.next().ok_or_else(|| error("not_found"))?;
+            if matches.next().is_some() {
+                return Err(error("ambiguous"));
+            }
+            canonical
+        } else {
+            candidates
+                .find(|candidate| *candidate == id.as_str())
+                .ok_or_else(|| error("not_found"))?
+        };
+        if !seen.insert(canonical) {
+            return Err(error("invalid_input"));
+        }
+        result.push(canonical.to_owned());
+    }
+    Ok(result)
+}
+
 pub(super) fn submit(store: &Store, op: &mut Operation, solution: &SyncSolution) -> Result<()> {
     let packet = op.packet.clone().unwrap();
     let digest = git::hash(&serde_json::to_vec(solution).unwrap());
@@ -333,7 +374,7 @@ pub(super) fn submit(store: &Store, op: &mut Operation, solution: &SyncSolution)
             .into_iter()
             .map(|u| (u.entity_id.clone(), u))
             .collect::<BTreeMap<_, _>>();
-        for proposed in &solution.units {
+        for (index, proposed) in solution.units.iter().enumerate() {
             let input = packet.inputs.get(&proposed.metadata_from).ok_or_else(|| {
                 DomainError::new(
                     "unknown_packet_handle",
@@ -416,6 +457,11 @@ pub(super) fn submit(store: &Store, op: &mut Operation, solution: &SyncSolution)
                 ("required", &proposed.required_memory_ids),
             ] {
                 if let Some(ids) = ids {
+                    let ids = frozen_memory_ids(
+                        &current,
+                        ids,
+                        &format!("/solution/units/{index}/{kind}_memory_ids"),
+                    )?;
                     let prior = metadata["relations"]
                         .as_array()
                         .cloned()
@@ -440,7 +486,11 @@ pub(super) fn submit(store: &Store, op: &mut Operation, solution: &SyncSolution)
                 metadata["use_when"] = json!(value);
             }
             if let Some(value) = &proposed.evidence_memory_ids {
-                metadata["evidence_memory_ids"] = json!(value);
+                metadata["evidence_memory_ids"] = json!(frozen_memory_ids(
+                    &current,
+                    value,
+                    &format!("/solution/units/{index}/evidence_memory_ids")
+                )?);
             }
             if input.entity_type == "learned_procedure"
                 && (proposed.is_rule.is_some()

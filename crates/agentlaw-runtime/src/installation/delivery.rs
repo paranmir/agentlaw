@@ -19,7 +19,32 @@ impl Write for Count {
         Ok(())
     }
 }
-pub fn adapt(mut value: Value, state: &Path, limit: usize) -> Result<Value> {
+#[derive(Clone, Copy)]
+pub enum Operation {
+    Read,
+    StateChanging,
+}
+
+#[cfg(test)]
+fn adapt(value: Value, state: &Path, limit: usize) -> Result<Value> {
+    adapt_for_operation(value, state, limit, Operation::Read)
+}
+
+pub fn adapt_for_operation(
+    value: Value,
+    state: &Path,
+    limit: usize,
+    operation: Operation,
+) -> Result<Value> {
+    adapt_result(value, state, limit).map_err(|error| {
+        error.with_next_action(match operation {
+            Operation::Read => "Restore write access and sufficient space in the response-artifact directory, then repeat the original read.",
+            Operation::StateChanging => "Check current state or the existing work reference before resubmitting. Restore write access and sufficient space in the response-artifact directory.",
+        })
+    })
+}
+
+fn adapt_result(mut value: Value, state: &Path, limit: usize) -> Result<Value> {
     let config_path = std::path::absolute(state.join("config.json")).map_err(|_| failure())?;
     if let Some(notice) = value
         .get_mut("response_limit")
@@ -36,9 +61,19 @@ pub fn adapt(mut value: Value, state: &Path, limit: usize) -> Result<Value> {
         return Ok(value);
     }
     let directory = state.join("response-artifacts");
-    let mut writer = agentlaw_flows::artifacts::ArtifactWriter::create(&directory)?;
-    serde_json::to_writer(&mut writer, &value).map_err(|_| failure())?;
-    let artifact = writer.finish()?;
+    let artifact = (|| {
+        let mut writer = agentlaw_flows::artifacts::ArtifactWriter::create(&directory)?;
+        serde_json::to_writer(&mut writer, &value).map_err(|error| {
+            DomainError::new(
+                "result_delivery_failed",
+                format!(
+                    "Could not write the result file in {}: {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+        writer.finish()
+    })()?;
     let mut envelope = json!({
         "code":"complete_content_in_file",
         "content_read":false,

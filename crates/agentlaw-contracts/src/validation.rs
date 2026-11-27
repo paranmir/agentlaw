@@ -7,6 +7,46 @@ use serde::{
 use serde_json::{Map, Value};
 use std::fmt;
 
+const ENTITY_ID_PATTERN: &str =
+    "^(?:[0-9A-Fa-f]{8,32}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$";
+
+pub fn is_identity_prefix(value: &str) -> bool {
+    (8..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn is_entity_identity(value: &str) -> bool {
+    is_identity_prefix(value)
+        || (value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                14 => byte == b'4',
+                19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+                _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+            }))
+}
+
+pub fn identity_input_error(code: &str, path: &str, provided: &Value) -> DomainError {
+    identity_error(code).with_details(serde_json::json!([{"path":path,"provided_value":provided}]))
+}
+
+pub fn identity_error(code: &str) -> DomainError {
+    let (message, action) = match code {
+        "not_found" => (
+            "The requested identity was not found.",
+            "Look up an existing ID of the requested kind and submit it.",
+        ),
+        "ambiguous" => (
+            "The identity prefix matches multiple identities.",
+            "Submit a longer prefix or the full canonical UUID.",
+        ),
+        _ => (
+            "The identity input is invalid or duplicates an earlier identity.",
+            "Use a canonical lowercase UUIDv4 or an 8–32 digit hex prefix. Supply each identity only once in a unique list.",
+        ),
+    };
+    DomainError::new(code, message).with_next_action(action)
+}
+
 struct Unique(Value);
 impl<'de> Deserialize<'de> for Unique {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -87,11 +127,85 @@ pub fn validate_input(value: &Value) -> Result<()> {
     if accepts(&schema, value, &schema) {
         Ok(())
     } else {
-        Err(DomainError::new(
+        Err(input_field_error(value, &schema).unwrap_or_else(|| DomainError::new(
             "invalid_input",
             "Input does not match an Agentlaw action schema. Check required, forbidden, and dependent fields.",
-        ))
+        )))
     }
+}
+
+pub(crate) fn public_input_field_error(value: &Value) -> Option<DomainError> {
+    let schema = serde_json::from_str(INPUT_SCHEMA).expect("bundled schema");
+    input_field_error(value, &schema)
+}
+
+fn input_field_error(value: &Value, schema: &Value) -> Option<DomainError> {
+    fn visit(schema: &Value, value: &Value, root: &Value, path: &str) -> Option<DomainError> {
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            return visit(
+                root.pointer(reference.strip_prefix('#')?)?,
+                value,
+                root,
+                path,
+            );
+        }
+        if let Some(action) = schema.pointer("/properties/action/const") {
+            if value.get("action") != Some(action) {
+                return None;
+            }
+        }
+        if schema.get("pattern").and_then(Value::as_str) == Some(ENTITY_ID_PATTERN)
+            && !value.as_str().is_some_and(is_entity_identity)
+        {
+            return Some(identity_input_error("invalid_input", path, value));
+        }
+        if let Some(fields) = schema.get("properties").and_then(Value::as_object) {
+            for (name, field) in fields {
+                let child_path = format!("{path}/{}", name.replace('~', "~0").replace('/', "~1"));
+                if let Some(child) = value.get(name) {
+                    if let Some(error) = visit(field, child, root, &child_path) {
+                        return Some(error);
+                    }
+                } else if name == "evidence"
+                    && schema["required"]
+                        .as_array()
+                        .is_some_and(|required| required.iter().any(|field| field == "evidence"))
+                {
+                    return Some(
+                        DomainError::new("invalid_input", "Evidence is required.")
+                            .with_next_action(
+                                "Provide evidence in the required field and resubmit.",
+                            )
+                            .with_details(
+                                serde_json::json!([{"path":child_path,"constraint":"required"}]),
+                            ),
+                    );
+                }
+            }
+        }
+        if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+            for (index, item) in values.iter().enumerate() {
+                if let Some(error) = visit(items, item, root, &format!("{path}/{index}")) {
+                    return Some(error);
+                }
+                if schema["uniqueItems"] == true
+                    && items["$ref"] == "#/$defs/entityIdentityInput"
+                    && values[..index].contains(item)
+                {
+                    return Some(identity_input_error(
+                        "invalid_input",
+                        &format!("{path}/{index}"),
+                        item,
+                    ));
+                }
+            }
+        }
+        schema["oneOf"]
+            .as_array()?
+            .iter()
+            .find_map(|branch| visit(branch, value, root, path))
+    }
+    visit(schema, value, schema, "")
 }
 fn ensure_supported(s: &Value) -> Result<()> {
     let supported = [
@@ -121,6 +235,7 @@ fn ensure_supported(s: &Value) -> Result<()> {
         "dependentRequired",
         "minimum",
         "minProperties",
+        "pattern",
     ];
     let obj = s
         .as_object()
@@ -133,6 +248,12 @@ fn ensure_supported(s: &Value) -> Result<()> {
             ));
         }
         match k.as_str() {
+            "pattern" if v.as_str() != Some(ENTITY_ID_PATTERN) => {
+                return Err(DomainError::new(
+                    "schema_unsupported",
+                    "Unsupported string pattern in input schema.",
+                ));
+            }
             "$defs" | "properties" => {
                 for child in v
                     .as_object()
@@ -265,6 +386,9 @@ fn accepts(s: &Value, v: &Value, root: &Value) -> bool {
         }
     }
     if let Some(t) = v.as_str() {
+        if s.get("pattern").is_some() && !is_entity_identity(t) {
+            return false;
+        }
         if s.get("minLength")
             .and_then(Value::as_u64)
             .is_some_and(|n| (t.chars().count() as u64) < n)

@@ -107,10 +107,15 @@ pub(crate) fn normalize(value: Value) -> Result<Value> {
         return Err(invalid(format!("For action={action}, supply only action and the {action} object. Do not mix action objects or top-level input fields.")));
     }
     let input = root[action].clone();
-    check_shape(&schema["properties"][action], &input, action, &schema)?;
-    let mut flat: Map<String, Value> = input.as_object().unwrap().clone();
+    let shape = check_shape(&schema["properties"][action], &input, action, &schema);
+    let mut flat: Map<String, Value> = match input.as_object() {
+        Some(fields) => fields.clone(),
+        None => return Err(shape.expect_err("action input must be an object")),
+    };
     flat.insert("action".into(), action.into());
-    Ok(Value::Object(flat))
+    let flat = Value::Object(flat);
+    shape.map_err(|error| crate::validation::public_input_field_error(&flat).unwrap_or(error))?;
+    Ok(flat)
 }
 
 fn check_shape(schema: &Value, value: &Value, path: &str, public: &Value) -> Result<()> {

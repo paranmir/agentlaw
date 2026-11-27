@@ -276,10 +276,7 @@ fn serve_control<D: Dispatcher>(mut stream: TcpStream, ctx: Arc<Context<D>>) {
                         config::get_value(&ctx.state, Some(&snapshot.config), &key)
                     }
                     ConfigState::Missing => config::get_value(&ctx.state, None, &key),
-                    ConfigState::Invalid(reason) => Err(agentlaw_contracts::DomainError::new(
-                        "invalid_configuration",
-                        reason,
-                    )),
+                    ConfigState::Invalid(failure) => Err(failure.into_domain()),
                 };
                 match result {
                     Ok(value) => ControlReply::Config(value),
@@ -374,6 +371,17 @@ fn admit_call<D: Dispatcher>(
         .begin(ActivityKind::Execution)
         .map_err(|e| e.stopping_reason().unwrap_or(RejectReason::Busy))?;
     let history = matches!(&classified, Classified::Query(QueryRequest::History(_)));
+    let operation = match &classified {
+        Classified::Query(_) | Classified::Admin(AdminCommand::ImportCall { .. }) => {
+            delivery::Operation::Read
+        }
+        Classified::Command(crate::protocol::CommandRequest::Sync(request))
+            if matches!(request.command, agentlaw_contracts::SyncCommand::Status) =>
+        {
+            delivery::Operation::Read
+        }
+        _ => delivery::Operation::StateChanging,
+    };
     let admin = matches!(&classified, Classified::Admin(command) if !matches!(command, AdminCommand::ImportCall { .. }));
     let fallback = match header.target {
         CallTarget::Store(reference) => ctx.registry.resolve(&reference).ok().map(|s| {
@@ -399,6 +407,7 @@ fn admit_call<D: Dispatcher>(
             id,
             fallback,
             admin,
+            operation,
             (guard, registration, slot, body_reservation),
         )
     });
@@ -413,6 +422,7 @@ fn run_execution<D: Dispatcher>(
     id: RequestId,
     fallback: Option<usize>,
     admin: bool,
+    operation: delivery::Operation,
     resources: (
         super::lifecycle::LifecycleGuard,
         Registration,
@@ -429,13 +439,14 @@ fn run_execution<D: Dispatcher>(
                 if admin {
                     return Ok(value);
                 }
-                delivery::adapt(
+                delivery::adapt_for_operation(
                     value,
                     &ctx.state,
                     selected
                         .or(fallback)
                         .unwrap_or(MAX_RESULT_FRAME_BYTES as usize)
                         .min(MAX_RESULT_FRAME_BYTES as usize),
+                    operation,
                 )
             })
     }));

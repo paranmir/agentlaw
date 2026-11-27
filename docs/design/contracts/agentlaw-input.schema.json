@@ -12,6 +12,7 @@
     {
       "$ref": "#/$defs/rememberInitial"
     },
+    {"$ref": "#/$defs/publicationInspect"},
     {
       "$ref": "#/$defs/pendingInspect"
     },
@@ -35,6 +36,10 @@
     }
   ],
   "$defs": {
+    "entityIdentityInput": {
+      "type": "string",
+      "pattern": "^(?:[0-9A-Fa-f]{8,32}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
+    },
     "sync": {
       "type": "object",
       "properties": {
@@ -108,13 +113,15 @@
                   "related_memory_ids": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "$ref": "#/$defs/entityIdentityInput"
                     }
                   },
                   "required_memory_ids": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "$ref": "#/$defs/entityIdentityInput"
                     }
                   },
                   "work_targets": {
@@ -163,7 +170,8 @@
                   "evidence_memory_ids": {
                     "type": "array",
                     "items": {
-                      "type": "string"
+                      "type": "string",
+                      "$ref": "#/$defs/entityIdentityInput"
                     }
                   }
                 },
@@ -371,6 +379,7 @@
       "properties": {
         "memory_id": {
           "type": "string",
+          "$ref": "#/$defs/entityIdentityInput",
           "minLength": 1,
           "description": "Copy memory_id from the returned memory_ref."
         },
@@ -391,6 +400,7 @@
       "properties": {
         "procedure_id": {
           "type": "string",
+          "$ref": "#/$defs/entityIdentityInput",
           "minLength": 1
         },
         "observed_version": {
@@ -546,6 +556,7 @@
           "type": "array",
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1
           },
           "minItems": 0,
@@ -555,6 +566,7 @@
           "type": "array",
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1
           },
           "minItems": 0,
@@ -697,8 +709,9 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1,
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           }
         },
         "procedure_ids": {
@@ -707,8 +720,9 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1,
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           }
         },
         "restore_context": {
@@ -820,6 +834,21 @@
         "action",
         "memories"
       ],
+      "additionalProperties": false
+    },
+    "publicationInspect": {
+      "type": "object",
+      "properties": {
+        "action": {"const": "remember_this"},
+        "pending_action": {"const": "inspect"},
+        "publication_ref": {
+          "type": "string",
+          "minLength": 36,
+          "allOf": [{"$ref": "#/$defs/entityIdentityInput"}],
+          "description": "Copy the complete operation UUID for read-only inspection. A settled rejection includes rejection_code. A settled review includes pending_batch_ref."
+        }
+      },
+      "required": ["action", "pending_action", "publication_ref"],
       "additionalProperties": false
     },
     "pendingInspect": {
@@ -971,8 +1000,9 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1,
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           }
         },
         "applies_to": {
@@ -1055,8 +1085,9 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
+            "$ref": "#/$defs/entityIdentityInput",
             "minLength": 1,
-            "description": "Copy a returned identity; do not invent one."
+            "description": "Use a known UUID or its unique 8–32 digit hex prefix."
           }
         },
         "applies_to": {
@@ -1210,10 +1241,12 @@
         },
         "memory_id": {
           "type": "string",
+          "$ref": "#/$defs/entityIdentityInput",
           "minLength": 1
         },
         "procedure_id": {
           "type": "string",
+          "$ref": "#/$defs/entityIdentityInput",
           "minLength": 1
         },
         "context_layers": {

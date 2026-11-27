@@ -133,6 +133,12 @@ fn doctor_with_health_and_control(
     result["audit"] = match audit {
         Ok(value) => value,
         Err(error) => {
+            if let Some(mut details) = error.diagnostic::<agentlaw_contracts::AuditFailureDetails>()
+            {
+                details.worker_runtime = Some(result["worker_runtime"].clone());
+                details.observed_at_ms = result["observed_at_ms"].as_u64();
+                return Err(error.with_diagnostic(details));
+            }
             json!({"status":"failed","error":{"code":error.code,"message":error.message}})
         }
     };
