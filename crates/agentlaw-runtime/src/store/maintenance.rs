@@ -1,12 +1,15 @@
 //! Read-only audit and binding-exclusive source recovery.
 use crate::installation::{config, registry::ConfigSnapshot};
 use agentlaw_contracts::{DomainError, RequestControl, Result};
+use agentlaw_flows::store::PUBLICATION_RECOVERY_NEXT_ACTION;
 use agentlaw_storage::Store;
 use serde_json::{json, Value};
 use std::path::Path;
 
 fn storage_error(e: agentlaw_storage::Error) -> DomainError {
-    let code = match &e {
+    let recovery_cause = e.decided_recovery_cause();
+    let cause = recovery_cause.unwrap_or(&e);
+    let code = match cause {
         agentlaw_storage::Error::RecoveryRequired(_) => "recovery_required",
         agentlaw_storage::Error::LocalBindingMismatch => "binding_mismatch",
         agentlaw_storage::Error::CoverageLost => "coverage_lost",
@@ -23,11 +26,14 @@ fn storage_error(e: agentlaw_storage::Error) -> DomainError {
     };
     let mut error = DomainError::new(code, format!("Diagnosis or repair could not complete: {e}. Source, retained proposals and recovery materials were preserved; do not treat this as a clean result."));
     error.retryable = matches!(
-        e,
+        cause,
         agentlaw_storage::Error::InsufficientResource { .. }
             | agentlaw_storage::Error::ResourceUnknown(_)
             | agentlaw_storage::Error::Stale(_)
     );
+    if recovery_cause.is_some() {
+        error = error.with_next_action(PUBLICATION_RECOVERY_NEXT_ACTION);
+    }
     error
 }
 fn database_health(path: &Path) -> Result<Value> {
@@ -152,10 +158,14 @@ pub fn repair(
         config::coordination_root(state),
     ) {
         Ok(store) => store,
-        Err(agentlaw_storage::Error::Sql(rusqlite::Error::SqliteFailure(ref detail, _)))
+        Err(error)
             if matches!(
-                detail.code,
-                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                error.decided_recovery_cause().unwrap_or(&error),
+                agentlaw_storage::Error::Sql(rusqlite::Error::SqliteFailure(detail, _))
+                    if matches!(
+                        detail.code,
+                        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                    )
             ) =>
         {
             control.check()?;

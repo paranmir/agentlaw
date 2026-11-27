@@ -19,7 +19,15 @@ impl Store {
                 if decision != md {
                     return Err(Error::RecoveryRequired("decision binding".into()));
                 }
-                self.redo(&dir, &m, None)?;
+                self.redo(&dir, &m, None).map_err(|error| match error {
+                    Error::Io(_)
+                    | Error::SourceRead { .. }
+                    | Error::Sql(_)
+                    | Error::RecoveryRequired(_) => {
+                        Error::DecidedPublicationRecovery(Box::new(error))
+                    }
+                    other => other,
+                })?;
             } else {
                 for t in &m.targets {
                     if hash_file(&self.safe_path(&t.path)?)? != t.expected {

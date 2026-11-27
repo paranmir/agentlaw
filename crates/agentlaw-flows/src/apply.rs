@@ -966,7 +966,7 @@ fn finish_prefix_execution(
         }
         Err(error) => {
             let state = if matches!(
-                error,
+                error.decided_recovery_cause().unwrap_or(&error),
                 agentlaw_storage::Error::Io(_)
                     | agentlaw_storage::Error::SourceRead { .. }
                     | agentlaw_storage::Error::Sql(_)

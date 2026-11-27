@@ -50,6 +50,8 @@ pub enum Error {
     PublicationInvariant(&'static str),
     #[error("cannot confirm the publication decision: {0}")]
     PublicationDecisionIo(Box<Error>),
+    #[error(transparent)]
+    DecidedPublicationRecovery(Box<Error>),
     #[error("current heads changed: {0:?}")]
     HeadsChanged(Vec<String>),
     #[error("external operation: {0}")]
@@ -92,6 +94,14 @@ pub enum Error {
     Interrupted(FaultPoint),
 }
 impl Error {
+    /// The original cause of a failure while completing a durable publication decision.
+    pub fn decided_recovery_cause(&self) -> Option<&Self> {
+        match self {
+            Self::DecidedPublicationRecovery(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     fn local_recall_spool(error: impl Into<Error>) -> Self {
         Self::LocalRecallSpool(Box::new(error.into()))
     }

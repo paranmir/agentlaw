@@ -21,6 +21,9 @@ pub(crate) fn sql<T>(r: std::result::Result<T, rusqlite::Error>) -> Result<T> {
 pub(crate) fn control_backup_required() -> DomainError {
     DomainError::new("control_backup_required","Authoritative local control state is absent or cannot be retained. Existing pending proposals and authoring decisions cannot be reconstructed from canonical memories. Preserve database and WAL/SHM files, stop clients, and restore a consistent backup for this binding; no empty replacement was created.")
 }
+pub const PUBLICATION_RECOVERY_NEXT_ACTION: &str =
+    "Complete publication recovery, then check the retained operation or current heads before resubmitting a write.";
+
 pub(crate) fn source<T>(r: agentlaw_storage::Result<T>) -> Result<T> {
     r.map_err(|e| match e {
         agentlaw_storage::Error::InsufficientResource { .. } => { let mut error = DomainError::new("insufficient_resource", "Canonical work requires more available disk or memory; source and retained pending work were preserved. Free resources and retry."); error.retryable = true; error },
@@ -29,7 +32,9 @@ pub(crate) fn source<T>(r: agentlaw_storage::Result<T>) -> Result<T> {
         agentlaw_storage::Error::Stale(_) => DomainError::new("stale_memory_ref", "Source state changed; inspect current heads and retry review."),
         agentlaw_storage::Error::NotFound(_) => DomainError::new("memory_not_found", "Requested source identity is absent."),
         agentlaw_storage::Error::RecoveryRequired(_) => DomainError::new("recovery_required", "Source publication recovery must complete before access.")
-            .with_next_action("Complete publication recovery, then check the retained operation or current heads before resubmitting a write."),
+            .with_next_action(PUBLICATION_RECOVERY_NEXT_ACTION),
+        agentlaw_storage::Error::DecidedPublicationRecovery(cause) =>
+            source_error(*cause).with_next_action(PUBLICATION_RECOVERY_NEXT_ACTION),
         agentlaw_storage::Error::Corrupt(_) => DomainError::new("source_corrupt", format!("Cannot read canonical source: {e}"))
             .with_diagnostic(AcquisitionDetails { acquisition_failure: AcquisitionFailure::SourceCorrupt }),
         agentlaw_storage::Error::Io(_) | agentlaw_storage::Error::SourceRead { .. } =>
