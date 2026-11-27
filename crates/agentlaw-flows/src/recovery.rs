@@ -13,6 +13,12 @@ pub fn recover(ctx: &mut LaneCtx<'_>) -> Result<()> {
         move |phase| original.phase(phase),
     );
     source(ctx.source.recover())?;
+    crate::apply::recover_prefix_executions(
+        ctx.source,
+        &ctx.control.connection,
+        &ctx.identity.binding_id,
+        &request,
+    )?;
     recover_authoring_parts(
         ctx.source,
         &ctx.control.connection,

@@ -2,6 +2,11 @@
 use super::*;
 use published::SourcePosition;
 
+pub enum PublicationBasis<'a> {
+    ReadSet(&'a ReadSet),
+    Generation(u64),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadSet {
     pub source_position: SourcePosition,
@@ -30,15 +35,54 @@ impl Store {
             cancel,
             Some(read_set),
             None,
+            &[],
+        )
+    }
+    pub fn publish_conditionally(
+        &self,
+        operation_id: &str,
+        mutations: Vec<Mutation>,
+        basis: PublicationBasis<'_>,
+        prefix_conditions: &[PrefixCondition],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<PublishReceipt> {
+        let (generation, read_set) = match basis {
+            PublicationBasis::ReadSet(read_set) => (None, Some(read_set)),
+            PublicationBasis::Generation(generation) => (Some(generation), None),
+        };
+        let fault = None;
+        #[cfg(all(feature = "test-conditional-publication", debug_assertions))]
+        let fault = match std::env::var("AGENTLAW_TEST_CONDITIONAL_PUBLISH_FAULT").as_deref() {
+            Ok("decision") => Some(FaultPoint::Decision),
+            _ => fault,
+        };
+        self.publish_checked(
+            operation_id,
+            mutations,
+            fault,
+            generation,
+            Some(cancel),
+            read_set,
+            None,
+            prefix_conditions,
         )
     }
     pub(super) fn validate_read_set_locked(&self, read_set: &ReadSet) -> Result<()> {
+        self.validate_publication_read_set_locked(read_set, false)
+    }
+
+    pub(super) fn validate_publication_read_set_locked(
+        &self,
+        read_set: &ReadSet,
+        conditional: bool,
+    ) -> Result<()> {
         let generation = self.ensure_clean()?;
         let epoch: String = self.load(&self.local.join("source-epoch"))?;
         if epoch != read_set.source_position.epoch || read_set.source_position.sequence > generation
         {
             return Err(Error::CoverageLost);
         }
+        let mut changed_heads = Vec::new();
         for (id, expected) in &read_set.observed {
             let references = match self.read_kind(id, "memory") {
                 Ok(unit) => unit.references()?,
@@ -61,7 +105,10 @@ impl Store {
                 .collect::<BTreeSet<_>>();
             let expected = expected.iter().cloned().collect::<BTreeSet<_>>();
             if actual != expected {
-                return Err(Error::Stale(id.clone()));
+                if !conditional {
+                    return Err(Error::Stale(id.clone()));
+                }
+                changed_heads.push(id.clone());
             }
         }
         for id in &read_set.absent {
@@ -83,15 +130,29 @@ impl Store {
             }
         }
         let mut actual = baseline.clone();
+        let heads_result = if changed_heads.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::HeadsChanged(changed_heads))
+        };
         if read_set.source_position.sequence == generation {
-            return Ok(());
+            return heads_result;
         }
+        let journal_unavailable = |error| {
+            if conditional {
+                Error::Sql(error)
+            } else {
+                Error::CoverageLost
+            }
+        };
         let conn = agentlaw_sqlite::open_with_flags(
             self.local.join("journal.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
-        .map_err(|_| Error::CoverageLost)?;
-        let mut query=conn.prepare("SELECT manifest FROM publications WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence").map_err(|_|Error::CoverageLost)?;
+        .map_err(journal_unavailable)?;
+        let mut query = conn
+            .prepare("SELECT manifest FROM publications WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence")
+            .map_err(journal_unavailable)?;
         let mut rows = query.query(rusqlite::params![
             read_set.source_position.sequence.to_be_bytes().as_slice(),
             generation.to_be_bytes().as_slice()
@@ -158,6 +219,6 @@ impl Store {
         if actual != baseline {
             return Err(Error::Stale("reverse required adjacency changed".into()));
         }
-        Ok(())
+        heads_result
     }
 }

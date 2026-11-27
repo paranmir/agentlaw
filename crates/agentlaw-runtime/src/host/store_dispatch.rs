@@ -21,7 +21,7 @@ use std::{
 pub(super) fn read_config(state: &Path) -> ConfigState {
     match config::load(state) {
         Ok(None) => ConfigState::Missing,
-        Err(error) => ConfigState::Invalid(error.to_string()),
+        Err(error) => ConfigState::Invalid(crate::protocol::ConfigurationFailure::Domain(error)),
         Ok(Some(config)) => {
             match agentlaw_storage::binding_identity(
                 &config.memory_store_path,
@@ -35,7 +35,10 @@ pub(super) fn read_config(state: &Path) -> ConfigState {
                         reference,
                     }))
                 }
-                Err(error) => ConfigState::Invalid(error.to_string()),
+                Err(error) => ConfigState::Invalid(crate::protocol::ConfigurationFailure::Domain(
+                    DomainError::new("configuration_io", format!("Cannot access the configured store binding: {error}"))
+                        .with_next_action("Restore access to the configured memory store and binding directory, then retry."),
+                )),
             }
         }
     }

@@ -456,7 +456,11 @@ impl DeltaErrorPolicy {
 
     fn capacity(self, message: &str) -> DomainError {
         match self {
-            Self::General => DomainError::new("capacity", message),
+            Self::General => {
+                DomainError::new("capacity", message).with_diagnostic(AcquisitionDetails {
+                    acquisition_failure: AcquisitionFailure::ProjectionCapacity,
+                })
+            }
             Self::Recall => recall_capacity(message),
         }
     }
@@ -914,11 +918,30 @@ fn source_error(error: agentlaw_storage::Error) -> DomainError {
     match error {
         agentlaw_storage::Error::Capacity => {
             DomainError::new("capacity", "Source acquisition exceeded its capacity.")
+                .with_diagnostic(AcquisitionDetails {
+                    acquisition_failure: AcquisitionFailure::ProjectionCapacity,
+                })
         }
         agentlaw_storage::Error::CoverageLost => DomainError::new(
             "source_coverage_lost",
             "Source publication coverage is incomplete.",
         ),
+        agentlaw_storage::Error::Corrupt(_) => DomainError::new(
+            "source_corrupt",
+            format!("Cannot read published source: {error}"),
+        )
+        .with_diagnostic(AcquisitionDetails {
+            acquisition_failure: AcquisitionFailure::SourceCorrupt,
+        }),
+        agentlaw_storage::Error::Io(_) | agentlaw_storage::Error::SourceRead { .. } => {
+            DomainError::new(
+                "source_operation_failed",
+                format!("Cannot read published source: {error}"),
+            )
+            .with_diagnostic(AcquisitionDetails {
+                acquisition_failure: AcquisitionFailure::SourceRead,
+            })
+        }
         _ => DomainError::new(
             "source_unavailable",
             format!("Cannot read published source: {error}"),

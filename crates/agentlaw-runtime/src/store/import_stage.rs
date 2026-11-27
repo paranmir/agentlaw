@@ -106,6 +106,11 @@ pub fn call(
     let request = agentlaw_contracts::wire::ValidatedRequest::parse_public(&text)?;
     let classified = crate::protocol::classify(request);
     let is_history = matches!(&classified, Classified::Query(QueryRequest::History(_)));
+    let operation = if matches!(&classified, Classified::Query(_)) {
+        crate::installation::delivery::Operation::Read
+    } else {
+        crate::installation::delivery::Operation::StateChanging
+    };
     let mut value = match classified {
         Classified::Query(request) => service.query_import(request, snapshot, control)?,
         Classified::Command(crate::protocol::CommandRequest::Sync(_)) => {
@@ -126,5 +131,5 @@ pub fn call(
     };
     value["workspace"] = serde_json::json!("isolated_import_review");
     value["active_memory_changed"] = serde_json::json!(false);
-    service.deliver_import(value, is_history, snapshot)
+    service.deliver_import(value, is_history, operation, snapshot)
 }

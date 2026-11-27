@@ -23,19 +23,47 @@ pub struct Artifact {
 fn failure() -> DomainError {
     DomainError::new("result_delivery_failed","Could not retain the complete result artifact. A completed source mutation is not rolled back by a delivery failure.")
 }
-fn now() -> Result<u64> {
+fn registry_path(directory: &Path) -> PathBuf {
+    directory.join("response-registry.sqlite")
+}
+fn registry_error(directory: &Path, stage: &str, cause: impl std::fmt::Display) -> DomainError {
+    DomainError::new(
+        "result_delivery_failed",
+        format!(
+            "Could not {stage} at {}: {cause}",
+            registry_path(directory).display()
+        ),
+    )
+}
+fn now() -> std::result::Result<u64, std::time::SystemTimeError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|_| failure())
+}
+fn registry_now(directory: &Path) -> Result<u64> {
+    now().map_err(|error| registry_error(directory, "read the clock for artifact expiry", error))
+}
+fn expiration(directory: &Path, now: u64) -> Result<u64> {
+    now.checked_add(RETENTION_SECONDS).ok_or_else(|| {
+        registry_error(
+            directory,
+            "compute artifact expiry",
+            "retention deadline exceeds the clock range",
+        )
+    })
+}
+fn registry_time(directory: &Path, seconds: u64) -> Result<i64> {
+    i64::try_from(seconds)
+        .map_err(|error| registry_error(directory, "encode artifact expiry", error))
 }
 fn registry(directory: &Path) -> Result<Connection> {
-    let connection =
-        agentlaw_sqlite::open(directory.join("response-registry.sqlite")).map_err(|_| failure())?;
+    let connection = agentlaw_sqlite::open(registry_path(directory))
+        .map_err(|error| registry_error(directory, "open the result registry", error))?;
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|_| failure())?;
-    connection.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE IF NOT EXISTS response_artifacts(id TEXT PRIMARY KEY,expires INTEGER NOT NULL,next_attempt INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS response_expiration ON response_artifacts(expires,next_attempt);").map_err(|_|failure())?;
+        .map_err(|error| registry_error(directory, "configure result registry access", error))?;
+    connection.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;CREATE TABLE IF NOT EXISTS response_artifacts(id TEXT PRIMARY KEY,expires INTEGER NOT NULL,next_attempt INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS response_expiration ON response_artifacts(expires,next_attempt);")
+        .map_err(|error| registry_error(directory, "initialize the result registry", error))?;
     Ok(connection)
 }
 fn remove_expired_file(directory: &Path, id: &str, extension: &str) -> io::Result<()> {
@@ -72,15 +100,13 @@ fn remove_expired_file(directory: &Path, id: &str, extension: &str) -> io::Resul
     }
 }
 fn cleanup(directory: &Path, connection: &Connection, now: u64) -> Result<usize> {
-    let mut query=connection.prepare("SELECT id FROM response_artifacts WHERE expires<=?1 AND next_attempt<=?1 ORDER BY expires,id LIMIT 32").map_err(|_|failure())?;
+    let mut query=connection.prepare("SELECT id FROM response_artifacts WHERE expires<=?1 AND next_attempt<=?1 ORDER BY expires,id LIMIT 32").map_err(|error| registry_error(directory, "prepare the expired result query", error))?;
     let rows = query
-        .query_map([i64::try_from(now).map_err(|_| failure())?], |r| {
-            r.get::<_, String>(0)
-        })
-        .map_err(|_| failure())?;
+        .query_map([registry_time(directory, now)?], |r| r.get::<_, String>(0))
+        .map_err(|error| registry_error(directory, "query expired results", error))?;
     let ids = rows
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| failure())?;
+        .map_err(|error| registry_error(directory, "read expired result rows", error))?;
     drop(query);
     let mut removed = 0;
     for id in ids {
@@ -92,24 +118,25 @@ fn cleanup(directory: &Path, connection: &Connection, now: u64) -> Result<usize>
         if deleted {
             connection
                 .execute("DELETE FROM response_artifacts WHERE id=?1", [id])
-                .map_err(|_| failure())?;
+                .map_err(|error| {
+                    registry_error(directory, "remove an expired result registration", error)
+                })?;
             removed += 1;
         } else {
             connection
                 .execute(
                     "UPDATE response_artifacts SET next_attempt=?1 WHERE id=?2",
-                    params![
-                        i64::try_from(now.saturating_add(3600)).map_err(|_| failure())?,
-                        id
-                    ],
+                    params![registry_time(directory, now.saturating_add(3600))?, id],
                 )
-                .map_err(|_| failure())?;
+                .map_err(|error| {
+                    registry_error(directory, "defer the next expiry cleanup", error)
+                })?;
         }
     }
     Ok(removed)
 }
 pub struct ArtifactWriter {
-    writer: io::BufWriter<File>,
+    writer: Option<io::BufWriter<File>>,
     directory: PathBuf,
     id: String,
     expires: u64,
@@ -117,26 +144,32 @@ pub struct ArtifactWriter {
 }
 impl ArtifactWriter {
     pub fn create(directory: impl AsRef<Path>) -> Result<Self> {
-        std::fs::create_dir_all(directory.as_ref()).map_err(|_| failure())?;
-        let directory = std::fs::canonicalize(directory).map_err(|_| failure())?;
+        let directory = directory.as_ref();
+        std::fs::create_dir_all(directory).map_err(|error| {
+            artifact_io("create the response-artifact directory", directory, error)
+        })?;
+        let directory = std::fs::canonicalize(directory).map_err(|error| {
+            artifact_io("resolve the response-artifact directory", directory, error)
+        })?;
         let connection = registry(&directory)?;
-        let current = now()?;
+        let current = registry_now(&directory)?;
         let removed = cleanup(&directory, &connection, current)?;
-        let expires = current.checked_add(RETENTION_SECONDS).ok_or_else(failure)?;
+        let expires = expiration(&directory, current)?;
         let id = uuid::Uuid::new_v4().to_string();
         connection
             .execute(
                 "INSERT INTO response_artifacts VALUES(?1,?2,?2)",
-                params![id, i64::try_from(expires).map_err(|_| failure())?],
+                params![id, registry_time(&directory, expires)?],
             )
-            .map_err(|_| failure())?;
+            .map_err(|error| registry_error(&directory, "register the result", error))?;
+        let temporary = directory.join(format!("response-{id}.tmp"));
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(directory.join(format!("response-{id}.tmp")))
-            .map_err(|_| failure())?;
+            .open(&temporary)
+            .map_err(|error| artifact_io("open the temporary result file", &temporary, error))?;
         Ok(Self {
-            writer: io::BufWriter::new(file),
+            writer: Some(io::BufWriter::new(file)),
             directory,
             id,
             expires,
@@ -144,28 +177,31 @@ impl ArtifactWriter {
         })
     }
     pub fn finish(mut self) -> Result<Artifact> {
-        self.expires = now()?.checked_add(RETENTION_SECONDS).ok_or_else(failure)?;
+        self.expires = expiration(&self.directory, registry_now(&self.directory)?)?;
         registry(&self.directory)?
             .execute(
                 "UPDATE response_artifacts SET expires=?1,next_attempt=?1 WHERE id=?2",
-                params![i64::try_from(self.expires).map_err(|_| failure())?, self.id],
+                params![registry_time(&self.directory, self.expires)?, self.id],
             )
-            .map_err(|_| failure())?;
-        self.writer.flush().map_err(|_| failure())?;
-        self.writer.get_ref().sync_all().map_err(|_| failure())?;
-        let bytes = self
-            .writer
+            .map_err(|error| registry_error(&self.directory, "update the result expiry", error))?;
+        let temporary = self.directory.join(format!("response-{}.tmp", self.id));
+        let mut writer = self.writer.take().expect("artifact writer is open");
+        writer
+            .flush()
+            .map_err(|error| artifact_io("flush the result file", &temporary, error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| artifact_io("sync the result file", &temporary, error))?;
+        let bytes = writer
             .get_ref()
             .metadata()
-            .map_err(|_| failure())?
+            .map_err(|error| artifact_io("read the result file metadata", &temporary, error))?
             .len();
         let path = self.directory.join(format!("response-{}.json", self.id));
-        drop(self.writer);
-        std::fs::rename(
-            self.directory.join(format!("response-{}.tmp", self.id)),
-            &path,
-        )
-        .map_err(|_| failure())?;
+        drop(writer);
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| artifact_io("publish the complete result file", &path, error))?;
         Ok(Artifact {
             path,
             format: "json",
@@ -180,11 +216,30 @@ impl ArtifactWriter {
 }
 impl Write for ArtifactWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.writer.write(bytes)
+        self.writer
+            .as_mut()
+            .expect("artifact writer is open")
+            .write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer
+            .as_mut()
+            .expect("artifact writer is open")
+            .flush()
     }
+}
+impl Drop for ArtifactWriter {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        let _ = std::fs::remove_file(self.directory.join(format!("response-{}.tmp", self.id)));
+    }
+}
+
+fn artifact_io(stage: &str, path: &Path, error: io::Error) -> DomainError {
+    DomainError::new(
+        "result_delivery_failed",
+        format!("Could not {stage} at {}: {error}", path.display()),
+    )
 }
 pub fn create_from_reader(directory: impl AsRef<Path>, reader: &mut impl Read) -> Result<Artifact> {
     let mut writer = ArtifactWriter::create(directory)?;

@@ -54,8 +54,31 @@ pub fn recall(
     r: &RecallRequest,
     current_time: String,
 ) -> Result<RecallResponse> {
+    let mut request = r.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, id) in request.memory_ids.iter_mut().flatten().enumerate() {
+        let path = format!("/memory_ids/{index}");
+        let error =
+            || validation::identity_input_error("invalid_input", &path, &serde_json::json!(id));
+        if !validation::is_entity_identity(id) {
+            return Err(error());
+        }
+        let selected = if validation::is_identity_prefix(id) {
+            crate::store::selected_id(
+                source.match_memory_prefix(&id.to_ascii_lowercase())?,
+                &path,
+                id,
+            )?
+        } else {
+            id.clone()
+        };
+        if !seen.insert(selected.clone()) {
+            return Err(error());
+        }
+        *id = selected;
+    }
     let (mut response, handoff_id) =
-        recall_with_control(source, search, context, r, current_time, None, None)?;
+        recall_with_control(source, search, context, &request, current_time, None, None)?;
     if let Some(id) = handoff_id {
         let sections = source.current(&id).and_then(|state| {
             let state = state.ok_or_else(task_source_unavailable)?;

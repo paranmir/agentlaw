@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 write-audit = ["agentlaw-sqlite/write-audit"]
+test-conditional-publication = []
 
 [dependencies]
 agentlaw-sqlite = { path = "../agentlaw-sqlite" }

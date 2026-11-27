@@ -61,10 +61,18 @@ fn bounded_queue_processes_one_stores_commands_in_order() {
         },
         &RequestControl::default(),
     );
+    let error = result.err().expect("CT-04e: queue must reject overflow");
+    assert_eq!(error.code, "capacity", "FR-06.4 CT-04e: {error:?}");
+    assert!(!error.retryable);
+    let action = error.next_action.expect("CT-04e: queue recovery guidance");
+    let action = action.to_lowercase();
     assert!(
-        matches!(result, Err(error) if error.code == "capacity"
-        && !error.retryable && error.next_action.is_none()),
-        "FR-06.4: writing uses ordinary capacity"
+        action.contains("queue") && (action.contains("drain") || action.contains("empty")),
+        "{action}"
+    );
+    assert!(
+        action.contains("stor") || action.contains("writ") || action.contains("remember"),
+        "{action}"
     );
     lock.execute_batch("COMMIT").unwrap();
     assert!(matches!(first.join().unwrap(), Ok(LaneReply::Done)));

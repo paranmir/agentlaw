@@ -35,10 +35,7 @@ pub fn search_procedures_filtered(
 ) -> Result<Value> {
     ctx.request.check()?;
     let project = if let Some(selector) = project {
-        let catalog = ctx
-            .source
-            .list_catalog()
-            .map_err(|_| DomainError::new("source_unavailable", "Cannot read project catalog."))?;
+        let catalog = source(ctx.source.list_catalog())?;
         let matches: Vec<_> = catalog
             .iter()
             .filter(|p| {
@@ -571,17 +568,52 @@ pub fn prepare_recall(ctx: &ReadCtx<'_>, request: &RecallRequest) -> Result<Prep
 }
 
 fn prepare_queries(ctx: &ReadCtx<'_>, request: &RecallRequest) -> RecallResult<PreparedRecall> {
-    for id in request
+    Ok(PreparedRecall {
+        queries: query_texts(ctx, request)?,
+    })
+}
+
+fn resolve_recall_ids(
+    guard: &agentlaw_storage::published::SourceReadGuard<'_>,
+    request: &RecallRequest,
+) -> Result<RecallRequest> {
+    let mut resolved = request.clone();
+    for (field, kind, ids) in [
+        (
+            "memory_ids",
+            agentlaw_storage::EntityKind::Memory,
+            &mut resolved.memory_ids,
+        ),
+        (
+            "procedure_ids",
+            agentlaw_storage::EntityKind::Procedure,
+            &mut resolved.procedure_ids,
+        ),
+    ] {
+        let mut seen = BTreeSet::new();
+        for (index, id) in ids.iter_mut().flatten().enumerate() {
+            let path = format!("/{field}/{index}");
+            let canonical = select_source_id(guard, kind, id, &path, recall_source_error)?;
+            if !seen.insert(canonical.clone()) {
+                return Err(validation::identity_input_error(
+                    "invalid_input",
+                    &path,
+                    &json!(id),
+                ));
+            }
+            *id = canonical;
+        }
+    }
+    Ok(resolved)
+}
+
+fn has_identity_prefix(request: &RecallRequest) -> bool {
+    request
         .memory_ids
         .iter()
         .flatten()
         .chain(request.procedure_ids.iter().flatten())
-    {
-        validate_id(id)?;
-    }
-    Ok(PreparedRecall {
-        queries: query_texts(ctx, request)?,
-    })
+        .any(|id| validation::is_identity_prefix(id))
 }
 
 pub fn recall(
@@ -763,7 +795,15 @@ fn execute_recall<S: std::borrow::BorrowMut<ExactSnapshot>>(
     observe_failure: impl FnOnce(&DomainError),
 ) -> Result<(Value, Vec<DomainError>)> {
     ctx.request.check()?;
-    let (context, outer) = match resolve_recall_scope(ctx, request, fixed_project)? {
+    let scope = resolve_recall_scope(ctx, request, fixed_project)?;
+    if !matches!(scope, RecallScope::Ready(_)) && has_identity_prefix(request) {
+        let guard = ctx
+            .source
+            .read_snapshot_for_recall()
+            .map_err(recall_source_error)?;
+        resolve_recall_ids(&guard, request)?;
+    }
+    let (context, outer) = match scope {
         RecallScope::Ready(context) => (context, None),
         RecallScope::Unbound(context, value) => {
             if request.recall_for.is_none() {
@@ -848,6 +888,8 @@ fn recall_scoped(
     completeness_diagnostics: &mut Vec<DomainError>,
 ) -> RecallResult<Value> {
     check_recall(ctx.request)?;
+    let submitted_request = request;
+    let has_prefix = has_identity_prefix(submitted_request);
     if (request.include_active_tasks == Some(true) || request.work_targets.is_some())
         && context.project_id.is_none()
     {
@@ -873,9 +915,22 @@ fn recall_scoped(
         rules,
         mut full_ids,
         handoff,
+        resolved_request,
     ) = loop {
         check_recall(ctx.request)?;
         let position = exact.position().clone();
+        let selected_request = {
+            let guard = ctx
+                .source
+                .read_snapshot_for_recall()
+                .map_err(recall_source_error)?;
+            if guard.position() != &position {
+                exact.advance(&guard, budget)?;
+                continue;
+            }
+            resolve_recall_ids(&guard, request)?
+        };
+        let request = &selected_request;
         let mut findings = BTreeMap::new();
         let mut procedure_findings = BTreeMap::new();
         let mut selected: BTreeSet<String> = request
@@ -988,6 +1043,19 @@ fn recall_scoped(
         if exact.position() != &position {
             drop(guard);
             continue;
+        }
+        if has_prefix {
+            let selected = resolve_recall_ids(&guard, submitted_request)?;
+            if selected.memory_ids != request.memory_ids
+                || selected.procedure_ids != request.procedure_ids
+            {
+                return Err(DomainError::new(
+                    "source_changed",
+                    "A prefix matched a different identity while acquiring recall material.",
+                )
+                .with_next_action("Repeat the original recall against the current source.")
+                .into());
+            }
         }
         let selected_ids: Vec<_> = selected.iter().cloned().collect();
         let (resolved, missing) = match guard.read_closure(&selected_ids) {
@@ -1304,8 +1372,10 @@ fn recall_scoped(
             rules,
             full_ids,
             handoff,
+            selected_request,
         );
     };
+    let request = &resolved_request;
     let mut queries = BTreeMap::new();
     let mut weak = BTreeSet::new();
     let mut strong = BTreeSet::new();
@@ -1502,6 +1572,23 @@ fn recall_scoped(
         });
     }
     crate::recall::finalize_recall_guidance(&mut assembled);
+    let delivered_tasks: BTreeSet<_> = assembled
+        .memories
+        .iter()
+        .filter(|memory| {
+            memory
+                .current_heads
+                .iter()
+                .any(|head| head.in_working_set.is_some())
+        })
+        .map(|memory| memory.memory_id.clone())
+        .chain(
+            assembled
+                .active_task_handoff
+                .iter()
+                .map(|task| task.memory_id.clone()),
+        )
+        .collect();
     let mut result = to_value(assembled)?;
     if !rules.is_empty() {
         result["rules"] = json!(rules
@@ -1683,6 +1770,7 @@ fn recall_scoped(
         result,
         required_procedure_count,
         outer,
+        &delivered_tasks,
     )
 }
 
@@ -1768,38 +1856,22 @@ fn update_candidate_diagnostics(value: &mut Value, original: &Value, required: u
     }
 }
 
-fn recall_file_error(error: DomainError, recall: &Value) -> DomainError {
-    let full_tasks = recall["memories"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|memory| {
-            memory["current_heads"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|head| head["in_working_set"].is_boolean())
-        });
-    let task_candidates = recall["candidates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|candidate| candidate.get("objective").is_some());
-    let ids: BTreeSet<_> = full_tasks
-        .chain(task_candidates)
-        .filter_map(|task| task["memory_id"].as_str())
-        .chain(recall["active_task_handoff"]["memory_id"].as_str())
-        .collect();
-    if ids.is_empty() {
+fn recall_file_error(error: DomainError, delivered_tasks: &BTreeSet<String>) -> DomainError {
+    let next_action = "Check that the response-artifact directory exists or can be created, is writable, and has available space. Then repeat the original recall.";
+    let error = error.with_next_action(next_action);
+    if delivered_tasks.is_empty() {
         return error;
     }
-    let details: Vec<_> = ids.into_iter().map(|id| {
-        json!({
-            "memory_id": id,
-            "reason": error.message,
-            "next_action": "Check that the response-artifact directory exists or can be created, is writable, and has available space. Then repeat the original recall."
+    let details: Vec<_> = delivered_tasks
+        .iter()
+        .map(|id| {
+            json!({
+                "memory_id": id,
+                "reason": error.message,
+                "next_action": next_action
+            })
         })
-    }).collect();
+        .collect();
     error.with_details(json!(details))
 }
 
@@ -1809,6 +1881,7 @@ fn fit_response(
     value: Value,
     required_procedure_count: usize,
     outer: Option<&Value>,
+    delivered_tasks: &BTreeSet<String>,
 ) -> RecallResult<Value> {
     let limit = ctx.identity.response_limit.min(256 * 1024 * 1024);
     let wrap = |partial: &Value| {
@@ -1858,7 +1931,7 @@ fn fit_response(
             .finish_recall(&complete, &ctx.identity.local, ctx.request)
             .map_err(|failure| match failure {
                 RecallFailure::DeliveryFailed(error) => {
-                    RecallFailure::DeliveryFailed(recall_file_error(error, &value))
+                    RecallFailure::DeliveryFailed(recall_file_error(error, delivered_tasks))
                 }
                 other => other,
             });

@@ -249,6 +249,10 @@ Pro review's illustrative `Saved: T@r` text as a replacement schema. Put
 operational guidance outside quoted/retrieved memory so historical instructions
 are not mistaken for current tool rules.
 
+### Identity selection and write corrections
+
+For a known memory or learned procedure, use its returned UUID or a unique prefix of 8–32 hex digits. Discovery can accompany exact selection. Use a longer prefix for `ambiguous`, look up an existing identity of the requested kind for `not_found`, and correct the indicated field for `invalid_input`. Keep the returned full references and their observed versions for updates. For `metadata_resolution_required`, compare each field across the listed heads and submit your choices together. If publication fails with a publication_ref, use remember_this with pending_action=inspect and that reference to check the original operation. For rejected, use rejection_code to correct the request if the write is still needed. For review_required, inspect the returned pending_batch_ref and continue that batch. An unresolved decision can still be published during recovery. Missing records or decision_unknown never authorize resubmission. If write delivery failed, inspect the current state before submitting another write.
+
 ### Runtime exception guidance
 
 Use the following text only for the corresponding exception response, outside recalled memory.

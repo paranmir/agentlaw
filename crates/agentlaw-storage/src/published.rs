@@ -2,6 +2,132 @@
 use crate::{CurrentUnit, Error, Fence, Manifest, Result, Store};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs};
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum EntityKind {
+    Memory,
+    Procedure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrefixMatch {
+    Absent,
+    Unique(String),
+    Ambiguous,
+}
+
+pub enum PublicationEvidence {
+    Undecided,
+    Inconclusive,
+    Decided,
+    Published,
+}
+
+impl PrefixMatch {
+    pub fn count(ids: impl IntoIterator<Item = String>) -> Self {
+        let mut ids = ids.into_iter();
+        let Some(first) = ids.next() else {
+            return Self::Absent;
+        };
+        if ids.any(|id| id != first) {
+            Self::Ambiguous
+        } else {
+            Self::Unique(first)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrefixCondition {
+    pub kind: EntityKind,
+    pub prefix: String,
+    pub selected: String,
+}
+
+impl Store {
+    pub(crate) fn match_identity_prefix_locked(
+        &self,
+        kind: EntityKind,
+        prefix: &str,
+    ) -> Result<PrefixMatch> {
+        if !(8..=32).contains(&prefix.len())
+            || !prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Error::PublicationInvariant(
+                "invalid identity prefix condition",
+            ));
+        }
+        let kind = match kind {
+            EntityKind::Memory => "memory",
+            EntityKind::Procedure => "procedure",
+        };
+        let shard = &prefix[..2];
+        let relative = format!("current/{kind}/{shard}");
+        let directory = self.root.join(&relative);
+        let source_read = |source| Error::SourceRead {
+            path: directory.clone(),
+            source,
+        };
+        let path = self.safe_path(&relative).map_err(|error| match error {
+            Error::Io(source) => source_read(source),
+            other => other,
+        })?;
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PrefixMatch::Absent)
+            }
+            Err(error) => return Err(source_read(error)),
+        };
+        let mut selected = None;
+        for entry in entries {
+            let entry = entry.map_err(source_read)?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|id| {
+                    path.extension().is_some_and(|ext| ext == "md") && id.starts_with(shard)
+                })
+                .ok_or_else(|| Error::Corrupt("invalid current source filename".into()))?;
+            crate::validate_id(id)?;
+            if !entry
+                .file_type()
+                .map_err(|source| Error::SourceRead {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_file()
+            {
+                return Err(Error::Corrupt(
+                    "current source entry is not a regular file".into(),
+                ));
+            }
+            if id.replace('-', "").starts_with(prefix) {
+                if selected.is_some() {
+                    return Ok(PrefixMatch::Ambiguous);
+                }
+                selected = Some(id.to_owned());
+            }
+        }
+        Ok(selected.map_or(PrefixMatch::Absent, PrefixMatch::Unique))
+    }
+
+    pub(crate) fn validate_prefixes_locked(&self, conditions: &[PrefixCondition]) -> Result<()> {
+        for (index, condition) in conditions.iter().enumerate() {
+            let actual = self.match_identity_prefix_locked(condition.kind, &condition.prefix)?;
+            if !matches!(&actual, PrefixMatch::Unique(id) if id == &condition.selected) {
+                return Err(Error::PrefixSelection { index, actual });
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourcePosition {
     pub epoch: String,
@@ -60,6 +186,36 @@ impl Clone for OwnedPublishedReader {
     }
 }
 impl OwnedPublishedReader {
+    pub fn publication_evidence(&self, operation: &str) -> Result<PublicationEvidence> {
+        crate::validate_id(operation)?;
+        let store = &self.store;
+        let _guard = store.lock_shared()?;
+        let dir = store.local.join("recovery").join(operation);
+        match store.load::<crate::PublishReceipt>(&dir.join("published")) {
+            Ok(_) => return Ok(PublicationEvidence::Published),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match store.load::<String>(&dir.join("decision")) {
+            Ok(decision) => {
+                let manifest_path = dir.join("manifest");
+                let bytes = fs::read(&manifest_path)?;
+                let manifest: Manifest = store.load(&manifest_path)?;
+                if manifest.operation_id == operation && decision == crate::codec::digest(&bytes) {
+                    return Ok(PublicationEvidence::Decided);
+                }
+                return Ok(PublicationEvidence::Inconclusive);
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let fence: Fence = store.load(&store.local.join("source-fence"))?;
+        Ok(if fence.operation_id.as_deref() == Some(operation) {
+            PublicationEvidence::Inconclusive
+        } else {
+            PublicationEvidence::Undecided
+        })
+    }
     /// Construct an isolated import review using the binding's coordinated source.
     pub fn prepare_import_union(
         &self,
@@ -154,6 +310,13 @@ impl OwnedPublishedReader {
     }
 }
 impl SourceReadGuard<'_> {
+    pub fn match_identity_prefix(&self, kind: EntityKind, prefix: &str) -> Result<PrefixMatch> {
+        self.store.match_identity_prefix_locked(kind, prefix)
+    }
+
+    pub fn validate_prefixes(&self, conditions: &[PrefixCondition]) -> Result<()> {
+        self.store.validate_prefixes_locked(conditions)
+    }
     pub fn position(&self) -> &SourcePosition {
         &self.position
     }

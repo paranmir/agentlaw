@@ -36,6 +36,7 @@ sysinfo = "0.33"
 libc = "0.2"
 
 [dev-dependencies]
+agentlaw-storage = { path = "../agentlaw-storage", features = ["test-conditional-publication"] }
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]

@@ -28,6 +28,53 @@ pub struct DomainError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSourceFailure {
+    Corrupt,
+    Read,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFailureDetails {
+    pub audit_source_failure: AuditSourceFailure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_runtime: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationState {
+    BeforeDecision,
+    DecisionUnknown,
+    Decided,
+    Published,
+    Rejected,
+    ReviewRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationDetails {
+    pub publication_state: PublicationState,
+    pub publication_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcquisitionFailure {
+    SourceRead,
+    SourceCorrupt,
+    ProjectionCapacity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AcquisitionDetails {
+    pub acquisition_failure: AcquisitionFailure,
+}
+
 impl DomainError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -41,6 +88,12 @@ impl DomainError {
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
         self
+    }
+    pub fn with_diagnostic(self, details: impl Serialize) -> Self {
+        self.with_details(serde_json::to_value(details).expect("serializable diagnostic"))
+    }
+    pub fn diagnostic<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_value(self.details.clone()?).ok()
     }
     pub fn with_next_action(mut self, action: impl Into<String>) -> Self {
         self.next_action = Some(action.into());
@@ -185,6 +238,8 @@ pub struct ProcedureProposal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RememberRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_ref: Option<String>,
     pub project_path: Option<String>,
     pub resolution_ref: Option<String>,
     pub memories: Option<Vec<MemoryProposal>>,

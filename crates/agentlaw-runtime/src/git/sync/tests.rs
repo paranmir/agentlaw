@@ -162,6 +162,9 @@ impl Fixture {
         )
     }
     fn remote_write(&self, body: &str) {
+        self.remote_write_with(|store| save(store, &self.id, &self.machine, body));
+    }
+    fn remote_write_with(&self, write: impl FnOnce(&Store)) {
         let oid = git::text(&self.remote, &["rev-parse", "refs/heads/main"]).unwrap();
         let view = checkout(
             &self.store,
@@ -178,7 +181,7 @@ impl Fixture {
         )
         .unwrap();
         let store = view.open(&self.store).unwrap();
-        save(&store, &self.id, &self.machine, body);
+        write(&store);
         git::continuity_save(
             &crate::test_support::store_service::git_handle(&store).handle,
             &view.local.join("git"),
@@ -1169,5 +1172,160 @@ fn changed_inputs_during_index_preparation_are_preserved_and_resume() {
     assert_eq!(
         f.store.read_current(&f.id).unwrap().heads()[0].body,
         "real local write after overlay guard"
+    );
+}
+
+#[test]
+fn fr_01_5_sync_resolution_records_canonical_memory_relationships() {
+    // ID-13
+    check_sync_prefix_resolution(false);
+    check_sync_prefix_resolution(true);
+}
+
+fn check_sync_prefix_resolution(use_local_tail: bool) {
+    let f = Fixture::new();
+    let related = "abcdef12-0000-4000-8000-000000000001";
+    let required = "fedcba98-0000-4000-8000-000000000002";
+    let procedure = "ab987654-0000-4000-8000-000000000003";
+    save(&f.store, related, &f.machine, "Supporting release record");
+    save(&f.store, required, &f.machine, "Required release record");
+    let publish_procedure = |store: &Store, body: &str| {
+        let expected_versions = store
+            .read_procedure(procedure)
+            .ok()
+            .map(|unit| {
+                unit.references()
+                    .unwrap()
+                    .into_iter()
+                    .map(|reference| reference.observed_version)
+                    .collect()
+            })
+            .unwrap_or_default();
+        store.publish(&uid(), vec![Mutation {
+            unit: CurrentUnit {
+                entity_id:procedure.into(), entity_type:"learned_procedure".into(),
+                state:UnitState::Live { heads:vec![Head {
+                    metadata:json!({"change_id":uid(),"applicability":{"scope":"user"},
+                        "origin":{"machine_id":f.machine,"user_id":"test"},"recorded_at_ms":1,
+                        "name":"Release review","use_when":"During a release","evidence_memory_ids":[related]}),
+                    body:body.into(),
+                }] },
+            },
+            expected_versions, evidence:"Observed release checks".into(),
+        }]).unwrap();
+    };
+    publish_procedure(&f.store, "Review the published release.");
+    let source = f
+        .store
+        .with_source_read(|path, _| Ok(path.to_path_buf()))
+        .unwrap();
+    git::continuity_save(
+        &crate::test_support::store_service::git_handle(&f.store).handle,
+        &f.local.join("git"),
+        "shared release review",
+    )
+    .unwrap();
+    git::run(&source, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+    f.remote_write_with(|store| {
+        save(store, &f.id, &f.machine, "incoming release review");
+        publish_procedure(store, "Review the incoming release record.");
+    });
+    save(&f.store, &f.id, &f.machine, "outgoing release review");
+    publish_procedure(&f.store, "Review the outgoing release record.");
+    let initial = f.start(RequestControl::default());
+    let local_tail = "834a57fc-0000-4000-8000-000000000004";
+    let related_prefix = if use_local_tail {
+        save(
+            &f.store,
+            local_tail,
+            &f.machine,
+            "Published after the packet froze",
+        );
+        &local_tail[..8]
+    } else {
+        &related[..8]
+    };
+    let inputs = initial["resolution_packet"]["inputs"]
+        .as_object()
+        .expect("FR-01.5 ID-13: conflicting packet");
+    let handles = |id: &str| {
+        let matching: Vec<_> = inputs
+            .iter()
+            .filter(|(_, input)| input["entity_id"] == id)
+            .map(|(handle, _)| handle.as_str())
+            .collect();
+        assert!(matching.len() >= 2, "{id}: {inputs:?}");
+        matching
+    };
+    let memory_heads = handles(&f.id);
+    let procedure_heads = handles(procedure);
+    let dependent_dispositions: Vec<_> = initial["resolution_packet"]["dependents"]
+        .as_array()
+        .expect("FR-01.5 ID-13: frozen dependent identities")
+        .iter()
+        .map(|identity| {
+            if identity == procedure || identity == f.id.as_str() {
+                json!({"identity":identity,"disposition":"updated","evidence":"Reconciled both branches in the submitted unit."})
+            } else {
+                json!({"identity":identity,"disposition":"unchanged","evidence":"The combined review preserves this dependent's assumptions."})
+            }
+        })
+        .collect();
+    let resolved = f.request(
+        json!({
+            "command":"resolve", "operation_id":initial["operation_id"],
+            "expected_revision":initial["revision"],"request_id":uid(),
+            "solution":{"units":[{
+                "target":f.id, "metadata_from":memory_heads[0],"derived_from":memory_heads,
+                "body":"Combined release review","evidence":"Both branches reviewed",
+                "related_memory_ids":[related_prefix],"required_memory_ids":[&required[..8]]
+            },{
+                "target":procedure, "metadata_from":procedure_heads[0],"derived_from":procedure_heads,
+                "body":"Review both release records.","evidence":"Both branches reviewed",
+                "evidence_memory_ids":[&required[..8]]
+            }],"redirects":[],"projects":[],"dependent_dispositions":dependent_dispositions}
+        }),
+        RequestControl::default(),
+    );
+    if use_local_tail {
+        assert_eq!(resolved["status"], "solution_rejected", "{resolved:#}");
+        assert!(
+            resolved.to_string().contains("\"not_found\""),
+            "{resolved:#}"
+        );
+        assert_eq!(
+            f.store.read_current(local_tail).unwrap().heads()[0].body,
+            "Published after the packet froze"
+        );
+        return;
+    }
+    assert_eq!(resolved["status"], "completed_for_cutoff", "{resolved:#}");
+    let oid = resolved["candidate_commit"].as_str().unwrap();
+    let shared = git::text(
+        &f.remote,
+        &[
+            "show",
+            &format!("{oid}:current/memory/{}/{}.md", &f.id[..2], f.id),
+        ],
+    )
+    .unwrap();
+    for id in [related, required] {
+        assert!(
+            shared.contains(id),
+            "FR-01.5 ID-13: missing canonical relationship {id}"
+        );
+    }
+    let shared = checkout(
+        &f.store,
+        &f.remote,
+        oid,
+        f._temp.path(),
+        "verify-shared-relationships",
+    )
+    .unwrap();
+    let published = shared.open(&f.store).unwrap();
+    assert_eq!(
+        published.read_procedure(procedure).unwrap().heads()[0].metadata["evidence_memory_ids"],
+        json!([required]),
     );
 }

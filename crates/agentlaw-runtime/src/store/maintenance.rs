@@ -1,12 +1,15 @@
 //! Read-only audit and binding-exclusive source recovery.
 use crate::installation::{config, registry::ConfigSnapshot};
 use agentlaw_contracts::{DomainError, RequestControl, Result};
+use agentlaw_flows::store::PUBLICATION_RECOVERY_NEXT_ACTION;
 use agentlaw_storage::Store;
 use serde_json::{json, Value};
 use std::path::Path;
 
 fn storage_error(e: agentlaw_storage::Error) -> DomainError {
-    let code = match &e {
+    let recovery_cause = e.decided_recovery_cause();
+    let cause = recovery_cause.unwrap_or(&e);
+    let code = match cause {
         agentlaw_storage::Error::RecoveryRequired(_) => "recovery_required",
         agentlaw_storage::Error::LocalBindingMismatch => "binding_mismatch",
         agentlaw_storage::Error::CoverageLost => "coverage_lost",
@@ -14,17 +17,23 @@ fn storage_error(e: agentlaw_storage::Error) -> DomainError {
         agentlaw_storage::Error::Corrupt(_) => "source_corrupt",
         agentlaw_storage::Error::InsufficientResource { .. } => "insufficient_resource",
         agentlaw_storage::Error::ResourceUnknown(_) => "resource_capacity_unknown",
-        agentlaw_storage::Error::Io(_) => "diagnostic_io",
+        agentlaw_storage::Error::SourceRead { .. } => "diagnostic_io",
+        agentlaw_storage::Error::Io(_) | agentlaw_storage::Error::LocalRecallSpool(_) => {
+            "local_state_unreadable"
+        }
         agentlaw_storage::Error::Sql(_) => "local_state_unreadable",
         _ => "diagnostic_incomplete",
     };
     let mut error = DomainError::new(code, format!("Diagnosis or repair could not complete: {e}. Source, retained proposals and recovery materials were preserved; do not treat this as a clean result."));
     error.retryable = matches!(
-        e,
+        cause,
         agentlaw_storage::Error::InsufficientResource { .. }
             | agentlaw_storage::Error::ResourceUnknown(_)
             | agentlaw_storage::Error::Stale(_)
     );
+    if recovery_cause.is_some() {
+        error = error.with_next_action(PUBLICATION_RECOVERY_NEXT_ACTION);
+    }
     error
 }
 fn database_health(path: &Path) -> Result<Value> {
@@ -63,6 +72,9 @@ fn journal_corrupt(path: &Path) -> Result<bool> {
         Err(error) => Err(DomainError::new("local_state_unreadable", format!("The publication journal could not be inspected: {error}. No database was replaced."))),
     }
 }
+fn audit_report_failure(error: DomainError) -> Value {
+    json!({"status":"failed","error":{"code":error.code,"message":error.message}})
+}
 pub fn audit(
     state: &Path,
     snapshot: &ConfigSnapshot,
@@ -71,15 +83,40 @@ pub fn audit(
 ) -> Result<Value> {
     control.check()?;
     let local = snapshot.config.runtime_root(state);
+    let store = match Store::open_read_only_with_coordination(
+        &snapshot.config.memory_store_path,
+        local.join("canonical"),
+        config::coordination_root(state),
+    ) {
+        Ok(store) => store,
+        Err(cause) => return Ok(audit_report_failure(storage_error(cause))),
+    };
+    let source = match store.audit_source() {
+        Ok(source) => source,
+        Err(cause) => {
+            use agentlaw_contracts::{AuditFailureDetails, AuditSourceFailure};
+            let (kind, action) = match &cause {
+                agentlaw_storage::Error::Corrupt(_) => (
+                    AuditSourceFailure::Corrupt,
+                    "Preserve the source and restore the damaged canonical data from a verified copy before auditing again.",
+                ),
+                agentlaw_storage::Error::SourceRead { .. } => (
+                    AuditSourceFailure::Read,
+                    "Restore read access to the source and repeat doctor --audit.",
+                ),
+                _ => return Ok(audit_report_failure(storage_error(cause))),
+            };
+            return Err(storage_error(cause)
+                .with_next_action(action)
+                .with_diagnostic(AuditFailureDetails {
+                    audit_source_failure: kind,
+                    worker_runtime: None,
+                    observed_at_ms: None,
+                }));
+        }
+    };
+    control.check()?;
     let result = (|| -> Result<Value> {
-        let store = Store::open_read_only_with_coordination(
-            &snapshot.config.memory_store_path,
-            local.join("canonical"),
-            config::coordination_root(state),
-        )
-        .map_err(storage_error)?;
-        let source = store.audit_source().map_err(storage_error)?;
-        control.check()?;
         let control_db = database_health(&local.join("control.sqlite"))?;
         let journal = database_health(&local.join("canonical/journal.sqlite"))?;
         if control_db["present"] == false {
@@ -101,13 +138,7 @@ pub fn audit(
             json!({"status":"passed","source":source,"local_databases":{"control":control_db,"publication_journal":journal},"background_indexing":background}),
         )
     })();
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) if error.code == "cancelled" => Err(error),
-        Err(error) => {
-            Ok(json!({"status":"failed","error":{"code":error.code,"message":error.message}}))
-        }
-    }
+    Ok(result.unwrap_or_else(audit_report_failure))
 }
 
 pub fn repair(
@@ -127,10 +158,14 @@ pub fn repair(
         config::coordination_root(state),
     ) {
         Ok(store) => store,
-        Err(agentlaw_storage::Error::Sql(rusqlite::Error::SqliteFailure(ref detail, _)))
+        Err(error)
             if matches!(
-                detail.code,
-                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                error.decided_recovery_cause().unwrap_or(&error),
+                agentlaw_storage::Error::Sql(rusqlite::Error::SqliteFailure(detail, _))
+                    if matches!(
+                        detail.code,
+                        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                    )
             ) =>
         {
             control.check()?;

@@ -170,6 +170,7 @@ fn error(error: ClientError, has_reference: bool) -> DomainError {
         ClientError::Runtime(RuntimeError::Unresponsive) => DomainError::new("runtime_unresponsive", "The Agentlaw runtime process is running but not responding, so this operation was not executed. You must tell the user in their language that Agentlaw memory is unavailable because its runtime is unresponsive, and that ending the Agentlaw runtime process lets the next call start a new one. Do not retry automatically and do not end the process yourself."),
         ClientError::Runtime(RuntimeError::Protocol(reason)) => DomainError::new("runtime_protocol_mismatch", format!("The runtime does not match this installation. Restart the harness. {reason}")),
         ClientError::Rejected(RejectReason::InvalidBody(error)) => error,
+        ClientError::Rejected(RejectReason::ConfigInvalid(failure)) => failure.into_domain(),
         ClientError::Rejected(RejectReason::ConnectionRequired) => DomainError::new("memory_store_connection_required", "No memory store is connected. Connect a memory store before continuing."),
         ClientError::Rejected(RejectReason::StoreUnavailable(reason)) => {
             if let Some((code, message)) = reason.split_once(": ") {

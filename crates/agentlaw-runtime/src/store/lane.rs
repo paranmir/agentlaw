@@ -303,12 +303,13 @@ impl LaneSender {
         };
         match self.shared.sender.try_send(Message::Work(work)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                return Err(DomainError::new(
-                    "capacity",
-                    "The store mutation queue is full.",
-                ))
-            }
+            Err(TrySendError::Full(_)) => return Err(DomainError::new(
+                "capacity",
+                "The store mutation queue is full.",
+            )
+            .with_next_action(
+                "Wait for the publication queue to drain, then repeat the original write request.",
+            )),
             Err(TrySendError::Disconnected(_)) => return Err(unavailable()),
         }
         loop {

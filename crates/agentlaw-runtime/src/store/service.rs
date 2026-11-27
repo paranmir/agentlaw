@@ -22,7 +22,7 @@ use agentlaw_flows::{
     history_cache::HistoryCacheGuards,
     prepare::Prepared,
     semantic::{SemanticCoverage, SemanticError},
-    store::{ReadCtx, StoreIdentity},
+    store::{ReadCtx, StoreIdentity, PUBLICATION_RECOVERY_NEXT_ACTION},
     DomainError, RecallRequest, RequestControl, Result,
 };
 use agentlaw_storage::{
@@ -109,6 +109,7 @@ impl StoreService {
         &self,
         value: Value,
         history: bool,
+        operation: crate::installation::delivery::Operation,
         snapshot: &ConfigSnapshot,
     ) -> Result<Value> {
         let limit = if history {
@@ -119,7 +120,7 @@ impl StoreService {
         } else {
             snapshot.config.response_limit_bytes
         };
-        crate::installation::delivery::adapt(value, &self.state, limit)
+        crate::installation::delivery::adapt_for_operation(value, &self.state, limit, operation)
     }
     fn import_identity(&self, snapshot: &ConfigSnapshot) -> StoreIdentity {
         StoreIdentity {
@@ -490,7 +491,16 @@ impl StoreService {
             identity.local.join("canonical"),
             &deps.coordination,
         )
-        .map_err(|e| RuntimeError::StoreUnavailable(e.to_string()))?;
+        .map_err(|error| {
+            let unavailable = RuntimeError::StoreUnavailable(error.to_string());
+            if error.decided_recovery_cause().is_some() {
+                return RuntimeError::Domain(
+                    DomainError::new("store_unavailable", unavailable.to_string())
+                        .with_next_action(PUBLICATION_RECOVERY_NEXT_ACTION),
+                );
+            }
+            unavailable
+        })?;
         writer.finish_binding_initialization(&identity)?;
         let source = store.owned_published_reader();
         let key = agentlaw_storage::binding_identity(&identity.root, &identity.local)

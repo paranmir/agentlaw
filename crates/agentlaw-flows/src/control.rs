@@ -47,6 +47,20 @@ impl ControlWriter {
             CREATE TABLE IF NOT EXISTS pending(id TEXT PRIMARY KEY,version TEXT NOT NULL,binding TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','published','discarded')),result TEXT,discard_reason TEXT);
             CREATE TABLE IF NOT EXISTS authoring(token TEXT PRIMARY KEY,binding TEXT NOT NULL,basis TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS authoring_executions(token TEXT PRIMARY KEY,binding TEXT NOT NULL,operation TEXT NOT NULL,generation TEXT NOT NULL,mutation TEXT NOT NULL,submission TEXT NOT NULL,status TEXT NOT NULL,result TEXT);
+            CREATE TABLE IF NOT EXISTS prefix_executions(binding TEXT NOT NULL,operation TEXT NOT NULL,subject TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(binding,operation),UNIQUE(binding,subject));
+            CREATE TABLE IF NOT EXISTS prefix_execution_outcomes(
+                completion_seq INTEGER PRIMARY KEY,
+                binding TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                state TEXT NOT NULL,
+                rejection_code TEXT,
+                pending_batch_id TEXT,
+                observed_version TEXT,
+                UNIQUE(binding,operation),
+                CHECK((state='rejected' AND rejection_code IS NOT NULL AND pending_batch_id IS NULL AND observed_version IS NULL)
+                   OR (state='review_required' AND rejection_code IS NULL AND pending_batch_id IS NOT NULL AND observed_version IS NOT NULL))
+            );
+            CREATE INDEX IF NOT EXISTS prefix_execution_outcomes_retention ON prefix_execution_outcomes(binding,completion_seq);
         "))?;
         Ok(Self { connection })
     }
@@ -194,6 +208,51 @@ impl ControlWriter {
 pub struct ControlReader {
     connection: Connection,
 }
+
+pub(crate) enum PrefixExecutionOutcome {
+    InProgress,
+    Rejected(String),
+    ReviewRequired(PendingBatchRef),
+}
+
+pub(crate) fn record_prefix_outcome(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &str,
+    operation: &str,
+    outcome: PrefixTerminalOutcome<'_>,
+) -> Result<()> {
+    let (state, code, id, version) = match outcome {
+        PrefixTerminalOutcome::Rejected(code) => ("rejected", Some(code), None, None),
+        PrefixTerminalOutcome::ReviewRequired(reference) => (
+            "review_required",
+            None,
+            Some(reference.pending_batch_id.as_str()),
+            Some(reference.observed_version.as_str()),
+        ),
+    };
+    let inserted = sql(tx.execute(
+        "INSERT INTO prefix_execution_outcomes(binding,operation,state,rejection_code,pending_batch_id,observed_version)
+         VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(binding,operation) DO NOTHING",
+        params![binding, operation, state, code, id, version],
+    ))?;
+    if inserted != 0 {
+        const RETAINED_OUTCOMES: usize = 4096;
+        sql(tx.execute(
+            "DELETE FROM prefix_execution_outcomes WHERE binding=?1 AND completion_seq <= (
+                SELECT completion_seq FROM prefix_execution_outcomes WHERE binding=?1
+                ORDER BY completion_seq DESC LIMIT 1 OFFSET ?2
+             )",
+            params![binding, RETAINED_OUTCOMES],
+        ))?;
+    }
+    Ok(())
+}
+
+pub(crate) enum PrefixTerminalOutcome<'a> {
+    Rejected(&'a str),
+    ReviewRequired(&'a PendingBatchRef),
+}
+
 impl ControlReader {
     pub fn open(local: impl AsRef<Path>) -> Result<Self> {
         let connection = sql(agentlaw_sqlite::open_with_flags(
@@ -293,6 +352,29 @@ impl ControlReader {
             )
             .optional())
     }
+    pub(crate) fn prefix_execution_outcome(
+        &self,
+        binding: &str,
+        operation: &str,
+    ) -> Result<Option<PrefixExecutionOutcome>> {
+        sql(self.connection.query_row(
+            "SELECT state,rejection_code,pending_batch_id,observed_version
+             FROM prefix_execution_outcomes WHERE binding=?1 AND operation=?2
+             UNION ALL
+             SELECT 'in_progress',NULL,NULL,NULL FROM prefix_executions WHERE binding=?1 AND operation=?2",
+            params![binding, operation],
+            |row| match row.get::<_, String>(0)?.as_str() {
+                "in_progress" => Ok(PrefixExecutionOutcome::InProgress),
+                "rejected" => Ok(PrefixExecutionOutcome::Rejected(row.get(1)?)),
+                "review_required" => Ok(PrefixExecutionOutcome::ReviewRequired(PendingBatchRef {
+                    pending_batch_id: row.get(2)?,
+                    observed_version: row.get(3)?,
+                })),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            },
+        ).optional())
+    }
+
     pub fn pending_inspect(&self, binding: &str, reference: &PendingBatchRef) -> Result<Value> {
         let (retained, status, result) = load_pending(&self.connection, binding, reference)?;
         if status == "published" {

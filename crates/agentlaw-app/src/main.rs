@@ -133,6 +133,14 @@ impl ErrorPolicy {
 
     fn report(self, error: &DomainError) -> ! {
         let code = match self {
+            Self::Stdout
+                if error
+                    .diagnostic::<agentlaw_contracts::AuditFailureDetails>()
+                    .is_some() =>
+            {
+                eprintln!("{}", agentlaw_app::error_payload(error));
+                agentlaw_app::exit_code(error)
+            }
             Self::Stdout => {
                 println!("{}", agentlaw_app::error_payload(error));
                 agentlaw_app::exit_code(error)

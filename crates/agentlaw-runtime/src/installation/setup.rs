@@ -162,9 +162,7 @@ pub fn command(state: &Path, registry: &ConfigRegistry, command: SetupCommand) -
                         "Connect a memory store first.",
                     ))
                 }
-                ConfigState::Invalid(reason) => {
-                    return Err(DomainError::new("invalid_configuration", reason))
-                }
+                ConfigState::Invalid(failure) => return Err(failure.into_domain()),
             };
             let mut next = current.config.clone();
             if key == "history.response_limit_bytes" {

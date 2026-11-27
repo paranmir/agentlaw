@@ -39,6 +39,8 @@ pub fn recall_source_error(error: agentlaw_storage::Error) -> DomainError {
             "Stored source failed an integrity check because a frame ended before its declared length.",
         ),
         Error::Io(error) => read_failed(error.kind()),
+        error @ Error::SourceRead { .. } => source_operation_failed(error.to_string()),
+        Error::PublicationInvariant(reason) => panic!("publication invariant failed: {reason}"),
         Error::Json(error) => match error.io_error_kind() {
             Some(kind) => read_failed(kind),
             None => corrupt_recall_source("Stored source metadata failed validation as JSON."),
@@ -131,6 +133,67 @@ fn check_recall(control: &RequestControl) -> RecallResult<()> {
 /// Inspect retained pending work without opening a writable control connection.
 pub fn pending_inspect(ctx: &ReadCtx<'_>, request: &RememberRequest) -> Result<Value> {
     ctx.request.check()?;
+    if let Some(operation) = &request.publication_ref {
+        use crate::control::PrefixExecutionOutcome;
+        use agentlaw_storage::PublicationEvidence;
+        if validate_id(operation).is_err() {
+            return Err(DomainError::new(
+                "invalid_input",
+                "publication_ref must be a canonical UUIDv4.",
+            ));
+        }
+        let state = match ctx.source.publication_evidence(operation) {
+            Ok(PublicationEvidence::Published) => PublicationState::Published,
+            Ok(PublicationEvidence::Decided) => PublicationState::Decided,
+            evidence => match (
+                evidence,
+                ctx.control
+                    .prefix_execution_outcome(&ctx.identity.binding_id, operation)?,
+            ) {
+                (_, Some(PrefixExecutionOutcome::Rejected(code))) => {
+                    let next_action = match code.as_str() {
+                    "ambiguous" | "not_found" | "invalid_input" => {
+                        validation::identity_error(&code)
+                            .next_action
+                            .expect("identity rejection has guidance")
+                    }
+                    "cancelled" => "Submit a new request if the write is still needed.".into(),
+                    _ => {
+                        "Inspect current heads and review the proposed changes before resubmitting."
+                            .into()
+                    }
+                };
+                    return Ok(json!({
+                        "publication_state": PublicationState::Rejected,
+                        "publication_ref": operation,
+                        "rejection_code": code,
+                        "next_action": next_action,
+                    }));
+                }
+                (_, Some(PrefixExecutionOutcome::ReviewRequired(reference))) => {
+                    return Ok(json!({
+                        "publication_state": PublicationState::ReviewRequired,
+                        "publication_ref": operation,
+                        "pending_batch_ref": reference,
+                        "next_action": "Inspect the returned pending_batch_ref to review the proposals and current heads, then continue that batch.",
+                    }));
+                }
+                (Ok(PublicationEvidence::Undecided), Some(PrefixExecutionOutcome::InProgress)) => {
+                    PublicationState::BeforeDecision
+                }
+                _ => PublicationState::DecisionUnknown,
+            },
+        };
+        let next_action = if state == PublicationState::Published {
+            "The original operation was published. Use the current source to verify its outcome."
+                .to_owned()
+        } else {
+            crate::apply::publication_inspect_action(operation)
+        };
+        return Ok(
+            json!({"publication_state":state,"publication_ref":operation,"next_action":next_action}),
+        );
+    }
     let reference = request
         .pending_batch_ref
         .as_ref()
